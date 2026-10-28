@@ -150,102 +150,24 @@ pub fn interleave(src: &AudioBuffer, frames: usize, out: &mut [f32]) {
     }
 }
 
-/// Realtime backend (CPAL). Compiled only with `--features realtime`.
+/// Realtime CPAL backend (SPEC-005). Always compiled for its pure helpers;
+/// the device glue requires the `realtime` feature.
+pub mod realtime;
+
+/// Builds the demo graph used by `daw bounce`, `daw play`, and `selftest`: a
+/// single 440 Hz sine at half amplitude on a mono graph.
 ///
-/// The adapter is deliberately tiny: CPAL calls [`audio_core::Renderer::render`]
-/// directly from the data callback, then [`interleave`]s the planar result.
-#[cfg(feature = "realtime")]
-pub mod realtime {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use cpal::{SampleFormat, StreamConfig};
-
-    use audio_core::buffer::AudioBuffer;
-    use audio_core::graph::Graph;
-    use audio_core::render::Renderer;
-    use audio_core::transport::{DEFAULT_SAMPLE_RATE, Transport};
-
-    /// Error type for stream startup.
-    #[derive(Debug, thiserror::Error)]
-    pub enum BackendError {
-        /// Enumerating device formats failed.
-        #[error("audio backend: {0}")]
-        Configs(#[from] cpal::SupportedStreamConfigsError),
-        /// Opening or starting the stream failed.
-        #[error("audio stream: {0}")]
-        Stream(#[from] cpal::BuildStreamError),
-        /// Starting playback failed.
-        #[error("audio play: {0}")]
-        Play(#[from] cpal::PlayStreamError),
-        /// The default output device has no usable configuration.
-        #[error("default output device has no f32 configuration")]
-        NoF32Config,
-        /// No default output device.
-        #[error("no default output device")]
-        NoDevice,
-    }
-
-    /// Writes `frames` planar samples into an interleaved output slice.
-    fn interleave_stereo(src: &AudioBuffer, frames: usize, channels: usize, out: &mut [f32]) {
-        for frame in 0..frames {
-            for ch in 0..channels {
-                // Mono graphs are upmixed by repeating channel 0.
-                let s = src.channel(ch.min(src.channels() - 1))[frame];
-                out[frame * channels + ch] = s;
-            }
-        }
-    }
-
-    /// Plays a graph through the default output device until `stream` drops.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError`] if the device cannot be opened or configured,
-    /// or [`BackendError::NoF32Config`] if no output config supports 48 kHz f32.
-    pub fn play_default(graph: Graph) -> Result<cpal::Stream, BackendError> {
-        let host = cpal::default_host();
-        let device = host.default_output_device().ok_or(BackendError::NoDevice)?;
-        let config = device
-            .supported_output_configs()?
-            .find(|c| {
-                c.sample_format() == SampleFormat::F32
-                    && c.min_sample_rate().0 <= DEFAULT_SAMPLE_RATE
-                    && DEFAULT_SAMPLE_RATE <= c.max_sample_rate().0
-            })
-            .ok_or(BackendError::NoF32Config)?
-            .with_sample_rate(cpal::SampleRate(DEFAULT_SAMPLE_RATE));
-        let config: StreamConfig = config.into();
-        let channels = usize::from(config.channels);
-        // Fixed quantum: the renderer reserves scratch for this size once, so
-        // the callback never allocates or resizes. Larger device buffers are
-        // rendered in pieces of `BLOCK` frames.
-        const BLOCK: usize = 1024;
-        let mut renderer = Renderer::new(graph, Transport::new(DEFAULT_SAMPLE_RATE), BLOCK);
-        renderer
-            .transport_mut()
-            .apply(audio_core::TransportCommand::Play);
-        let mut scratch = AudioBuffer::new(renderer.channels(), BLOCK);
-
-        let stream = device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _| {
-                let frames = data.len() / channels;
-                let mut written = 0;
-                // Loop instead of assuming the device honours our block size.
-                while written < frames {
-                    let n = (frames - written).min(BLOCK);
-                    if renderer.render(n, &mut scratch).is_err() {
-                        // Never panic in the callback: silence on error.
-                        data[written * channels..].fill(0.0);
-                        return;
-                    }
-                    interleave_stereo(&scratch, n, channels, &mut data[written * channels..]);
-                    written += n;
-                }
-            },
-            move |err| eprintln!("audio stream error: {err}"),
-            None,
-        )?;
-        stream.play()?;
-        Ok(stream)
-    }
+/// # Errors
+///
+/// Returns a boxed error if the graph cannot be built.
+pub fn build_demo_graph(sample_rate: u32) -> Result<Graph, Box<dyn std::error::Error>> {
+    let mut graph = Graph::with_capacity(sample_rate, 1, 1024, 4);
+    graph.add_node(
+        "tone",
+        nodes::Tone {
+            freq_hz: 440.0,
+            level: 0.5,
+        },
+    )?;
+    Ok(graph)
 }

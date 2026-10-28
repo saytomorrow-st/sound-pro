@@ -7,8 +7,7 @@
 //! Useful as a smoke test of the whole engine path on a machine without audio
 //! hardware, and as a template for future "bounce with a script" workflows.
 
-use audio_core::buffer::AudioBuffer;
-use audio_core::graph::{Graph, NodeProcessor, ProcessContext};
+use audio_core::graph::{Graph, NodeProcessor, NodeView, ProcessContext};
 use audio_core::offline::OfflineRenderer;
 use audio_core::render::Renderer;
 use audio_core::transport::{DEFAULT_SAMPLE_RATE, Transport, TransportCommand};
@@ -21,7 +20,7 @@ struct Tone {
 }
 
 impl NodeProcessor for Tone {
-    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut AudioBuffer) {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
         let block = sine(self.freq_hz, ctx.sample_rate, ctx.position, ctx.frames);
         let dst = output.channel_mut(0);
         for (i, sample) in block.iter().enumerate() {

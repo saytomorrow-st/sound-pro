@@ -133,6 +133,13 @@ impl Renderer {
 
     /// Renders one quantum into `out` and advances the transport.
     ///
+    /// Only the first `frames` frames of every channel are written; the rest of
+    /// `out` is left untouched. A realtime backend that renders a large device
+    /// buffer in several quanta therefore never leaks samples from a previous
+    /// quantum into the tail of the current one — nodes cannot write past
+    /// `frames` in the first place (they get a [`crate::graph::NodeView`] of
+    /// exactly `frames` frames) and the renderer copies exactly `frames`.
+    ///
     /// # Errors
     ///
     /// Returns [`RenderError::InvalidFrameCount`] for zero/oversized quanta and
@@ -146,6 +153,10 @@ impl Renderer {
         }
         self.drain_commands();
         let position = self.transport.advance(frames);
+        // Nodes write `..=ctx.frames`; clearing the whole reserved scratch keeps
+        // any stale samples from a previous, longer quantum out of this one.
+        // `AudioBuffer::clear` is allocation-free.
+        self.scratch.clear();
         let ctx = ProcessContext {
             sample_rate: self.transport.sample_rate(),
             position,
@@ -154,7 +165,9 @@ impl Renderer {
         };
         self.graph.process(&ctx, frames, &mut self.scratch)?;
         for ch in 0..out.channels().min(self.scratch.channels()) {
-            out.channel_mut(ch)[..frames].copy_from_slice(&self.scratch.channel(ch)[..frames]);
+            let dst = &mut out.channel_mut(ch)[..frames];
+            let src = &self.scratch.channel(ch)[..frames];
+            dst.copy_from_slice(src);
         }
         for ch in self.scratch.channels()..out.channels() {
             out.channel_mut(ch)[..frames].fill(0.0);

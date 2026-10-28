@@ -115,6 +115,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "play" => {
+            let seconds = args
+                .next()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(3.0);
+            play(seconds)
+        }
         "-h" | "--help" | "help" => {
             usage();
             ExitCode::SUCCESS
@@ -129,9 +136,45 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage:\n  daw bounce <out.wav> [seconds] [--split <samples>]\n  daw selftest\n\n\
+        "usage:\n  daw bounce <out.wav> [seconds] [--split <samples>]\n  \
+         daw play [seconds]\n  daw selftest\n\n\
          --split <samples> writes part-01.wav, part-02.wav, ... each at most\n\
          <samples> long (samples, not frames; mono).\n\n\
+         `daw play` needs `--features realtime`; without it the command exits 2.\n\
          Build with `--features realtime` to enable the CPAL backend."
     );
+}
+
+/// `daw play`: render the demo graph to the default output device for `seconds`.
+#[cfg(feature = "realtime")]
+fn play(seconds: f64) -> ExitCode {
+    use std::time::Duration;
+
+    // The graph is built by the backend at the rate the device actually runs.
+    let mut handle = match daw_app::realtime::play_default(daw_app::build_demo_graph) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("play failed: {e}");
+            // No device / no config are user-facing setup problems: exit 2.
+            return ExitCode::from(2);
+        }
+    };
+    std::thread::sleep(Duration::from_secs_f64(seconds.max(0.0)));
+    handle.stop();
+    let stats = handle.stats();
+    println!(
+        "played: {} frames, {} dropped callbacks, {} render errors, {} stream errors",
+        stats.rendered_frames(),
+        stats.dropped_callbacks(),
+        stats.render_errors(),
+        stats.stream_errors()
+    );
+    ExitCode::SUCCESS
+}
+
+/// `daw play` without the realtime feature: explain and exit 2.
+#[cfg(not(feature = "realtime"))]
+fn play(_seconds: f64) -> ExitCode {
+    eprintln!("play is unavailable: rebuild with `--features realtime`");
+    ExitCode::from(2)
 }

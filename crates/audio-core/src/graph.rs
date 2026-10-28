@@ -9,6 +9,7 @@
 //! reserved by [`Graph::with_capacity`] at setup time.
 
 use std::collections::TryReserveError;
+use std::marker::PhantomData;
 
 use crate::buffer::AudioBuffer;
 use crate::transport::Transport;
@@ -37,9 +38,10 @@ pub struct ProcessContext<'a> {
 pub trait NodeProcessor {
     /// Renders exactly `ctx.frames` frames into `output`.
     ///
-    /// The engine zeroes `output` before calling, so nodes may either write
-    /// or accumulate with `+=`.
-    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut AudioBuffer);
+    /// The engine zeroes `output` before calling and hands over a window of
+    /// exactly `ctx.frames` frames, so nodes may either write or accumulate
+    /// with `+=` and cannot reach past the current quantum.
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>);
 }
 
 /// Errors that can occur while building or processing a graph.
@@ -79,7 +81,103 @@ pub enum GraphError {
 struct NodeSlot {
     id: NodeId,
     processor: Box<dyn NodeProcessor + Send>,
+    /// Reserved for `max_quantum` frames; nodes only ever see the first
+    /// `frames` frames of it (see [`NodeView`]) so the reserved tail can never
+    /// carry samples from an earlier, longer quantum.
     scratch: AudioBuffer,
+}
+
+impl NodeSlot {
+    /// Silences the reserved scratch. The graph silences before handing the view
+    /// over, so a node's output never depends on what an earlier quantum left in
+    /// the reserved frames. Realtime-safe: a plain `f32` fill.
+    fn silence(&mut self) {
+        self.scratch.clear();
+    }
+}
+
+/// The slice of a node's reserved scratch that belongs to the current quantum.
+///
+/// Nodes receive this instead of the full reserved buffer: writes stay inside
+/// `frames` by construction, and a write one frame past the quantum cannot
+/// leave a sample that a later, shorter quantum would pick up.
+pub struct NodeView<'a> {
+    buffer: AudioBuffer,
+    frames: usize,
+    _slot: PhantomData<&'a mut ()>,
+}
+
+impl<'a> NodeView<'a> {
+    /// Reinterprets the first `frames` frames of `buffer` as one quantum.
+    fn new(buffer: &'a mut AudioBuffer, frames: usize) -> Self {
+        Self {
+            buffer: buffer.view(frames),
+            frames,
+            _slot: PhantomData,
+        }
+    }
+
+    /// Hands the reinterpreted storage back to the slot, still addressed with
+    /// the full reserved frame count.
+    fn into_buffer(self) -> AudioBuffer {
+        self.buffer.restore()
+    }
+}
+
+impl std::fmt::Debug for NodeView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeView")
+            .field("channels", &self.buffer.channels())
+            .field("frames", &self.frames)
+            .finish()
+    }
+}
+
+impl NodeView<'_> {
+    /// Number of channels in the current quantum.
+    #[must_use]
+    pub fn channels(&self) -> usize {
+        self.buffer.channels()
+    }
+
+    /// Number of frames in the current quantum (equals `ctx.frames`).
+    #[must_use]
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+
+    /// Immutable view of one channel for this quantum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `channel` is out of range.
+    #[must_use]
+    pub fn channel(&self, channel: usize) -> &[crate::buffer::Sample] {
+        self.buffer.channel(channel)
+    }
+
+    /// Mutable view of one channel for this quantum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `channel` is out of range.
+    pub fn channel_mut(&mut self, channel: usize) -> &mut [crate::buffer::Sample] {
+        self.buffer.channel_mut(channel)
+    }
+}
+
+impl std::ops::Deref for NodeView<'_> {
+    type Target = [crate::buffer::Sample];
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for NodeView<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
 }
 
 /// Realtime-safe node chain.
@@ -253,12 +351,18 @@ impl Graph {
         let node_ctx = ProcessContext { frames, ..*ctx };
         if !ctx.transport.is_playing() {
             // A stopped transport is silent for *every* node, including
-            // generators that ignore position; `mix` is already zeroed.
+            // generators that ignore position; `mix` and the node scratch
+            // (cleared once at construction) are already silent.
             return Ok(());
         }
         let channels = self.channels;
         for slot in &mut self.nodes {
-            slot.processor.process(&node_ctx, &mut slot.scratch);
+            slot.silence();
+            // Borrow the storage for the node, run it, then take the storage
+            // back to mix it: only one live handle to a slot at a time.
+            let mut view = NodeView::new(&mut slot.scratch, frames);
+            slot.processor.process(&node_ctx, &mut view);
+            slot.scratch = view.into_buffer();
             for ch in 0..channels {
                 let src = &slot.scratch.channel(ch)[..frames];
                 mix.add_from(ch, 0, src);

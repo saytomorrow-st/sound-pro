@@ -102,6 +102,51 @@ impl AudioBuffer {
         self.data.fill(0.0);
     }
 
+    /// Borrows the first `frames` frames of every channel.
+    ///
+    /// Reinterprets the existing storage in place — no allocation, so this is
+    /// safe to use on the audio path. The result addresses each channel with
+    /// a stride of `frames`, which is exactly what a node sees for one
+    /// quantum: its slices end at `frames`, so writes cannot spill into the
+    /// reserved tail.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `frames` is zero or larger than the buffer's own frame count.
+    #[must_use]
+    pub fn view(&mut self, frames: usize) -> Self {
+        assert!(frames > 0, "frames must be non-zero");
+        assert!(frames <= self.frames, "view exceeds the buffer");
+        Self {
+            data: std::mem::take(&mut self.data),
+            channels: self.channels,
+            frames,
+        }
+    }
+
+    /// Reassembles a view created by [`AudioBuffer::view`] back into one buffer.
+    ///
+    /// The original frame count is recovered from the storage length, so the
+    /// reserved tail is addressable again and its samples are untouched.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the storage length is not a multiple of the channel count.
+    pub(crate) fn restore(self) -> Self {
+        let channels = self.channels;
+        let data = self.data;
+        assert!(
+            channels > 0 && data.len() % channels == 0,
+            "storage is not a whole number of channels"
+        );
+        let frames = data.len() / channels;
+        Self {
+            data,
+            channels,
+            frames,
+        }
+    }
+
     /// Copies `source` into this buffer starting at `offset` frames.
     ///
     /// Frames beyond the end of this buffer are silently dropped, which makes

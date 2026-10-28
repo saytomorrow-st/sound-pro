@@ -2,8 +2,7 @@
 
 #![allow(dead_code)]
 
-use audio_core::buffer::AudioBuffer;
-use audio_core::graph::{Graph, NodeProcessor, ProcessContext};
+use audio_core::graph::{Graph, NodeProcessor, NodeView, ProcessContext};
 use audio_core::wav::sine;
 
 pub const SR: u32 = 48_000;
@@ -23,7 +22,7 @@ impl SineNode {
 }
 
 impl NodeProcessor for SineNode {
-    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut AudioBuffer) {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
         let block = sine(self.freq_hz, ctx.sample_rate, ctx.position, ctx.frames);
         for ch in 0..self.channels.min(output.channels()) {
             output.channel_mut(ch)[..ctx.frames].copy_from_slice(&block);
@@ -45,7 +44,7 @@ impl ClipNode {
 }
 
 impl NodeProcessor for ClipNode {
-    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut AudioBuffer) {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
         for ch in 0..output.channels() {
             let dst = output.channel_mut(ch);
             dst[..ctx.frames].fill(0.0);

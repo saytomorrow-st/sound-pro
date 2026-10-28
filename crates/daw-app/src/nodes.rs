@@ -1,7 +1,6 @@
 //! Demo nodes shipped with the shell.
 
-use audio_core::buffer::AudioBuffer;
-use audio_core::graph::{NodeProcessor, ProcessContext};
+use audio_core::graph::{NodeProcessor, NodeView, ProcessContext};
 use audio_core::wav::sine;
 
 /// Steady sine with a short fade-out at the very end of a fixed length.
@@ -14,7 +13,7 @@ pub struct Tone {
 }
 
 impl NodeProcessor for Tone {
-    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut AudioBuffer) {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
         let block = sine(self.freq_hz, ctx.sample_rate, ctx.position, ctx.frames);
         let dst = output.channel_mut(0);
         for (i, sample) in block.iter().enumerate() {
