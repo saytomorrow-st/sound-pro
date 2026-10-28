@@ -8,10 +8,10 @@
 ## Структура
 
 ```
-crates/audio-core   движок: часы, буферы, граф, renderer, offline, WAV
+crates/audio-core   движок: часы, буферы, граф, renderer, offline, WAV, MIDI
 crates/daw-app      оболочка: CLI smoke-инструменты, фича realtime (CPAL)
 specs/              спецификации; агенты реализуют только то, что здесь описано
-docs/               REALTIME.md (контракт аудиопотока), AI-WORKFLOW.md
+docs/               REALTIME.md, MIDI.md (поддержка SMF), AI-WORKFLOW.md
 clean-room/         журнал метода чистой комнаты
 AGENTS.md           правила для ИИ-агентов (читать первым)
 .github/            CI, инструкции и промпты Copilot, шаблон задачи
