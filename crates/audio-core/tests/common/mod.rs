@@ -65,5 +65,5 @@ impl NodeProcessor for ClipNode {
 /// Builds a graph with room for `nodes` nodes and a 1024-frame quantum.
 #[must_use]
 pub fn graph(channels: usize, nodes: usize) -> Graph {
-    Graph::with_capacity(SR, channels, 1024, nodes)
+    Graph::with_capacity(SR, channels, 1024, nodes, 0)
 }

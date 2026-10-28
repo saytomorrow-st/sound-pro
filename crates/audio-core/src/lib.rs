@@ -23,6 +23,7 @@ pub mod commands;
 pub mod graph;
 pub mod midi;
 pub mod offline;
+pub mod params;
 pub mod render;
 pub mod transport;
 pub mod wav;
@@ -32,6 +33,7 @@ pub use commands::{CommandConsumer, CommandQueue};
 pub use graph::{Graph, GraphError, Node, NodeId, NodeProcessor};
 pub use midi::{MidiError, MidiEvent, MidiFile, MidiMessage, parse_smf};
 pub use offline::{OfflineError, OfflineRenderer};
+pub use params::{MAX_SMOOTHING_MS, ParamError, ParamHandle, ParamId, ParamSpec};
 pub use render::{RenderStats, Renderer};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
 pub use wav::{Recorder, WavError, WavSpec, read_wav_mono, write_wav_mono};
@@ -52,7 +54,7 @@ pub trait AudioBackend {
 }
 
 /// Errors produced by [`AudioBackend::process`].
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RenderError {
     /// The requested frame count is zero or larger than the buffer allows.
     #[error("invalid frame count: {0}")]

@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use audio_core::buffer::AudioBuffer;
 use audio_core::graph::Graph;
 use audio_core::offline::OfflineRenderer;
+use audio_core::params::{ParamHandle, ParamId, ParamSpec};
 use audio_core::render::Renderer;
 use audio_core::transport::{DEFAULT_SAMPLE_RATE, Transport, TransportCommand};
 use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
@@ -84,14 +85,10 @@ pub fn run_offline(job: &OfflineJob) -> Result<BounceReport, Box<dyn std::error:
             std::fs::create_dir_all(parent)?;
         }
     }
-    let mut graph = Graph::with_capacity(job.sample_rate, 1, 1024, 4);
-    graph.add_node(
-        "tone",
-        nodes::Tone {
-            freq_hz: 440.0,
-            level: 0.5,
-        },
-    )?;
+    let mut graph = Graph::with_capacity(job.sample_rate, 1, 1024, 4, 1);
+    let level = ParamHandle::new(demo_level_spec()?);
+    graph.register_param(level.clone())?;
+    graph.add_node("tone", nodes::Tone::new(440.0, level))?;
 
     let mut transport = Transport::new(job.sample_rate);
     transport.apply(TransportCommand::Play);
@@ -161,13 +158,20 @@ pub mod realtime;
 ///
 /// Returns a boxed error if the graph cannot be built.
 pub fn build_demo_graph(sample_rate: u32) -> Result<Graph, Box<dyn std::error::Error>> {
-    let mut graph = Graph::with_capacity(sample_rate, 1, 1024, 4);
-    graph.add_node(
-        "tone",
-        nodes::Tone {
-            freq_hz: 440.0,
-            level: 0.5,
-        },
-    )?;
+    let mut graph = Graph::with_capacity(sample_rate, 1, 1024, 4, 1);
+    let level = ParamHandle::new(demo_level_spec()?);
+    graph.register_param(level.clone())?;
+    graph.add_node("tone", nodes::Tone::new(440.0, level))?;
     Ok(graph)
+}
+
+/// Description of the demo tone's amplitude: 0..1, half by default, 10 ms ramp.
+///
+/// # Errors
+///
+/// Returns a boxed [`audio_core::params::ParamError`] if the description is
+/// invalid; it is a constant, so this only trips if the constant is edited
+/// wrongly.
+pub fn demo_level_spec() -> Result<ParamSpec, Box<dyn std::error::Error>> {
+    Ok(ParamSpec::new(ParamId(0), "tone.level", 0.0, 1.0, 0.5, 10)?)
 }
