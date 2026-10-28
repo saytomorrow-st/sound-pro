@@ -29,6 +29,7 @@ AGENTS.md           правила для ИИ-агентов (читать пе
 cargo test --workspace --all-targets
 cargo run -q --bin daw -- selftest
 cargo run -q --bin daw -- bounce tone.wav 1.0
+cargo run -q --bin daw -- bounce take.wav 30.0 --split 48000   # части по 1 с
 ```
 
 Реальный аудиовыход (CPAL; Linux: `libasound2-dev`, Windows: без зависимостей):
@@ -43,6 +44,8 @@ cargo build -p daw-app --features realtime
 - Граф: резервируемая ёмкость, суммирование, ошибки вместо паник на горячем пути.
 - Offline-рендер с независимостью от размера кванта; golden-тесты.
 - WAV float32/PCM16, CLI-смок (`selftest`, `bounce`).
+- Инкрементальная запись (`Recorder`) с разбиением на части — длинный bounce
+  не держится в памяти целиком (SPEC-002).
 
 ## Что дальше
 
