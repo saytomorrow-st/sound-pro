@@ -1,32 +1,38 @@
 {
   "rust-analyzer.cargo.features": "all",
   "rust-analyzer.check.command": "clippy",
-  "rust-analyzer.check.extraArgs": ["--all-targets", "--", "-D", "warnings"],
+  "rust-analyzer.check.extraArgs": [
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+  ],
   "rust-analyzer.inlayHints.chainingHints.enable": true,
   "rust-analyzer.inlayHints.parameterHints.enable": false,
   "rust-analyzer.lens.enable": true,
   "rust-analyzer.imports.granularity.group": "module",
   "rust-analyzer.imports.granularity.enforce": true,
-
   "[rust]": {
     "editor.defaultFormatter": "rust-lang.rust-analyzer",
     "editor.formatOnSave": true,
-    "editor.rulers": [100]
+    "editor.rulers": [
+      100
+    ]
   },
   "[toml]": {
     "editor.formatOnSave": true
   },
-
   "files.watcherExclude": {
     "**/target/**": true
   },
   "search.exclude": {
     "**/target": true
   },
-
   "github.copilot.chat.codeGeneration.useInstructionFiles": true,
   "chat.promptFilesRecommendations": true,
   "chat.tools.terminal.autoApprove": {
-    "/^cargo (fmt|clippy|test|build|check|run|metadata)/": true
+    "/^cargo (fmt|clippy|check|build|metadata)/": true,
+    "/^cargo test/": true,
+    "/^cargo run -q --bin daw -- (selftest|bounce)/": true
   }
 }
