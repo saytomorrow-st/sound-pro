@@ -1,5 +1,5 @@
 {
-  "rust-analyzer.cargo.features": "all",
+  "rust-analyzer.cargo.features": [],
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.check.extraArgs": [
     "--all-targets",
@@ -23,6 +23,7 @@
     "editor.formatOnSave": true
   },
   "files.watcherExclude": {
+    "**/.git/objects/**": true,
     "**/target/**": true
   },
   "search.exclude": {
@@ -34,5 +35,9 @@
     "/^cargo (fmt|clippy|check|build|metadata)/": true,
     "/^cargo test/": true,
     "/^cargo run -q --bin daw -- (selftest|bounce)/": true
+  },
+  "files.watcherPolling": false,
+  "rust-analyzer.cargo.extraEnv": {
+    "CARGO_BUILD_JOBS": "2"
   }
 }
