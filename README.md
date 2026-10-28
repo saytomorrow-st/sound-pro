@@ -46,10 +46,14 @@ cargo build -p daw-app --features realtime
 - WAV float32/PCM16, CLI-смок (`selftest`, `bounce`).
 - Инкрементальная запись (`Recorder`) с разбиением на части — длинный bounce
   не держится в памяти целиком (SPEC-002).
+- SPSC-очередь команд UI → аудио (SPEC-003), парсер MIDI SMF (SPEC-004).
+- Realtime-бэкенд на CPAL (`daw play`, фича `realtime`) — SPEC-005.
 
 ## Что дальше
 
-См. `docs/AI-WORKFLOW.md` → «Первые 4 задачи для агента» и `specs/000-template.md`.
+См. `docs/AI-WORKFLOW.md` → «Первые 5 задач для агента» и `specs/000-template.md`.
+Ближайшее — [SPEC-006](specs/006-live-parameter-channel.md): живой канал
+параметров.
 
 ## Лицензия
 
