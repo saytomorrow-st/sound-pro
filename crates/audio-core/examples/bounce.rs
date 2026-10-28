@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "tone.wav".into());
     let sr = DEFAULT_SAMPLE_RATE;
 
-    let mut graph = Graph::with_capacity(sr, 1, 1024, 4);
+    let mut graph = Graph::with_capacity(sr, 1, 1024, 4, 0);
     graph.add_node(
         "tone",
         Tone {

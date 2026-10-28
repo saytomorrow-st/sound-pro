@@ -49,7 +49,7 @@ fn fill(dst: &mut [f32], value: f32) {
 
 fn greedy_renderer() -> Renderer {
     // (sample_rate, channels, max_quantum, max_nodes)
-    let mut graph = Graph::with_capacity(DEFAULT_SAMPLE_RATE, 1, QUANTUM, 2);
+    let mut graph = Graph::with_capacity(DEFAULT_SAMPLE_RATE, 1, QUANTUM, 2, 0);
     graph.add_node("greedy", Greedy).unwrap();
     let mut renderer = Renderer::new(graph, Transport::new(DEFAULT_SAMPLE_RATE), QUANTUM);
     renderer.transport_mut().apply(TransportCommand::Play);

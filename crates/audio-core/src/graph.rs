@@ -12,6 +12,7 @@ use std::collections::TryReserveError;
 use std::marker::PhantomData;
 
 use crate::buffer::AudioBuffer;
+use crate::params::{ParamError, ParamHandle, ParamId, ParamSpec};
 use crate::transport::Transport;
 
 /// Stable identifier of a node inside a graph.
@@ -45,7 +46,7 @@ pub trait NodeProcessor {
 }
 
 /// Errors that can occur while building or processing a graph.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum GraphError {
     /// The graph has zero available node slots.
     #[error("graph node capacity exhausted")]
@@ -59,6 +60,9 @@ pub enum GraphError {
     /// Scratch memory could not be reserved for a new node (setup-time only).
     #[error("out of memory reserving scratch for a node: {0}")]
     ScratchAllocation(TryReserveError),
+    /// The parameter registry could not be reserved (setup-time only).
+    #[error("parameter registry: {0}")]
+    Param(#[from] ParamError),
     /// Requested quantum is larger than the reserved scratch size.
     #[error("quantum of {requested} frames exceeds reserved {reserved}")]
     QuantumTooLarge {
@@ -180,6 +184,15 @@ impl std::ops::DerefMut for NodeView<'_> {
     }
 }
 
+/// One parameter as visible to the UI: its description and its live handle.
+#[derive(Debug, Clone)]
+pub struct ParamRegistration {
+    /// Description given at registration time.
+    pub spec: ParamSpec,
+    /// Live handle; the UI calls [`ParamHandle::set`] on it.
+    pub handle: ParamHandle,
+}
+
 /// Realtime-safe node chain.
 pub struct Graph {
     sample_rate: u32,
@@ -187,6 +200,7 @@ pub struct Graph {
     max_quantum: usize,
     nodes: Vec<NodeSlot>,
     next_id: u32,
+    params: Vec<ParamRegistration>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -196,26 +210,31 @@ impl std::fmt::Debug for Graph {
             .field("channels", &self.channels)
             .field("max_quantum", &self.max_quantum)
             .field("nodes", &self.nodes.len())
+            .field("params", &self.params.len())
             .field("next_id", &self.next_id)
             .finish()
     }
 }
 
 impl Graph {
-    /// Reserves room for `max_nodes` nodes and a `max_quantum`-frame callback.
+    /// Reserves room for `max_nodes` nodes, `max_params` parameters, and a
+    /// `max_quantum`-frame callback.
     ///
-    /// The graph never resizes afterwards; adding one node more than reserved
-    /// returns [`GraphError::CapacityExhausted`] instead of allocating.
+    /// The graph never resizes afterwards: one node or parameter more than
+    /// reserved returns an error instead of allocating.
     ///
     /// # Panics
     ///
-    /// Panics on zero `channels`, `max_nodes`, or `max_quantum`.
+    /// Panics on zero `channels`, `max_nodes`, or `max_quantum`. `max_params`
+    /// may be zero, which makes every [`Graph::register_param`] fail with
+    /// [`ParamError::RegistryFull`].
     #[must_use]
     pub fn with_capacity(
         sample_rate: u32,
         channels: usize,
         max_quantum: usize,
         max_nodes: usize,
+        max_params: usize,
     ) -> Self {
         assert!(sample_rate > 0, "sample_rate must be non-zero");
         assert!(max_nodes > 0, "max_nodes must be non-zero");
@@ -225,6 +244,7 @@ impl Graph {
             max_quantum,
             nodes: Vec::with_capacity(max_nodes),
             next_id: 0,
+            params: Vec::with_capacity(max_params),
         }
     }
 
@@ -297,6 +317,57 @@ impl Graph {
             scratch,
         });
         Ok(id)
+    }
+
+    /// Registers `handle` so the UI can enumerate and reach the parameter.
+    ///
+    /// Registration is explicit: [`Graph::add_boxed`] does not scan a node for
+    /// parameters, because probing a plugin is a setup-time operation the graph
+    /// does not want to guess. Layout is reserved by [`Graph::with_capacity`],
+    /// so this never allocates on the audio path (it is control-thread only).
+    ///
+    /// # Errors
+    ///
+    /// * [`ParamError::DuplicateId`] if `spec.id` is already registered
+    /// * [`ParamError::RegistryFull`] if `max_params` was used up
+    pub fn register_param(&mut self, handle: ParamHandle) -> Result<(), ParamError> {
+        let spec = handle.spec();
+        if self.params.iter().any(|r| r.spec.id == spec.id) {
+            return Err(ParamError::DuplicateId { id: spec.id });
+        }
+        let max = self.params.capacity();
+        if self.params.len() == max {
+            return Err(ParamError::RegistryFull { max });
+        }
+        // Capacity is reserved and the length is below it, so this cannot
+        // allocate; `try_reserve` keeps that a hard guarantee.
+        self.params
+            .try_reserve(1)
+            .map_err(|_| ParamError::RegistryFull { max })?;
+        self.params.push(ParamRegistration { spec, handle });
+        Ok(())
+    }
+
+    /// Every registered parameter, in registration order.
+    #[must_use]
+    pub fn params(&self) -> &[ParamRegistration] {
+        &self.params
+    }
+
+    /// Looks a parameter up by id.
+    ///
+    /// A linear scan over the small, fixed registry; keep it off the audio
+    /// path (nodes hold their handle directly).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParamError::UnknownParam`] if `id` was never registered.
+    pub fn param(&self, id: ParamId) -> Result<ParamHandle, ParamError> {
+        self.params
+            .iter()
+            .find(|registration| registration.spec.id == id)
+            .map(|registration| registration.handle.clone())
+            .ok_or(ParamError::UnknownParam { id })
     }
 
     /// Removes a node by id. Setup-time only.
