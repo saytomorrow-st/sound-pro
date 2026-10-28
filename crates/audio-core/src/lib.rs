@@ -21,6 +21,7 @@
 pub mod buffer;
 pub mod commands;
 pub mod graph;
+pub mod midi;
 pub mod offline;
 pub mod render;
 pub mod transport;
@@ -29,6 +30,7 @@ pub mod wav;
 pub use buffer::{AudioBuffer, Sample};
 pub use commands::{CommandConsumer, CommandQueue};
 pub use graph::{Graph, GraphError, Node, NodeId, NodeProcessor};
+pub use midi::{MidiError, MidiEvent, MidiFile, MidiMessage, parse_smf};
 pub use offline::{OfflineError, OfflineRenderer};
 pub use render::{RenderStats, Renderer};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
