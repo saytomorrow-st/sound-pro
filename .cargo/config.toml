@@ -1,0 +1,4 @@
+[alias]
+# One command that locally mirrors what CI does. Agents should run this
+# before proposing any change; it is the cheapest guard against regressions.
+ci = "test --workspace --all-targets --locked"

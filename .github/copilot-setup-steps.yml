@@ -1,0 +1,18 @@
+# Environment prep for the Copilot coding agent.
+# Keep it fast and idempotent: the agent runs these steps before every task.
+steps:
+  - name: Install ALSA headers (realtime backend only)
+    if: runner.os == 'Linux'
+    run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+  - name: Install Rust components
+    run: rustup component add rustfmt clippy
+
+  - name: Warm the build cache
+    run: cargo fetch --locked
+
+  - name: Verify the gate works before the agent starts
+    run: |
+      cargo fmt --all --check
+      cargo clippy --workspace --all-targets -- -D warnings
+      cargo test --workspace --all-targets --locked

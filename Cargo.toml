@@ -1,0 +1,27 @@
+[workspace]
+members = ["crates/audio-core", "crates/daw-app"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/saytomorrow-st/sound-pro"
+publish = false
+
+[workspace.dependencies]
+audio-core = { path = "crates/audio-core" }
+rtrb = "0.3"
+cpal = "0.15"
+hound = "3.5"
+thiserror = "2.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Golden-test and offline rendering runs in debug during CI; keep debug
+# assertions on but make numbers reproducible across platforms.
+[profile.bench]
+debug = true

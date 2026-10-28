@@ -1,0 +1,18 @@
+[package]
+name = "audio-core"
+description = "Realtime-safe audio engine core: clock, buffers, graph, offline renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rtrb = { workspace = true }
+hound = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# criterion is intentionally not enabled yet: golden tests compare against
+# committed reference buffers, benchmarks land in the next milestone.

@@ -1,0 +1,26 @@
+[package]
+name = "daw-app"
+description = "Thin application shell: backend selection, CLI smoke tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "daw"
+path = "src/main.rs"
+
+[features]
+default = []
+# Builds the realtime CPAL backend. Kept off by default so CI and agents can
+# build/test the workspace on machines without ALSA/PipeWire headers.
+realtime = ["dep:cpal"]
+
+[dependencies]
+audio-core = { workspace = true }
+rtrb = { workspace = true }
+hound = { workspace = true }
+cpal = { workspace = true, optional = true }
+thiserror = { workspace = true }

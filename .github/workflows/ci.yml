@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The gate every agent must pass. No audio hardware is required: the engine
+  # is exercised through the offline renderer only.
+  check:
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (offline engine, goldens, app)
+        run: cargo test --workspace --all-targets --locked
+      - name: CLI selftest
+        run: cargo run --release --bin daw -- selftest
+
+  # Goldens are the oracle for DSP. An agent must never regenerate them as
+  # part of a feature change, so this job fails if they differ from HEAD.
+  goldens-untouched:
+    name: goldens must match committed reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Works for both `push` (no base ref) and `pull_request`, with a single
+      # checkout instead of fetching the base branch.
+      - name: Verify golden fixtures are unchanged by this commit
+        run: |
+          changed=$(git show --pretty=format: --name-only HEAD | grep -E 'tests/golden/' || true)
+          if [ -n "$changed" ]; then
+            echo "::error::Golden fixtures changed in this commit: $changed"
+            echo "Regenerating goldens hides regressions. Revert them; an intentional"
+            echo "change is a separate human PR after listening to the result."
+            exit 1
+          fi
+        shell: bash
+
+  # Realtime backend compiles and links on both platforms. Linux needs the
+  # ALSA dev package; Windows uses the system WASAPI headers.
+  realtime-build:
+    name: realtime backend build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build with realtime feature
+        run: cargo build --workspace --features daw-app/realtime
