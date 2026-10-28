@@ -44,10 +44,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Works for both `push` (no base ref) and `pull_request`, with a single
-      # checkout instead of fetching the base branch.
+      # checkout instead of fetching the base branch. Root commit and squashed
+      # merges have no parent: there is nothing to compare against, so only
+      # edits to already-committed goldens are rejected.
       - name: Verify golden fixtures are unchanged by this commit
         run: |
-          changed=$(git show --pretty=format: --name-only HEAD | grep -E 'tests/golden/' || true)
+          if git rev-parse --verify -q HEAD^ >/dev/null; then
+            changed=$(git diff --name-only HEAD^ HEAD -- '*/tests/golden/*' || true)
+          else
+            changed=""
+          fi
           if [ -n "$changed" ]; then
             echo "::error::Golden fixtures changed in this commit: $changed"
             echo "Regenerating goldens hides regressions. Revert them; an intentional"
