@@ -24,18 +24,55 @@ fn main() -> ExitCode {
                 usage();
                 return ExitCode::from(2);
             };
-            let seconds = args
-                .next()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(1.0);
+            let mut seconds = 1.0;
+            let mut seen_seconds = false;
+            let mut split_part_samples = None;
+            while let Some(arg) = args.next() {
+                if arg == "--split" {
+                    let Some(value) = args.next() else {
+                        eprintln!("--split requires a value (samples per part)");
+                        return ExitCode::from(2);
+                    };
+                    match value.parse::<u64>() {
+                        Ok(n) if n > 0 => split_part_samples = Some(n),
+                        _ => {
+                            eprintln!("--split expects a positive sample count, got {value}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else if !seen_seconds {
+                    match arg.parse::<f64>() {
+                        Ok(s) => {
+                            seconds = s;
+                            seen_seconds = true;
+                        }
+                        Err(_) => {
+                            eprintln!("invalid duration: {arg}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("unexpected argument: {arg}");
+                    usage();
+                    return ExitCode::from(2);
+                }
+            }
             let job = OfflineJob {
                 output: PathBuf::from(output),
                 seconds,
+                split_part_samples,
                 ..OfflineJob::default()
             };
             match run_offline(&job) {
-                Ok(frames) => {
-                    println!("rendered {frames} frames to {}", job.output.display());
+                Ok(report) => {
+                    println!(
+                        "rendered {} frames to {} file(s)",
+                        report.frames,
+                        report.parts.len()
+                    );
+                    for part in &report.parts {
+                        println!("  {}", part.display());
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -58,12 +95,18 @@ fn main() -> ExitCode {
             let _ = std::fs::remove_file(&output);
             let _ = std::fs::remove_dir(&dir);
             match result {
-                Ok(frames) if frames == 4_800 => {
-                    println!("selftest OK: {frames} frames, engine, wav and transport agree");
+                Ok(report) if report.frames == 4_800 => {
+                    println!(
+                        "selftest OK: {} frames, engine, wav and transport agree",
+                        report.frames
+                    );
                     ExitCode::SUCCESS
                 }
-                Ok(frames) => {
-                    eprintln!("selftest FAILED: expected 4800 frames, got {frames}");
+                Ok(report) => {
+                    eprintln!(
+                        "selftest FAILED: expected 4800 frames, got {}",
+                        report.frames
+                    );
                     ExitCode::FAILURE
                 }
                 Err(e) => {
@@ -86,7 +129,9 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage:\n  daw bounce <out.wav> [seconds]\n  daw selftest\n\n\
+        "usage:\n  daw bounce <out.wav> [seconds] [--split <samples>]\n  daw selftest\n\n\
+         --split <samples> writes part-01.wav, part-02.wav, ... each at most\n\
+         <samples> long (samples, not frames; mono).\n\n\
          Build with `--features realtime` to enable the CPAL backend."
     );
 }

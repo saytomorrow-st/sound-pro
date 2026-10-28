@@ -30,7 +30,7 @@ pub use graph::{Graph, GraphError, Node, NodeId, NodeProcessor};
 pub use offline::{OfflineError, OfflineRenderer};
 pub use render::{RenderStats, Renderer};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
-pub use wav::{WavError, WavSpec, read_wav_mono, write_wav_mono};
+pub use wav::{Recorder, WavError, WavSpec, read_wav_mono, write_wav_mono};
 
 /// Abstraction over "who drives the clock".
 ///
