@@ -100,3 +100,30 @@ steps:
 | `missing golden …wav` | нет эталона в репо | склонируйте репозиторий целиком; не запускайте `UPDATE_GOLDENS` |
 | CI «goldens must match» | коммит меняет `tests/golden/` | откатите изменения эталонов |
 | Тест падает на Windows, но не на Linux | расхождение `sin` | допуск `1e-6` в `golden.rs`; сравнение `to_bits()` только там, где это контракт |
+
+## 8. Custom endpoint (OpenAI-совместимый сервер)
+
+Расширение **GitHub Copilot LLM Gateway** уже установлено: оно направляет
+запросы Copilot Chat в ваш собственный сервер.
+
+1. `Ctrl+Shift+P` → **Configure Server** (команда
+   `github.copilot.llm-gateway.manage`).
+2. Указать базовый URL, например `https://llm.example.com/v1`
+   (без `/chat/completions`), ключ и список моделей, если сервер его не отдаёт
+   через `/models`.
+3. **Test Server Connection**, затем **Refresh Models**.
+4. В чате выбрать модель из пикера — она придёт с вашего сервера.
+5. Если провайдер требует нестандартных заголовков — **Edit Custom Headers**;
+   для моделей с маленьким контекстом — `perModelOptions` /
+   `modelContextWindows`.
+
+Агентский режим требует поддержки tool calls на сервере
+(`github.copilot.llm-gateway.enableToolCalling` включён по умолчанию).
+При проблемах: **Show Output Log** — там виден сырой запрос/ответ.
+
+Держите ключ вне репозитория: настройки хранятся в профиле VS Code, но не
+пишите их в `.vscode/settings.json`.
+
+Если нужен не-Copilot клиент: Codex CLI / aider / Continue читают те же
+OpenAI-совместимые эндпоинты; правила проекта у них подхватываются из
+`AGENTS.md`.
