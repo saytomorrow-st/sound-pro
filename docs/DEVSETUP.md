@@ -59,6 +59,7 @@ cargo build --workspace
 cargo test --workspace --all-targets
 cargo run -q --bin daw -- selftest
 cargo run -q --bin daw -- bounce tone.wav 1.0   # послушать tone.wav
+cargo run -q --bin daw -- bounce take.wav 30.0 --split 48000  # части по 1 с (SPEC-002)
 ```
 
 Realtime-бэкенд (нужен звуковой сервер):

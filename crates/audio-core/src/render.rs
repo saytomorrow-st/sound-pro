@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::buffer::{AudioBuffer, Sample};
+use crate::commands::CommandConsumer;
 use crate::graph::{Graph, ProcessContext};
 use crate::transport::Transport;
 use crate::{AudioBackend, RenderError};
@@ -48,6 +49,8 @@ pub struct Renderer {
     /// Destination for the current quantum; pre-allocated for `max_quantum`.
     scratch: AudioBuffer,
     max_quantum: usize,
+    /// Optional SPSC command channel drained at the start of every quantum.
+    commands: Option<CommandConsumer>,
 }
 
 impl Renderer {
@@ -66,6 +69,30 @@ impl Renderer {
             stats: RenderStats::default(),
             scratch: AudioBuffer::new(channels, max_quantum),
             max_quantum,
+            commands: None,
+        }
+    }
+
+    /// Attaches a command consumer that [`Renderer::render`] drains at the start
+    /// of every quantum (SPEC-003).
+    ///
+    /// The matching [`crate::CommandQueue`] (producer) goes to the control
+    /// thread. This is setup-time wiring; call it before the audio thread runs.
+    pub fn set_command_consumer(&mut self, consumer: CommandConsumer) {
+        self.commands = Some(consumer);
+    }
+
+    /// Applies every command already waiting on the queue, in FIFO order.
+    ///
+    /// Draining *all* pending commands at the top of a quantum (never halfway)
+    /// is the documented strategy from SPEC-003 §4: a command is either fully
+    /// applied in the quantum it is seen in, or — if it arrives after the drain
+    /// — applied at the start of the next quantum. Never split.
+    fn drain_commands(&mut self) {
+        if let Some(commands) = self.commands.as_mut() {
+            while let Some(command) = commands.pop_next() {
+                self.transport.apply(command);
+            }
         }
     }
 
@@ -117,6 +144,7 @@ impl Renderer {
         if out.frames() < frames {
             return Err(RenderError::InvalidFrameCount(out.frames()));
         }
+        self.drain_commands();
         let position = self.transport.advance(frames);
         let ctx = ProcessContext {
             sample_rate: self.transport.sample_rate(),

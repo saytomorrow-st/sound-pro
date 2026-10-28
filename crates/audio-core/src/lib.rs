@@ -19,6 +19,7 @@
 #![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
 
 pub mod buffer;
+pub mod commands;
 pub mod graph;
 pub mod offline;
 pub mod render;
@@ -26,6 +27,7 @@ pub mod transport;
 pub mod wav;
 
 pub use buffer::{AudioBuffer, Sample};
+pub use commands::{CommandConsumer, CommandQueue};
 pub use graph::{Graph, GraphError, Node, NodeId, NodeProcessor};
 pub use offline::{OfflineError, OfflineRenderer};
 pub use render::{RenderStats, Renderer};
