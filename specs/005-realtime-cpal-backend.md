@@ -4,7 +4,13 @@
 Владелец: команда платформы
 Для агента: разрешено реализовывать
 
-Файлы: `crates/daw-app/src/realtime.rs`, `crates/daw-app/src/main.rs`, `.github/workflows/ci.yml`, `docs/`
+Файлы: `crates/daw-app/src/realtime.rs` (новый модуль), `crates/daw-app/src/lib.rs`,
+`crates/daw-app/src/main.rs`, `crates/daw-app/Cargo.toml`, `.github/workflows/ci.yml`,
+`docs/`, `crates/daw-app/tests/`
+
+Разрешённый рефакторинг: перенести inline-модуль `pub mod realtime` из `lib.rs`
+в отдельный файл `src/realtime.rs` и переименовать `BackendError` →
+`RealtimeError`. Публичный путь `daw_app::realtime::*` сохраняется.
 
 ## Проблема
 
