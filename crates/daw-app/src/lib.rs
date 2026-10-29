@@ -453,16 +453,6 @@ pub enum LoadError {
         /// Underlying error.
         source: audio_core::WavError,
     },
-    /// A clip's WAV file runs at a different rate than the session.
-    #[error("{path}: sample rate {file} Hz, session runs at {session} Hz")]
-    SampleRate {
-        /// Resolved file path.
-        path: PathBuf,
-        /// Rate stored in the file.
-        file: u32,
-        /// Session rate.
-        session: u32,
-    },
     /// A clip's WAV file holds fewer frames than its `source_length`.
     #[error("{path}: {file_frames} frame(s), clip needs source_length {source_length}")]
     SourceTooShort {
@@ -545,48 +535,47 @@ pub fn load_session(
     })
 }
 
-/// Reads `path` as mono content of exactly `source_length` frames.
+/// Reads `path` as mono content of exactly `source_length` frames at
+/// `sample_rate`, converting the rate first when the file differs (SPEC-019).
 fn load_clip_file(
     path: &std::path::Path,
     sample_rate: u32,
     source_length: u64,
 ) -> Result<Vec<f32>, LoadError> {
-    let (spec, buffer) = audio_core::wav::read_wav_mono(path).map_err(|source| LoadError::Wav {
+    let wav_error = |source| LoadError::Wav {
         path: path.to_path_buf(),
         source,
-    })?;
-    if spec.sample_rate != sample_rate {
-        return Err(LoadError::SampleRate {
-            path: path.to_path_buf(),
-            file: spec.sample_rate,
-            session: sample_rate,
-        });
-    }
-    let file_frames = buffer.channel(0).len() as u64;
-    let too_short = || LoadError::SourceTooShort {
-        path: path.to_path_buf(),
-        file_frames,
-        source_length,
     };
-    if file_frames < source_length {
-        return Err(too_short());
-    }
-    let frames = usize::try_from(source_length).map_err(|_| too_short())?;
+    let (spec, buffer) = audio_core::wav::read_wav_mono(path).map_err(wav_error)?;
     let channels = usize::from(spec.channels).max(1);
-    if channels == 1 {
-        return Ok(buffer.channel(0)[..frames].to_vec());
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let scale = 1.0 / channels as f32;
-    let mut mono = vec![0.0_f32; frames];
-    for ch in 0..channels {
-        for (out, sample) in mono.iter_mut().zip(buffer.channel(ch)) {
-            *out += sample;
+    let mut mono = buffer.channel(0).to_vec();
+    if channels > 1 {
+        for ch in 1..channels {
+            for (out, sample) in mono.iter_mut().zip(buffer.channel(ch)) {
+                *out += sample;
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / channels as f32;
+        for out in &mut mono {
+            *out *= scale;
         }
     }
-    for out in &mut mono {
-        *out *= scale;
+    if spec.sample_rate != sample_rate {
+        mono = audio_core::resample(&mono, spec.sample_rate, sample_rate)
+            .map_err(|_| wav_error(audio_core::WavError::Empty))?;
     }
+    let file_frames = mono.len() as u64;
+    if file_frames < source_length {
+        return Err(LoadError::SourceTooShort {
+            path: path.to_path_buf(),
+            file_frames,
+            source_length,
+        });
+    }
+    // `source_length <= mono.len()`, so it fits in usize.
+    #[allow(clippy::cast_possible_truncation)]
+    mono.truncate(source_length as usize);
     Ok(mono)
 }
 

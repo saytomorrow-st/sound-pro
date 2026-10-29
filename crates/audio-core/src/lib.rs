@@ -26,6 +26,7 @@ pub mod offline;
 pub mod params;
 pub mod project;
 pub mod render;
+pub mod resample;
 pub mod schedule;
 pub mod session;
 pub mod synth;
@@ -40,6 +41,7 @@ pub use offline::{OfflineError, OfflineRenderer};
 pub use params::{MAX_SMOOTHING_MS, ParamError, ParamHandle, ParamId, ParamSpec};
 pub use project::{MAX_NAME_BYTES, ParamState, Project, ProjectError};
 pub use render::{RenderStats, Renderer};
+pub use resample::{ResampleError, resample};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
     Clip, MAX_CLIPS_PER_TRACK, MAX_SOURCE_BYTES, MAX_TRACKS, Session, SessionError,

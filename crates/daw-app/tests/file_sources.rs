@@ -209,23 +209,35 @@ fn a_missing_file_is_reported_with_its_resolved_path() {
 }
 
 #[test]
-fn a_file_at_another_sample_rate_is_rejected() {
+fn a_file_at_another_sample_rate_is_converted_on_load() {
+    // SPEC-019: a 44.1 kHz constant renders as the same constant at 48 kHz.
     let dir = Scratch::new("rate");
-    write_wav(&dir.join("audio/x.wav"), 44_100, &[vec![0.0; 10]]);
-    let project = one_clip_project(&dir, Some("audio/x.wav"), 10);
+    write_wav(&dir.join("audio/x.wav"), 44_100, &[vec![0.5; 4410]]);
+    let project = one_clip_project(&dir, Some("audio/x.wav"), 4800);
+    let out = render_to(load_session_project(&project, dir.join("o.wav")).unwrap());
+    assert_eq!(out.frames(), 4800);
+    for (i, &v) in out.channel(0).iter().enumerate().skip(500).take(3800) {
+        assert!((v - 0.5).abs() < 1e-3, "frame {i}: {v}");
+    }
+}
+
+#[test]
+fn a_converted_file_shorter_than_source_length_is_rejected() {
+    let dir = Scratch::new("rate-short");
+    write_wav(&dir.join("audio/x.wav"), 44_100, &[vec![0.5; 4410]]);
+    let project = one_clip_project(&dir, Some("audio/x.wav"), 4801);
     let err = load_session_project(&project, dir.join("o.wav")).unwrap_err();
     assert!(
         matches!(
             err,
-            LoadError::SampleRate {
-                file: 44_100,
-                session: RATE,
+            LoadError::SourceTooShort {
+                file_frames: 4800,
+                source_length: 4801,
                 ..
             }
         ),
         "{err:?}"
     );
-    assert!(err.to_string().contains("44100"), "{err}");
 }
 
 #[test]
