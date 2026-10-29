@@ -352,8 +352,78 @@ mod device {
         ChosenConfig, DeviceConfig, QuantumSplitter, RealtimeError, RealtimeHandle, RealtimeStats,
         choose_config, choose_exact_config, interleave_into,
     };
+    use crate::audio_settings::{AudioSettings, choose_buffer, find_device};
     use crate::capture::{CaptureControl, capture};
     use crate::playback::PlaybackEngine;
+
+    fn names(devices: impl Iterator<Item = cpal::Device>) -> (Vec<cpal::Device>, Vec<String>) {
+        let mut found = Vec::new();
+        let mut names = Vec::new();
+        for device in devices {
+            let name = device.name().unwrap_or_else(|_| "(без имени)".to_owned());
+            found.push(device);
+            names.push(name);
+        }
+        (found, names)
+    }
+
+    /// Names of the output devices the system offers (SPEC-033).
+    #[must_use]
+    pub fn output_device_names() -> Vec<String> {
+        cpal::default_host()
+            .output_devices()
+            .map(|d| names(d).1)
+            .unwrap_or_default()
+    }
+
+    /// Names of the input devices the system offers (SPEC-033).
+    #[must_use]
+    pub fn input_device_names() -> Vec<String> {
+        cpal::default_host()
+            .input_devices()
+            .map(|d| names(d).1)
+            .unwrap_or_default()
+    }
+
+    /// Output device named in `settings`, or the default when it is absent.
+    fn pick_output(settings: &AudioSettings) -> Result<cpal::Device, RealtimeError> {
+        let host = cpal::default_host();
+        if settings.output.is_some()
+            && let Ok(devices) = host.output_devices()
+        {
+            let (mut found, names) = names(devices);
+            if let Some(i) = find_device(&names, settings.output.as_deref()) {
+                return Ok(found.swap_remove(i));
+            }
+        }
+        host.default_output_device().ok_or(RealtimeError::NoDevice)
+    }
+
+    /// Input device named in `settings`, or the default when it is absent.
+    fn pick_input(settings: &AudioSettings) -> Result<cpal::Device, RealtimeError> {
+        let host = cpal::default_host();
+        if settings.input.is_some()
+            && let Ok(devices) = host.input_devices()
+        {
+            let (mut found, names) = names(devices);
+            if let Some(i) = find_device(&names, settings.input.as_deref()) {
+                return Ok(found.swap_remove(i));
+            }
+        }
+        host.default_input_device()
+            .ok_or(RealtimeError::NoInputDevice)
+    }
+
+    fn buffer_size(
+        requested: Option<u32>,
+        supported: &cpal::SupportedBufferSize,
+    ) -> cpal::BufferSize {
+        let range = match supported {
+            cpal::SupportedBufferSize::Range { min, max } => Some((*min, *max)),
+            cpal::SupportedBufferSize::Unknown => None,
+        };
+        choose_buffer(requested, range).map_or(cpal::BufferSize::Default, cpal::BufferSize::Fixed)
+    }
 
     /// Fixed render quantum reserved by the engine. Larger device buffers are
     /// rendered in pieces of this many frames; nothing resizes in the callback.
@@ -481,13 +551,24 @@ mod device {
     /// [`RealtimeError::SampleRate`] when the device cannot run at
     /// `sample_rate`, or a CPAL error while building/starting the stream.
     pub fn start_output(
-        mut engine: PlaybackEngine,
+        engine: PlaybackEngine,
         sample_rate: u32,
     ) -> Result<RealtimeHandle, RealtimeError> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(RealtimeError::NoDevice)?;
+        start_output_with(engine, sample_rate, &AudioSettings::default())
+    }
+
+    /// [`start_output`] on the device and buffer chosen in `settings`
+    /// (SPEC-033). A device that is gone falls back to the default.
+    ///
+    /// # Errors
+    ///
+    /// As [`start_output`].
+    pub fn start_output_with(
+        mut engine: PlaybackEngine,
+        sample_rate: u32,
+        settings: &AudioSettings,
+    ) -> Result<RealtimeHandle, RealtimeError> {
+        let device = pick_output(settings)?;
         let configs = device_configs(&device)?;
         let chosen = choose_exact_config(&configs, sample_rate)?;
         let supported = device
@@ -499,9 +580,11 @@ mod device {
                     && sample_rate <= r.max_sample_rate().0
             })
             .ok_or(RealtimeError::NoF32Config)?;
-        let stream_config: StreamConfig = supported
+        let buffer = buffer_size(settings.buffer_frames, supported.buffer_size());
+        let mut stream_config: StreamConfig = supported
             .with_sample_rate(cpal::SampleRate(sample_rate))
             .into();
+        stream_config.buffer_size = buffer;
         let channels = usize::from(stream_config.channels);
         let stats = Arc::new(RealtimeStats::default());
         let cb_stats = Arc::clone(&stats);
@@ -540,10 +623,21 @@ mod device {
         preferred_rate: u32,
         seconds: u32,
     ) -> Result<(CaptureControl, RealtimeHandle), RealtimeError> {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or(RealtimeError::NoInputDevice)?;
+        start_input_with(preferred_rate, seconds, &AudioSettings::default())
+    }
+
+    /// [`start_input`] on the microphone and buffer chosen in `settings`
+    /// (SPEC-033). A device that is gone falls back to the default.
+    ///
+    /// # Errors
+    ///
+    /// As [`start_input`].
+    pub fn start_input_with(
+        preferred_rate: u32,
+        seconds: u32,
+        settings: &AudioSettings,
+    ) -> Result<(CaptureControl, RealtimeHandle), RealtimeError> {
+        let device = pick_input(settings)?;
         let mut configs = Vec::new();
         for range in device.supported_input_configs()? {
             configs.push(DeviceConfig {
@@ -564,7 +658,10 @@ mod device {
                     && rate <= r.max_sample_rate().0
             })
             .ok_or(RealtimeError::NoF32Config)?;
-        let stream_config: StreamConfig = supported.with_sample_rate(cpal::SampleRate(rate)).into();
+        let buffer = buffer_size(settings.buffer_frames, supported.buffer_size());
+        let mut stream_config: StreamConfig =
+            supported.with_sample_rate(cpal::SampleRate(rate)).into();
+        stream_config.buffer_size = buffer;
         let channels = usize::from(stream_config.channels);
         let capacity =
             usize::try_from(u64::from(rate) * u64::from(seconds.max(1))).unwrap_or(usize::MAX);
@@ -597,7 +694,10 @@ mod device {
 }
 
 #[cfg(feature = "realtime")]
-pub use device::{play_default, start_input, start_output};
+pub use device::{
+    input_device_names, output_device_names, play_default, start_input, start_input_with,
+    start_output, start_output_with,
+};
 
 #[cfg(test)]
 mod tests {
