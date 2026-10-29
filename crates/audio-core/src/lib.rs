@@ -27,6 +27,7 @@ pub mod params;
 pub mod project;
 pub mod render;
 pub mod schedule;
+pub mod synth;
 pub mod transport;
 pub mod wav;
 
@@ -39,6 +40,7 @@ pub use params::{MAX_SMOOTHING_MS, ParamError, ParamHandle, ParamId, ParamSpec};
 pub use project::{MAX_NAME_BYTES, ParamState, Project, ProjectError};
 pub use render::{RenderStats, Renderer};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
+pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
 pub use wav::{Recorder, WavError, WavSpec, read_wav_mono, write_wav_mono};
 
