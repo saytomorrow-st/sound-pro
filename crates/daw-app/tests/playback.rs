@@ -201,3 +201,127 @@ fn mono_devices_get_the_left_channel() {
     engine.fill(&mut out, 1);
     assert_eq!(out, &source[..300]);
 }
+
+/// Plays `frames` stereo frames in device buffers of `buffer` frames.
+fn play_frames(engine: &mut PlaybackEngine, buffer: usize, frames: usize) -> Vec<f32> {
+    let mut all = Vec::new();
+    let mut out = vec![1.0f32; buffer * 2];
+    while all.len() < frames * 2 {
+        engine.fill(&mut out, 2);
+        all.extend_from_slice(&out);
+    }
+    all.truncate(frames * 2);
+    all
+}
+
+/// What the cycle `[from, to)` should sound like, starting at `start`.
+fn expected_cycle(start: usize, from: usize, to: usize, frames: usize) -> Vec<f32> {
+    let source = ramp(LEN);
+    let mut pos = start;
+    (0..frames)
+        .map(|_| {
+            let s = source[pos];
+            pos += 1;
+            if pos == to {
+                pos = from;
+            }
+            s
+        })
+        .collect()
+}
+
+#[test]
+fn the_cycle_repeats_its_region_for_any_buffer_and_block() {
+    for (block, buffer) in [(1024, 64), (1024, 1000), (256, 333), (64, 3000), (7, 5)] {
+        let (mut control, mut engine) = pair(block, 500);
+        control.set_cycle(Some((500, 1_200)));
+        assert_eq!(control.cycle(), Some((500, 1_200)));
+        assert!(control.play());
+        let l = left(&play_frames(&mut engine, buffer, 4_000));
+        assert_eq!(
+            l,
+            expected_cycle(500, 500, 1_200, 4_000),
+            "block {block} buffer {buffer}"
+        );
+        assert!(control.is_playing(), "a cycle never reaches the end");
+        let pos = control.position();
+        assert!((500..1_200).contains(&pos), "position {pos} stays inside");
+    }
+}
+
+#[test]
+fn the_end_frame_of_the_cycle_is_never_heard() {
+    let (mut control, mut engine) = pair(128, 0);
+    control.set_cycle(Some((100, 200)));
+    control.play();
+    let l = left(&play_frames(&mut engine, 256, 2_000));
+    let end_sample = ramp(LEN)[200];
+    assert!(l.iter().all(|s| *s != end_sample));
+}
+
+#[test]
+fn playback_before_the_region_runs_into_the_cycle() {
+    let (mut control, mut engine) = pair(1024, 0);
+    control.set_cycle(Some((1_000, 1_500)));
+    control.play();
+    let l = left(&play_frames(&mut engine, 512, 3_000));
+    assert_eq!(l, expected_cycle(0, 1_000, 1_500, 3_000));
+}
+
+#[test]
+fn playback_after_the_region_plays_to_the_end() {
+    let (mut control, mut engine) = pair(1024, 2_000);
+    control.set_cycle(Some((100, 500)));
+    control.play();
+    let l = left(&play_frames(&mut engine, 256, 1_500));
+    assert_eq!(&l[..1_000], &ramp(LEN)[2_000..]);
+    assert!(l[1_000..].iter().all(|s| *s == 0.0));
+    assert!(!control.is_playing());
+    assert_eq!(control.position(), LEN as u64);
+}
+
+#[test]
+fn the_cycle_end_is_clamped_and_empty_regions_turn_it_off() {
+    let (mut control, _engine) = pair(1024, 0);
+    control.set_cycle(Some((2_000, 9_000)));
+    assert_eq!(control.cycle(), Some((2_000, LEN as u64)));
+    control.set_cycle(Some((700, 700)));
+    assert_eq!(control.cycle(), None);
+    control.set_cycle(Some((5_000, 6_000)));
+    assert_eq!(control.cycle(), None);
+    control.set_cycle(Some((10, 20)));
+    control.set_cycle(None);
+    assert_eq!(control.cycle(), None);
+}
+
+#[test]
+fn a_cycle_up_to_the_end_loops_instead_of_stopping() {
+    let (mut control, mut engine) = pair(1024, 2_500);
+    control.set_cycle(Some((2_500, 9_000)));
+    control.play();
+    let l = left(&play_frames(&mut engine, 300, 2_000));
+    assert_eq!(l, expected_cycle(2_500, 2_500, LEN, 2_000));
+    assert!(control.is_playing());
+}
+
+#[test]
+fn turning_the_cycle_off_while_playing_plays_on_to_the_end() {
+    let (mut control, mut engine) = pair(1024, 0);
+    control.set_cycle(Some((0, 400)));
+    control.play();
+    let _ = play_frames(&mut engine, 100, 1_000);
+    control.set_cycle(None);
+    let pos = control.position() as usize;
+    assert!(pos < 400);
+    let l = left(&play_frames(&mut engine, 100, LEN - pos));
+    assert_eq!(l, ramp(LEN)[pos..]);
+}
+
+#[test]
+fn a_buffer_larger_than_the_region_repeats_it_several_times() {
+    let (mut control, mut engine) = pair(1024, 10);
+    control.set_cycle(Some((10, 40)));
+    control.play();
+    let l = left(&play_frames(&mut engine, 1_000, 1_000));
+    assert_eq!(l, expected_cycle(10, 10, 40, 1_000));
+}

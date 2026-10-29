@@ -95,6 +95,9 @@ pub enum EditorError {
     /// The track or automation point index does not exist (SPEC-023).
     #[error("no such track or automation point")]
     NoPoint,
+    /// A cycle region must not be empty (SPEC-025).
+    #[error("the cycle region is empty")]
+    EmptyCycle,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -175,6 +178,10 @@ pub struct Editor {
     pub selected_track: Option<usize>,
     /// Selected clip as `(track, clip)`, if any.
     pub selected_clip: Option<(usize, usize)>,
+    /// Cycle region `[start, end)` of the window; not saved (SPEC-025).
+    cycle: Option<(u64, u64)>,
+    /// Whether playback repeats [`Self::cycle`].
+    pub cycle_enabled: bool,
 }
 
 impl Default for Editor {
@@ -205,6 +212,8 @@ impl Editor {
             group: None,
             selected_track: None,
             selected_clip: None,
+            cycle: None,
+            cycle_enabled: false,
         }
     }
 
@@ -260,6 +269,8 @@ impl Editor {
             group: None,
             selected_track: None,
             selected_clip: None,
+            cycle: None,
+            cycle_enabled: false,
         };
         Ok(())
     }
@@ -489,8 +500,49 @@ impl Editor {
         let rate = job.sample_rate;
         let graph =
             daw_app::build_session_graph(job).map_err(|e| EditorError::Render(e.to_string()))?;
-        let start = if start >= end { 0 } else { start };
-        Ok(daw_app::playback::playback(graph, rate, start, end))
+        let mut start = if start >= end { 0 } else { start };
+        let cycle = self.active_cycle();
+        if let Some((from, to)) = cycle
+            && (start < from || start >= to)
+        {
+            start = from.min(end);
+        }
+        let (mut control, engine) = daw_app::playback::playback(graph, rate, start, end);
+        control.set_cycle(cycle);
+        Ok((control, engine))
+    }
+
+    /// The cycle region, even while it is turned off (SPEC-025).
+    #[must_use]
+    pub const fn cycle(&self) -> Option<(u64, u64)> {
+        self.cycle
+    }
+
+    /// The cycle region if it is turned on.
+    #[must_use]
+    pub fn active_cycle(&self) -> Option<(u64, u64)> {
+        self.cycle.filter(|_| self.cycle_enabled)
+    }
+
+    /// Sets the cycle region (ends in any order) and turns it on.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::EmptyCycle`] when `start == end`; the previous region
+    /// is kept.
+    pub fn set_cycle(&mut self, start: u64, end: u64) -> Result<(), EditorError> {
+        if start == end {
+            return Err(EditorError::EmptyCycle);
+        }
+        self.cycle = Some((start.min(end), start.max(end)));
+        self.cycle_enabled = true;
+        Ok(())
+    }
+
+    /// Removes the cycle region and turns the cycle off.
+    pub const fn clear_cycle(&mut self) {
+        self.cycle = None;
+        self.cycle_enabled = false;
     }
 
     /// Removes one clip; out-of-range indices do nothing.
