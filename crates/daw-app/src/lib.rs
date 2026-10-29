@@ -454,6 +454,16 @@ pub enum LoadError {
         /// Underlying error.
         source: audio_core::WavError,
     },
+    /// A MIDI clip's notes could not be rendered (SPEC-021).
+    #[error("track {track} clip {clip}: {source}")]
+    Synth {
+        /// Track index.
+        track: usize,
+        /// Clip index inside the track.
+        clip: usize,
+        /// Synthesizer error.
+        source: audio_core::SynthError,
+    },
     /// A clip's WAV file holds fewer frames than its `source_length`.
     #[error("{path}: {file_frames} frame(s), clip needs source_length {source_length}")]
     SourceTooShort {
@@ -493,6 +503,9 @@ pub fn load_session_project(
 
 /// Loads every clip's WAV file of an in-memory `session` into a [`SessionJob`].
 ///
+/// MIDI clips need no file: their notes are rendered by the built-in synth
+/// here, before playback (SPEC-021).
+///
 /// Relative `source` paths are resolved against `base`; this is what
 /// [`load_session_project`] does after parsing the document, and what the
 /// editor calls for a project that has not been saved yet.
@@ -510,6 +523,17 @@ pub fn load_session(
         let mut clips: Vec<Box<dyn nodes::ClipSource + Send>> =
             Vec::with_capacity(track.clips.len());
         for (clip_index, clip) in track.clips.iter().enumerate() {
+            if let Some(notes) = &clip.notes {
+                let samples =
+                    audio_core::render_notes(notes, session.sample_rate, clip.source_length)
+                        .map_err(|source| LoadError::Synth {
+                            track: track_index,
+                            clip: clip_index,
+                            source,
+                        })?;
+                clips.push(Box::new(samples));
+                continue;
+            }
             let source = clip.source.as_deref().ok_or(LoadError::MissingSource {
                 track: track_index,
                 clip: clip_index,

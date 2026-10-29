@@ -18,6 +18,7 @@ fn clip(start: u64, length: u64, source: u64) -> Clip {
         gain: 1.0,
         name: String::new(),
         source: None,
+        notes: None,
     }
 }
 

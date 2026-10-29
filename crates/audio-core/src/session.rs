@@ -17,6 +17,9 @@ pub const MAX_CLIPS_PER_TRACK: usize = 128;
 /// Longest accepted clip source path, in bytes.
 pub const MAX_SOURCE_BYTES: usize = 4096;
 
+/// Most notes a single MIDI clip may hold (SPEC-021).
+pub const MAX_NOTES_PER_CLIP: usize = 4096;
+
 /// Why a session (or one of its clips) is inconsistent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -92,6 +95,17 @@ pub enum SessionError {
         /// Index of the clip inside the track.
         clip: usize,
     },
+    /// A MIDI clip note is out of range, ends past the clip's content, or the
+    /// clip has both notes and a file source (SPEC-021).
+    InvalidNote {
+        /// Index of the track holding the clip.
+        track: usize,
+        /// Index of the clip inside the track.
+        clip: usize,
+        /// Index of the offending note; [`MAX_NOTES_PER_CLIP`] when there are
+        /// too many, `0` when the clip also has a `source`.
+        note: usize,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -131,6 +145,9 @@ impl fmt::Display for SessionError {
             Self::InvalidClipGain { track, clip } => {
                 write!(f, "clip {clip} of track {track} gain is not in [0, 1]")
             }
+            Self::InvalidNote { track, clip, note } => {
+                write!(f, "track {track} clip {clip}: note {note} is invalid")
+            }
         }
     }
 }
@@ -156,6 +173,38 @@ pub struct Clip {
     ///
     /// The engine never opens it; the shell resolves it (SPEC-014).
     pub source: Option<String>,
+    /// Notes of a MIDI clip (SPEC-021); `None` for an audio clip.
+    pub notes: Option<Vec<Note>>,
+}
+
+/// One note of a MIDI clip, positioned inside the clip's content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Note {
+    /// MIDI pitch, `0..=127`; 60 is middle C.
+    pub pitch: u8,
+    /// Start, in samples from the beginning of the clip's content.
+    pub start: u64,
+    /// Duration in samples; always `> 0`.
+    pub length: u64,
+    /// Strength, `1..=127`.
+    pub velocity: u8,
+}
+
+impl Note {
+    /// Sample (exclusive) where the note is released, `None` on overflow.
+    #[must_use]
+    pub const fn end(&self) -> Option<u64> {
+        self.start.checked_add(self.length)
+    }
+
+    /// Whether the note fits a clip whose content is `source_length` long.
+    #[must_use]
+    pub fn is_valid(&self, source_length: u64) -> bool {
+        self.pitch <= 127
+            && (1..=127).contains(&self.velocity)
+            && self.length > 0
+            && self.end().is_some_and(|end| end <= source_length)
+    }
 }
 
 impl Clip {
@@ -170,7 +219,23 @@ impl Clip {
             gain: 1.0,
             name: String::new(),
             source: None,
+            notes: None,
         }
+    }
+
+    /// Empty MIDI clip of `length_samples`, playing from its beginning.
+    #[must_use]
+    pub fn midi(start_samples: u64, length_samples: u64) -> Self {
+        Self {
+            notes: Some(Vec::new()),
+            ..Self::full(start_samples, length_samples)
+        }
+    }
+
+    /// Whether this is a MIDI clip (it holds notes, not audio).
+    #[must_use]
+    pub const fn is_midi(&self) -> bool {
+        self.notes.is_some()
     }
 
     /// Sample index on the timeline where the clip stops sounding (exclusive).
@@ -401,9 +466,39 @@ impl Session {
                         clip: clip_index,
                     });
                 }
+                if let Some(notes) = &clip.notes {
+                    validate_notes(notes, clip, track_index, clip_index)?;
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// SPEC-021 checks for one MIDI clip.
+fn validate_notes(
+    notes: &[Note],
+    clip: &Clip,
+    track: usize,
+    clip_index: usize,
+) -> Result<(), SessionError> {
+    let error = |note| SessionError::InvalidNote {
+        track,
+        clip: clip_index,
+        note,
+    };
+    if clip.source.is_some() {
+        return Err(error(0));
+    }
+    if notes.len() > MAX_NOTES_PER_CLIP {
+        return Err(error(MAX_NOTES_PER_CLIP));
+    }
+    match notes
+        .iter()
+        .position(|note| !note.is_valid(clip.source_length))
+    {
+        Some(index) => Err(error(index)),
+        None => Ok(()),
     }
 }
 
@@ -592,6 +687,7 @@ mod tests {
             gain: 1.0,
             name: String::new(),
             source: None,
+            notes: None,
         };
         assert!(!clip.covers(99));
         assert!(clip.covers(100));
