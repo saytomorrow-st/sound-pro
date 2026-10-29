@@ -8,9 +8,17 @@ use std::fmt;
 
 use crate::fx::{Effect, MAX_EFFECTS_PER_TRACK};
 use crate::project::MAX_NAME_BYTES;
+use crate::transport::TimeSignature;
 
 /// Most tracks a session may hold.
 pub const MAX_TRACKS: usize = 32;
+
+/// Whether `signature` is one the editor supports: `1..=16` beats of a
+/// half, quarter, eighth or sixteenth note (SPEC-026).
+#[must_use]
+pub const fn valid_time_signature(signature: TimeSignature) -> bool {
+    matches!(signature.numerator, 1..=16) && matches!(signature.denominator, 2 | 4 | 8 | 16)
+}
 
 /// Most clips a single track may hold.
 pub const MAX_CLIPS_PER_TRACK: usize = 128;
@@ -92,6 +100,9 @@ pub enum SessionError {
     },
     /// The master gain is not finite or outside `[0, 1]`.
     InvalidMasterGain,
+    /// The time signature numerator is outside `1..=16` or the denominator
+    /// is not 2, 4, 8 or 16 (SPEC-026).
+    InvalidTimeSignature,
     /// A clip gain is not finite or outside `[0, 1]`.
     InvalidClipGain {
         /// Index of the track holding the clip.
@@ -166,6 +177,7 @@ impl fmt::Display for SessionError {
                 write!(f, "track {track} pan is not in [-1, 1]")
             }
             Self::InvalidMasterGain => write!(f, "master gain is not in [0, 1]"),
+            Self::InvalidTimeSignature => write!(f, "time signature is not supported"),
             Self::InvalidClipGain { track, clip } => {
                 write!(f, "clip {clip} of track {track} gain is not in [0, 1]")
             }
@@ -470,6 +482,8 @@ pub struct Session {
     pub tempo_bpm: f64,
     /// Linear master gain, `0.0..=1.0`, applied to the whole mix.
     pub master_gain: f32,
+    /// Bar layout; `tempo_bpm` counts its beats (SPEC-026).
+    pub time_signature: TimeSignature,
     /// Tracks in session order.
     pub tracks: Vec<Track>,
 }
@@ -483,6 +497,7 @@ impl Session {
             sample_rate,
             tempo_bpm,
             master_gain: 1.0,
+            time_signature: TimeSignature::default(),
             tracks: Vec::new(),
         }
     }
@@ -542,6 +557,9 @@ impl Session {
         }
         if !valid_gain(self.master_gain) {
             return Err(SessionError::InvalidMasterGain);
+        }
+        if !valid_time_signature(self.time_signature) {
+            return Err(SessionError::InvalidTimeSignature);
         }
         if self.tracks.len() > MAX_TRACKS {
             return Err(SessionError::TooManyTracks { max: MAX_TRACKS });

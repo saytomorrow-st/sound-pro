@@ -20,6 +20,10 @@ use audio_core::{
 pub const DEFAULT_RATE: u32 = 48_000;
 /// Tempo of a new project.
 pub const DEFAULT_TEMPO: f64 = 120.0;
+/// Slowest tempo the window allows (SPEC-026).
+pub const MIN_TEMPO: f64 = 20.0;
+/// Fastest tempo the window allows (SPEC-026).
+pub const MAX_TEMPO: f64 = 999.0;
 /// Frames summarised by one [`Peaks`] entry.
 pub const PEAK_BLOCK: usize = 256;
 
@@ -98,6 +102,9 @@ pub enum EditorError {
     /// A cycle region must not be empty (SPEC-025).
     #[error("the cycle region is empty")]
     EmptyCycle,
+    /// The time signature is not supported (SPEC-026).
+    #[error("time signature is not supported")]
+    InvalidTimeSignature,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -182,6 +189,8 @@ pub struct Editor {
     cycle: Option<(u64, u64)>,
     /// Whether playback repeats [`Self::cycle`].
     pub cycle_enabled: bool,
+    /// Whether playback clicks on every beat; not saved (SPEC-026).
+    pub metronome: bool,
 }
 
 impl Default for Editor {
@@ -214,6 +223,7 @@ impl Editor {
             selected_clip: None,
             cycle: None,
             cycle_enabled: false,
+            metronome: false,
         }
     }
 
@@ -271,6 +281,7 @@ impl Editor {
             selected_clip: None,
             cycle: None,
             cycle_enabled: false,
+            metronome: self.metronome,
         };
         Ok(())
     }
@@ -509,6 +520,12 @@ impl Editor {
         }
         let (mut control, engine) = daw_app::playback::playback(graph, rate, start, end);
         control.set_cycle(cycle);
+        control.set_metronome(self.metronome);
+        let session = &self.project.session;
+        control.set_meter(
+            session.tempo_bpm,
+            u32::from(session.time_signature.numerator),
+        );
         Ok((control, engine))
     }
 
@@ -980,6 +997,48 @@ impl Editor {
         self.dirty = true;
     }
 
+    /// Sets the tempo, clamped to `20..=999` BPM (SPEC-026). A value that is
+    /// not finite, or the current tempo, changes nothing.
+    pub fn set_tempo(&mut self, tempo_bpm: f64) {
+        if !tempo_bpm.is_finite() {
+            return;
+        }
+        let tempo = tempo_bpm.clamp(MIN_TEMPO, MAX_TEMPO);
+        if tempo.to_bits() == self.project.session.tempo_bpm.to_bits() {
+            return;
+        }
+        self.record();
+        self.project.session.tempo_bpm = tempo;
+        self.dirty = true;
+    }
+
+    /// Sets the time signature (SPEC-026).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::InvalidTimeSignature`] for an unsupported signature;
+    /// `self` is unchanged.
+    pub fn set_time_signature(
+        &mut self,
+        numerator: u8,
+        denominator: u8,
+    ) -> Result<(), EditorError> {
+        let signature = audio_core::TimeSignature {
+            numerator,
+            denominator,
+        };
+        if !audio_core::valid_time_signature(signature) {
+            return Err(EditorError::InvalidTimeSignature);
+        }
+        if signature == self.project.session.time_signature {
+            return Ok(());
+        }
+        self.record();
+        self.project.session.time_signature = signature;
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Remembers the session before an edit (once per group).
     fn record(&mut self) {
         match self.group {
@@ -1207,6 +1266,14 @@ pub fn clock(samples: u64, rate: u32) -> String {
 /// Musical position `bar.beat` in 4/4, both counted from 1.
 #[must_use]
 pub fn bars(samples: u64, rate: u32, tempo_bpm: f64) -> String {
+    bars_in(samples, rate, tempo_bpm, 4)
+}
+
+/// Like [`bars`], with `beats_per_bar` beats in a bar (SPEC-026); zero
+/// counts as 4.
+#[must_use]
+pub fn bars_in(samples: u64, rate: u32, tempo_bpm: f64, beats_per_bar: u32) -> String {
+    let per_bar = u64::from(if beats_per_bar == 0 { 4 } else { beats_per_bar });
     let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
         tempo_bpm
     } else {
@@ -1216,7 +1283,7 @@ pub fn bars(samples: u64, rate: u32, tempo_bpm: f64) -> String {
     let beats = samples as f64 / f64::from(rate.max(1)) * tempo / 60.0;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let beat = (beats + 1e-9).floor() as u64;
-    format!("{}.{}", beat / 4 + 1, beat % 4 + 1)
+    format!("{}.{}", beat / per_bar + 1, beat % per_bar + 1)
 }
 
 /// Reads a WAV file as peaks of its mono average at `rate` (SPEC-019).

@@ -317,3 +317,37 @@ fn source_paths_are_checked_after_the_clip_name_and_before_gain() {
             .contains("source")
     );
 }
+
+// ---- SPEC-026 ----
+
+#[test]
+fn the_time_signature_defaults_to_four_four() {
+    let s = Session::new("s", 48_000, 120.0);
+    assert_eq!(s.time_signature, audio_core::TimeSignature::default());
+    assert_eq!(s.time_signature.numerator, 4);
+    assert_eq!(s.time_signature.denominator, 4);
+}
+
+#[test]
+fn supported_time_signatures_are_valid_and_others_rejected() {
+    use audio_core::TimeSignature;
+    let mut s = Session::new("s", 48_000, 120.0);
+    for (n, d) in [(1, 4), (3, 4), (6, 8), (7, 8), (16, 16), (2, 2)] {
+        s.time_signature = TimeSignature {
+            numerator: n,
+            denominator: d,
+        };
+        assert_eq!(s.validate(), Ok(()), "{n}/{d}");
+    }
+    for (n, d) in [(0, 4), (17, 4), (4, 0), (4, 3), (4, 1), (4, 32)] {
+        s.time_signature = TimeSignature {
+            numerator: n,
+            denominator: d,
+        };
+        assert_eq!(
+            s.validate(),
+            Err(SessionError::InvalidTimeSignature),
+            "{n}/{d}"
+        );
+    }
+}
