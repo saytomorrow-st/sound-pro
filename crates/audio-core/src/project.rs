@@ -17,7 +17,8 @@ use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
     AutoPoint, Automation, Bus, BusSend, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
-    MAX_CLIPS_PER_TRACK, MAX_NOTES_PER_CLIP, MAX_TRACKS, Note, Session, SessionError, Track,
+    MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker, Note, Session,
+    SessionError, Track,
 };
 use crate::transport::TimeSignature;
 
@@ -455,6 +456,10 @@ fn write_session(out: &mut String, session: &Session) {
     if !session.buses.is_empty() {
         write_buses(out, &session.buses);
     }
+    // Written only when present (SPEC-030).
+    if !session.markers.is_empty() {
+        write_markers(out, &session.markers);
+    }
     out.push_str("\n  }");
 }
 
@@ -492,6 +497,60 @@ fn write_buses(out: &mut String, buses: &[Bus]) {
         out.push_str("\n      }");
     }
     out.push_str("\n    ]");
+}
+
+/// Appends the session's `"markers"` array (SPEC-030).
+fn write_markers(out: &mut String, markers: &[Marker]) {
+    out.push_str(",\n    \"markers\": [");
+    for (index, marker) in markers.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n      {\"name\": ");
+        write_string(out, &marker.name);
+        out.push_str(", \"position\": ");
+        out.push_str(&marker.position.to_string());
+        out.push('}');
+    }
+    out.push_str("\n    ]");
+}
+
+fn markers_from_value(value: &Value) -> Result<Vec<Marker>, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    if items.len() > MAX_MARKERS {
+        return Err(ProjectError::Session(SessionError::InvalidMarker {
+            marker: MAX_MARKERS,
+        }));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let Value::Object(entries) = item else {
+                return Err(ProjectError::Malformed { at: 0 });
+            };
+            let mut name = None;
+            let mut position = None;
+            for (key, value) in entries {
+                match key.as_str() {
+                    "name" => name = Some(require_string(value)?),
+                    "position" => position = Some(require_u64(value)?),
+                    other => {
+                        return Err(ProjectError::UnknownField {
+                            field: other.to_owned(),
+                        });
+                    }
+                }
+            }
+            Ok(Marker {
+                name: name.ok_or(ProjectError::MissingField {
+                    field: "session.markers[].name",
+                })?,
+                position: position.ok_or(ProjectError::MissingField {
+                    field: "session.markers[].position",
+                })?,
+            })
+        })
+        .collect()
 }
 
 fn sends_from_value(value: &Value) -> Result<Vec<BusSend>, ProjectError> {
@@ -584,9 +643,11 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut time_signature = None;
     let mut tracks = None;
     let mut buses = None;
+    let mut markers = None;
     for (key, value) in entries {
         match key.as_str() {
             "buses" => buses = Some(buses_from_value(value)?),
+            "markers" => markers = Some(markers_from_value(value)?),
             "name" => name = Some(require_string(value)?),
             "sample_rate" => sample_rate = Some(require_u32(value)?),
             "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
@@ -636,6 +697,8 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         })?,
         // Optional since SPEC-028.
         buses: buses.unwrap_or_default(),
+        // Optional since SPEC-030.
+        markers: markers.unwrap_or_default(),
     })
 }
 

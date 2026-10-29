@@ -1387,3 +1387,99 @@ fn the_palette_has_eight_colours() {
     session.tracks[0].color = Some(audio_core::TRACK_COLORS - 1);
     assert!(session.validate().is_ok());
 }
+
+// --- SPEC-030: markers ------------------------------------------------------
+
+fn marked_session() -> audio_core::Session {
+    let mut session = demo_session();
+    session.markers = vec![
+        audio_core::Marker {
+            name: "Куплет".into(),
+            position: 0,
+        },
+        audio_core::Marker {
+            name: "Припев".into(),
+            position: 96_000,
+        },
+    ];
+    session
+}
+
+fn marked_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        marked_session(),
+    )
+    .to_json()
+}
+
+#[test]
+fn markers_survive_the_round_trip() {
+    let text = marked_json();
+    assert!(text.contains("\"markers\""), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &marked_session());
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn a_session_without_markers_writes_no_markers_key() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert!(!text.contains("markers"), "{text}");
+    assert!(
+        Project::from_json(&text)
+            .unwrap()
+            .session()
+            .markers
+            .is_empty()
+    );
+}
+
+#[test]
+fn markers_out_of_order_fail_validation() {
+    let text = marked_json().replace("\"position\": 96000", "\"position\": 0");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidMarker { marker: 1 })
+    );
+}
+
+#[test]
+fn a_marker_with_a_bad_field_is_rejected() {
+    let text = marked_json();
+    let fractional = text.replace("\"position\": 96000", "\"position\": 1.5");
+    assert!(matches!(
+        Project::from_json(&fractional).unwrap_err(),
+        ProjectError::Malformed { .. }
+    ));
+    let stray = text.replace("\"position\": 96000", "\"position\": 96000, \"x\": 1");
+    assert!(matches!(
+        Project::from_json(&stray).unwrap_err(),
+        ProjectError::UnknownField { .. }
+    ));
+    let missing = text.replace(", \"position\": 96000", "");
+    assert!(matches!(
+        Project::from_json(&missing).unwrap_err(),
+        ProjectError::MissingField { .. }
+    ));
+}
+
+#[test]
+fn too_many_markers_are_rejected() {
+    let mut session = demo_session();
+    session.markers = (0..=audio_core::MAX_MARKERS as u64)
+        .map(|position| audio_core::Marker {
+            name: String::new(),
+            position,
+        })
+        .collect();
+    assert_eq!(
+        session.validate(),
+        Err(audio_core::SessionError::InvalidMarker {
+            marker: audio_core::MAX_MARKERS
+        })
+    );
+}
