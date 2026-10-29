@@ -210,3 +210,28 @@ pub fn pan_angle(pan: f32) -> f32 {
     };
     pan * 135f32.to_radians()
 }
+
+/// Horizontal scroll offset that keeps a point of the timeline still while
+/// the zoom changes (SPEC-037).
+///
+/// `anchor` is the point's distance from the left edge of the visible area,
+/// `offset` the scroll offset before the change. The result is never negative.
+#[must_use]
+pub fn zoom_offset(old_zoom: f32, new_zoom: f32, offset: f32, anchor: f32) -> f32 {
+    if !(old_zoom.is_finite() && new_zoom.is_finite() && old_zoom > 0.0 && new_zoom > 0.0) {
+        return offset.max(0.0);
+    }
+    ((offset + anchor) * new_zoom / old_zoom - anchor).max(0.0)
+}
+
+/// Anchor of a zoom made with the slider (SPEC-037): the playhead when it is
+/// on screen, the middle of the visible area otherwise.
+#[must_use]
+pub fn slider_anchor(playhead_x: f32, offset: f32, view_width: f32) -> f32 {
+    let x = playhead_x - offset;
+    if (0.0..=view_width).contains(&x) {
+        x
+    } else {
+        view_width / 2.0
+    }
+}

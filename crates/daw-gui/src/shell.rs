@@ -29,16 +29,55 @@ const LCD_BG: Color32 = Color32::from_rgb(22, 26, 30);
 const LCD_TEXT: Color32 = Color32::from_rgb(170, 220, 255);
 const STRIP_WIDTH: f32 = 74.0;
 
-fn lcd_cell(ui: &mut egui::Ui, value: &str, caption: &str) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(RichText::new(value).monospace().size(18.0).color(LCD_TEXT));
-        ui.label(
-            RichText::new(caption)
-                .size(9.0)
-                .color(Color32::from_gray(140)),
-        );
-    });
+const LCD_CELL_HEIGHT: f32 = 38.0;
+
+/// One display cell: a value row of fixed height and a small caption below,
+/// so every cell of the LCD lines up regardless of the widget inside.
+fn lcd_slot<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    caption: &str,
+    value: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, LCD_CELL_HEIGHT),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(Vec2::new(width, LCD_CELL_HEIGHT));
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let inner = ui
+                .allocate_ui_with_layout(
+                    Vec2::new(width, 24.0),
+                    egui::Layout::left_to_right(egui::Align::Center)
+                        .with_main_align(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(Vec2::new(width, 24.0));
+                        value(ui)
+                    },
+                )
+                .inner;
+            ui.label(
+                RichText::new(caption)
+                    .size(9.0)
+                    .color(Color32::from_gray(140)),
+            );
+            inner
+        },
+    )
+    .inner
+}
+
+fn lcd_text(ui: &mut egui::Ui, value: &str) -> egui::Response {
+    ui.add(
+        egui::Label::new(RichText::new(value).monospace().size(18.0).color(LCD_TEXT))
+            .sense(Sense::click()),
+    )
+}
+
+/// Greyed menu entry for a feature that is not ready yet.
+fn menu_stub(ui: &mut egui::Ui, text: &str) {
+    ui.add_enabled(false, egui::Button::new(text))
+        .on_disabled_hover_text("Скоро");
 }
 
 fn placeholder(ui: &mut egui::Ui, text: &str) {
@@ -269,6 +308,51 @@ fn name_plate(ui: &mut egui::Ui, name: &str, color: Color32) {
         });
 }
 
+/// Collapsible inspector block that always spans the full panel width.
+fn inspector_block(
+    ui: &mut egui::Ui,
+    width: f32,
+    id: &str,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(Color32::from_gray(44))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.set_width(width - 12.0);
+            egui::CollapsingHeader::new(RichText::new(title).strong())
+                .id_salt(id)
+                .default_open(false)
+                .show(ui, body);
+        });
+    ui.add_space(2.0);
+}
+
+/// In full screen the system title bar is gone, so the window controls are
+/// drawn in the control bar: minimize, leave full screen, close.
+fn window_buttons(ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    if !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+        return;
+    }
+    if ui.button("✕").on_hover_text("Закрыть").clicked() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+    if ui
+        .button("🗗")
+        .on_hover_text("Выйти из полноэкранного режима (F11)")
+        .clicked()
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
+    if ui.button("🗕").on_hover_text("Свернуть").clicked() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+    ui.separator();
+}
+
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong().color(Color32::from_gray(200)));
@@ -298,7 +382,7 @@ impl App {
             bottom_button(ui, Bottom::Mixer, "🎚", "Микшер (X)");
             bottom_button(ui, Bottom::Editor, "✏", "Редактор нот (E)");
             let full = ui.max_rect();
-            let center_width = 640.0_f32.min(full.width());
+            let center_width = 1000.0_f32.min(full.width());
             let center = egui::Rect::from_center_size(
                 egui::pos2(full.center().x, full.center().y),
                 Vec2::new(center_width, full.height()),
@@ -317,6 +401,7 @@ impl App {
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                window_buttons(ui);
                 ui.toggle_value(&mut self.layout.browser, "🗁")
                     .on_hover_text("Браузер файлов (F)");
                 placeholder(ui, "📝");
@@ -386,47 +471,69 @@ impl App {
         }
     }
 
-    /// The position display: bar.beat.sixteenth.tick, time, tempo, meter.
+    /// The position display: bar.beat.sixteenth.tick, time, tempo, meter, key.
     fn lcd(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new()
             .fill(LCD_BG)
             .corner_radius(CornerRadius::same(8))
             .stroke(Stroke::new(1.0_f32, Color32::from_gray(60)))
-            .inner_margin(egui::Margin::symmetric(12, 2))
+            .inner_margin(egui::Margin::symmetric(10, 3))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     let session = self.editor.session();
+                    let rate = session.sample_rate;
                     let [bar, beat, div, tick] = lcd_position(
                         self.playhead,
-                        session.sample_rate,
+                        rate,
                         session.tempo_bpm,
                         u32::from(session.time_signature.numerator),
                     );
-                    lcd_cell(
-                        ui,
-                        &format!("{bar:>3} {beat} {div} {tick:>3}"),
-                        "ТАКТ ДОЛЯ ДЕЛ ТИК",
-                    );
+                    let position = format!("{bar:>3} {beat} {div} {tick:>3}");
+                    let clock = super::clock(self.playhead, rate);
+                    let r = lcd_slot(ui, 150.0, "ТАКТ ДОЛЯ ДЕЛ ТИК", |ui| {
+                        lcd_text(ui, &position)
+                    });
+                    self.position_menu(&r);
                     ui.separator();
-                    lcd_cell(
-                        ui,
-                        &super::clock(self.playhead, session.sample_rate),
-                        "ВРЕМЯ",
-                    );
+                    let r = lcd_slot(ui, 120.0, "ВРЕМЯ", |ui| lcd_text(ui, &clock));
+                    self.position_menu(&r);
                     ui.separator();
                     ui.visuals_mut().override_text_color = Some(LCD_TEXT);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| self.meter_fields(ui));
-                        ui.label(
-                            RichText::new("ТЕМП / РАЗМЕР")
-                                .size(9.0)
-                                .color(Color32::from_gray(140)),
-                        );
-                    });
+                    lcd_slot(ui, 96.0, "ТЕМП", |ui| self.tempo_field(ui));
                     ui.separator();
-                    lcd_cell(ui, "C maj", "ТОНАЛЬНОСТЬ");
+                    lcd_slot(ui, 96.0, "РАЗМЕР", |ui| self.meter_field(ui));
+                    ui.separator();
+                    let r = lcd_slot(ui, 80.0, "ТОНАЛЬНОСТЬ", |ui| {
+                        lcd_text(ui, "C maj")
+                    })
+                    .on_hover_text("Тональность (правый клик — выбор, скоро)");
+                    r.context_menu(|ui| {
+                        for key in ["C maj", "G maj", "D maj", "A min", "E min"] {
+                            menu_stub(ui, key);
+                        }
+                    });
                 });
             });
+    }
+
+    fn position_menu(&mut self, response: &egui::Response) {
+        response.context_menu(|ui| {
+            if ui.button("В начало проекта").clicked() {
+                self.rewind();
+                ui.close();
+            }
+            if let Some((start, _)) = self.editor.active_cycle() {
+                if ui.button("В начало цикла").clicked() {
+                    self.seek(start);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            menu_stub(ui, "Показывать такты и время");
+            menu_stub(ui, "Показывать SMPTE");
+            menu_stub(ui, "Перейти к позиции…");
+        });
     }
 
     fn mode_buttons(&mut self, ui: &mut egui::Ui) {
@@ -535,30 +642,25 @@ impl App {
             ui.label(RichText::new("Щёлкните по дорожке").weak());
             return;
         };
-        egui::CollapsingHeader::new("Регион")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(RichText::new("Петля, транспонирование: скоро").weak());
-            });
-        egui::CollapsingHeader::new(
-            RichText::new(&self.editor.session().tracks[index].name).strong(),
-        )
-        .id_salt("inspector_track")
-        .default_open(false)
-        .show(ui, |ui| {
+        let width = ui.available_width();
+        inspector_block(ui, width, "inspector_region", "Регион", |ui| {
+            ui.label(RichText::new("Петля, транспонирование: скоро").weak());
+        });
+        let name = self.editor.session().tracks[index].name.clone();
+        inspector_block(ui, width, "inspector_track", &name, |ui| {
             ui.label(RichText::new("Параметры дорожки: скоро").weak());
         });
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
-            self.channel_strip(ui, index, true);
-            self.master_strip(ui, 150.0);
+            let height = self.channel_strip(ui, index, true);
+            self.master_strip(ui, 150.0, Some(height));
         });
     }
 
     /// One channel strip; `full` adds effect slots and sends.
     #[allow(clippy::too_many_lines)]
-    fn channel_strip(&mut self, ui: &mut egui::Ui, index: usize, full: bool) {
+    fn channel_strip(&mut self, ui: &mut egui::Ui, index: usize, full: bool) -> f32 {
         let track = self.editor.session().tracks[index].clone();
         let selected = self.editor.selected_track == Some(index);
         let fill = if selected {
@@ -688,10 +790,13 @@ impl App {
         if response.interact(Sense::click()).clicked() {
             self.editor.selected_track = Some(index);
         }
+        response.rect.height()
     }
 
-    /// Master channel strip (Stereo Out).
-    fn master_strip(&mut self, ui: &mut egui::Ui, height: f32) {
+    /// Master channel strip (Stereo Out). With `match_height` the strip is
+    /// stretched to that outer height and its fader is pinned to the bottom,
+    /// so it lines up with the neighbouring channel strip.
+    fn master_strip(&mut self, ui: &mut egui::Ui, height: f32, match_height: Option<f32>) {
         let playing = self.is_playing();
         egui::Frame::new()
             .fill(Color32::from_gray(48))
@@ -701,35 +806,45 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(STRIP_WIDTH);
                 ui.spacing_mut().item_spacing.y = 3.0;
+                let top = ui.cursor().top();
                 ui.vertical_centered(|ui| {
                     stub_slot(ui, "Settings");
                     eq_thumb(ui);
                     strip_caption(ui, "Audio FX");
                     stub_slot(ui, "");
-                    ui.add_space(34.0);
-                    let mut master = self.editor.session().master_gain;
-                    ui.label(
-                        RichText::new(db_label(master))
-                            .monospace()
-                            .size(10.0)
-                            .color(Color32::from_gray(210)),
-                    );
-                    let level = if playing {
-                        fader_position(master) * 0.85
-                    } else {
-                        0.0
-                    };
-                    if fader(ui, &mut master, true, height, level).changed() {
-                        self.editor.set_master_gain(master);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        pill_stub(ui, "M");
-                        pill_stub(ui, "D");
-                    });
-                    name_plate(ui, "Stereo Out", Color32::from_gray(170));
                 });
+                // Outer height minus the frame's margins and stroke.
+                let inner = match_height.map_or(0.0, |h| h - 10.0);
+                let rest = (inner - (ui.cursor().top() - top)).max(height + 70.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(STRIP_WIDTH, rest),
+                    egui::Layout::bottom_up(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(Vec2::new(STRIP_WIDTH, rest));
+                        name_plate(ui, "Stereo Out", Color32::from_gray(170));
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            pill_stub(ui, "M");
+                            pill_stub(ui, "D");
+                        });
+                        let mut master = self.editor.session().master_gain;
+                        let level = if playing {
+                            fader_position(master) * 0.85
+                        } else {
+                            0.0
+                        };
+                        if fader(ui, &mut master, true, height, level).changed() {
+                            self.editor.set_master_gain(master);
+                        }
+                        ui.label(
+                            RichText::new(db_label(master))
+                                .monospace()
+                                .size(10.0)
+                                .color(Color32::from_gray(210)),
+                        );
+                    },
+                );
             });
     }
 
@@ -792,8 +907,10 @@ impl App {
             .id_salt("mixer")
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
+                    let mut tallest = None;
                     for index in 0..self.editor.session().tracks.len() {
-                        self.channel_strip(ui, index, false);
+                        let h = self.channel_strip(ui, index, false);
+                        tallest = Some(tallest.map_or(h, |t: f32| t.max(h)));
                     }
                     if self.editor.session().tracks.is_empty() {
                         ui.label(RichText::new("Нет дорожек").weak());
@@ -802,7 +919,7 @@ impl App {
                     for index in 0..self.editor.session().buses.len() {
                         self.bus_strip(ui, index);
                     }
-                    self.master_strip(ui, 130.0);
+                    self.master_strip(ui, 130.0, tallest);
                 });
             });
     }

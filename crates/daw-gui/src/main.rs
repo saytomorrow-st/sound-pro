@@ -95,6 +95,14 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Whether a text field has the keyboard (SPEC-037). Any widget that was
+/// clicked takes focus in egui, so plain focus would block every shortcut
+/// after a click on a button or slider.
+fn typing(ctx: &egui::Context) -> bool {
+    ctx.memory(egui::Memory::focused)
+        .is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some())
+}
+
 /// A running playback: the control side and, with sound, the open stream.
 struct Player {
     control: PlaybackControl,
@@ -140,6 +148,18 @@ struct Recorder {
     start: u64,
 }
 
+/// Region menu command chosen in this frame (SPEC-037).
+#[derive(Clone, Copy)]
+enum RegionAction {
+    Piano,
+    Copy,
+    Paste,
+    Duplicate,
+    Split,
+    Delete,
+    NewMidi,
+}
+
 /// Track header command chosen in this frame (SPEC-029).
 #[derive(Clone, Copy)]
 enum TrackAction {
@@ -178,6 +198,15 @@ struct App {
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
+    /// Zoom the timeline was last drawn at; a difference means a zoom to
+    /// apply around `zoom_anchor` (SPEC-037).
+    drawn_zoom: f32,
+    /// Point to keep still, in px from the left of the visible timeline.
+    zoom_anchor: Option<f32>,
+    /// Track to scroll into view on the next frame (SPEC-037).
+    reveal_track: Option<usize>,
+    /// Horizontal scroll offset and width of the visible timeline.
+    timeline_view: (f32, f32),
     title: String,
     confirm_quit: bool,
     /// Snap clip edits to beats (Shift turns it off while dragging).
@@ -272,6 +301,10 @@ impl App {
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
+            drawn_zoom: 100.0,
+            zoom_anchor: None,
+            reveal_track: None,
+            timeline_view: (0.0, 0.0),
             title: String::new(),
             confirm_quit: false,
             snap: true,
@@ -673,19 +706,16 @@ impl App {
     }
 
     /// Tempo and time signature fields of the transport bar (SPEC-026).
-    fn meter_fields(&mut self, ui: &mut egui::Ui) {
-        let session = self.editor.session();
-        let mut tempo = session.tempo_bpm;
-        let signature = session.time_signature;
+    pub(crate) fn tempo_field(&mut self, ui: &mut egui::Ui) {
+        let mut tempo = self.editor.session().tempo_bpm;
         let response = ui
             .add(
                 egui::DragValue::new(&mut tempo)
                     .range(MIN_TEMPO..=MAX_TEMPO)
                     .speed(0.5)
-                    .max_decimals(2)
-                    .suffix(" BPM"),
+                    .max_decimals(2),
             )
-            .on_hover_text("Темп");
+            .on_hover_text("Темп: тяните или дважды щёлкните для ввода. Правый клик — пресеты.");
         if response.drag_started() {
             self.editor.begin_group();
         }
@@ -695,23 +725,59 @@ impl App {
         if response.drag_stopped() {
             self.editor.end_group();
         }
+        response.context_menu(|ui| {
+            for preset in [60.0, 90.0, 100.0, 120.0, 140.0] {
+                if ui.button(format!("{preset} BPM")).clicked() {
+                    self.editor.set_tempo(preset);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            for stub in ["Удвоить темп", "Половина темпа", "Подстучать темп (Tap)"]
+            {
+                ui.add_enabled(false, egui::Button::new(stub))
+                    .on_disabled_hover_text("Скоро");
+            }
+        });
+        self.sync_metronome();
+    }
+
+    /// Time signature: numerator and denominator are both picked from a list.
+    pub(crate) fn meter_field(&mut self, ui: &mut egui::Ui) {
+        let signature = self.editor.session().time_signature;
         let mut numerator = signature.numerator;
         let mut denominator = signature.denominator;
-        ui.add(
-            egui::DragValue::new(&mut numerator)
-                .range(1..=16)
-                .speed(0.1),
-        )
-        .on_hover_text("Долей в такте");
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().combo_width = 34.0;
+        egui::ComboBox::from_id_salt("numerator")
+            .width(34.0)
+            .selected_text(numerator.to_string())
+            .show_ui(ui, |ui| {
+                for n in 1u8..=16 {
+                    ui.selectable_value(&mut numerator, n, n.to_string());
+                }
+            })
+            .response
+            .on_hover_text("Долей в такте");
         ui.label("/");
-        egui::ComboBox::from_id_salt("denominator")
-            .width(40.0)
+        let response = egui::ComboBox::from_id_salt("denominator")
+            .width(34.0)
             .selected_text(denominator.to_string())
             .show_ui(ui, |ui| {
                 for d in [2u8, 4, 8, 16] {
                     ui.selectable_value(&mut denominator, d, d.to_string());
                 }
-            });
+            })
+            .response
+            .on_hover_text("Длительность доли. Правый клик — частые размеры.");
+        response.context_menu(|ui| {
+            for (n, d) in [(2u8, 4u8), (3, 4), (4, 4), (5, 4), (6, 8), (7, 8), (12, 8)] {
+                if ui.button(format!("{n}/{d}")).clicked() {
+                    (numerator, denominator) = (n, d);
+                    ui.close();
+                }
+            }
+        });
         if (numerator, denominator) != (signature.numerator, signature.denominator) {
             let result = self.editor.set_time_signature(numerator, denominator);
             self.report(result, &format!("Размер {numerator}/{denominator}"));
@@ -1179,6 +1245,28 @@ impl App {
         self.import_in_background(dropped, track, Some(start));
     }
 
+    /// Scroll offset that keeps the zoom anchor still (SPEC-037): the
+    /// pointer for Ctrl+wheel, the playhead (or the middle) for the slider.
+    #[allow(clippy::float_cmp)]
+    fn zoom_scroll(&mut self) -> Option<f32> {
+        let anchor = self.zoom_anchor.take();
+        if self.zoom == self.drawn_zoom {
+            return None;
+        }
+        let (offset, width) = self.timeline_view;
+        let anchor = anchor.unwrap_or_else(|| {
+            let rate = self.editor.session().sample_rate;
+            let x = samples_to_x(self.playhead, rate, self.drawn_zoom);
+            daw_gui::layout::slider_anchor(x, offset, width)
+        });
+        Some(daw_gui::layout::zoom_offset(
+            self.drawn_zoom,
+            self.zoom,
+            offset,
+            anchor,
+        ))
+    }
+
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let rate = f64::from(self.editor.session().sample_rate);
         let session_seconds = self.editor.session().length_samples() as f64 / rate;
@@ -1188,6 +1276,17 @@ impl App {
 
         let (area, response) =
             ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+        self.drawn_zoom = self.zoom;
+        if let Some(t) = self.reveal_track.take() {
+            let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
+            let left = area.min.x + samples_to_x(self.playhead, rate as u32, self.zoom);
+            ui.scroll_to_rect(
+                Rect::from_min_size(Pos2::new(left, top), Vec2::new(1.0, TRACK_HEIGHT)),
+                None,
+            );
+        }
+        let view = ui.clip_rect();
+        self.timeline_view = ((view.min.x - area.min.x).max(0.0), view.width());
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 0.0, Color32::from_gray(24));
         self.handle_drop(ui, area, tracks);
@@ -1358,7 +1457,9 @@ impl App {
                 };
                 painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
                 rects.push(((t, c), rect));
-                if response.clicked() && pointer.is_some_and(|p| rect.contains(p)) {
+                if (response.clicked() || response.secondary_clicked())
+                    && pointer.is_some_and(|p| rect.contains(p))
+                {
                     clicked = Some((t, c));
                 }
                 if response.double_clicked()
@@ -1419,7 +1520,7 @@ impl App {
             if let (Some(t), Some(row)) = (self.auto, auto_row) {
                 self.edit_lane(ui, &response, area, row, t);
             }
-        } else if response.clicked() {
+        } else if response.clicked() || response.secondary_clicked() {
             self.editor.selected_clip = clicked;
             if let Some((t, _)) = clicked {
                 self.editor.selected_track = Some(t);
@@ -1433,6 +1534,9 @@ impl App {
         if let Some(at) = open_piano {
             self.open_piano(at);
         }
+        if !lane_owned && !ruler_owned {
+            self.region_menu(&response);
+        }
 
         if !lane_owned && !ruler_owned {
             self.drag_clips(ui, &response, area, &rects);
@@ -1442,6 +1546,9 @@ impl App {
             let (ctrl, scroll) = ui.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
             if ctrl && scroll != 0.0 {
                 self.zoom = (self.zoom * (1.0 + scroll * 0.002)).clamp(MIN_ZOOM, MAX_ZOOM);
+                self.zoom_anchor = ui
+                    .input(|i| i.pointer.hover_pos())
+                    .map(|p| p.x - ui.clip_rect().min.x);
             }
         }
     }
@@ -1900,12 +2007,11 @@ impl App {
     }
 
     fn add_midi_track(&mut self) {
-        let session = self.editor.session();
-        let length = sixteenth_samples(session.sample_rate, session.tempo_bpm) * 64;
-        let start = self.editor.new_clip_start(self.playhead);
+        let (start, length) = self.editor.new_midi_region(self.playhead);
         let result = self.editor.add_midi_track(start, length);
         if let Some(at) = self.report(result, "MIDI-дорожка добавлена") {
             self.open_piano(at);
+            self.reveal_track = Some(at.0);
         }
     }
 
@@ -2154,6 +2260,78 @@ impl App {
         };
     }
 
+    /// Right-click menu of the tracks area (SPEC-037): region commands for
+    /// the region under the pointer, paste and new track on empty space.
+    fn region_menu(&mut self, response: &egui::Response) {
+        let mut action = None;
+        let selected = self.editor.selected_clip;
+        let midi = selected.is_some_and(|(t, c)| {
+            self.editor
+                .session()
+                .tracks
+                .get(t)
+                .and_then(|track| track.clips.get(c))
+                .is_some_and(audio_core::session::Clip::is_midi)
+        });
+        response.context_menu(|ui| {
+            ui.set_min_width(190.0);
+            let mut item = |ui: &mut egui::Ui, label: &str, hint: &str, a: RegionAction| {
+                if ui
+                    .add(egui::Button::new(label).shortcut_text(hint))
+                    .clicked()
+                {
+                    action = Some(a);
+                    ui.close();
+                }
+            };
+            if selected.is_some() {
+                if midi {
+                    item(ui, "Открыть в пиано-ролле", "", RegionAction::Piano);
+                    ui.separator();
+                }
+                item(ui, "Копировать", "Ctrl+C", RegionAction::Copy);
+                item(ui, "Вставить", "Ctrl+V", RegionAction::Paste);
+                item(ui, "Дублировать", "Ctrl+D", RegionAction::Duplicate);
+                item(ui, "Разрезать по курсору", "S", RegionAction::Split);
+                ui.separator();
+                for stub in ["Переименовать", "Цвет", "Квантизация", "Зациклить", "Фейды"]
+                {
+                    ui.add_enabled(false, egui::Button::new(stub));
+                }
+                ui.separator();
+                item(ui, "Удалить", "Del", RegionAction::Delete);
+            } else {
+                item(ui, "Вставить", "Ctrl+V", RegionAction::Paste);
+                item(ui, "Новая MIDI-дорожка", "", RegionAction::NewMidi);
+                ui.separator();
+                for stub in ["Новая аудиодорожка", "Выделить всё"] {
+                    ui.add_enabled(false, egui::Button::new(stub));
+                }
+            }
+        });
+        match action {
+            Some(RegionAction::Piano) => {
+                if let Some(at) = selected {
+                    self.open_piano(at);
+                }
+            }
+            Some(RegionAction::Copy) => self.copy_clip(&response.ctx),
+            Some(RegionAction::Paste) => self.paste_clip(),
+            Some(RegionAction::Duplicate) => self.duplicate_clip(),
+            Some(RegionAction::Split) => self.split_clip(),
+            Some(RegionAction::Delete) => self.delete_selected_clip(),
+            Some(RegionAction::NewMidi) => self.add_midi_track(),
+            None => {}
+        }
+    }
+
+    fn delete_selected_clip(&mut self) {
+        if let Some((t, c)) = self.editor.selected_clip {
+            self.editor.delete_clip(t, c);
+            self.status = "Клип удалён".into();
+        }
+    }
+
     fn split_clip(&mut self) {
         let Some((t, c)) = self.editor.selected_clip else {
             self.status = "Выберите клип".into();
@@ -2211,7 +2389,11 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if !ctx.wants_keyboard_input() {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F11)) {
+            let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+        }
+        if !typing(ctx) {
             let (space, home, record, cycle, click) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, Key::Space),
@@ -2294,19 +2476,21 @@ impl App {
                 self.rewind();
             }
         }
+        let in_text = typing(ctx);
         let (delete, save, open, import) = ctx.input_mut(|i| {
             (
-                i.consume_key(egui::Modifiers::NONE, Key::Delete),
+                // SPEC-037: Delete and Backspace both remove the region,
+                // unless a text field is taking the keys.
+                !in_text
+                    && (i.consume_key(egui::Modifiers::NONE, Key::Delete)
+                        || i.consume_key(egui::Modifiers::NONE, Key::Backspace)),
                 i.consume_key(egui::Modifiers::COMMAND, Key::S),
                 i.consume_key(egui::Modifiers::COMMAND, Key::O),
                 i.consume_key(egui::Modifiers::COMMAND, Key::I),
             )
         });
-        if delete && !ctx.wants_keyboard_input() {
-            if let Some((t, c)) = self.editor.selected_clip {
-                self.editor.delete_clip(t, c);
-                self.status = "Клип удалён".into();
-            }
+        if delete {
+            self.delete_selected_clip();
         }
         if save {
             self.save();
@@ -2317,7 +2501,7 @@ impl App {
         if import {
             self.import_dialog();
         }
-        if !ctx.wants_keyboard_input() {
+        if !typing(ctx) {
             let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
             let (redo, undo) = ctx.input_mut(|i| {
                 (
@@ -2838,9 +3022,11 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::both()
-                .id_salt("timeline")
-                .show(ui, |ui| self.timeline(ui));
+            let mut area = egui::ScrollArea::both().id_salt("timeline");
+            if let Some(offset) = self.zoom_scroll() {
+                area = area.horizontal_scroll_offset(offset);
+            }
+            area.show(ui, |ui| self.timeline(ui));
         });
 
         self.effects_window(ctx);
