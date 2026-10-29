@@ -1,4 +1,4 @@
-//! Sound Pro desktop editor (SPEC-015, SPEC-016, SPEC-017).
+//! Sound Pro desktop editor (SPEC-015 to SPEC-018).
 //!
 //! [`Editor`] is the window's model: the open project, its file path, the
 //! selection and the waveform cache. It knows nothing about drawing, so every
@@ -147,6 +147,9 @@ impl Peaks {
     }
 }
 
+/// How many edits [`Editor::undo`] can step back.
+pub const UNDO_LIMIT: usize = 100;
+
 /// The window's model: one open project and what the user selected.
 #[derive(Debug)]
 pub struct Editor {
@@ -154,6 +157,12 @@ pub struct Editor {
     path: Option<PathBuf>,
     dirty: bool,
     waves: HashMap<String, Peaks>,
+    undo: Vec<Session>,
+    redo: Vec<Session>,
+    /// The session as last opened or saved.
+    saved: Session,
+    /// `Some(recorded)` while edits are grouped into one step.
+    group: Option<bool>,
     /// Selected track, if any.
     pub selected_track: Option<usize>,
     /// Selected clip as `(track, clip)`, if any.
@@ -170,17 +179,22 @@ impl Editor {
     /// An empty, unsaved project.
     #[must_use]
     pub fn new() -> Self {
+        let session = Session::new("untitled", DEFAULT_RATE, DEFAULT_TEMPO);
         Self {
             project: Project {
                 name: "untitled".to_owned(),
                 sample_rate: DEFAULT_RATE,
                 tempo_bpm: DEFAULT_TEMPO,
                 params: Vec::new(),
-                session: Session::new("untitled", DEFAULT_RATE, DEFAULT_TEMPO),
+                session: session.clone(),
             },
             path: None,
             dirty: false,
             waves: HashMap::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            saved: session,
+            group: None,
             selected_track: None,
             selected_clip: None,
         }
@@ -227,10 +241,14 @@ impl Editor {
             }
         }
         *self = Self {
+            saved: project.session.clone(),
             project,
             path: Some(path),
             dirty: false,
             waves,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            group: None,
             selected_track: None,
             selected_clip: None,
         };
@@ -289,6 +307,7 @@ impl Editor {
         track.clips.push(clip);
         let clip_index = track.clips.len() - 1;
         session.validate()?;
+        self.record();
         self.project.session = session;
         self.waves.insert(source, peaks);
         self.selected_track = Some(track_index);
@@ -329,6 +348,7 @@ impl Editor {
         })?;
         self.project.name = document.name;
         self.project.session.name = document.session.name;
+        self.saved = self.project.session.clone();
         self.path = Some(path);
         self.dirty = false;
         Ok(())
@@ -389,7 +409,8 @@ impl Editor {
             return;
         };
         if clip < t.clips.len() {
-            t.clips.remove(clip);
+            self.record();
+            self.project.session.tracks[track].clips.remove(clip);
             self.selected_clip = None;
             self.dirty = true;
         }
@@ -483,6 +504,7 @@ impl Editor {
 
     fn commit(&mut self, session: Session, selected: (usize, usize)) -> Result<(), EditorError> {
         session.validate()?;
+        self.record();
         self.project.session = session;
         self.selected_track = Some(selected.0);
         self.selected_clip = Some(selected);
@@ -493,6 +515,7 @@ impl Editor {
     /// Removes one track and its clips; out-of-range indices do nothing.
     pub fn delete_track(&mut self, track: usize) {
         if track < self.project.session.tracks.len() {
+            self.record();
             self.project.session.tracks.remove(track);
             self.selected_track = None;
             self.selected_clip = None;
@@ -503,19 +526,101 @@ impl Editor {
     /// Mutable access to one track's mixer settings; marks the project
     /// changed.
     pub fn track_mut(&mut self, track: usize) -> Option<&mut Track> {
-        let t = self.project.session.tracks.get_mut(track)?;
+        if track >= self.project.session.tracks.len() {
+            return None;
+        }
+        self.record();
         self.dirty = true;
-        Some(t)
+        self.project.session.tracks.get_mut(track)
     }
 
     /// Sets the master gain, clamped to `0.0..=1.0`.
     pub fn set_master_gain(&mut self, gain: f32) {
-        self.project.session.master_gain = if gain.is_finite() {
+        let gain = if gain.is_finite() {
             gain.clamp(0.0, 1.0)
         } else {
             1.0
         };
+        if gain.to_bits() == self.project.session.master_gain.to_bits() {
+            return;
+        }
+        self.record();
+        self.project.session.master_gain = gain;
         self.dirty = true;
+    }
+
+    /// Remembers the session before an edit (once per group).
+    fn record(&mut self) {
+        match self.group {
+            Some(true) => return,
+            Some(false) => self.group = Some(true),
+            None => {}
+        }
+        if self.undo.len() == UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.undo.push(self.project.session.clone());
+        self.redo.clear();
+    }
+
+    /// Starts grouping edits into one undo step; does nothing if a group is
+    /// already open.
+    pub fn begin_group(&mut self) {
+        self.group.get_or_insert(false);
+    }
+
+    /// Ends the open group, if any.
+    pub fn end_group(&mut self) {
+        self.group = None;
+    }
+
+    /// Whether [`Self::undo`] has a step to go back to.
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    /// Whether [`Self::redo`] has an undone step to repeat.
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Returns to the session before the last edit; `false` if there is none.
+    pub fn undo(&mut self) -> bool {
+        let Some(session) = self.undo.pop() else {
+            return false;
+        };
+        let current = self.restore(session);
+        self.redo.push(current);
+        true
+    }
+
+    /// Repeats the last undone edit; `false` if there is none.
+    pub fn redo(&mut self) -> bool {
+        let Some(session) = self.redo.pop() else {
+            return false;
+        };
+        let current = self.restore(session);
+        self.undo.push(current);
+        true
+    }
+
+    /// Puts `session` in place, keeping the project name; returns the
+    /// replaced session.
+    fn restore(&mut self, mut session: Session) -> Session {
+        self.group = None;
+        session.name.clone_from(&self.project.session.name);
+        let current = std::mem::replace(&mut self.project.session, session);
+        let tracks = &self.project.session.tracks;
+        self.selected_track = self.selected_track.filter(|&t| t < tracks.len());
+        self.selected_clip = self
+            .selected_clip
+            .filter(|&(t, c)| tracks.get(t).is_some_and(|tr| c < tr.clips.len()));
+        let mut saved = self.saved.clone();
+        saved.name.clone_from(&self.project.session.name);
+        self.dirty = self.project.session != saved;
+        current
     }
 
     /// The open session.

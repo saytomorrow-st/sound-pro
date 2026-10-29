@@ -1,4 +1,4 @@
-//! Sound Pro window (SPEC-015, SPEC-016, SPEC-017). All editing goes through
+//! Sound Pro window (SPEC-015 to SPEC-018). All editing goes through
 //! [`daw_gui::Editor`].
 
 #![forbid(unsafe_code)]
@@ -347,6 +347,16 @@ impl App {
                     ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                 }
             });
+            ui.menu_button("Правка", |ui| {
+                let undo = egui::Button::new("Отменить").shortcut_text("Ctrl+Z");
+                if ui.add_enabled(self.editor.can_undo(), undo).clicked() {
+                    self.undo();
+                }
+                let redo = egui::Button::new("Повторить").shortcut_text("Ctrl+Shift+Z");
+                if ui.add_enabled(self.editor.can_redo(), redo).clicked() {
+                    self.redo();
+                }
+            });
         });
     }
 
@@ -648,6 +658,24 @@ impl App {
         self.drag = Some(drag);
     }
 
+    fn undo(&mut self) {
+        self.drag = None;
+        self.status = if self.editor.undo() {
+            "Отменено".into()
+        } else {
+            "Нечего отменять".into()
+        };
+    }
+
+    fn redo(&mut self) {
+        self.drag = None;
+        self.status = if self.editor.redo() {
+            "Повторено".into()
+        } else {
+            "Нечего повторять".into()
+        };
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if !ctx.wants_keyboard_input() {
             let (space, home) = ctx.input_mut(|i| {
@@ -686,12 +714,32 @@ impl App {
         if import {
             self.import_dialog();
         }
+        if !ctx.wants_keyboard_input() {
+            let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+            let (redo, undo) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(shift, Key::Z) || i.consume_key(egui::Modifiers::COMMAND, Key::Y),
+                    i.consume_key(egui::Modifiers::COMMAND, Key::Z),
+                )
+            });
+            if redo {
+                self.redo();
+            } else if undo {
+                self.undo();
+            }
+        }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_player(ctx);
+        // Everything done during one mouse press is one undo step.
+        if ctx.input(|i| i.pointer.any_down()) {
+            self.editor.begin_group();
+        } else {
+            self.editor.end_group();
+        }
         self.shortcuts(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && self.editor.is_dirty() {
