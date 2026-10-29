@@ -413,6 +413,7 @@ impl App {
         } else {
             self.player = None;
             if !self.is_recording() {
+                self.playhead = self.editor.active_cycle().map_or(0, |(from, _)| from);
                 self.status = "Конец".into();
             }
         }
@@ -1615,7 +1616,8 @@ impl App {
     fn add_midi_track(&mut self) {
         let session = self.editor.session();
         let length = sixteenth_samples(session.sample_rate, session.tempo_bpm) * 64;
-        let result = self.editor.add_midi_track(self.playhead, length);
+        let start = self.editor.new_clip_start(self.playhead);
+        let result = self.editor.add_midi_track(start, length);
         if let Some(at) = self.report(result, "MIDI-дорожка добавлена") {
             self.open_piano(at);
         }

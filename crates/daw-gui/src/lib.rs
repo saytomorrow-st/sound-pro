@@ -770,6 +770,20 @@ impl Editor {
         Ok(at)
     }
 
+    /// Where a new clip goes for a playhead (SPEC-031): the start of the bar
+    /// under it, or `0` once it is at or past the end of a non-empty project.
+    #[must_use]
+    pub fn new_clip_start(&self, playhead: u64) -> u64 {
+        let session = &self.project.session;
+        let end = session.length_samples();
+        if end > 0 && playhead >= end {
+            return 0;
+        }
+        let beats = u64::from(session.time_signature.numerator.max(1));
+        let bar = sixteenth_samples(session.sample_rate, session.tempo_bpm) * 4 * beats;
+        playhead - playhead % bar
+    }
+
     /// Adds a track named "MIDI" holding one empty MIDI clip at `start`
     /// (SPEC-021). Returns `(track, clip)`, which becomes selected.
     ///

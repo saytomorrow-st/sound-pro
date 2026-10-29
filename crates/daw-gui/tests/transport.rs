@@ -138,3 +138,89 @@ fn bars_count_from_one_in_four_four() {
     assert_eq!(bars(96_000, RATE, 120.0), "2.1");
     assert_eq!(bars(96_000 + 72_000, RATE, 120.0), "2.4");
 }
+
+/// Regression: a MIDI track must not silence playback (it rendered fine on
+/// export but the player stopped).
+#[test]
+fn playback_with_a_midi_track_sounds_like_the_export() {
+    let dir = Scratch::new("midi");
+    let a = dir.join("a.wav");
+    write_wav(&a, &ramp(4_000));
+    let mut editor = Editor::new();
+    editor.import_wav(&a).unwrap();
+    let (t, c) = editor.add_midi_track(0, 4_000).unwrap();
+    editor
+        .add_note(
+            t,
+            c,
+            audio_core::session::Note {
+                start: 0,
+                length: 3_000,
+                pitch: 60,
+                velocity: 100,
+            },
+        )
+        .unwrap();
+
+    let out = dir.join("mix.wav");
+    editor.export(&out).unwrap();
+    let (_, mix) = read_wav_mono(&out).unwrap();
+
+    let (mut control, mut engine) = editor.playback(0).unwrap();
+    control.play();
+    let mut played = Vec::new();
+    let mut buffer = vec![0.0f32; 512 * 2];
+    while played.len() < 4_000 * 2 {
+        engine.fill(&mut buffer, 2);
+        played.extend_from_slice(&buffer);
+    }
+    for frame in 0..4_000 {
+        assert!(
+            (played[frame * 2] - mix.channel(0)[frame]).abs() < 1e-6,
+            "left {frame}: {} vs {}",
+            played[frame * 2],
+            mix.channel(0)[frame]
+        );
+    }
+    assert!(!control.is_playing());
+    assert_eq!(control.position(), 4_000);
+}
+
+/// SPEC-031: a playhead parked at the end must not put a new clip past the
+/// sound; otherwise playback starts in silence.
+#[test]
+fn new_clip_start_returns_to_zero_past_the_end() {
+    let dir = Scratch::new("clipstart");
+    let a = dir.join("a.wav");
+    write_wav(&a, &ramp(4_000));
+    let mut editor = Editor::new();
+    editor.import_wav(&a).unwrap();
+    assert_eq!(editor.new_clip_start(4_000), 0);
+    assert_eq!(editor.new_clip_start(10_000), 0);
+
+    let at = editor.new_clip_start(4_000);
+    editor.add_midi_track(at, 4_000).unwrap();
+    let (mut control, mut engine) = editor.playback(at).unwrap();
+    control.play();
+    let mut buffer = vec![0.0f32; 512 * 2];
+    let mut loud = 0.0f32;
+    for _ in 0..4 {
+        engine.fill(&mut buffer, 2);
+        loud = buffer.iter().fold(loud, |m, s| m.max(s.abs()));
+    }
+    assert!(loud > 0.01, "playback is silent");
+}
+
+#[test]
+fn new_clip_start_snaps_to_the_bar() {
+    let mut editor = Editor::new();
+    let rate = u64::from(editor.session().sample_rate);
+    let bar = rate * 2; // 4/4 at 120 bpm
+    assert_eq!(editor.new_clip_start(0), 0);
+    assert_eq!(editor.new_clip_start(bar + 5), bar);
+
+    let (t, _) = editor.add_midi_track(0, bar * 4).unwrap();
+    assert_eq!(t, 0);
+    assert_eq!(editor.new_clip_start(bar * 2 + bar / 2), bar * 2);
+    assert_eq!(editor.new_clip_start(bar * 4), 0);
+}
