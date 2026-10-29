@@ -51,6 +51,14 @@ pub enum RealtimeError {
     /// The caller's graph factory failed.
     #[error("graph: {0}")]
     Graph(String),
+    /// The device cannot run at the project's sample rate (SPEC-016).
+    #[error("output device cannot play {project} Hz (nearest is {nearest} Hz)")]
+    SampleRate {
+        /// Rate the project needs.
+        project: u32,
+        /// Closest rate the device offers.
+        nearest: u32,
+    },
 }
 
 /// One F32 output configuration advertised by a device.
@@ -301,6 +309,30 @@ pub fn interleave_into(
     }
 }
 
+/// Picks an F32 configuration that runs at exactly `rate` (SPEC-016).
+///
+/// Playback never resamples, so a near miss is an error rather than a
+/// detuned song.
+///
+/// # Errors
+///
+/// Those of [`choose_config`], and [`RealtimeError::SampleRate`] when no F32
+/// configuration covers `rate`.
+pub fn choose_exact_config(
+    configs: &[DeviceConfig],
+    rate: u32,
+) -> Result<ChosenConfig, RealtimeError> {
+    let chosen = choose_config(configs, rate)?;
+    if chosen.sample_rate == rate {
+        Ok(chosen)
+    } else {
+        Err(RealtimeError::SampleRate {
+            project: rate,
+            nearest: chosen.sample_rate,
+        })
+    }
+}
+
 #[cfg(feature = "realtime")]
 mod device {
     use std::sync::Arc;
@@ -315,8 +347,9 @@ mod device {
 
     use super::{
         ChosenConfig, DeviceConfig, QuantumSplitter, RealtimeError, RealtimeHandle, RealtimeStats,
-        choose_config, interleave_into,
+        choose_config, choose_exact_config, interleave_into,
     };
+    use crate::playback::PlaybackEngine;
 
     /// Fixed render quantum reserved by the engine. Larger device buffers are
     /// rendered in pieces of this many frames; nothing resizes in the callback.
@@ -434,10 +467,64 @@ mod device {
             stats,
         })
     }
+
+    /// Opens the default output device at `sample_rate` and lets `engine`
+    /// fill every buffer (SPEC-016).
+    ///
+    /// # Errors
+    ///
+    /// [`RealtimeError::NoDevice`], [`RealtimeError::NoF32Config`],
+    /// [`RealtimeError::SampleRate`] when the device cannot run at
+    /// `sample_rate`, or a CPAL error while building/starting the stream.
+    pub fn start_output(
+        mut engine: PlaybackEngine,
+        sample_rate: u32,
+    ) -> Result<RealtimeHandle, RealtimeError> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or(RealtimeError::NoDevice)?;
+        let configs = device_configs(&device)?;
+        let chosen = choose_exact_config(&configs, sample_rate)?;
+        let supported = device
+            .supported_output_configs()?
+            .find(|r| {
+                r.sample_format() == SampleFormat::F32
+                    && r.channels() == chosen.channels
+                    && r.min_sample_rate().0 <= sample_rate
+                    && sample_rate <= r.max_sample_rate().0
+            })
+            .ok_or(RealtimeError::NoF32Config)?;
+        let stream_config: StreamConfig = supported
+            .with_sample_rate(cpal::SampleRate(sample_rate))
+            .into();
+        let channels = usize::from(stream_config.channels);
+        let stats = Arc::new(RealtimeStats::default());
+        let cb_stats = Arc::clone(&stats);
+        let err_stats = Arc::clone(&stats);
+        let stream = device.build_output_stream(
+            &stream_config,
+            move |data: &mut [f32], _| {
+                engine.fill(data, channels);
+                cb_stats
+                    .rendered_frames
+                    .fetch_add((data.len() / channels.max(1)) as u64, Ordering::Relaxed);
+            },
+            move |_err| {
+                err_stats.stream_errors.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        )?;
+        stream.play()?;
+        Ok(RealtimeHandle {
+            stream: Some(stream),
+            stats,
+        })
+    }
 }
 
 #[cfg(feature = "realtime")]
-pub use device::play_default;
+pub use device::{play_default, start_output};
 
 #[cfg(test)]
 mod tests {
@@ -450,6 +537,24 @@ mod tests {
             max_sample_rate: max,
             channels,
             is_f32: true,
+        }
+    }
+
+    #[test]
+    fn exact_config_accepts_a_rate_inside_a_range() {
+        let cfgs = [f32_cfg(44_100, 96_000, 2)];
+        let chosen = choose_exact_config(&cfgs, 44_100).unwrap();
+        assert_eq!(chosen.sample_rate, 44_100);
+    }
+
+    #[test]
+    fn exact_config_rejects_a_rate_the_device_cannot_play() {
+        let cfgs = [f32_cfg(48_000, 48_000, 2)];
+        match choose_exact_config(&cfgs, 44_100) {
+            Err(RealtimeError::SampleRate { project, nearest }) => {
+                assert_eq!((project, nearest), (44_100, 48_000));
+            }
+            other => panic!("expected SampleRate, got {other:?}"),
         }
     }
 

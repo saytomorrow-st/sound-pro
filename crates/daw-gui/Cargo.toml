@@ -18,3 +18,7 @@ daw-app = { path = "../daw-app" }
 thiserror = { workspace = true }
 eframe = { version = "0.33", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 rfd = "0.17"
+
+[features]
+# Live sound through the default output device (needs ALSA headers on Linux).
+audio = ["daw-app/realtime"]

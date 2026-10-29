@@ -80,3 +80,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Build with realtime feature
         run: cargo build --workspace --features daw-app/realtime
+      - name: Build the window with sound
+        run: cargo build -p daw-gui --features audio
