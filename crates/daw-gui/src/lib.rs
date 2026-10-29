@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod layout;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

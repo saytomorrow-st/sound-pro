@@ -5,6 +5,8 @@
 // No console window behind the GUI in Windows release builds (SPEC-024).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod shell;
+
 use std::path::PathBuf;
 
 use audio_core::{
@@ -12,6 +14,7 @@ use audio_core::{
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
+use daw_gui::layout::{Bottom, Layout};
 use daw_gui::{
     Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
     snap_to_beat, x_to_samples,
@@ -179,6 +182,9 @@ struct App {
     audio_open: bool,
     outputs: Vec<String>,
     inputs: Vec<String>,
+    /// Visible panels of the main window (SPEC-034).
+    layout: Layout,
+    themed: bool,
 }
 
 /// What the user asked to do with a marker flag (SPEC-030).
@@ -246,6 +252,8 @@ impl App {
             audio_open: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
+            layout: Layout::default(),
+            themed: false,
         };
         if let Some(path) = &app.audio_path {
             app.audio = AudioSettings::load(path);
@@ -513,82 +521,6 @@ impl App {
     fn reset_playback(&mut self) {
         self.player = None;
         self.playhead = 0;
-    }
-
-    fn transport(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("⏮").on_hover_text("В начало (Home)").clicked() {
-                self.rewind();
-            }
-            let label = if self.is_playing() { "⏸" } else { "▶" };
-            if ui
-                .button(label)
-                .on_hover_text("Играть / пауза (пробел)")
-                .clicked()
-            {
-                self.toggle_play();
-            }
-            if ui.button("⏹").on_hover_text("Стоп").clicked() {
-                self.stop();
-            }
-            let rec = egui::RichText::new("⏺").color(if self.is_recording() {
-                Color32::RED
-            } else {
-                Color32::from_rgb(200, 80, 80)
-            });
-            if ui
-                .add(egui::Button::new(rec).selected(self.is_recording()))
-                .on_hover_text("Запись с микрофона (R)")
-                .clicked()
-            {
-                self.toggle_record();
-            }
-            let cycle = egui::Button::new("🔁").selected(self.editor.active_cycle().is_some());
-            if ui
-                .add(cycle)
-                .on_hover_text("Цикл (C). Протяните по линейке, чтобы задать участок.")
-                .clicked()
-            {
-                self.toggle_cycle();
-            }
-            let click = egui::Button::new("🎵").selected(self.editor.metronome);
-            if ui.add(click).on_hover_text("Метроном (K)").clicked() {
-                self.toggle_metronome();
-            }
-            if ui
-                .button("+ Маркер")
-                .on_hover_text("Метка в позиции курсора (M). «,» и «.» — к соседним меткам.")
-                .clicked()
-            {
-                self.add_marker();
-            }
-            let buses = egui::Button::new("Шины").selected(self.buses_open);
-            if ui
-                .add(buses)
-                .on_hover_text("Общие эффекты для нескольких дорожек")
-                .clicked()
-            {
-                self.buses_open = !self.buses_open;
-            }
-            ui.separator();
-            let session = self.editor.session();
-            let text = format!(
-                "{}   такт {}",
-                clock(self.playhead, session.sample_rate),
-                bars_in(
-                    self.playhead,
-                    session.sample_rate,
-                    session.tempo_bpm,
-                    u32::from(session.time_signature.numerator),
-                )
-            );
-            ui.label(egui::RichText::new(text).monospace().size(16.0));
-            ui.separator();
-            self.meter_fields(ui);
-            ui.separator();
-            ui.checkbox(&mut self.snap, "Сетка")
-                .on_hover_text("Привязка клипов к долям. Shift при перетаскивании отключает.");
-        });
     }
 
     /// Tempo and time signature fields of the transport bar (SPEC-026).
@@ -1732,6 +1664,7 @@ impl App {
         self.piano_scroll = true;
         self.editor.selected_clip = Some(at);
         self.editor.selected_track = Some(at.0);
+        self.layout.show_editor();
     }
 
     /// The open piano roll clip, closed if it is gone or no longer MIDI.
@@ -2044,6 +1977,28 @@ impl App {
                     i.consume_key(egui::Modifiers::NONE, Key::Period),
                 )
             });
+            let (mixer, editors, inspector, library, smart, browser) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, Key::X),
+                    i.consume_key(egui::Modifiers::NONE, Key::E),
+                    i.consume_key(egui::Modifiers::NONE, Key::I),
+                    i.consume_key(egui::Modifiers::NONE, Key::Y),
+                    i.consume_key(egui::Modifiers::NONE, Key::B),
+                    i.consume_key(egui::Modifiers::NONE, Key::F),
+                )
+            });
+            if mixer {
+                self.layout.toggle_bottom(Bottom::Mixer);
+            }
+            if editors {
+                self.layout.toggle_bottom(Bottom::Editor);
+            }
+            if smart {
+                self.layout.toggle_bottom(Bottom::SmartControls);
+            }
+            self.layout.inspector ^= inspector;
+            self.layout.library ^= library;
+            self.layout.browser ^= browser;
             if marker {
                 self.add_marker();
             }
@@ -2521,6 +2476,10 @@ enum FxAction {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.themed {
+            shell::apply_theme(ctx);
+            self.themed = true;
+        }
         self.poll_player(ctx);
         self.poll_recorder(ctx);
         // Everything done during one mouse press is one undo step.
@@ -2537,7 +2496,9 @@ impl eframe::App for App {
         }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu(ui));
-        egui::TopBottomPanel::top("transport").show(ctx, |ui| self.transport(ui));
+        egui::TopBottomPanel::top("transport")
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(6.0))
+            .show(ctx, |ui| self.control_bar(ui));
 
         egui::TopBottomPanel::bottom("status")
             .exact_height(30.0)
@@ -2555,12 +2516,31 @@ impl eframe::App for App {
                 });
             });
 
-        if self.piano_clip().is_some() {
-            egui::TopBottomPanel::bottom("piano")
+        self.bottom_area(ctx);
+
+        if self.layout.library {
+            egui::SidePanel::left("library")
                 .resizable(true)
-                .default_height(PIANO_HEIGHT)
-                .show(ctx, |ui| self.piano_roll(ui));
+                .default_width(180.0)
+                .show(ctx, |ui| self.library(ui));
         }
+        if self.layout.inspector {
+            egui::SidePanel::left("inspector")
+                .resizable(true)
+                .default_width(170.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("inspector")
+                        .show(ui, |ui| self.inspector(ui));
+                });
+        }
+        if self.layout.browser {
+            egui::SidePanel::right("browser")
+                .resizable(true)
+                .default_width(220.0)
+                .show(ctx, |ui| self.browser(ui));
+        }
+        egui::TopBottomPanel::top("tracks_toolbar").show(ctx, |ui| self.tracks_toolbar(ui));
 
         egui::SidePanel::left("tracks")
             .resizable(true)
