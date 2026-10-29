@@ -115,6 +115,9 @@ pub enum EditorError {
     /// Nothing has been copied yet (SPEC-027).
     #[error("nothing to paste")]
     EmptyClipboard,
+    /// A track name must not be blank (SPEC-029).
+    #[error("the name is empty")]
+    EmptyName,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -1218,6 +1221,99 @@ impl Editor {
         self.selected_track = Some(track);
         self.dirty = true;
         Ok(())
+    }
+
+    /// Renames a track; surrounding spaces are trimmed (SPEC-029).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for a bad index, [`EditorError::EmptyName`]
+    /// for a blank name, [`EditorError::Session`] for a too long one.
+    pub fn rename_track(&mut self, track: usize, name: &str) -> Result<(), EditorError> {
+        let name = name.trim();
+        let current = &self
+            .project
+            .session
+            .tracks
+            .get(track)
+            .ok_or(EditorError::NoClip)?
+            .name;
+        if name.is_empty() {
+            return Err(EditorError::EmptyName);
+        }
+        if current == name {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        name.clone_into(&mut session.tracks[track].name);
+        self.commit_session(session)
+    }
+
+    /// Sets or clears a track's palette colour (SPEC-029).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for a bad index, [`EditorError::Session`] for
+    /// a colour outside the palette.
+    pub fn set_track_color(&mut self, track: usize, color: Option<u8>) -> Result<(), EditorError> {
+        let current = self
+            .project
+            .session
+            .tracks
+            .get(track)
+            .ok_or(EditorError::NoClip)?
+            .color;
+        if current == color {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        session.tracks[track].color = color;
+        self.commit_session(session)
+    }
+
+    /// Moves a track to position `to`; the others shift (SPEC-029).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] when either index is out of range.
+    pub fn move_track(&mut self, from: usize, to: usize) -> Result<(), EditorError> {
+        let count = self.project.session.tracks.len();
+        if from >= count || to >= count {
+            return Err(EditorError::NoClip);
+        }
+        if from == to {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        let moved = session.tracks.remove(from);
+        session.tracks.insert(to, moved);
+        self.commit_track(session, to)?;
+        self.selected_clip = None;
+        Ok(())
+    }
+
+    /// Inserts a copy of a track right below it and selects the copy
+    /// (SPEC-029). Returns the copy's index.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for a bad index, [`EditorError::Session`] when
+    /// the session already holds [`audio_core::MAX_TRACKS`] tracks.
+    pub fn duplicate_track(&mut self, track: usize) -> Result<usize, EditorError> {
+        let mut session = self.project.session.clone();
+        let mut copy = session
+            .tracks
+            .get(track)
+            .ok_or(EditorError::NoClip)?
+            .clone();
+        copy.name.push_str(" копия");
+        if copy.name.len() > audio_core::MAX_NAME_BYTES {
+            copy.name.clone_from(&session.tracks[track].name);
+        }
+        session.tracks.insert(track + 1, copy);
+        self.commit_track(session, track + 1)?;
+        self.selected_clip = None;
+        Ok(track + 1)
     }
 
     /// Removes one track and its clips; out-of-range indices do nothing.

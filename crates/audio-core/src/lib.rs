@@ -48,7 +48,7 @@ pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, Schedu
 pub use session::{
     AutoPoint, Automation, Bus, BusSend, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
     MAX_CLIPS_PER_TRACK, MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES, MAX_TRACKS, Note, Session,
-    SessionError, Track as SessionTrack, pan_law, valid_time_signature,
+    SessionError, TRACK_COLORS, Track as SessionTrack, pan_law, valid_time_signature,
 };
 pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz, render_notes};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
