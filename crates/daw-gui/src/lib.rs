@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use audio_core::session::{Clip, Note, Session, Track};
+use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track};
 use audio_core::{
     Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Project, ProjectError, SessionError,
 };
@@ -92,6 +92,9 @@ pub enum EditorError {
     /// The track or effect index does not exist (SPEC-022).
     #[error("no such track or effect")]
     NoEffect,
+    /// The track or automation point index does not exist (SPEC-023).
+    #[error("no such track or automation point")]
+    NoPoint,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -776,6 +779,109 @@ impl Editor {
         self.commit_track(session, track)
     }
 
+    /// Adds an automation point, keeping the lane ordered by time; a point
+    /// at the same time is replaced. Returns its index (SPEC-023).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoPoint`] for a bad track index,
+    /// [`EditorError::Session`] for an out-of-range value or a full lane;
+    /// `self` is unchanged.
+    pub fn add_point(
+        &mut self,
+        track: usize,
+        lane: Lane,
+        point: AutoPoint,
+    ) -> Result<usize, EditorError> {
+        let mut session = self.project.session.clone();
+        let points = lane_mut(&mut session, track, lane)?;
+        let index = points.partition_point(|p| p.time < point.time);
+        if points.get(index).is_some_and(|p| p.time == point.time) {
+            if points[index] == point {
+                return Ok(index);
+            }
+            points[index] = point;
+        } else {
+            points.insert(index, point);
+        }
+        self.commit_track(session, track)?;
+        Ok(index)
+    }
+
+    /// Moves one automation point; its time is clamped between its
+    /// neighbours so the lane order never changes. Returns the stored point.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoPoint`] for bad indices, [`EditorError::Session`]
+    /// for an out-of-range value; `self` is unchanged.
+    pub fn move_point(
+        &mut self,
+        track: usize,
+        lane: Lane,
+        index: usize,
+        point: AutoPoint,
+    ) -> Result<AutoPoint, EditorError> {
+        let mut session = self.project.session.clone();
+        let points = lane_mut(&mut session, track, lane)?;
+        if index >= points.len() {
+            return Err(EditorError::NoPoint);
+        }
+        let low = if index == 0 {
+            0
+        } else {
+            points[index - 1].time.saturating_add(1)
+        };
+        let high = points
+            .get(index + 1)
+            .map_or(u64::MAX, |next| next.time.saturating_sub(1));
+        let point = AutoPoint {
+            time: point.time.clamp(low, high.max(low)),
+            value: point.value,
+        };
+        if points[index] == point {
+            return Ok(point);
+        }
+        points[index] = point;
+        self.commit_track(session, track)?;
+        Ok(point)
+    }
+
+    /// Removes one automation point.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoPoint`] for bad indices; `self` is unchanged.
+    pub fn remove_point(
+        &mut self,
+        track: usize,
+        lane: Lane,
+        index: usize,
+    ) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let points = lane_mut(&mut session, track, lane)?;
+        if index >= points.len() {
+            return Err(EditorError::NoPoint);
+        }
+        points.remove(index);
+        self.commit_track(session, track)
+    }
+
+    /// Removes every point of one lane; an empty lane records no undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoPoint`] for a bad track index.
+    pub fn clear_lane(&mut self, track: usize, lane: Lane) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let points = lane_mut(&mut session, track, lane)?;
+        if points.is_empty() {
+            return Ok(());
+        }
+        points.clear();
+        self.commit_track(session, track)
+    }
+
     fn commit_track(&mut self, session: Session, track: usize) -> Result<(), EditorError> {
         session.validate()?;
         self.record();
@@ -955,6 +1061,18 @@ fn insert_note(notes: &mut Vec<Note>, note: Note) -> usize {
 }
 
 /// A track's effect chain, provided `index` is inside it.
+fn lane_mut(
+    session: &mut Session,
+    track: usize,
+    lane: Lane,
+) -> Result<&mut Vec<AutoPoint>, EditorError> {
+    session
+        .tracks
+        .get_mut(track)
+        .map(|track| track.automation.lane_mut(lane))
+        .ok_or(EditorError::NoPoint)
+}
+
 fn effects_mut(
     session: &mut Session,
     track: usize,

@@ -288,3 +288,43 @@ fn a_track_with_an_effect_chain_does_not_allocate() {
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "effect chain allocated {count} times");
 }
+
+#[test]
+fn a_track_with_automation_does_not_allocate() {
+    use audio_core::AutoPoint;
+    let mut track = overlapping_track();
+    track.automation.gain = (0..64)
+        .map(|i| AutoPoint {
+            time: i * 97,
+            value: if i % 2 == 0 { 0.2 } else { 0.9 },
+        })
+        .collect();
+    track.automation.pan = vec![
+        AutoPoint {
+            time: 0,
+            value: -1.0,
+        },
+        AutoPoint {
+            time: 5_000,
+            value: 1.0,
+        },
+    ];
+    let mut session = Session::new("s", RATE, 120.0);
+    session.tracks.push(track.clone());
+    let job = SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: sources(),
+        }],
+        sample_rate: RATE,
+        block_frames: BLOCK,
+        frames: None,
+        output: std::path::PathBuf::new(),
+    };
+    let mut renderer = renderer_for(build_session_graph(job).unwrap());
+    let mut mix = AudioBuffer::new(2, BLOCK);
+    renderer.render(BLOCK, &mut mix).unwrap();
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(count, 0, "automation allocated {count} times");
+}

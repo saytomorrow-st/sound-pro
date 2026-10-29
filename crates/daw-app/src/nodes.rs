@@ -295,6 +295,10 @@ pub struct Track {
     right: f32,
     // SPEC-022: the insert chain, built once; processing never allocates.
     effects: Vec<audio_core::EffectProcessor>,
+    // SPEC-023: lanes copied at build time; `master` is kept apart from
+    // `left`/`right` so an automated pan can be re-scaled per sample.
+    automation: audio_core::Automation,
+    master: f32,
 }
 
 impl Track {
@@ -324,6 +328,8 @@ impl Track {
             left,
             right,
             effects: Vec::new(),
+            automation: audio_core::Automation::default(),
+            master: 1.0,
         })
     }
 
@@ -345,6 +351,15 @@ impl Track {
         self.mute = self.mute || !audible;
         self.left *= master_gain;
         self.right *= master_gain;
+        self.master *= master_gain;
+        self
+    }
+
+    /// Copies the track's gain and pan lanes (SPEC-023). A non-empty lane
+    /// replaces the matching slider; empty lanes leave the sound untouched.
+    #[must_use]
+    pub fn with_automation(mut self, automation: &audio_core::Automation) -> Self {
+        self.automation = automation.clone();
         self
     }
 
@@ -368,6 +383,8 @@ impl std::fmt::Debug for Track {
             .field("left", &self.left)
             .field("right", &self.right)
             .field("effects", &self.effects.len())
+            .field("gain_points", &self.automation.gain.len())
+            .field("pan_points", &self.automation.pan.len())
             .field("length_samples", &self.length_samples())
             .finish()
     }
@@ -382,7 +399,7 @@ impl NodeProcessor for Track {
         }
         let dst = output.channel_mut(0);
         dst[..frames].fill(0.0);
-        if self.mute || self.gain == 0.0 {
+        if self.mute || (self.automation.gain.is_empty() && self.gain == 0.0) {
             return;
         }
         for (clip, source) in self.clips.iter().zip(&self.sources) {
@@ -408,6 +425,10 @@ impl NodeProcessor for Track {
         for effect in &mut self.effects {
             effect.process(&mut output.channel_mut(0)[..frames]);
         }
+        if !self.automation.is_empty() {
+            self.apply_automation(ctx.position, frames, output, stereo);
+            return;
+        }
         if stereo {
             let right = self.gain * self.right;
             for index in 0..frames {
@@ -418,6 +439,35 @@ impl NodeProcessor for Track {
         let left = self.gain * self.left;
         for slot in &mut output.channel_mut(0)[..frames] {
             *slot *= left;
+        }
+    }
+}
+
+impl Track {
+    /// Per-sample gain and pan from the lanes (SPEC-023); allocation-free.
+    fn apply_automation(
+        &self,
+        position: u64,
+        frames: usize,
+        output: &mut NodeView<'_>,
+        stereo: bool,
+    ) {
+        use audio_core::Automation;
+        for index in 0..frames {
+            let time = position.saturating_add(index as u64);
+            let gain = Automation::value_at(&self.automation.gain, time).unwrap_or(self.gain);
+            let (left, right) = match Automation::value_at(&self.automation.pan, time) {
+                Some(pan) => {
+                    let (l, r) = audio_core::pan_law(pan);
+                    (l * self.master, r * self.master)
+                }
+                None => (self.left, self.right),
+            };
+            let mono = output.channel(0)[index];
+            if stereo {
+                output.channel_mut(1)[index] = mono * (gain * right);
+            }
+            output.channel_mut(0)[index] = mono * (gain * left);
         }
     }
 }

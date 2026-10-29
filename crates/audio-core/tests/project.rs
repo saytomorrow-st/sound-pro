@@ -1005,3 +1005,135 @@ fn too_many_effects_are_rejected_before_decoding() {
             if effect == audio_core::MAX_EFFECTS_PER_TRACK
     ));
 }
+
+// --- SPEC-023: automation ------------------------------------------------
+
+fn automation_session() -> audio_core::Session {
+    use audio_core::AutoPoint;
+    let mut session = demo_session();
+    session.tracks[0].automation.gain = vec![
+        AutoPoint {
+            time: 0,
+            value: 0.0,
+        },
+        AutoPoint {
+            time: 48_000,
+            value: 0.75,
+        },
+    ];
+    session.tracks[0].automation.pan = vec![AutoPoint {
+        time: 100,
+        value: -0.5,
+    }];
+    session
+}
+
+fn automation_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        automation_session(),
+    )
+    .to_json()
+}
+
+#[test]
+fn automation_survives_the_round_trip() {
+    let text = automation_json();
+    assert!(text.contains("\"automation\""), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &automation_session());
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn a_track_without_automation_writes_no_automation_key() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert!(!text.contains("automation"), "{text}");
+    assert!(
+        Project::from_json(&text).unwrap().session().tracks[0]
+            .automation
+            .is_empty()
+    );
+}
+
+#[test]
+fn an_empty_lane_is_not_written() {
+    let mut session = automation_session();
+    session.tracks[0].automation.pan.clear();
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), session.clone())
+        .to_json();
+    assert!(text.contains("\"gain\": [{"), "{text}");
+    assert!(!text.contains("\"pan\": [{"), "{text}");
+    assert_eq!(Project::from_json(&text).unwrap().session(), &session);
+}
+
+#[test]
+fn an_unknown_automation_lane_is_rejected() {
+    let text = automation_json().replace("\"pan\": [{", "\"tempo\": [{");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "tempo".to_owned()
+        }
+    );
+}
+
+#[test]
+fn an_unknown_key_inside_a_point_is_rejected() {
+    let text = automation_json().replace("\"value\": -0.5", "\"curve\": -0.5");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "curve".to_owned()
+        }
+    );
+}
+
+#[test]
+fn a_point_without_a_value_is_reported() {
+    let text = automation_json().replace("{\"time\": 100, \"value\": -0.5}", "{\"time\": 100}");
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::MissingField { .. }
+    ));
+}
+
+#[test]
+fn a_fractional_point_time_is_malformed() {
+    let text = automation_json().replace("\"time\": 100", "\"time\": 100.5");
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Malformed { .. }
+    ));
+}
+
+#[test]
+fn an_out_of_range_point_fails_validation() {
+    let text = automation_json().replace("\"value\": -0.5", "\"value\": -3");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidAutomation {
+            track: 0,
+            lane: audio_core::Lane::Pan,
+            point: 0
+        })
+    );
+}
+
+#[test]
+fn too_many_points_are_rejected_before_decoding() {
+    let list = ["\"junk\""; audio_core::MAX_AUTOMATION_POINTS + 1].join(", ");
+    let text = automation_json();
+    let start = text.find("\"pan\": [").unwrap();
+    let end = start + text[start..].find(']').unwrap();
+    let text = format!("{}\"pan\": [{list}{}", &text[..start], &text[end..]);
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidAutomation { point, .. })
+            if point == audio_core::MAX_AUTOMATION_POINTS
+    ));
+}
