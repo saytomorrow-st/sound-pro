@@ -48,12 +48,16 @@ cargo build -p daw-app --features realtime
   не держится в памяти целиком (SPEC-002).
 - SPSC-очередь команд UI → аудио (SPEC-003), парсер MIDI SMF (SPEC-004).
 - Realtime-бэкенд на CPAL (`daw play`, фича `realtime`) — SPEC-005.
+- [Документ проекта](docs/PROJECT.md): сессия как JSON без `serde`
+  (`daw project save|show`) — SPEC-008.
 
 ## Что дальше
 
 См. `docs/AI-WORKFLOW.md` → «Первые 5 задач для агента» и `specs/000-template.md`.
-Ближайшее — [SPEC-007](specs/007-midi-event-scheduler.md): планировщик
-MIDI-событий (тик → сэмпл, опрос в узле).
+Ближайшее — [SPEC-009](specs/009-polyphonic-synth.md): полифонический
+синтезатор, который играет `Schedule` вместо голой синусоиды. Сейчас
+[SPEC-007](specs/007-midi-event-scheduler.md) отдаёт события в узел, а
+[SPEC-008](specs/008-project-document.md) умеет сохранять сессию.
 
 ## Лицензия
 
