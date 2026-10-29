@@ -56,16 +56,6 @@ pub enum EditorError {
         /// Decoder error.
         source: audio_core::WavError,
     },
-    /// The WAV file runs at another rate than the project.
-    #[error("{path}: sample rate {file} Hz, project runs at {project} Hz")]
-    SampleRate {
-        /// File path.
-        path: PathBuf,
-        /// Rate stored in the file.
-        file: u32,
-        /// Project rate.
-        project: u32,
-    },
     /// The WAV file holds no audio.
     #[error("{path}: the file has no audio")]
     EmptyFile {
@@ -224,6 +214,7 @@ impl Editor {
         })?;
         let base = path.parent().unwrap_or_else(|| Path::new(""));
         let mut waves = HashMap::new();
+        let rate = project.session.sample_rate;
         for track in &mut project.session.tracks {
             for clip in &mut track.clips {
                 let Some(source) = clip.source.as_mut() else {
@@ -234,7 +225,7 @@ impl Editor {
                     *source = text.to_owned();
                 }
                 if !waves.contains_key(source.as_str()) {
-                    if let Ok((_, peaks)) = read_mono(&resolved) {
+                    if let Ok(peaks) = read_mono(&resolved, rate) {
                         waves.insert(source.clone(), peaks);
                     }
                 }
@@ -263,7 +254,7 @@ impl Editor {
     ///
     /// # Errors
     ///
-    /// File, rate and limit errors (see [`EditorError`]); `self` is unchanged.
+    /// File and limit errors (see [`EditorError`]); `self` is unchanged.
     pub fn import_wav(&mut self, path: &Path) -> Result<(usize, usize), EditorError> {
         let path = std::path::absolute(path).map_err(|source| EditorError::Read {
             path: path.to_path_buf(),
@@ -273,14 +264,7 @@ impl Editor {
             .to_str()
             .ok_or_else(|| EditorError::NonUtf8Path { path: path.clone() })?
             .to_owned();
-        let (rate, peaks) = read_mono(&path)?;
-        if rate != self.project.sample_rate {
-            return Err(EditorError::SampleRate {
-                path,
-                file: rate,
-                project: self.project.sample_rate,
-            });
-        }
+        let peaks = read_mono(&path, self.project.session.sample_rate)?;
         if peaks.frames == 0 {
             return Err(EditorError::EmptyFile { path });
         }
@@ -727,8 +711,8 @@ pub fn bars(samples: u64, rate: u32, tempo_bpm: f64) -> String {
     format!("{}.{}", beat / 4 + 1, beat % 4 + 1)
 }
 
-/// Reads a WAV file as `(rate, peaks of its mono average)`.
-fn read_mono(path: &Path) -> Result<(u32, Peaks), EditorError> {
+/// Reads a WAV file as peaks of its mono average at `rate` (SPEC-019).
+fn read_mono(path: &Path, rate: u32) -> Result<Peaks, EditorError> {
     let (spec, buffer) = audio_core::wav::read_wav_mono(path).map_err(|source| match source {
         audio_core::WavError::Empty => EditorError::EmptyFile {
             path: path.to_path_buf(),
@@ -752,7 +736,14 @@ fn read_mono(path: &Path) -> Result<(u32, Peaks), EditorError> {
             *out *= scale;
         }
     }
-    Ok((spec.sample_rate, Peaks::from_samples(&mono)))
+    if spec.sample_rate != rate {
+        mono = audio_core::resample(&mono, spec.sample_rate, rate).map_err(|_| {
+            EditorError::EmptyFile {
+                path: path.to_path_buf(),
+            }
+        })?;
+    }
+    Ok(Peaks::from_samples(&mono))
 }
 
 /// File stem, cut to [`MAX_NAME_BYTES`] on a character boundary.

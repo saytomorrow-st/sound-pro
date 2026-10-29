@@ -122,21 +122,11 @@ fn importing_onto_a_selected_track_appends_after_its_last_clip() {
 #[test]
 fn import_errors_leave_the_project_unchanged() {
     let dir = Scratch::new("import-errors");
-    let slow = dir.join("audio").join("slow.wav");
     let empty = dir.join("audio").join("empty.wav");
     let missing = dir.join("audio").join("missing.wav");
-    write_wav(&slow, 44_100, &ramp(100));
     write_empty_wav(&empty);
     let mut editor = Editor::new();
 
-    assert!(matches!(
-        editor.import_wav(&slow),
-        Err(EditorError::SampleRate {
-            file: 44_100,
-            project: RATE,
-            ..
-        })
-    ));
     assert!(matches!(
         editor.import_wav(&empty),
         Err(EditorError::EmptyFile { .. })
@@ -351,4 +341,38 @@ fn peaks_summarise_blocks_and_the_short_tail() {
     assert_eq!(peaks.range(PEAK_BLOCK as u64, 10_000), Some((-0.25, 0.0)));
     assert_eq!(peaks.range(10_000, 20_000), None);
     assert_eq!(Peaks::from_samples(&[]).range(0, 10), None);
+}
+
+#[test]
+fn a_file_at_another_rate_is_converted_to_the_project_rate() {
+    // SPEC-019: one second at 44.1 kHz becomes one second at 48 kHz.
+    let dir = Scratch::new("import-rate");
+    let path = dir.join("audio").join("cd.wav");
+    write_wav(&path, 44_100, &vec![0.5; 44_100]);
+    let mut editor = Editor::new();
+
+    let (t, c) = editor.import_wav(&path).unwrap();
+    let clip = &editor.session().tracks[t].clips[c];
+    assert_eq!(clip.source_length, u64::from(RATE));
+    assert_eq!(editor.peaks(clip).unwrap().frames, u64::from(RATE));
+    let before = std::fs::read(&path).unwrap();
+    assert!(clip.source.as_deref().unwrap().ends_with("cd.wav"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn a_converted_file_plays_at_the_right_length_after_reopening() {
+    let dir = Scratch::new("import-rate-open");
+    let path = dir.join("audio").join("cd.wav");
+    write_wav(&path, 44_100, &vec![0.5; 4410]);
+    let project = dir.join("p.json");
+    let mut editor = Editor::new();
+    editor.import_wav(&path).unwrap();
+    editor.save_as(&project).unwrap();
+
+    let mut reopened = Editor::new();
+    reopened.open(&project).unwrap();
+    let clip = &reopened.session().tracks[0].clips[0];
+    assert_eq!(clip.source_length, 4800);
+    assert_eq!(reopened.peaks(clip).unwrap().frames, 4800);
 }
