@@ -105,6 +105,12 @@ pub enum EditorError {
     /// The time signature is not supported (SPEC-026).
     #[error("time signature is not supported")]
     InvalidTimeSignature,
+    /// A split point must lie strictly inside the clip (SPEC-027).
+    #[error("the split point is outside the clip")]
+    SplitOutside,
+    /// Nothing has been copied yet (SPEC-027).
+    #[error("nothing to paste")]
+    EmptyClipboard,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -191,6 +197,8 @@ pub struct Editor {
     pub cycle_enabled: bool,
     /// Whether playback clicks on every beat; not saved (SPEC-026).
     pub metronome: bool,
+    /// Clip copied with [`Self::copy_clip`]; not saved (SPEC-027).
+    clipboard: Option<Clip>,
 }
 
 impl Default for Editor {
@@ -224,6 +232,7 @@ impl Editor {
             cycle: None,
             cycle_enabled: false,
             metronome: false,
+            clipboard: None,
         }
     }
 
@@ -282,6 +291,7 @@ impl Editor {
             cycle: None,
             cycle_enabled: false,
             metronome: self.metronome,
+            clipboard: None,
         };
         Ok(())
     }
@@ -650,6 +660,101 @@ impl Editor {
         let mut session = self.project.session.clone();
         session.tracks[track].clips[clip].length_samples = length;
         self.commit(session, (track, clip))
+    }
+
+    /// Cuts a clip at timeline position `at` (SPEC-027). The left part keeps
+    /// its index; the right part goes right after it and becomes selected.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::SplitOutside`]
+    /// unless `start < at < end`, [`EditorError::Session`] for a full track;
+    /// `self` is unchanged.
+    pub fn split_clip(
+        &mut self,
+        track: usize,
+        clip: usize,
+        at: u64,
+    ) -> Result<(usize, usize), EditorError> {
+        let c = self.clip_ref(track, clip)?;
+        if at <= c.start_samples || at >= c.end_samples() {
+            return Err(EditorError::SplitOutside);
+        }
+        let head = at - c.start_samples;
+        let mut right = c.clone();
+        right.start_samples = at;
+        right.offset_samples += head;
+        right.length_samples -= head;
+        let mut session = self.project.session.clone();
+        session.tracks[track].clips[clip].length_samples = head;
+        session.tracks[track].clips.insert(clip + 1, right);
+        let at = (track, clip + 1);
+        self.commit(session, at)?;
+        Ok(at)
+    }
+
+    /// Copies a clip to the window's clipboard; the project is untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; the clipboard is unchanged.
+    pub fn copy_clip(&mut self, track: usize, clip: usize) -> Result<(), EditorError> {
+        self.clipboard = Some(self.clip_ref(track, clip)?.clone());
+        Ok(())
+    }
+
+    /// Whether [`Self::paste_clip`] has something to paste.
+    #[must_use]
+    pub const fn has_clipboard(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// Appends the copied clip to `track`, starting at `at`. Returns the new
+    /// `(track, clip)`, which becomes selected; the clipboard is kept.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::EmptyClipboard`], [`EditorError::NoClip`] for a bad
+    /// track, [`EditorError::Session`] for a full track or a timeline
+    /// overflow; `self` is unchanged.
+    pub fn paste_clip(&mut self, track: usize, at: u64) -> Result<(usize, usize), EditorError> {
+        let clip = self.clipboard.clone().ok_or(EditorError::EmptyClipboard)?;
+        self.append_clip(track, clip, at)
+    }
+
+    /// Appends a copy of a clip to its track, starting where it ends.
+    /// Returns the copy's `(track, clip)`, which becomes selected.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::Session`] for
+    /// a full track or a timeline overflow; `self` is unchanged.
+    pub fn duplicate_clip(
+        &mut self,
+        track: usize,
+        clip: usize,
+    ) -> Result<(usize, usize), EditorError> {
+        let original = self.clip_ref(track, clip)?.clone();
+        let at = original.end_samples();
+        self.append_clip(track, original, at)
+    }
+
+    fn append_clip(
+        &mut self,
+        track: usize,
+        mut clip: Clip,
+        at: u64,
+    ) -> Result<(usize, usize), EditorError> {
+        if track >= self.project.session.tracks.len() {
+            return Err(EditorError::NoClip);
+        }
+        clip.start_samples = at;
+        let mut session = self.project.session.clone();
+        let clips = &mut session.tracks[track].clips;
+        clips.push(clip);
+        let at = (track, clips.len() - 1);
+        self.commit(session, at)?;
+        Ok(at)
     }
 
     /// Adds a track named "MIDI" holding one empty MIDI clip at `start`
