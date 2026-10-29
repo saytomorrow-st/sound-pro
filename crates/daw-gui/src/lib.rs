@@ -1,4 +1,4 @@
-//! Sound Pro desktop editor (SPEC-015).
+//! Sound Pro desktop editor (SPEC-015, SPEC-016, SPEC-017).
 //!
 //! [`Editor`] is the window's model: the open project, its file path, the
 //! selection and the waveform cache. It knows nothing about drawing, so every
@@ -84,6 +84,9 @@ pub enum EditorError {
     /// There is nothing to export.
     #[error("the project is empty")]
     Empty,
+    /// The track or clip index does not exist.
+    #[error("no such track or clip")]
+    NoClip,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -392,6 +395,101 @@ impl Editor {
         }
     }
 
+    /// Places a clip at `start` on `to_track`. On the same track the clip
+    /// keeps its index; on another one it goes to the end of its list.
+    /// Returns the new `(track, clip)`, which becomes selected.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::Session`] for
+    /// a full track or a timeline overflow; `self` is unchanged.
+    pub fn move_clip(
+        &mut self,
+        track: usize,
+        clip: usize,
+        start: u64,
+        to_track: usize,
+    ) -> Result<(usize, usize), EditorError> {
+        self.clip_ref(track, clip)?;
+        if to_track >= self.project.session.tracks.len() {
+            return Err(EditorError::NoClip);
+        }
+        let mut session = self.project.session.clone();
+        let at = if to_track == track {
+            session.tracks[track].clips[clip].start_samples = start;
+            (track, clip)
+        } else {
+            let target = &session.tracks[to_track];
+            if target.clips.len() >= MAX_CLIPS_PER_TRACK {
+                return Err(SessionError::TooManyClips {
+                    track: to_track,
+                    max: MAX_CLIPS_PER_TRACK,
+                }
+                .into());
+            }
+            let mut moved = session.tracks[track].clips.remove(clip);
+            moved.start_samples = start;
+            session.tracks[to_track].clips.push(moved);
+            (to_track, session.tracks[to_track].clips.len() - 1)
+        };
+        self.commit(session, at)?;
+        Ok(at)
+    }
+
+    /// Moves a clip's left edge to `start`, keeping its right edge. The edge
+    /// stops at the start of the audio and one sample before the right edge.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; `self` is unchanged.
+    pub fn trim_start(&mut self, track: usize, clip: usize, start: u64) -> Result<(), EditorError> {
+        let c = self.clip_ref(track, clip)?;
+        let right = c.start_samples + c.length_samples;
+        let earliest = c.start_samples.saturating_sub(c.offset_samples);
+        let start = start.clamp(earliest, right - 1);
+        // `start >= earliest` keeps the new offset non-negative.
+        let offset = c.offset_samples + start - c.start_samples;
+        let mut session = self.project.session.clone();
+        let edited = &mut session.tracks[track].clips[clip];
+        edited.start_samples = start;
+        edited.offset_samples = offset;
+        edited.length_samples = right - start;
+        self.commit(session, (track, clip))
+    }
+
+    /// Moves a clip's right edge to `end`, keeping its left edge. The length
+    /// stays between one sample and the rest of the audio.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; `self` is unchanged.
+    pub fn trim_end(&mut self, track: usize, clip: usize, end: u64) -> Result<(), EditorError> {
+        let c = self.clip_ref(track, clip)?;
+        let longest = c.source_length - c.offset_samples;
+        let length = end.saturating_sub(c.start_samples).clamp(1, longest);
+        let mut session = self.project.session.clone();
+        session.tracks[track].clips[clip].length_samples = length;
+        self.commit(session, (track, clip))
+    }
+
+    fn clip_ref(&self, track: usize, clip: usize) -> Result<&Clip, EditorError> {
+        self.project
+            .session
+            .tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .ok_or(EditorError::NoClip)
+    }
+
+    fn commit(&mut self, session: Session, selected: (usize, usize)) -> Result<(), EditorError> {
+        session.validate()?;
+        self.project.session = session;
+        self.selected_track = Some(selected.0);
+        self.selected_clip = Some(selected);
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Removes one track and its clips; out-of-range indices do nothing.
     pub fn delete_track(&mut self, track: usize) {
         if track < self.project.session.tracks.len() {
@@ -477,6 +575,23 @@ pub fn x_to_samples(x: f32, rate: u32, zoom: f32) -> u64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let samples = (f64::from(x) / f64::from(zoom) * f64::from(rate)).round() as u64;
     samples
+}
+
+/// The beat (4/4 grid) nearest to `samples`; halfway rounds up. A bad tempo
+/// falls back to [`DEFAULT_TEMPO`].
+#[must_use]
+pub fn snap_to_beat(samples: u64, rate: u32, tempo_bpm: f64) -> u64 {
+    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
+        tempo_bpm
+    } else {
+        DEFAULT_TEMPO
+    };
+    let beat = f64::from(rate.max(1)) * 60.0 / tempo;
+    #[allow(clippy::cast_precision_loss)]
+    let beats = (samples as f64 / beat + 0.5).floor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let snapped = (beats * beat).round() as u64;
+    snapped
 }
 
 /// Clock time `m:ss.mmm` of a sample position.

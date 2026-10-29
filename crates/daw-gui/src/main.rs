@@ -1,4 +1,4 @@
-//! Sound Pro window (SPEC-015, SPEC-016). All editing goes through
+//! Sound Pro window (SPEC-015, SPEC-016, SPEC-017). All editing goes through
 //! [`daw_gui::Editor`].
 
 #![forbid(unsafe_code)]
@@ -6,9 +6,9 @@
 use std::path::PathBuf;
 
 use daw_app::playback::PlaybackControl;
-use daw_gui::{Editor, bars, clock, samples_to_x, x_to_samples};
+use daw_gui::{Editor, bars, clock, samples_to_x, snap_to_beat, x_to_samples};
 use eframe::egui::{
-    self, Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
+    self, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
     ViewportCommand,
 };
 
@@ -16,6 +16,36 @@ const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 24.0;
 const MIN_ZOOM: f32 = 5.0;
 const MAX_ZOOM: f32 = 2_000.0;
+/// Width of the grab zone on each clip edge used for trimming.
+const EDGE_PX: f32 = 6.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragMode {
+    Move,
+    TrimStart,
+    TrimEnd,
+}
+
+/// A clip being dragged with the mouse.
+#[derive(Clone, Copy)]
+struct Drag {
+    track: usize,
+    clip: usize,
+    mode: DragMode,
+    /// Pointer position minus clip start, in samples, at the press.
+    grab: i64,
+}
+
+fn edge_mode(rect: Rect, x: f32) -> DragMode {
+    let edge = EDGE_PX.min(rect.width() / 3.0);
+    if x <= rect.min.x + edge {
+        DragMode::TrimStart
+    } else if x >= rect.max.x - edge {
+        DragMode::TrimEnd
+    } else {
+        DragMode::Move
+    }
+}
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -50,6 +80,9 @@ struct App {
     zoom: f32,
     title: String,
     confirm_quit: bool,
+    /// Snap clip edits to beats (Shift turns it off while dragging).
+    snap: bool,
+    drag: Option<Drag>,
 }
 
 impl App {
@@ -62,6 +95,8 @@ impl App {
             zoom: 100.0,
             title: String::new(),
             confirm_quit: false,
+            snap: true,
+            drag: None,
         };
         if let Some(path) = start {
             app.open(path);
@@ -206,6 +241,9 @@ impl App {
                 bars(self.playhead, session.sample_rate, session.tempo_bpm)
             );
             ui.label(egui::RichText::new(text).monospace().size(16.0));
+            ui.separator();
+            ui.checkbox(&mut self.snap, "Сетка")
+                .on_hover_text("Привязка клипов к долям. Shift при перетаскивании отключает.");
         });
     }
 
@@ -384,7 +422,8 @@ impl App {
         let tracks = self.editor.session().tracks.len();
         let height = (RULER_HEIGHT + TRACK_HEIGHT * tracks as f32).max(ui.available_height() - 4.0);
 
-        let (area, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let (area, response) =
+            ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 0.0, Color32::from_gray(24));
 
@@ -424,6 +463,7 @@ impl App {
 
         let px_per_sample = self.zoom / rate as f32;
         let mut clicked = None;
+        let mut rects = Vec::new();
         let pointer = response.interact_pointer_pos();
         for (t, track) in self.editor.session().tracks.iter().enumerate() {
             let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
@@ -481,6 +521,7 @@ impl App {
                     Stroke::new(1.0_f32, Color32::from_gray(10))
                 };
                 painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
+                rects.push(((t, c), rect));
                 if response.clicked() && pointer.is_some_and(|p| rect.contains(p)) {
                     clicked = Some((t, c));
                 }
@@ -509,12 +550,102 @@ impl App {
             }
         }
 
+        self.drag_clips(ui, &response, area, &rects);
+
         if response.hovered() || ui.rect_contains_pointer(ui.clip_rect()) {
             let (ctrl, scroll) = ui.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
             if ctrl && scroll != 0.0 {
                 self.zoom = (self.zoom * (1.0 + scroll * 0.002)).clamp(MIN_ZOOM, MAX_ZOOM);
             }
         }
+    }
+
+    /// Mouse editing of clips: drag the body to move, drag an edge to trim.
+    fn drag_clips(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        area: Rect,
+        rects: &[((usize, usize), Rect)],
+    ) {
+        let hit = |p: Pos2| rects.iter().rev().find(|(_, r)| r.contains(p)).copied();
+        if self.drag.is_none() {
+            if let Some((_, rect)) = response.hover_pos().and_then(hit) {
+                if let Some(p) = response.hover_pos() {
+                    if edge_mode(rect, p.x) != DragMode::Move {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    }
+                }
+            }
+        }
+
+        let rate = self.editor.session().sample_rate;
+        let tempo = self.editor.session().tempo_bpm;
+        if response.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            self.drag = origin.and_then(|p| {
+                let ((track, clip), rect) = hit(p)?;
+                let start = self.editor.session().tracks[track].clips[clip].start_samples;
+                let at = x_to_samples(p.x - area.min.x, rate, self.zoom);
+                Some(Drag {
+                    track,
+                    clip,
+                    mode: edge_mode(rect, p.x),
+                    grab: at as i64 - start as i64,
+                })
+            });
+            if let Some(d) = self.drag {
+                self.editor.selected_clip = Some((d.track, d.clip));
+                self.editor.selected_track = Some(d.track);
+            }
+        }
+
+        let Some(mut drag) = self.drag else { return };
+        if response.drag_stopped() {
+            self.drag = None;
+            self.status = "Клип изменён".into();
+            return;
+        }
+        let Some(p) = response.interact_pointer_pos() else {
+            return;
+        };
+        ui.ctx().set_cursor_icon(match drag.mode {
+            DragMode::Move => CursorIcon::Grabbing,
+            _ => CursorIcon::ResizeHorizontal,
+        });
+        let snap = self.snap && !ui.input(|i| i.modifiers.shift);
+        let fit = |samples: u64| {
+            if snap {
+                snap_to_beat(samples, rate, tempo)
+            } else {
+                samples
+            }
+        };
+        let at = x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom);
+        let result = match drag.mode {
+            DragMode::Move => {
+                let start = fit((at as i64 - drag.grab).max(0) as u64);
+                let tracks = self.editor.session().tracks.len();
+                let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
+                let to = if row < 0.0 {
+                    0
+                } else {
+                    (row as usize).min(tracks.saturating_sub(1))
+                };
+                self.editor
+                    .move_clip(drag.track, drag.clip, start, to)
+                    .map(|(t, c)| {
+                        drag.track = t;
+                        drag.clip = c;
+                    })
+            }
+            DragMode::TrimStart => self.editor.trim_start(drag.track, drag.clip, fit(at)),
+            DragMode::TrimEnd => self.editor.trim_end(drag.track, drag.clip, fit(at)),
+        };
+        if let Err(e) = result {
+            self.status = format!("Ошибка: {e}");
+        }
+        self.drag = Some(drag);
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
