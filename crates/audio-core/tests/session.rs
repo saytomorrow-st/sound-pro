@@ -19,6 +19,8 @@ fn clip(start: u64, length: u64, source: u64) -> Clip {
         name: String::new(),
         source: None,
         notes: None,
+        fade_in_samples: 0,
+        fade_out_samples: 0,
     }
 }
 

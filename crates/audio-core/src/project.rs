@@ -421,6 +421,14 @@ fn write_session(out: &mut String, session: &Session) {
                 out.push_str(",\n            \"source\": ");
                 write_string(out, source);
             }
+            if clip.fade_in_samples > 0 {
+                out.push_str(",\n            \"fade_in\": ");
+                out.push_str(&clip.fade_in_samples.to_string());
+            }
+            if clip.fade_out_samples > 0 {
+                out.push_str(",\n            \"fade_out\": ");
+                out.push_str(&clip.fade_out_samples.to_string());
+            }
             if let Some(notes) = &clip.notes {
                 write_notes(out, notes);
             }
@@ -1027,9 +1035,13 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
     let mut name = None;
     let mut source = None;
     let mut notes = None;
+    let mut fade_in = 0;
+    let mut fade_out = 0;
     for (key, value) in entries {
         match key.as_str() {
             "notes" => notes = Some(notes_from_value(value)?),
+            "fade_in" => fade_in = require_u64(value)?,
+            "fade_out" => fade_out = require_u64(value)?,
             "start" => start = Some(require_u64(value)?),
             "length" => length = Some(require_u64(value)?),
             "offset" => offset = Some(require_u64(value)?),
@@ -1065,6 +1077,8 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
         })?,
         source,
         notes,
+        fade_in_samples: fade_in,
+        fade_out_samples: fade_out,
     })
 }
 

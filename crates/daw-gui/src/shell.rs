@@ -599,6 +599,16 @@ impl App {
                 self.add_midi_track();
             }
             ui.separator();
+            for tool in super::Tool::ALL {
+                if ui
+                    .selectable_label(self.tool == tool, tool.label())
+                    .on_hover_text("Инструмент: T — следующий, Esc — стрелка")
+                    .clicked()
+                {
+                    self.tool = tool;
+                }
+            }
+            ui.separator();
             ui.checkbox(&mut self.snap, "Сетка: доля")
                 .on_hover_text("Привязка клипов к долям. Shift при перетаскивании отключает.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

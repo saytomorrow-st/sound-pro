@@ -744,3 +744,85 @@ fn bus_effects_shape_only_the_sent_part() {
     assert_eq!(dry.channel(0), source.as_slice());
     assert_ne!(wet.channel(0), dry.channel(0));
 }
+
+/// Renders one track holding `clips`, each over its own constant source.
+fn render_track(scratch: &mut Scratch, clips: Vec<(Clip, f32)>) -> Vec<f32> {
+    let mut track = SessionTrack::new("t");
+    let mut sources: Vec<Box<dyn daw_app::nodes::ClipSource + Send>> = Vec::new();
+    for (clip, value) in clips {
+        sources.push(Box::new(vec![value; clip.source_length as usize]));
+        track.clips.push(clip);
+    }
+    let mut session = Session::new("s", RATE, 120.0);
+    session.tracks.push(track.clone());
+    let output = scratch.path();
+    render_session(SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: sources,
+        }],
+        sample_rate: RATE,
+        block_frames: 64,
+        frames: None,
+        output: output.clone(),
+    })
+    .unwrap();
+    audio_core::wav::read_wav_mono(&output)
+        .unwrap()
+        .1
+        .channel(0)
+        .to_vec()
+}
+
+#[test]
+fn overlapping_clips_are_not_summed_the_later_one_wins() {
+    // SPEC-038 §4, superseding the SPEC-010 sum.
+    let mut scratch = Scratch::new("overlap");
+    let out = render_track(
+        &mut scratch,
+        vec![
+            (Clip::full(0, 10_000), 1.0),
+            (Clip::full(2_000, 4_000), 0.5),
+        ],
+    );
+    assert_eq!(out[1_000], 1.0);
+    assert!(
+        (out[4_000] - 0.5).abs() < 1e-6,
+        "top clip only: {}",
+        out[4_000]
+    );
+    assert_eq!(out[8_000], 1.0);
+    // Crossfade halfway in: 0.5 * 0.5 + 1.0 * 0.5.
+    let mid = 2_000 + audio_core::CROSSFADE_SAMPLES as usize / 2;
+    assert!((out[mid] - 0.75).abs() < 1e-6, "{}", out[mid]);
+    // No sample jumps by more than one ramp step.
+    let step = 0.5 / audio_core::CROSSFADE_SAMPLES as f32 + 1e-6;
+    for pair in out[..10_000].windows(2) {
+        assert!((pair[1] - pair[0]).abs() <= step, "click: {pair:?}");
+    }
+}
+
+#[test]
+fn a_clip_fully_under_another_is_silent() {
+    let mut scratch = Scratch::new("hidden");
+    let out = render_track(
+        &mut scratch,
+        vec![(Clip::full(1_000, 500), 1.0), (Clip::full(0, 4_000), 0.25)],
+    );
+    assert!(out[1_000..1_500].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+}
+
+#[test]
+fn clip_fades_shape_the_rendered_sound() {
+    let mut scratch = Scratch::new("fades");
+    let mut clip = Clip::full(0, 1_000);
+    clip.fade_in_samples = 100;
+    clip.fade_out_samples = 200;
+    let out = render_track(&mut scratch, vec![(clip, 1.0)]);
+    assert_eq!(out[0], 0.0);
+    assert!((out[50] - 0.5).abs() < 1e-6);
+    assert_eq!(out[500], 1.0);
+    assert!((out[899] - 0.5).abs() < 1e-2);
+    assert_eq!(out[999], 0.0);
+}

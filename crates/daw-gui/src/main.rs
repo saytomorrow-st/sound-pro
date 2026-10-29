@@ -55,6 +55,66 @@ enum DragMode {
     Move,
     TrimStart,
     TrimEnd,
+    FadeIn,
+    FadeOut,
+}
+
+/// Region edit tool (SPEC-038 §7).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tool {
+    Pointer,
+    Scissors,
+    Glue,
+    Fade,
+}
+
+impl Tool {
+    pub(crate) const ALL: [Self; 4] = [Self::Pointer, Self::Scissors, Self::Glue, Self::Fade];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Pointer => "Стрелка",
+            Self::Scissors => "Ножницы",
+            Self::Glue => "Клей",
+            Self::Fade => "Фейд",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Pointer => Self::Scissors,
+            Self::Scissors => Self::Glue,
+            Self::Glue => Self::Fade,
+            Self::Fade => Self::Pointer,
+        }
+    }
+}
+
+/// Size of the fade handles on a region's top corners, in pixels.
+const FADE_HANDLE_PX: f32 = 8.0;
+
+/// Drag mode for a press at `p` on a region drawn in `rect` with `tool`.
+/// `None` means the tool does not drag.
+fn press_mode(tool: Tool, rect: Rect, p: Pos2) -> Option<DragMode> {
+    let left_half = p.x < rect.center().x;
+    match tool {
+        Tool::Scissors | Tool::Glue => None,
+        Tool::Fade => Some(if left_half {
+            DragMode::FadeIn
+        } else {
+            DragMode::FadeOut
+        }),
+        Tool::Pointer => {
+            let handle = FADE_HANDLE_PX.min(rect.width() / 3.0);
+            if p.y <= rect.min.y + FADE_HANDLE_PX && p.x <= rect.min.x + handle {
+                Some(DragMode::FadeIn)
+            } else if p.y <= rect.min.y + FADE_HANDLE_PX && p.x >= rect.max.x - handle {
+                Some(DragMode::FadeOut)
+            } else {
+                Some(edge_mode(rect, p.x))
+            }
+        }
+    }
 }
 
 /// A clip being dragged with the mouse.
@@ -75,6 +135,47 @@ fn edge_mode(rect: Rect, x: f32) -> DragMode {
         DragMode::TrimEnd
     } else {
         DragMode::Move
+    }
+}
+
+/// Fade ramps on a region: shading over the faded part and a line from the
+/// silent corner to full level; on the selected region, handles on the top
+/// corners (SPEC-038 §7).
+#[allow(clippy::cast_precision_loss)]
+fn draw_fades(
+    painter: &egui::Painter,
+    rect: Rect,
+    clip: &audio_core::session::Clip,
+    px_per_sample: f32,
+    selected: bool,
+) {
+    let shade = Color32::from_black_alpha(110);
+    let line = Stroke::new(1.5_f32, Color32::from_gray(235));
+    let fade_in = (clip.fade_in_samples as f32 * px_per_sample).min(rect.width());
+    let fade_out = (clip.fade_out_samples as f32 * px_per_sample).min(rect.width());
+    if fade_in >= 1.0 {
+        let top = Pos2::new(rect.min.x + fade_in, rect.min.y);
+        painter.add(egui::Shape::convex_polygon(
+            vec![rect.left_top(), top, rect.left_bottom()],
+            shade,
+            Stroke::NONE,
+        ));
+        painter.line_segment([rect.left_bottom(), top], line);
+    }
+    if fade_out >= 1.0 {
+        let top = Pos2::new(rect.max.x - fade_out, rect.min.y);
+        painter.add(egui::Shape::convex_polygon(
+            vec![top, rect.right_top(), rect.right_bottom()],
+            shade,
+            Stroke::NONE,
+        ));
+        painter.line_segment([top, rect.right_bottom()], line);
+    }
+    if selected && rect.width() > FADE_HANDLE_PX * 3.0 {
+        for x in [rect.min.x + fade_in, rect.max.x - fade_out] {
+            let x = x.clamp(rect.min.x + 3.0, rect.max.x - 3.0);
+            painter.circle_filled(Pos2::new(x, rect.min.y + 3.0), 3.0, Color32::WHITE);
+        }
     }
 }
 
@@ -158,6 +259,10 @@ enum RegionAction {
     Split,
     Delete,
     NewMidi,
+    FadeIn,
+    FadeOut,
+    NoFades,
+    Join,
 }
 
 /// Track header command chosen in this frame (SPEC-029).
@@ -212,6 +317,8 @@ struct App {
     /// Snap clip edits to beats (Shift turns it off while dragging).
     snap: bool,
     drag: Option<Drag>,
+    /// Active region tool (SPEC-038).
+    pub(crate) tool: Tool,
     /// MIDI clip open in the piano roll.
     piano: Option<(usize, usize)>,
     note_drag: Option<NoteDrag>,
@@ -309,6 +416,7 @@ impl App {
             confirm_quit: false,
             snap: true,
             drag: None,
+            tool: Tool::Pointer,
             piano: None,
             note_drag: None,
             piano_scroll: false,
@@ -1043,7 +1151,13 @@ impl App {
                             .on_hover_text("Без звука");
                         let s = shell::pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
                             .on_hover_text("Соло");
-                        shell::pill_stub(ui, "R");
+                        let mut armed = self.editor.armed_track() == Some(index);
+                        if shell::pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
+                            .on_hover_text("Запись на эту дорожку")
+                            .changed()
+                        {
+                            self.editor.arm_track(armed.then_some(index));
+                        }
                         shell::pill_stub(ui, "I");
                         if s.changed() || m.changed() {
                             if let Some(t) = self.editor.track_mut(index) {
@@ -1379,8 +1493,10 @@ impl App {
                 );
                 let selected = self.editor.selected_clip == Some((t, c));
                 let base = track_color(track.color, t);
-                let colors =
-                    daw_gui::layout::region_colors([base.r(), base.g(), base.b()], track.mute);
+                let colors = daw_gui::layout::region_colors(
+                    [base.r(), base.g(), base.b()],
+                    !self.editor.session().is_audible(t),
+                );
                 let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
                 let header_h = 14.0_f32.min(rect.height() * 0.4);
                 painter.rect_filled(rect, 4.0, rgb(colors.body).gamma_multiply(0.92));
@@ -1441,6 +1557,7 @@ impl App {
                         }
                     }
                 }
+                draw_fades(&painter, rect, clip, px_per_sample, selected);
                 painter
                     .with_clip_rect(header.intersect(painter.clip_rect()))
                     .text(
@@ -1554,7 +1671,8 @@ impl App {
     }
 
     /// The take being recorded, growing as it records, with its waveform
-    /// (SPEC-035). It lands on the selected track, or below the last one.
+    /// (SPEC-035). It lands on the armed track, else the selected one, else
+    /// below the last one (SPEC-038).
     #[cfg(feature = "audio")]
     #[allow(clippy::cast_precision_loss)]
     fn draw_take(&self, painter: &egui::Painter, area: Rect) {
@@ -1567,7 +1685,8 @@ impl App {
         let tracks = self.editor.session().tracks.len();
         let row = self
             .editor
-            .selected_track
+            .armed_track()
+            .or(self.editor.selected_track)
             .filter(|&t| t < tracks)
             .unwrap_or(tracks);
         let top = area.min.y + RULER_HEIGHT + row as f32 * TRACK_HEIGHT;
@@ -1927,18 +2046,55 @@ impl App {
         rects: &[((usize, usize), Rect)],
     ) {
         let hit = |p: Pos2| rects.iter().rev().find(|(_, r)| r.contains(p)).copied();
+        let tool = self.tool;
         if self.drag.is_none() {
-            if let Some((_, rect)) = response.hover_pos().and_then(hit) {
-                if let Some(p) = response.hover_pos() {
-                    if edge_mode(rect, p.x) != DragMode::Move {
-                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            if let Some(p) = response.hover_pos() {
+                let icon = match (tool, hit(p).and_then(|(_, r)| press_mode(tool, r, p))) {
+                    (Tool::Scissors, _) => Some(CursorIcon::Crosshair),
+                    (Tool::Glue, _) => Some(CursorIcon::PointingHand),
+                    (_, Some(DragMode::TrimStart | DragMode::TrimEnd)) => {
+                        Some(CursorIcon::ResizeHorizontal)
                     }
+                    (_, Some(DragMode::FadeIn)) => Some(CursorIcon::ResizeNorthWest),
+                    (_, Some(DragMode::FadeOut)) => Some(CursorIcon::ResizeNorthEast),
+                    _ => None,
+                };
+                if let Some(icon) = icon {
+                    ui.ctx().set_cursor_icon(icon);
                 }
             }
         }
 
         let rate = self.editor.session().sample_rate;
         let tempo = self.editor.session().tempo_bpm;
+        let snap = self.snap && !ui.input(|i| i.modifiers.shift);
+        let fit = |samples: u64| {
+            if snap {
+                snap_to_beat(samples, rate, tempo)
+            } else {
+                samples
+            }
+        };
+        if response.clicked() && matches!(tool, Tool::Scissors | Tool::Glue) {
+            if let Some((((t, c), _), p)) = response
+                .interact_pointer_pos()
+                .and_then(|p| Some((hit(p)?, p)))
+            {
+                self.drag = None;
+                self.note_drag = None;
+                if tool == Tool::Scissors {
+                    let at = fit(x_to_samples(p.x - area.min.x, rate, self.zoom));
+                    self.status = match self.editor.split_clip(t, c, at) {
+                        Ok(_) => "Клип разрезан".into(),
+                        Err(EditorError::SplitOutside) => "Точка на краю клипа".into(),
+                        Err(e) => format!("Не удалось разрезать: {e}"),
+                    };
+                } else {
+                    self.join_clip(t, c);
+                }
+            }
+            return;
+        }
         if response.drag_started() {
             let origin = ui.input(|i| i.pointer.press_origin());
             self.drag = origin.and_then(|p| {
@@ -1948,7 +2104,7 @@ impl App {
                 Some(Drag {
                     track,
                     clip,
-                    mode: edge_mode(rect, p.x),
+                    mode: press_mode(tool, rect, p)?,
                     grab: at as i64 - start as i64,
                 })
             });
@@ -1969,16 +2125,10 @@ impl App {
         };
         ui.ctx().set_cursor_icon(match drag.mode {
             DragMode::Move => CursorIcon::Grabbing,
+            DragMode::FadeIn => CursorIcon::ResizeNorthWest,
+            DragMode::FadeOut => CursorIcon::ResizeNorthEast,
             _ => CursorIcon::ResizeHorizontal,
         });
-        let snap = self.snap && !ui.input(|i| i.modifiers.shift);
-        let fit = |samples: u64| {
-            if snap {
-                snap_to_beat(samples, rate, tempo)
-            } else {
-                samples
-            }
-        };
         let at = x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom);
         let result = match drag.mode {
             DragMode::Move => {
@@ -1999,6 +2149,21 @@ impl App {
             }
             DragMode::TrimStart => self.editor.trim_start(drag.track, drag.clip, fit(at)),
             DragMode::TrimEnd => self.editor.trim_end(drag.track, drag.clip, fit(at)),
+            DragMode::FadeIn | DragMode::FadeOut => {
+                let clip = &self.editor.session().tracks[drag.track].clips[drag.clip];
+                let (start, end) = (clip.start_samples, clip.start_samples + clip.length_samples);
+                let (fade_in, fade_out) = (clip.fade_in_samples, clip.fade_out_samples);
+                // Fades follow the pointer freely: the grid is too coarse.
+                if drag.mode == DragMode::FadeIn {
+                    let len = at.saturating_sub(start);
+                    let len = len.min(clip.length_samples - fade_out);
+                    self.editor.set_fades(drag.track, drag.clip, len, fade_out)
+                } else {
+                    let len = end.saturating_sub(at);
+                    let len = len.min(clip.length_samples - fade_in);
+                    self.editor.set_fades(drag.track, drag.clip, fade_in, len)
+                }
+            }
         };
         if let Err(e) = result {
             self.status = format!("Ошибка: {e}");
@@ -2293,8 +2458,13 @@ impl App {
                 item(ui, "Вставить", "Ctrl+V", RegionAction::Paste);
                 item(ui, "Дублировать", "Ctrl+D", RegionAction::Duplicate);
                 item(ui, "Разрезать по курсору", "S", RegionAction::Split);
+                item(ui, "Склеить со следующим", "J", RegionAction::Join);
                 ui.separator();
-                for stub in ["Переименовать", "Цвет", "Квантизация", "Зациклить", "Фейды"]
+                item(ui, "Фейд-ин 10 мс", "", RegionAction::FadeIn);
+                item(ui, "Фейд-аут 10 мс", "", RegionAction::FadeOut);
+                item(ui, "Убрать фейды", "", RegionAction::NoFades);
+                ui.separator();
+                for stub in ["Переименовать", "Цвет", "Квантизация", "Зациклить"]
                 {
                     ui.add_enabled(false, egui::Button::new(stub));
                 }
@@ -2321,7 +2491,50 @@ impl App {
             Some(RegionAction::Split) => self.split_clip(),
             Some(RegionAction::Delete) => self.delete_selected_clip(),
             Some(RegionAction::NewMidi) => self.add_midi_track(),
+            Some(RegionAction::Join) => {
+                if let Some((t, c)) = selected {
+                    self.join_clip(t, c);
+                }
+            }
+            Some(a @ (RegionAction::FadeIn | RegionAction::FadeOut | RegionAction::NoFades)) => {
+                if let Some((t, c)) = selected {
+                    self.quick_fade(t, c, a);
+                }
+            }
             None => {}
+        }
+    }
+
+    /// Joins a clip with the next one on its track (SPEC-038 §5).
+    fn join_clip(&mut self, track: usize, clip: usize) {
+        self.drag = None;
+        self.note_drag = None;
+        self.status = match self.editor.join_clips(track, clip) {
+            Ok(_) => "Клипы склеены".into(),
+            Err(EditorError::CannotJoin) => "Эти клипы нельзя склеить".into(),
+            Err(e) => format!("Не удалось склеить: {e}"),
+        };
+    }
+
+    /// Region menu fades: 10 ms in or out, or none (SPEC-038 §8).
+    fn quick_fade(&mut self, track: usize, clip: usize, action: RegionAction) {
+        let ten_ms = u64::from(self.editor.session().sample_rate / 100);
+        let Some(c) = self
+            .editor
+            .session()
+            .tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+        else {
+            return;
+        };
+        let (fade_in, fade_out) = match action {
+            RegionAction::FadeIn => (ten_ms, c.fade_out_samples),
+            RegionAction::FadeOut => (c.fade_in_samples, ten_ms),
+            _ => (0, 0),
+        };
+        if let Err(e) = self.editor.set_fades(track, clip, fade_in, fade_out) {
+            self.status = format!("Ошибка: {e}");
         }
     }
 
@@ -2448,6 +2661,25 @@ impl App {
                     paste || i.consume_key(egui::Modifiers::COMMAND, Key::V),
                 )
             });
+            let (tool, pointer, join) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, Key::T),
+                    i.key_pressed(Key::Escape),
+                    i.consume_key(egui::Modifiers::NONE, Key::J),
+                )
+            });
+            if tool {
+                self.tool = self.tool.next();
+                self.drag = None;
+            }
+            if pointer {
+                self.tool = Tool::Pointer;
+            }
+            if join {
+                if let Some((t, c)) = self.editor.selected_clip {
+                    self.join_clip(t, c);
+                }
+            }
             if split {
                 self.split_clip();
             }

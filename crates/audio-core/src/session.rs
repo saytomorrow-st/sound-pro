@@ -119,6 +119,13 @@ pub enum SessionError {
         /// Index of the clip inside the track.
         clip: usize,
     },
+    /// A clip's fades are longer than the clip together (SPEC-038).
+    InvalidFade {
+        /// Index of the track holding the clip.
+        track: usize,
+        /// Index of the clip inside the track.
+        clip: usize,
+    },
     /// A MIDI clip note is out of range, ends past the clip's content, or the
     /// clip has both notes and a file source (SPEC-021).
     InvalidNote {
@@ -234,6 +241,12 @@ impl fmt::Display for SessionError {
             }
             Self::InvalidColor { track } => write!(f, "track {track}: colour is invalid"),
             Self::InvalidMarker { marker } => write!(f, "marker {marker} is invalid"),
+            Self::InvalidFade { track, clip } => {
+                write!(
+                    f,
+                    "track {track}, clip {clip}: fades are longer than the clip"
+                )
+            }
         }
     }
 }
@@ -261,7 +274,15 @@ pub struct Clip {
     pub source: Option<String>,
     /// Notes of a MIDI clip (SPEC-021); `None` for an audio clip.
     pub notes: Option<Vec<Note>>,
+    /// Linear fade-in from the clip start, in samples (SPEC-038).
+    pub fade_in_samples: u64,
+    /// Linear fade-out to the clip end, in samples (SPEC-038).
+    pub fade_out_samples: u64,
 }
+
+/// Length of the automatic crossfade where clips overlap: 10 ms at 48 kHz
+/// (SPEC-038 §4).
+pub const CROSSFADE_SAMPLES: u64 = 480;
 
 /// One note of a MIDI clip, positioned inside the clip's content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -306,6 +327,8 @@ impl Clip {
             name: String::new(),
             source: None,
             notes: None,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
         }
     }
 
@@ -347,6 +370,66 @@ impl Clip {
     pub const fn source_index(&self, position: u64) -> u64 {
         self.offset_samples
             .wrapping_add(position.wrapping_sub(self.start_samples))
+    }
+
+    /// Multiplier of the clip's own fades at `position` (SPEC-038 §1).
+    ///
+    /// Linear ramps: `t / fade_in` over the first `fade_in` samples, where
+    /// `t = position - start`, and `r / fade_out` over the last `fade_out`,
+    /// where `r = end - 1 - position`; the smaller one wins where they meet.
+    /// Exactly `1.0` outside both zones, so a clip without fades sounds
+    /// bit-identical. Only meaningful when [`Clip::covers`] is true.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "fade lengths are far below 2^24 samples in practice; the ramp only needs f32 precision"
+    )]
+    pub fn fade_gain(&self, position: u64) -> f32 {
+        let t = position.wrapping_sub(self.start_samples);
+        let r = self.length_samples.saturating_sub(t).saturating_sub(1);
+        let mut gain = 1.0_f32;
+        if t < self.fade_in_samples {
+            gain = gain.min(t as f32 / self.fade_in_samples as f32);
+        }
+        if r < self.fade_out_samples {
+            gain = gain.min(r as f32 / self.fade_out_samples as f32);
+        }
+        gain
+    }
+
+    /// Weight of this clip over `lower`, a clip it overlaps, at `position`
+    /// (SPEC-038 §4); `lower` gets `1 - weight`.
+    ///
+    /// An equal-gain linear crossfade, as in Roads, *The Computer Music
+    /// Tutorial* (1996), ch. 2: at each edge of this clip that lies inside
+    /// `lower`, the weight ramps over `n = min(CROSSFADE_SAMPLES, overlap)`
+    /// samples as `t / n` (from the start) or `r / n` (to the end). Away from
+    /// such edges the upper clip wins with exactly `1.0`. Only meaningful
+    /// when both clips cover `position`.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the ramp is at most CROSSFADE_SAMPLES long"
+    )]
+    pub fn layer_weight(&self, lower: &Self, position: u64) -> f32 {
+        let start = self.start_samples;
+        let end = self.end_samples();
+        let t = position.wrapping_sub(start);
+        let r = end.saturating_sub(position).saturating_sub(1);
+        let mut weight = 1.0_f32;
+        if lower.covers(start) {
+            let n = CROSSFADE_SAMPLES.min(lower.end_samples().min(end) - start);
+            if t < n {
+                weight = weight.min(t as f32 / n as f32);
+            }
+        }
+        if end > 0 && lower.covers(end - 1) {
+            let n = CROSSFADE_SAMPLES.min(end - lower.start_samples.max(start));
+            if r < n {
+                weight = weight.min(r as f32 / n as f32);
+            }
+        }
+        weight
     }
 }
 
@@ -691,60 +774,7 @@ impl Session {
                 });
             }
             for (clip_index, clip) in track.clips.iter().enumerate() {
-                if clip.name.len() > MAX_NAME_BYTES {
-                    return Err(SessionError::NameTooLong);
-                }
-                if clip
-                    .source
-                    .as_ref()
-                    .is_some_and(|path| path.is_empty() || path.len() > MAX_SOURCE_BYTES)
-                {
-                    return Err(SessionError::InvalidSource {
-                        track: track_index,
-                        clip: clip_index,
-                    });
-                }
-                if !valid_gain(clip.gain) {
-                    return Err(SessionError::InvalidClipGain {
-                        track: track_index,
-                        clip: clip_index,
-                    });
-                }
-                if clip.length_samples == 0 {
-                    return Err(SessionError::EmptyClip {
-                        track: track_index,
-                        clip: clip_index,
-                    });
-                }
-                if clip.source_length == 0 {
-                    return Err(SessionError::EmptySource {
-                        track: track_index,
-                        clip: clip_index,
-                    });
-                }
-                if clip
-                    .start_samples
-                    .checked_add(clip.length_samples)
-                    .is_none()
-                {
-                    return Err(SessionError::TimelineOverflow {
-                        track: track_index,
-                        clip: clip_index,
-                    });
-                }
-                if clip
-                    .offset_samples
-                    .checked_add(clip.length_samples)
-                    .is_none_or(|end| end > clip.source_length)
-                {
-                    return Err(SessionError::ClipOutOfSource {
-                        track: track_index,
-                        clip: clip_index,
-                    });
-                }
-                if let Some(notes) = &clip.notes {
-                    validate_notes(notes, clip, track_index, clip_index)?;
-                }
+                validate_clip(clip, track_index, clip_index)?;
             }
             validate_effects(&track.effects, track_index)?;
             validate_automation(&track.automation, track_index)?;
@@ -798,6 +828,75 @@ fn validate_sends(sends: &[BusSend], buses: usize, track: usize) -> Result<(), S
         if send.bus >= buses || repeated || !valid_gain(send.level) {
             return Err(SessionError::InvalidSend { track, send: index });
         }
+    }
+    Ok(())
+}
+
+/// Per-clip checks of [`Session::validate`].
+fn validate_clip(clip: &Clip, track_index: usize, clip_index: usize) -> Result<(), SessionError> {
+    if clip.name.len() > MAX_NAME_BYTES {
+        return Err(SessionError::NameTooLong);
+    }
+    if clip
+        .source
+        .as_ref()
+        .is_some_and(|path| path.is_empty() || path.len() > MAX_SOURCE_BYTES)
+    {
+        return Err(SessionError::InvalidSource {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    if !valid_gain(clip.gain) {
+        return Err(SessionError::InvalidClipGain {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    if clip
+        .fade_in_samples
+        .checked_add(clip.fade_out_samples)
+        .is_none_or(|fades| fades > clip.length_samples)
+    {
+        return Err(SessionError::InvalidFade {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    if clip.length_samples == 0 {
+        return Err(SessionError::EmptyClip {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    if clip.source_length == 0 {
+        return Err(SessionError::EmptySource {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    if clip
+        .start_samples
+        .checked_add(clip.length_samples)
+        .is_none()
+    {
+        return Err(SessionError::TimelineOverflow {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    if clip
+        .offset_samples
+        .checked_add(clip.length_samples)
+        .is_none_or(|end| end > clip.source_length)
+    {
+        return Err(SessionError::ClipOutOfSource {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
+    if let Some(notes) = &clip.notes {
+        validate_notes(notes, clip, track_index, clip_index)?;
     }
     Ok(())
 }
@@ -1047,6 +1146,8 @@ mod tests {
             name: String::new(),
             source: None,
             notes: None,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
         };
         assert!(!clip.covers(99));
         assert!(clip.covers(100));

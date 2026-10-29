@@ -448,6 +448,31 @@ impl NodeProcessor for Track {
     }
 }
 
+/// One clip's sample at timeline `position`, with its gain and fades; the
+/// caller has checked that the clip covers `position`.
+fn clip_sample(
+    clip: &audio_core::session::Clip,
+    source: &(dyn ClipSource + Send),
+    position: u64,
+) -> f32 {
+    if clip.gain == 0.0 {
+        return 0.0;
+    }
+    let Ok(source_index) = usize::try_from(clip.source_index(position)) else {
+        return 0.0;
+    };
+    // `source_length` is only a claim about the content: trust the slice,
+    // not the model, so a mismatch is silence, not a panic.
+    source.channel(0).get(source_index).map_or(0.0, |sample| {
+        let fade = clip.fade_gain(position);
+        if fade >= 1.0 {
+            sample * clip.gain
+        } else {
+            sample * clip.gain * fade
+        }
+    })
+}
+
 impl Track {
     /// Renders one quantum into `left` (and `right` when stereo); both slices
     /// hold exactly the quantum. Allocation-free.
@@ -461,25 +486,32 @@ impl Track {
         if self.mute || (self.automation.gain.is_empty() && self.gain == 0.0) {
             return;
         }
-        for (clip, source) in self.clips.iter().zip(&self.sources) {
-            if clip.gain == 0.0 || clip.length_samples == 0 {
+        // SPEC-038: where clips overlap, the later one in the list wins, with
+        // an automatic crossfade at its edges over the clip right below it.
+        for (index, slot) in dst.iter_mut().enumerate() {
+            let position = position.saturating_add(index as u64);
+            let mut layers = self
+                .clips
+                .iter()
+                .zip(&self.sources)
+                .rev()
+                .filter(|(clip, _)| clip.covers(position));
+            let Some((top, top_source)) = layers.next() else {
                 continue;
-            }
-            let content = source.channel(0);
-            for (index, slot) in dst.iter_mut().enumerate() {
-                let position = position.saturating_add(index as u64);
-                if !clip.covers(position) {
-                    continue;
+            };
+            let upper = clip_sample(top, top_source.as_ref(), position);
+            *slot = match layers.next() {
+                None => upper,
+                Some((below, below_source)) => {
+                    let weight = top.layer_weight(below, position);
+                    if weight >= 1.0 {
+                        upper
+                    } else {
+                        let lower = clip_sample(below, below_source.as_ref(), position);
+                        upper * weight + lower * (1.0 - weight)
+                    }
                 }
-                let Ok(source_index) = usize::try_from(clip.source_index(position)) else {
-                    continue;
-                };
-                // `source_length` is only a claim about `content`: trust the
-                // slice, not the model, so a mismatch is silence, not a panic.
-                if let Some(sample) = content.get(source_index) {
-                    *slot += sample * clip.gain;
-                }
-            }
+            };
         }
         for effect in &mut self.effects {
             effect.process(dst);
