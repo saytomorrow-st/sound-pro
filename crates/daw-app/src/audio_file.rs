@@ -127,9 +127,25 @@ pub fn resample_parallel(
 }
 
 fn read_mp3(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
+    let file = std::fs::File::open(path).map_err(|e| AudioFileError::Mp3(e.to_string()))?;
+    decode_mp3(Box::new(file))
+}
+
+/// Decodes MP3 data held in memory, e.g. samples built into the program.
+///
+/// # Errors
+///
+/// [`AudioFileError::Mp3`] for undecodable data, [`AudioFileError::Empty`]
+/// when it holds no audio.
+pub fn decode_mp3_bytes(bytes: &'static [u8]) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
+    decode_mp3(Box::new(std::io::Cursor::new(bytes)))
+}
+
+fn decode_mp3(
+    source: Box<dyn symphonia::core::io::MediaSource>,
+) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
     let mp3 = |e: &dyn std::fmt::Display| AudioFileError::Mp3(e.to_string());
-    let file = std::fs::File::open(path).map_err(|e| mp3(&e))?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     hint.with_extension("mp3");
     let probed = symphonia::default::get_probe()

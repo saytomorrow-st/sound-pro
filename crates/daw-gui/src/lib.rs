@@ -874,6 +874,32 @@ impl Editor {
         self.commit(session, (track, clip))
     }
 
+    /// Sets a clip's gain, limited to `0.0..=1.0`; NaN counts as 0
+    /// (SPEC-039 §13). One undo step unless the value is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; `self` is unchanged.
+    pub fn set_clip_gain(
+        &mut self,
+        track: usize,
+        clip: usize,
+        gain: f32,
+    ) -> Result<(), EditorError> {
+        let c = self.clip_ref(track, clip)?;
+        let gain = if gain.is_nan() {
+            0.0
+        } else {
+            gain.clamp(0.0, 1.0)
+        };
+        if c.gain.to_bits() == gain.to_bits() {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        session.tracks[track].clips[clip].gain = gain;
+        self.commit(session, (track, clip))
+    }
+
     /// Index of the clip that starts next after `clip` on its track.
     fn next_clip(&self, track: usize, clip: usize) -> Option<usize> {
         let clips = &self.project.session.tracks.get(track)?.clips;
