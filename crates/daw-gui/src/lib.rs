@@ -74,6 +74,9 @@ pub enum EditorError {
     /// There is nothing to export.
     #[error("the project is empty")]
     Empty,
+    /// The recording holds no audio (SPEC-020).
+    #[error("nothing was recorded")]
+    EmptyRecording,
     /// The track or clip index does not exist.
     #[error("no such track or clip")]
     NoClip,
@@ -298,6 +301,94 @@ impl Editor {
         self.selected_clip = Some((track_index, clip_index));
         self.dirty = true;
         Ok((track_index, clip_index))
+    }
+
+    /// Adds a microphone take as a clip at `start` (SPEC-020).
+    ///
+    /// The take is converted to the project rate and written to the first
+    /// free `rec-NNN.wav` in `dir`; the clip goes on the selected track, or a
+    /// new "Запись" track. One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::EmptyRecording`] for no audio, [`EditorError::Session`]
+    /// when a limit would break (nothing is written), [`EditorError::Write`]
+    /// or [`EditorError::NonUtf8Path`] for the file.
+    pub fn add_recording(
+        &mut self,
+        samples: &[f32],
+        rate: u32,
+        start: u64,
+        dir: &Path,
+    ) -> Result<(usize, usize), EditorError> {
+        if samples.is_empty() {
+            return Err(EditorError::EmptyRecording);
+        }
+        let project_rate = self.project.session.sample_rate;
+        let audio = if rate == project_rate {
+            samples.to_vec()
+        } else {
+            audio_core::resample(samples, rate, project_rate)
+                .map_err(|_| EditorError::EmptyRecording)?
+        };
+        if audio.is_empty() {
+            return Err(EditorError::EmptyRecording);
+        }
+        let mut session = self.project.session.clone();
+        let track_index = match self.selected_track.filter(|&t| t < session.tracks.len()) {
+            Some(t) => t,
+            None => {
+                session.tracks.push(Track::new("Запись"));
+                session.tracks.len() - 1
+            }
+        };
+        let track = &mut session.tracks[track_index];
+        let mut clip = Clip::full(start, audio.len() as u64);
+        track.clips.push(clip.clone());
+        let clip_index = track.clips.len() - 1;
+        session.validate()?;
+
+        let write_err = |path: &Path, source| EditorError::Write {
+            path: path.to_path_buf(),
+            source,
+        };
+        std::fs::create_dir_all(dir).map_err(|e| write_err(dir, e))?;
+        let dir = std::path::absolute(dir).map_err(|e| write_err(dir, e))?;
+        let path = (1..)
+            .map(|n| dir.join(format!("rec-{n:03}.wav")))
+            .find(|p| !p.exists())
+            .unwrap_or_else(|| dir.join("rec.wav"));
+        let source = path
+            .to_str()
+            .ok_or_else(|| EditorError::NonUtf8Path { path: path.clone() })?
+            .to_owned();
+        audio_core::wav::write_mono_slice(&path, project_rate, &audio).map_err(|e| {
+            EditorError::Write {
+                path: path.clone(),
+                source: std::io::Error::other(e.to_string()),
+            }
+        })?;
+        clip.name = clip_name(&path);
+        clip.source = Some(source.clone());
+        session.tracks[track_index].clips[clip_index] = clip;
+
+        self.record();
+        self.project.session = session;
+        self.waves.insert(source, Peaks::from_samples(&audio));
+        self.selected_track = Some(track_index);
+        self.selected_clip = Some((track_index, clip_index));
+        self.dirty = true;
+        Ok((track_index, clip_index))
+    }
+
+    /// Where new recordings go: `<project folder>/audio`, or a temp folder
+    /// for an unsaved project.
+    #[must_use]
+    pub fn recordings_dir(&self) -> PathBuf {
+        self.path.as_deref().and_then(Path::parent).map_or_else(
+            || std::env::temp_dir().join("sound-pro-recordings"),
+            |p| p.join("audio"),
+        )
     }
 
     /// Writes the project to `path`; sources inside its folder become

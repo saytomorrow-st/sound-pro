@@ -33,6 +33,9 @@ pub enum RealtimeError {
     /// No default output device is present.
     #[error("no default output device")]
     NoDevice,
+    /// No default input device (microphone) is present (SPEC-020).
+    #[error("no microphone found")]
+    NoInputDevice,
     /// The device exposes no 32-bit float output configuration.
     #[error("default output device has no f32 configuration")]
     NoF32Config,
@@ -349,6 +352,7 @@ mod device {
         ChosenConfig, DeviceConfig, QuantumSplitter, RealtimeError, RealtimeHandle, RealtimeStats,
         choose_config, choose_exact_config, interleave_into,
     };
+    use crate::capture::{CaptureControl, capture};
     use crate::playback::PlaybackEngine;
 
     /// Fixed render quantum reserved by the engine. Larger device buffers are
@@ -521,10 +525,79 @@ mod device {
             stats,
         })
     }
+
+    /// Opens the default microphone and feeds a capture pair (SPEC-020).
+    ///
+    /// Runs at `preferred_rate` when the device offers it, otherwise at the
+    /// closest F32 rate; the returned control reports the rate in use. The
+    /// ring holds `seconds` of audio between window drains.
+    ///
+    /// # Errors
+    ///
+    /// [`RealtimeError::NoInputDevice`], [`RealtimeError::NoF32Config`], or a
+    /// CPAL error while building/starting the stream.
+    pub fn start_input(
+        preferred_rate: u32,
+        seconds: u32,
+    ) -> Result<(CaptureControl, RealtimeHandle), RealtimeError> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or(RealtimeError::NoInputDevice)?;
+        let mut configs = Vec::new();
+        for range in device.supported_input_configs()? {
+            configs.push(DeviceConfig {
+                min_sample_rate: range.min_sample_rate().0,
+                max_sample_rate: range.max_sample_rate().0,
+                channels: range.channels(),
+                is_f32: range.sample_format() == SampleFormat::F32,
+            });
+        }
+        let chosen = choose_config(&configs, preferred_rate)?;
+        let rate = chosen.sample_rate;
+        let supported = device
+            .supported_input_configs()?
+            .find(|r| {
+                r.sample_format() == SampleFormat::F32
+                    && r.channels() == chosen.channels
+                    && r.min_sample_rate().0 <= rate
+                    && rate <= r.max_sample_rate().0
+            })
+            .ok_or(RealtimeError::NoF32Config)?;
+        let stream_config: StreamConfig = supported.with_sample_rate(cpal::SampleRate(rate)).into();
+        let channels = usize::from(stream_config.channels);
+        let capacity =
+            usize::try_from(u64::from(rate) * u64::from(seconds.max(1))).unwrap_or(usize::MAX);
+        let (control, mut engine) = capture(capacity, rate);
+        let stats = Arc::new(RealtimeStats::default());
+        let cb_stats = Arc::clone(&stats);
+        let err_stats = Arc::clone(&stats);
+        let stream = device.build_input_stream(
+            &stream_config,
+            move |data: &[f32], _| {
+                engine.push(data, channels);
+                cb_stats
+                    .rendered_frames
+                    .fetch_add((data.len() / channels.max(1)) as u64, Ordering::Relaxed);
+            },
+            move |_err| {
+                err_stats.stream_errors.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        )?;
+        stream.play()?;
+        Ok((
+            control,
+            RealtimeHandle {
+                stream: Some(stream),
+                stats,
+            },
+        ))
+    }
 }
 
 #[cfg(feature = "realtime")]
-pub use device::{play_default, start_output};
+pub use device::{play_default, start_input, start_output};
 
 #[cfg(test)]
 mod tests {
