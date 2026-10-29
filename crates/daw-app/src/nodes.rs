@@ -267,6 +267,47 @@ impl ClipSource for MonoClip {
     }
 }
 
+/// Mono material shared with the window's cache, without a copy (SPEC-035).
+///
+/// Plays the first `frames` samples of `samples`.
+#[derive(Debug, Clone)]
+pub struct SharedClip {
+    samples: std::sync::Arc<Vec<f32>>,
+    frames: usize,
+}
+
+impl SharedClip {
+    /// The first `frames` samples of `samples`; `None` when it is shorter.
+    #[must_use]
+    pub fn new(samples: std::sync::Arc<Vec<f32>>, frames: u64) -> Option<Self> {
+        let frames = usize::try_from(frames).ok()?;
+        (frames <= samples.len()).then_some(Self { samples, frames })
+    }
+}
+
+impl SharedClip {
+    /// All of `samples`.
+    #[must_use]
+    pub fn whole(samples: std::sync::Arc<Vec<f32>>) -> Self {
+        let frames = samples.len();
+        Self { samples, frames }
+    }
+}
+
+impl ClipSource for SharedClip {
+    fn frames(&self) -> u64 {
+        self.frames as u64
+    }
+
+    fn channel(&self, ch: usize) -> &[f32] {
+        if ch == 0 {
+            &self.samples[..self.frames]
+        } else {
+            &[]
+        }
+    }
+}
+
 impl ClipSource for Vec<f32> {
     fn frames(&self) -> u64 {
         self.len() as u64

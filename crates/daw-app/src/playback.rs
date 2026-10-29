@@ -17,6 +17,8 @@ use audio_core::Graph;
 use audio_core::{CommandConsumer, CommandQueue};
 use audio_core::{Renderer, Transport, TransportCommand};
 
+use rtrb::{Consumer, Producer, RingBuffer};
+
 use crate::realtime::interleave_into;
 
 /// Largest quantum the engine renders at once; bigger device buffers are
@@ -29,6 +31,10 @@ pub const COMMAND_CAPACITY: usize = 64;
 struct Shared {
     position: AtomicU64,
     playing: AtomicBool,
+    /// Commands the window has queued so far. The audio thread publishes
+    /// `playing` only once it has applied all of them, so a stale quantum
+    /// never overwrites a fresh `play`/`stop` (SPEC-035).
+    sent: AtomicU64,
     /// Cycle region packed as `start << 32 | end`; `end <= start` is off
     /// (SPEC-025). One atomic, so a region is never read half-updated.
     cycle: AtomicU64,
@@ -75,6 +81,12 @@ pub struct PlaybackControl {
     shared: Arc<Shared>,
     sample_rate: u32,
     end: u64,
+    /// New graphs for the audio thread and the replaced ones coming back,
+    /// so they are freed here, never on the audio thread (SPEC-035).
+    graphs: Producer<Graph>,
+    retired: Consumer<Graph>,
+    channels: usize,
+    block: usize,
 }
 
 impl std::fmt::Debug for PlaybackControl {
@@ -90,13 +102,24 @@ impl std::fmt::Debug for PlaybackControl {
 
 impl PlaybackControl {
     /// Starts rolling. `false` when the command queue is full.
+    ///
+    /// [`Self::is_playing`] turns true at once, before the audio thread
+    /// picks the command up (SPEC-035).
     pub fn play(&mut self) -> bool {
-        self.send(TransportCommand::Play)
+        let sent = self.send(TransportCommand::Play);
+        if sent {
+            self.shared.playing.store(true, Ordering::Relaxed);
+        }
+        sent
     }
 
     /// Stops and keeps the position. `false` when the queue is full.
     pub fn stop(&mut self) -> bool {
-        self.send(TransportCommand::Stop)
+        let sent = self.send(TransportCommand::Stop);
+        if sent {
+            self.shared.playing.store(false, Ordering::Relaxed);
+        }
+        sent
     }
 
     /// Moves to `frames`, clamped to the end. `false` when the queue is full.
@@ -171,8 +194,38 @@ impl PlaybackControl {
         self.end
     }
 
+    /// Replaces the sound being played without stopping, keeping the
+    /// position and transport state (SPEC-035): edits are heard at once.
+    ///
+    /// Returns the graph back when it cannot be used: a different channel
+    /// count, a smaller maximum quantum, or a swap already waiting.
+    ///
+    /// # Errors
+    ///
+    /// The rejected graph, unchanged.
+    pub fn replace_graph(&mut self, graph: Graph) -> Result<(), Graph> {
+        self.collect();
+        if graph.channels() != self.channels || graph.max_quantum() < self.block {
+            return Err(graph);
+        }
+        self.graphs
+            .push(graph)
+            .map_err(|rtrb::PushError::Full(g)| g)
+    }
+
+    /// Frees graphs the audio thread has swapped out.
+    pub fn collect(&mut self) {
+        while let Ok(graph) = self.retired.pop() {
+            drop(graph);
+        }
+    }
+
     fn send(&mut self, command: TransportCommand) -> bool {
-        self.commands.try_push(command).is_ok()
+        let sent = self.commands.try_push(command).is_ok();
+        if sent {
+            self.shared.sent.fetch_add(1, Ordering::AcqRel);
+        }
+        sent
     }
 }
 
@@ -186,6 +239,9 @@ pub struct PlaybackEngine {
     end: u64,
     sample_rate: u32,
     click: Click,
+    applied: u64,
+    graphs: Consumer<Graph>,
+    retired: Producer<Graph>,
 }
 
 /// The click being played: frames since its start and its kind.
@@ -223,6 +279,9 @@ pub fn playback(
     let (commands, consumer) = CommandQueue::new(COMMAND_CAPACITY);
     let scratch = AudioBuffer::new(renderer.channels().max(1), block);
     let shared = Arc::new(Shared::default());
+    let channels = renderer.channels();
+    let (graphs, incoming) = RingBuffer::new(1);
+    let (outgoing, retired) = RingBuffer::new(2);
     shared.position.store(start, Ordering::Relaxed);
     shared.meter.store(
         pack_meter(DEFAULT_METER.0, DEFAULT_METER.1),
@@ -234,6 +293,10 @@ pub fn playback(
             shared: Arc::clone(&shared),
             sample_rate,
             end,
+            graphs,
+            retired,
+            channels,
+            block,
         },
         PlaybackEngine {
             renderer,
@@ -244,6 +307,9 @@ pub fn playback(
             end,
             sample_rate,
             click: Click::default(),
+            applied: 0,
+            graphs: incoming,
+            retired: outgoing,
         },
     )
 }
@@ -262,6 +328,7 @@ impl PlaybackEngine {
         let cycle = unpack_cycle(self.shared.cycle.load(Ordering::Relaxed));
         let metronome = self.shared.metronome.load(Ordering::Relaxed);
         let meter = unpack_meter(self.shared.meter.load(Ordering::Relaxed));
+        self.swap_graph();
         let frames = out.len() / channels;
         let mut offset = 0usize;
         while offset < frames {
@@ -270,6 +337,7 @@ impl PlaybackEngine {
             // check below always sees the transport state of this quantum.
             while let Some(command) = self.commands.pop_next() {
                 self.renderer.transport_mut().apply(command);
+                self.applied += 1;
             }
             let transport = self.renderer.transport();
             let mut wrap = None;
@@ -318,9 +386,23 @@ impl PlaybackEngine {
         self.shared
             .position
             .store(transport.position(), Ordering::Relaxed);
-        self.shared
-            .playing
-            .store(transport.is_playing(), Ordering::Relaxed);
+        if self.applied >= self.shared.sent.load(Ordering::Acquire) {
+            self.shared
+                .playing
+                .store(transport.is_playing(), Ordering::Relaxed);
+        }
+    }
+
+    /// Takes a waiting graph and hands the old one back. Moves only; when
+    /// the return ring is full the swap waits for the next buffer.
+    fn swap_graph(&mut self) {
+        if self.retired.is_full() {
+            return;
+        }
+        if let Ok(mut graph) = self.graphs.pop() {
+            std::mem::swap(self.renderer.graph_mut(), &mut graph);
+            let _ = self.retired.push(graph);
+        }
     }
 
     /// Mixes the metronome into `dst`, whose first frame is at `from`.

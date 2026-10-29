@@ -16,7 +16,7 @@ path = "src/main.rs"
 audio-core = { workspace = true }
 daw-app = { path = "../daw-app" }
 thiserror = { workspace = true }
-eframe = { version = "0.33", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+eframe = { version = "0.33", default-features = false, features = ["glow", "x11", "default_fonts"] }
 rfd = "0.17"
 
 [features]

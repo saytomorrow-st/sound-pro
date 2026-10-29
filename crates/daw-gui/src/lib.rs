@@ -12,6 +12,7 @@ pub mod layout;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track};
 use audio_core::{
@@ -204,6 +205,11 @@ pub struct Editor {
     path: Option<PathBuf>,
     dirty: bool,
     waves: HashMap<String, Peaks>,
+    /// Decoded mono files at the project rate, so playback starts without
+    /// reading them again (SPEC-035).
+    sounds: HashMap<String, Arc<Vec<f32>>>,
+    /// Rendered MIDI clips of the last playback or export (SPEC-035).
+    rendered: Mutex<RenderedNotes>,
     undo: Vec<Session>,
     redo: Vec<Session>,
     /// The session as last opened or saved.
@@ -246,6 +252,8 @@ impl Editor {
             path: None,
             dirty: false,
             waves: HashMap::new(),
+            sounds: HashMap::new(),
+            rendered: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             saved: session,
@@ -283,6 +291,7 @@ impl Editor {
         })?;
         let base = path.parent().unwrap_or_else(|| Path::new(""));
         let mut waves = HashMap::new();
+        let mut sounds = HashMap::new();
         let rate = project.session.sample_rate;
         for track in &mut project.session.tracks {
             for clip in &mut track.clips {
@@ -294,8 +303,9 @@ impl Editor {
                     *source = text.to_owned();
                 }
                 if !waves.contains_key(source.as_str()) {
-                    if let Ok(peaks) = read_mono(&resolved, rate) {
-                        waves.insert(source.clone(), peaks);
+                    if let Ok(samples) = read_samples(&resolved, rate) {
+                        waves.insert(source.clone(), Peaks::from_samples(&samples));
+                        sounds.insert(source.clone(), Arc::new(samples));
                     }
                 }
             }
@@ -306,6 +316,8 @@ impl Editor {
             path: Some(path),
             dirty: false,
             waves,
+            sounds,
+            rendered: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             group: None,
@@ -347,6 +359,24 @@ impl Editor {
         track: Option<usize>,
         start: Option<u64>,
     ) -> Result<(usize, usize), EditorError> {
+        let samples = read_samples(path, self.project.session.sample_rate)?;
+        self.import_decoded(path, samples, track, start)
+    }
+
+    /// [`Editor::import_audio_at`] for a file already decoded with
+    /// [`read_samples`] at the project rate, e.g. on a background thread
+    /// (SPEC-035).
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::import_audio_at`]; nothing changes on error.
+    pub fn import_decoded(
+        &mut self,
+        path: &Path,
+        samples: Vec<f32>,
+        track: Option<usize>,
+        start: Option<u64>,
+    ) -> Result<(usize, usize), EditorError> {
         let path = std::path::absolute(path).map_err(|source| EditorError::Read {
             path: path.to_path_buf(),
             source,
@@ -355,7 +385,7 @@ impl Editor {
             .to_str()
             .ok_or_else(|| EditorError::NonUtf8Path { path: path.clone() })?
             .to_owned();
-        let peaks = read_mono(&path, self.project.session.sample_rate)?;
+        let peaks = Peaks::from_samples(&samples);
         if peaks.frames == 0 {
             return Err(EditorError::EmptyFile { path });
         }
@@ -384,7 +414,8 @@ impl Editor {
         session.validate()?;
         self.record();
         self.project.session = session;
-        self.waves.insert(source, peaks);
+        self.waves.insert(source.clone(), peaks);
+        self.sounds.insert(source, Arc::new(samples));
         self.selected_track = Some(track_index);
         self.selected_clip = Some((track_index, clip_index));
         self.dirty = true;
@@ -446,7 +477,7 @@ impl Editor {
         let audio = if rate == project_rate {
             samples.to_vec()
         } else {
-            audio_core::resample(samples, rate, project_rate)
+            daw_app::audio_file::resample_parallel(samples, rate, project_rate)
                 .map_err(|_| EditorError::EmptyRecording)?
         };
         if audio.is_empty() {
@@ -492,7 +523,9 @@ impl Editor {
 
         self.record();
         self.project.session = session;
-        self.waves.insert(source, Peaks::from_samples(&audio));
+        self.waves
+            .insert(source.clone(), Peaks::from_samples(&audio));
+        self.sounds.insert(source, Arc::new(audio));
         self.selected_track = Some(track_index);
         self.selected_clip = Some((track_index, clip_index));
         self.dirty = true;
@@ -557,12 +590,31 @@ impl Editor {
         if self.project.session.length_samples() == 0 {
             return Err(EditorError::Empty);
         }
-        let job = daw_app::load_session(
+        let job = self.load(out.to_path_buf())?;
+        daw_app::render_session(job).map_err(|e| EditorError::Render(e.to_string()))
+    }
+
+    /// Loads the session for rendering from the decoded files and rendered
+    /// notes this editor already holds (SPEC-035).
+    fn load(&self, output: PathBuf) -> Result<daw_app::SessionJob, EditorError> {
+        let mut rendered = self
+            .rendered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = EditorCache {
+            sounds: &self.sounds,
+            rendered: &mut rendered,
+            used: HashMap::new(),
+        };
+        let job = daw_app::load_session_cached(
             self.project.session.clone(),
             Path::new(""),
-            out.to_path_buf(),
+            output,
+            &mut cache,
         )?;
-        daw_app::render_session(job).map_err(|e| EditorError::Render(e.to_string()))
+        let used = cache.used;
+        rendered.0 = used;
+        Ok(job)
     }
 
     /// Builds a stopped playback pair for the current project, positioned
@@ -586,12 +638,7 @@ impl Editor {
         if end == 0 {
             return Err(EditorError::Empty);
         }
-        let mut job =
-            daw_app::load_session(self.project.session.clone(), Path::new(""), PathBuf::new())?;
-        job.block_frames = daw_app::playback::PLAYBACK_BLOCK;
-        let rate = job.sample_rate;
-        let graph =
-            daw_app::build_session_graph(job).map_err(|e| EditorError::Render(e.to_string()))?;
+        let (graph, rate) = self.playback_graph()?;
         let mut start = if start >= end { 0 } else { start };
         let cycle = self.active_cycle();
         if let Some((from, to)) = cycle
@@ -608,6 +655,22 @@ impl Editor {
             u32::from(session.time_signature.numerator),
         );
         Ok((control, engine))
+    }
+
+    /// The sound of the current project for a running player, to swap in
+    /// with [`daw_app::playback::PlaybackControl::replace_graph`] after an
+    /// edit (SPEC-035), and its sample rate.
+    ///
+    /// # Errors
+    ///
+    /// Load or graph errors.
+    pub fn playback_graph(&self) -> Result<(audio_core::Graph, u32), EditorError> {
+        let mut job = self.load(PathBuf::new())?;
+        job.block_frames = daw_app::playback::PLAYBACK_BLOCK;
+        let rate = job.sample_rate;
+        let graph =
+            daw_app::build_session_graph(job).map_err(|e| EditorError::Render(e.to_string()))?;
+        Ok((graph, rate))
     }
 
     /// The cycle region, even while it is turned off (SPEC-025).
@@ -1849,9 +1912,15 @@ pub fn bars_in(samples: u64, rate: u32, tempo_bpm: f64, beats_per_bar: u32) -> S
     format!("{}.{}", beat / per_bar + 1, beat % per_bar + 1)
 }
 
-/// Reads a WAV or MP3 file as peaks of its mono average at `rate`
-/// (SPEC-019, SPEC-032).
-fn read_mono(path: &Path, rate: u32) -> Result<Peaks, EditorError> {
+/// Reads a WAV or MP3 file as its mono average at `rate` (SPEC-019,
+/// SPEC-032). Slow for long files; the window calls it off its thread and
+/// hands the result to [`Editor::import_decoded`] (SPEC-035).
+///
+/// # Errors
+///
+/// [`EditorError::EmptyFile`], [`EditorError::Wav`] or
+/// [`EditorError::Decode`].
+pub fn read_samples(path: &Path, rate: u32) -> Result<Vec<f32>, EditorError> {
     use daw_app::audio_file::AudioFileError;
     let mono = daw_app::audio_file::read_mono_at(path, rate).map_err(|e| match e {
         AudioFileError::Empty | AudioFileError::Wav(audio_core::WavError::Empty) => {
@@ -1868,7 +1937,42 @@ fn read_mono(path: &Path, rate: u32) -> Result<Peaks, EditorError> {
             message,
         },
     })?;
-    Ok(Peaks::from_samples(&mono))
+    Ok(mono)
+}
+
+type NotesKey = (Vec<Note>, u32, u64);
+
+/// MIDI clips rendered by the last load, keyed by notes, rate and length.
+#[derive(Debug, Default)]
+struct RenderedNotes(HashMap<NotesKey, Arc<Vec<f32>>>);
+
+/// The editor's material as a [`daw_app::ClipCache`]; keeps only renders
+/// the current session still uses.
+struct EditorCache<'a> {
+    sounds: &'a HashMap<String, Arc<Vec<f32>>>,
+    rendered: &'a mut RenderedNotes,
+    used: HashMap<NotesKey, Arc<Vec<f32>>>,
+}
+
+impl daw_app::ClipCache for EditorCache<'_> {
+    fn audio(&mut self, source: &str) -> Option<Arc<Vec<f32>>> {
+        self.sounds.get(source).cloned()
+    }
+
+    fn notes(&mut self, notes: &[Note], rate: u32, frames: u64) -> Option<Arc<Vec<f32>>> {
+        let key = (notes.to_vec(), rate, frames);
+        let hit = self
+            .used
+            .get(&key)
+            .or_else(|| self.rendered.0.get(&key))
+            .cloned()?;
+        self.used.insert(key, Arc::clone(&hit));
+        Some(hit)
+    }
+
+    fn store_notes(&mut self, notes: &[Note], rate: u32, frames: u64, samples: Arc<Vec<f32>>) {
+        self.used.insert((notes.to_vec(), rate, frames), samples);
+    }
 }
 
 /// File stem, cut to [`MAX_NAME_BYTES`] on a character boundary.

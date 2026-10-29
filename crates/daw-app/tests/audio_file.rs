@@ -53,3 +53,23 @@ fn a_broken_mp3_is_an_error_not_a_panic() {
         "{result:?}"
     );
 }
+
+#[test]
+fn the_parallel_resampler_matches_the_plain_one_bit_for_bit() {
+    let input: Vec<f32> = (0..300_000)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    for (from, to) in [(44_100, 48_000), (48_000, 44_100), (48_000, 48_000)] {
+        let plain = audio_core::resample(&input, from, to).unwrap();
+        let fast = daw_app::audio_file::resample_parallel(&input, from, to).unwrap();
+        assert_eq!(plain.len(), fast.len());
+        assert!(
+            plain
+                .iter()
+                .zip(&fast)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{from} -> {to}"
+        );
+    }
+    assert!(daw_app::audio_file::resample_parallel(&input, 0, 48_000).is_err());
+}

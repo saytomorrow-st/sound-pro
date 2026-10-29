@@ -112,6 +112,13 @@ impl CaptureControl {
         self.samples.len() as u64
     }
 
+    /// Frames collected by [`Self::drain`] so far, for drawing the take
+    /// while it records (SPEC-035).
+    #[must_use]
+    pub fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+
     /// Rate the frames are captured at.
     #[must_use]
     pub const fn sample_rate(&self) -> u32 {
