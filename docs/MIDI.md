@@ -33,6 +33,32 @@
 - `MidiMessage::{NoteOn, NoteOff, Tempo}`.
 - `MidiFile::notes()` — только `NoteOn` в порядке сортировки.
 
+## Планировщик: тик → сэмпл (SPEC-007)
+
+`ScheduleSpec::from_midi(&file, sample_rate, start_tempo, tail_samples)`
+переводит события из тиков в абсолютные сэмплы в контрольном потоке:
+
+```text
+bpm(tick)     = 60_000_000 / micros_per_quarter   (до первого Tempo — start_tempo)
+seconds(tick) = seconds(prev) + (tick - prev) / (ppqn * bpm(tick) / 60)
+sample        = round(seconds(tick) * sample_rate)
+```
+
+- копятся именно **секунды** в `f64`, сэмпл округляется один раз: ошибка
+  округления не накапливается и смена темпа не сдвигает уже посчитанное;
+- `Tempo` действует с своего тика вперёд; `sample` самого `Tempo`-события
+  считается ещё по старому темпу;
+- `length_samples` = сэмпл последнего события + `tail_samples` (хвост
+  отпускания);
+- ошибки: `InvalidPpqn`, `InvalidTempo { tick }` (`micros_per_quarter == 0`),
+  `InvalidSampleRate` (`sample_rate == 0`), `Empty` (нет ни одного `NoteOn`).
+
+Пример: 120 bpm, 480 ppqn, 48 кГц → четверть (тик 480) = 0.5 с = 24 000
+сэмплов. После `Tempo` 60 bpm следующая четверть занимает вдвое больше.
+
+Исполнение в аудиопотоке — через `Schedule::next_event` с курсором; контракт
+реального времени — в [REALTIME.md](REALTIME.md), раздел «Опрос расписания».
+
 ## Граничные случаи
 
 | Вход | Результат |
