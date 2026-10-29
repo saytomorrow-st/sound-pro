@@ -128,6 +128,8 @@ struct App {
     auto_lane: Lane,
     /// Index of the automation point being dragged.
     auto_drag: Option<usize>,
+    /// Anchor of the cycle region being drawn on the ruler (SPEC-025).
+    cycle_drag: Option<u64>,
 }
 
 impl App {
@@ -151,6 +153,7 @@ impl App {
             auto: None,
             auto_lane: Lane::Gain,
             auto_drag: None,
+            cycle_drag: None,
         };
         if let Some(path) = start {
             app.open(path);
@@ -364,6 +367,28 @@ impl App {
         }
     }
 
+    /// Passes the current cycle to a running player.
+    fn sync_cycle(&mut self) {
+        let cycle = self.editor.active_cycle();
+        if let Some(player) = self.player.as_mut() {
+            player.control.set_cycle(cycle);
+        }
+    }
+
+    fn toggle_cycle(&mut self) {
+        if self.editor.cycle().is_none() {
+            self.status = "Протяните мышью по линейке, чтобы задать цикл".into();
+            return;
+        }
+        self.editor.cycle_enabled = !self.editor.cycle_enabled;
+        self.status = if self.editor.cycle_enabled {
+            "Цикл включён".into()
+        } else {
+            "Цикл выключен".into()
+        };
+        self.sync_cycle();
+    }
+
     fn reset_playback(&mut self) {
         self.player = None;
         self.playhead = 0;
@@ -396,6 +421,14 @@ impl App {
                 .clicked()
             {
                 self.toggle_record();
+            }
+            let cycle = egui::Button::new("🔁").selected(self.editor.active_cycle().is_some());
+            if ui
+                .add(cycle)
+                .on_hover_text("Цикл (C). Протяните по линейке, чтобы задать участок.")
+                .clicked()
+            {
+                self.toggle_cycle();
             }
             ui.separator();
             let session = self.editor.session();
@@ -695,6 +728,33 @@ impl App {
             }
         }
 
+        let rate_u32 = self.editor.session().sample_rate;
+        if let Some((from, to)) = self.editor.cycle() {
+            let x0 = area.min.x + samples_to_x(from, rate_u32, self.zoom);
+            let x1 = area.min.x + samples_to_x(to, rate_u32, self.zoom);
+            let (bar, under) = if self.editor.cycle_enabled {
+                (
+                    Color32::from_rgb(230, 190, 50),
+                    Color32::from_rgba_unmultiplied(230, 190, 50, 24),
+                )
+            } else {
+                (Color32::from_gray(110), Color32::TRANSPARENT)
+            };
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, ruler.min.y + RULER_HEIGHT * 0.55),
+                    Pos2::new(x1.max(x0 + 2.0), ruler.max.y),
+                ),
+                2.0,
+                bar,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(x0, ruler.max.y), Pos2::new(x1, area.max.y)),
+                0.0,
+                under,
+            );
+        }
+
         let px_per_sample = self.zoom / rate as f32;
         let mut clicked = None;
         let mut open_piano = None;
@@ -809,7 +869,14 @@ impl App {
             || response.clicked()
             || response.secondary_clicked()
             || response.drag_stopped();
-        let lane_owned = self.drag.is_none()
+        let press_on_ruler = ui
+            .input(|i| i.pointer.press_origin())
+            .is_some_and(|p| ruler.contains(p));
+        let ruler_owned = self.drag.is_none()
+            && self.auto_drag.is_none()
+            && (self.cycle_drag.is_some() || (response.drag_started() && press_on_ruler));
+        let lane_owned = !ruler_owned
+            && self.drag.is_none()
             && (self.auto_drag.is_some()
                 || (pressed
                     && auto_row.is_some_and(|row| {
@@ -817,14 +884,15 @@ impl App {
                             .is_some_and(|p| row.contains(p))
                     })));
 
-        let rate_u32 = self.editor.session().sample_rate;
         let cursor = area.min.x + samples_to_x(self.playhead, rate_u32, self.zoom);
         painter.line_segment(
             [Pos2::new(cursor, area.min.y), Pos2::new(cursor, area.max.y)],
             Stroke::new(1.5_f32, Color32::from_rgb(255, 90, 70)),
         );
 
-        if response.clicked() && pointer.is_some_and(|p| ruler.contains(p)) {
+        if ruler_owned {
+            self.draw_cycle(ui, &response, area);
+        } else if response.clicked() && pointer.is_some_and(|p| ruler.contains(p)) {
             if let Some(p) = pointer {
                 self.seek(x_to_samples(p.x - area.min.x, rate_u32, self.zoom));
             }
@@ -847,7 +915,7 @@ impl App {
             self.open_piano(at);
         }
 
-        if !lane_owned {
+        if !lane_owned && !ruler_owned {
             self.drag_clips(ui, &response, area, &rects);
         }
 
@@ -855,6 +923,42 @@ impl App {
             let (ctrl, scroll) = ui.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
             if ctrl && scroll != 0.0 {
                 self.zoom = (self.zoom * (1.0 + scroll * 0.002)).clamp(MIN_ZOOM, MAX_ZOOM);
+            }
+        }
+    }
+
+    /// Drawing a cycle region by dragging on the ruler (SPEC-025).
+    fn draw_cycle(&mut self, ui: &egui::Ui, response: &egui::Response, area: Rect) {
+        let session = self.editor.session();
+        let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+        let free = ui.input(|i| i.modifiers.shift) || !self.snap;
+        let at = |x: f32| {
+            let samples = x_to_samples(x - area.min.x, rate, self.zoom);
+            if free {
+                samples
+            } else {
+                snap_to_beat(samples, rate, tempo)
+            }
+        };
+        if self.cycle_drag.is_none() {
+            let Some(origin) = ui.input(|i| i.pointer.press_origin()) else {
+                return;
+            };
+            self.cycle_drag = Some(at(origin.x));
+        }
+        if let (Some(anchor), Some(p)) = (self.cycle_drag, ui.input(|i| i.pointer.latest_pos()))
+            && self.editor.set_cycle(anchor, at(p.x)).is_ok()
+        {
+            self.sync_cycle();
+        }
+        if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+            self.cycle_drag = None;
+            if let Some((from, to)) = self.editor.cycle() {
+                self.status = format!(
+                    "Цикл: такт {} – {}",
+                    bars(from, rate, tempo),
+                    bars(to, rate, tempo)
+                );
             }
         }
     }
@@ -1319,13 +1423,17 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if !ctx.wants_keyboard_input() {
-            let (space, home, record) = ctx.input_mut(|i| {
+            let (space, home, record, cycle) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, Key::Space),
                     i.consume_key(egui::Modifiers::NONE, Key::Home),
                     i.consume_key(egui::Modifiers::NONE, Key::R),
+                    i.consume_key(egui::Modifiers::NONE, Key::C),
                 )
             });
+            if cycle {
+                self.toggle_cycle();
+            }
             if record {
                 self.toggle_record();
             }
