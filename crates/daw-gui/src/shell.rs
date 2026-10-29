@@ -415,21 +415,25 @@ impl App {
         let big = |t: &str| RichText::new(t).size(15.0);
         if ui
             .add(egui::Button::new(big("⏮")).min_size(Vec2::new(28.0, 24.0)))
-            .on_hover_text("В начало (Home)")
+            .on_hover_text("В начало (Home / Enter)")
             .clicked()
         {
             self.rewind();
         }
-        ui.add_enabled(
-            false,
-            egui::Button::new(big("⏪")).min_size(Vec2::new(28.0, 24.0)),
-        )
-        .on_disabled_hover_text("Скоро");
-        ui.add_enabled(
-            false,
-            egui::Button::new(big("⏩")).min_size(Vec2::new(28.0, 24.0)),
-        )
-        .on_disabled_hover_text("Скоро");
+        if ui
+            .add(egui::Button::new(big("⏪")).min_size(Vec2::new(28.0, 24.0)))
+            .on_hover_text("Назад на такт (,)")
+            .clicked()
+        {
+            self.step_bar(false);
+        }
+        if ui
+            .add(egui::Button::new(big("⏩")).min_size(Vec2::new(28.0, 24.0)))
+            .on_hover_text("Вперёд на такт (.)")
+            .clicked()
+        {
+            self.step_bar(true);
+        }
         if ui
             .add(egui::Button::new(big("⏹")).min_size(Vec2::new(28.0, 24.0)))
             .on_hover_text("Стоп")

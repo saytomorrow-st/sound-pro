@@ -16,6 +16,7 @@ use audio_core::{
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
 use daw_gui::layout::{Bottom, Layout};
+use daw_gui::timeline::{self, CycleHit};
 use daw_gui::{
     Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
     snap_to_beat, x_to_samples,
@@ -49,6 +50,19 @@ struct NoteDrag {
 
 const fn is_black_key(pitch: u8) -> bool {
     matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)
+}
+
+/// What a drag on the ruler does (SPEC-040).
+#[derive(Clone, Copy)]
+enum RulerDrag {
+    /// Upper strip: the playhead follows the pointer.
+    Scrub,
+    /// A new cycle from this anchor.
+    New(u64),
+    /// The whole cycle, as it was when the drag began, from this press.
+    Move { start: u64, end: u64, from: u64 },
+    /// One edge of the cycle.
+    Resize(CycleHit),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,11 +106,13 @@ impl Tool {
 }
 
 /// Size of the fade handles on a region's top corners, in pixels.
-const FADE_HANDLE_PX: f32 = 8.0;
+const FADE_HANDLE_PX: f32 = 14.0;
 
 /// Drag mode for a press at `p` on a region drawn in `rect` with `tool`.
 /// `None` means the tool does not drag.
-fn press_mode(tool: Tool, rect: Rect, p: Pos2) -> Option<DragMode> {
+/// `fades` are the fade-in and fade-out widths in pixels: a handle sits
+/// where its ramp meets the top edge and is grabbed there (SPEC-040 §3).
+fn press_mode(tool: Tool, rect: Rect, p: Pos2, fades: (f32, f32)) -> Option<DragMode> {
     let left_half = p.x < rect.center().x;
     match tool {
         Tool::Scissors | Tool::Glue => None,
@@ -107,9 +123,12 @@ fn press_mode(tool: Tool, rect: Rect, p: Pos2) -> Option<DragMode> {
         }),
         Tool::Pointer => {
             let handle = FADE_HANDLE_PX.min(rect.width() / 3.0);
-            if p.y <= rect.min.y + FADE_HANDLE_PX && p.x <= rect.min.x + handle {
+            let top = p.y <= rect.min.y + FADE_HANDLE_PX;
+            let fade_in = rect.min.x + fades.0.min(rect.width());
+            let fade_out = rect.max.x - fades.1.min(rect.width());
+            if top && p.x <= (rect.min.x + handle).max(fade_in + handle / 2.0) {
                 Some(DragMode::FadeIn)
-            } else if p.y <= rect.min.y + FADE_HANDLE_PX && p.x >= rect.max.x - handle {
+            } else if top && p.x >= (rect.max.x - handle).min(fade_out - handle / 2.0) {
                 Some(DragMode::FadeOut)
             } else {
                 Some(edge_mode(rect, p.x))
@@ -140,8 +159,8 @@ fn edge_mode(rect: Rect, x: f32) -> DragMode {
 }
 
 /// Fade ramps on a region: shading over the faded part and a line from the
-/// silent corner to full level; on the selected region, handles on the top
-/// corners (SPEC-038 §7).
+/// silent corner to full level; on the selected or hovered region, handles
+/// on the top corners (SPEC-038 §7, SPEC-040 §3).
 #[allow(clippy::cast_precision_loss)]
 fn draw_fades(
     painter: &egui::Painter,
@@ -172,10 +191,12 @@ fn draw_fades(
         ));
         painter.line_segment([top, rect.right_bottom()], line);
     }
-    if selected && rect.width() > FADE_HANDLE_PX * 3.0 {
+    if selected && rect.width() > FADE_HANDLE_PX * 2.0 {
         for x in [rect.min.x + fade_in, rect.max.x - fade_out] {
-            let x = x.clamp(rect.min.x + 3.0, rect.max.x - 3.0);
-            painter.circle_filled(Pos2::new(x, rect.min.y + 3.0), 3.0, Color32::WHITE);
+            let x = x.clamp(rect.min.x + 4.0, rect.max.x - 4.0);
+            let at = Pos2::new(x, rect.min.y + 4.0);
+            painter.circle_filled(at, 4.0, Color32::WHITE);
+            painter.circle_stroke(at, 4.0, Stroke::new(1.0_f32, Color32::from_gray(40)));
         }
     }
 }
@@ -253,6 +274,8 @@ struct Recorder {
 /// Region menu command chosen in this frame (SPEC-037).
 #[derive(Clone, Copy)]
 enum RegionAction {
+    Front,
+    Back,
     Piano,
     Copy,
     Paste,
@@ -327,6 +350,10 @@ struct App {
     note_drag: Option<NoteDrag>,
     /// Scroll the piano roll to middle C on the next frame.
     piano_scroll: bool,
+    /// Horizontal zoom of the piano roll and the offset to apply on the
+    /// next frame so the time under the pointer stays put (SPEC-040 §5).
+    piano_zoom: f32,
+    piano_offset: Option<f32>,
     /// Track or bus whose effects window is open (SPEC-022, SPEC-028).
     fx: Option<FxTarget>,
     /// The buses window is open (SPEC-028).
@@ -338,8 +365,8 @@ struct App {
     auto_lane: Lane,
     /// Index of the automation point being dragged.
     auto_drag: Option<usize>,
-    /// Anchor of the cycle region being drawn on the ruler (SPEC-025).
-    cycle_drag: Option<u64>,
+    /// What a drag on the ruler is doing (SPEC-025, SPEC-040).
+    cycle_drag: Option<RulerDrag>,
     /// Marker being dragged and where it would land (SPEC-030).
     marker_drag: Option<(usize, u64)>,
     /// Marker whose name is being edited and the text typed so far (SPEC-030).
@@ -425,6 +452,8 @@ impl App {
             audio_edit: audio_editor::AudioEdit::default(),
             note_drag: None,
             piano_scroll: false,
+            piano_zoom: 1.0,
+            piano_offset: None,
             fx: None,
             buses_open: false,
             rename: None,
@@ -1569,7 +1598,8 @@ impl App {
                         }
                     }
                 }
-                draw_fades(&painter, rect, clip, px_per_sample, selected);
+                let hovered = pointer.is_some_and(|p| rect.contains(p));
+                draw_fades(&painter, rect, clip, px_per_sample, selected || hovered);
                 painter
                     .with_clip_rect(header.intersect(painter.clip_rect()))
                     .text(
@@ -1618,7 +1648,8 @@ impl App {
                 .is_some_and(|p| ruler.contains(p));
         let ruler_owned = self.drag.is_none()
             && self.auto_drag.is_none()
-            && (self.cycle_drag.is_some() || (response.drag_started() && press_on_ruler));
+            && (self.cycle_drag.is_some()
+                || (press_on_ruler && (response.drag_started() || response.clicked())));
         let lane_owned = !ruler_owned
             && self.drag.is_none()
             && (self.auto_drag.is_some()
@@ -1637,11 +1668,7 @@ impl App {
         );
 
         if ruler_owned {
-            self.draw_cycle(ui, &response, area);
-        } else if response.clicked() && !on_flag && pointer.is_some_and(|p| ruler.contains(p)) {
-            if let Some(p) = pointer {
-                self.seek(x_to_samples(p.x - area.min.x, rate_u32, self.zoom));
-            }
+            self.ruler_input(ui, &response, area);
         } else if lane_owned {
             if let (Some(t), Some(row)) = (self.auto, auto_row) {
                 self.edit_lane(ui, &response, area, row, t);
@@ -1669,9 +1696,11 @@ impl App {
         }
 
         if response.hovered() || ui.rect_contains_pointer(ui.clip_rect()) {
-            let (ctrl, scroll) = ui.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
-            if ctrl && scroll != 0.0 {
-                self.zoom = (self.zoom * (1.0 + scroll * 0.002)).clamp(MIN_ZOOM, MAX_ZOOM);
+            // Pinch on a touchpad and Ctrl+wheel both arrive as one zoom
+            // factor, anchored at the pointer (SPEC-040 §5).
+            let factor = ui.input(egui::InputState::zoom_delta);
+            if (factor - 1.0).abs() > f32::EPSILON {
+                self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
                 self.zoom_anchor = ui
                     .input(|i| i.pointer.hover_pos())
                     .map(|p| p.x - ui.clip_rect().min.x);
@@ -1892,34 +1921,91 @@ impl App {
         }
     }
 
-    /// Drawing a cycle region by dragging on the ruler (SPEC-025).
-    fn draw_cycle(&mut self, ui: &egui::Ui, response: &egui::Response, area: Rect) {
+    /// Presses on the ruler (SPEC-025, SPEC-040). The lower strip holds the
+    /// cycle: drag its body to move it, its edges to resize, empty space to
+    /// draw a new one, click it to switch it on or off. The upper strip
+    /// seeks on click and scrubs while dragged.
+    #[allow(clippy::too_many_lines)]
+    fn ruler_input(&mut self, ui: &egui::Ui, response: &egui::Response, area: Rect) {
         let session = self.editor.session();
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
         let per_bar = u32::from(session.time_signature.numerator);
         let free = ui.input(|i| i.modifiers.shift) || !self.snap;
+        let zoom = self.zoom;
+        let raw = |x: f32| x_to_samples(x - area.min.x, rate, zoom);
         let at = |x: f32| {
-            let samples = x_to_samples(x - area.min.x, rate, self.zoom);
             if free {
-                samples
+                raw(x)
             } else {
-                snap_to_beat(samples, rate, tempo)
+                snap_to_beat(raw(x), rate, tempo)
             }
         };
-        if self.cycle_drag.is_none() {
-            let Some(origin) = ui.input(|i| i.pointer.press_origin()) else {
-                return;
-            };
-            self.cycle_drag = Some(at(origin.x));
+        let Some(origin) = ui.input(|i| i.pointer.press_origin()) else {
+            self.cycle_drag = None;
+            return;
+        };
+        let cycle_x = self.editor.cycle().map(|(a, b)| {
+            (
+                area.min.x + samples_to_x(a, rate, zoom),
+                area.min.x + samples_to_x(b, rate, zoom),
+            )
+        });
+        let in_cycle_strip = origin.y >= area.min.y + RULER_HEIGHT * 0.55;
+        if response.clicked() && self.cycle_drag.is_none() {
+            if in_cycle_strip && timeline::cycle_hit(origin.x, cycle_x) != CycleHit::Empty {
+                self.toggle_cycle();
+            } else {
+                self.seek(raw(origin.x));
+            }
+            return;
         }
-        if let (Some(anchor), Some(p)) = (self.cycle_drag, ui.input(|i| i.pointer.latest_pos()))
-            && self.editor.set_cycle(anchor, at(p.x)).is_ok()
-        {
-            self.sync_cycle();
+        if self.cycle_drag.is_none() {
+            self.cycle_drag = Some(if !in_cycle_strip {
+                RulerDrag::Scrub
+            } else {
+                match (timeline::cycle_hit(origin.x, cycle_x), self.editor.cycle()) {
+                    (CycleHit::Body, Some((start, end))) => RulerDrag::Move {
+                        start,
+                        end,
+                        from: raw(origin.x),
+                    },
+                    (hit @ (CycleHit::Start | CycleHit::End), Some(_)) => RulerDrag::Resize(hit),
+                    _ => RulerDrag::New(at(origin.x)),
+                }
+            });
+        }
+        if let (Some(drag), Some(p)) = (self.cycle_drag, ui.input(|i| i.pointer.latest_pos())) {
+            let changed = match drag {
+                RulerDrag::Scrub => {
+                    self.seek(raw(p.x));
+                    false
+                }
+                RulerDrag::New(anchor) => self.editor.set_cycle(anchor, at(p.x)).is_ok(),
+                RulerDrag::Move { start, end, from } => {
+                    let delta = i64::try_from(raw(p.x)).unwrap_or(i64::MAX)
+                        - i64::try_from(from).unwrap_or(i64::MAX);
+                    let (mut a, _) = timeline::move_cycle(start, end, delta);
+                    if !free {
+                        a = snap_to_beat(a, rate, tempo);
+                    }
+                    let len = end - start;
+                    self.editor.set_cycle(a, a + len).is_ok()
+                }
+                RulerDrag::Resize(hit) => {
+                    let (start, end) = self.editor.cycle().unwrap_or((0, 0));
+                    let min = timeline::bar_samples(rate, tempo, per_bar) / 16;
+                    let (a, b) = timeline::resize_cycle(start, end, hit, at(p.x), min);
+                    self.editor.set_cycle(a, b).is_ok()
+                }
+            };
+            if changed {
+                self.sync_cycle();
+            }
         }
         if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+            let was_cycle = !matches!(self.cycle_drag, Some(RulerDrag::Scrub));
             self.cycle_drag = None;
-            if let Some((from, to)) = self.editor.cycle() {
+            if was_cycle && let Some((from, to)) = self.editor.cycle() {
                 self.status = format!(
                     "Цикл: такт {} – {}",
                     bars_in(from, rate, tempo, per_bar),
@@ -1927,6 +2013,21 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Moves the playhead one bar back or forward (⏪/⏩, SPEC-040).
+    pub(crate) fn step_bar(&mut self, forward: bool) {
+        let session = self.editor.session();
+        let bar = timeline::bar_samples(
+            session.sample_rate,
+            session.tempo_bpm,
+            u32::from(session.time_signature.numerator),
+        );
+        let at = self
+            .player
+            .as_ref()
+            .map_or(self.playhead, |p| p.control.position());
+        self.seek(timeline::step_bar(at, bar, forward));
     }
 
     /// Draws one track's automation lane over its clips (SPEC-023).
@@ -2056,9 +2157,20 @@ impl App {
     ) {
         let hit = |p: Pos2| rects.iter().rev().find(|(_, r)| r.contains(p)).copied();
         let tool = self.tool;
+        let px = self.zoom / self.editor.session().sample_rate.max(1) as f32;
+        let session = self.editor.session();
+        let fades = |(t, c): (usize, usize)| {
+            session.tracks[t].clips.get(c).map_or((0.0, 0.0), |clip| {
+                (
+                    clip.fade_in_samples as f32 * px,
+                    clip.fade_out_samples as f32 * px,
+                )
+            })
+        };
+        let mode_at = |p: Pos2| hit(p).and_then(|(at, r)| press_mode(tool, r, p, fades(at)));
         if self.drag.is_none() {
             if let Some(p) = response.hover_pos() {
-                let icon = match (tool, hit(p).and_then(|(_, r)| press_mode(tool, r, p))) {
+                let icon = match (tool, mode_at(p)) {
                     (Tool::Scissors, _) => Some(CursorIcon::Crosshair),
                     (Tool::Glue, _) => Some(CursorIcon::PointingHand),
                     (_, Some(DragMode::TrimStart | DragMode::TrimEnd)) => {
@@ -2107,13 +2219,13 @@ impl App {
         if response.drag_started() {
             let origin = ui.input(|i| i.pointer.press_origin());
             self.drag = origin.and_then(|p| {
-                let ((track, clip), rect) = hit(p)?;
+                let ((track, clip), _) = hit(p)?;
                 let start = self.editor.session().tracks[track].clips[clip].start_samples;
                 let at = x_to_samples(p.x - area.min.x, rate, self.zoom);
                 Some(Drag {
                     track,
                     clip,
-                    mode: press_mode(tool, rect, p)?,
+                    mode: mode_at(p)?,
                     grab: at as i64 - start as i64,
                 })
             });
@@ -2259,6 +2371,9 @@ impl App {
         if std::mem::take(&mut self.piano_scroll) {
             scroll = scroll.vertical_scroll_offset((127.0 - 72.0) * KEY_HEIGHT);
         }
+        if let Some(offset) = self.piano_offset.take() {
+            scroll = scroll.horizontal_scroll_offset(offset);
+        }
         scroll.show(ui, |ui| self.piano_grid(ui, t, c));
     }
 
@@ -2275,12 +2390,31 @@ impl App {
         let content = clip.source_length;
         let notes = clip.notes.clone().unwrap_or_default();
         let steps = content.div_ceil(step);
-        let px_per_sample = STEP_PX / step as f32;
+        let step_px = STEP_PX * self.piano_zoom;
+        let px_per_sample = step_px / step as f32;
         let width = KEYS_PX + content as f32 * px_per_sample + 2.0;
         let (area, response) = ui.allocate_exact_size(
             Vec2::new(width.max(ui.available_width()), KEY_HEIGHT * 128.0),
             Sense::click_and_drag(),
         );
+        if response.hovered() {
+            let factor = ui.input(egui::InputState::zoom_delta);
+            if (factor - 1.0).abs() > f32::EPSILON {
+                let old = self.piano_zoom;
+                self.piano_zoom = daw_gui::timeline::piano_zoom(old, factor);
+                let offset = (ui.clip_rect().min.x - area.min.x).max(0.0);
+                let anchor = ui
+                    .input(|i| i.pointer.hover_pos())
+                    .map_or(0.0, |p| p.x - ui.clip_rect().min.x);
+                self.piano_offset = Some(daw_gui::timeline::keyed_zoom_offset(
+                    old,
+                    self.piano_zoom,
+                    offset,
+                    anchor,
+                    KEYS_PX,
+                ));
+            }
+        }
         let painter = ui.painter_at(area);
         let grid_x = area.min.x + KEYS_PX;
         let row_y = |pitch: u8| area.min.y + f32::from(127 - pitch) * KEY_HEIGHT;
@@ -2299,7 +2433,7 @@ impl App {
             }
         }
         for s in 0..=steps.min(100_000) {
-            let x = grid_x + s as f32 * STEP_PX;
+            let x = grid_x + s as f32 * step_px;
             let gray = if s % 16 == 0 {
                 80
             } else if s % 4 == 0 {
@@ -2497,6 +2631,9 @@ impl App {
                 item(ui, "Фейд-аут 10 мс", "", RegionAction::FadeOut);
                 item(ui, "Убрать фейды", "", RegionAction::NoFades);
                 ui.separator();
+                item(ui, "На передний план", "Ctrl+]", RegionAction::Front);
+                item(ui, "На задний план", "Ctrl+[", RegionAction::Back);
+                ui.separator();
                 for stub in ["Переименовать", "Цвет", "Квантизация", "Зациклить"]
                 {
                     ui.add_enabled(false, egui::Button::new(stub));
@@ -2529,6 +2666,9 @@ impl App {
                     self.join_clip(t, c);
                 }
             }
+            Some(a @ (RegionAction::Front | RegionAction::Back)) => {
+                self.reorder_selected(matches!(a, RegionAction::Front));
+            }
             Some(a @ (RegionAction::FadeIn | RegionAction::FadeOut | RegionAction::NoFades)) => {
                 if let Some((t, c)) = selected {
                     self.quick_fade(t, c, a);
@@ -2536,6 +2676,25 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// Puts the selected region above or below the others where they
+    /// overlap (SPEC-040 §2).
+    fn reorder_selected(&mut self, front: bool) {
+        let Some((t, c)) = self.editor.selected_clip else {
+            return;
+        };
+        self.drag = None;
+        let result = if front {
+            self.editor.bring_to_front(t, c)
+        } else {
+            self.editor.send_to_back(t, c)
+        };
+        self.status = match result {
+            Ok(_) if front => "Регион на переднем плане".into(),
+            Ok(_) => "Регион на заднем плане".into(),
+            Err(e) => format!("Ошибка: {e}"),
+        };
     }
 
     /// Joins a clip with the next one on its track (SPEC-038 §5).
@@ -2649,13 +2808,31 @@ impl App {
                     i.consume_key(egui::Modifiers::NONE, Key::K),
                 )
             });
-            let (marker, back, forward) = ctx.input_mut(|i| {
+            let (marker, back, forward, bar_back, bar_forward, enter) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, Key::M),
+                    i.consume_key(egui::Modifiers::ALT, Key::Comma),
+                    i.consume_key(egui::Modifiers::ALT, Key::Period),
                     i.consume_key(egui::Modifiers::NONE, Key::Comma),
                     i.consume_key(egui::Modifiers::NONE, Key::Period),
+                    i.consume_key(egui::Modifiers::NONE, Key::Enter),
                 )
             });
+            let (front, back_layer) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::COMMAND, Key::CloseBracket),
+                    i.consume_key(egui::Modifiers::COMMAND, Key::OpenBracket),
+                )
+            });
+            if front || back_layer {
+                self.reorder_selected(front);
+            }
+            if bar_back || bar_forward {
+                self.step_bar(bar_forward);
+            }
+            if enter {
+                self.rewind();
+            }
             let (mixer, editors, inspector, library, smart, browser) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, Key::X),
