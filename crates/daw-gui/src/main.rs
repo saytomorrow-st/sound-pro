@@ -5,6 +5,7 @@
 // No console window behind the GUI in Windows release builds (SPEC-024).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_editor;
 mod shell;
 
 use std::path::PathBuf;
@@ -321,6 +322,8 @@ struct App {
     pub(crate) tool: Tool,
     /// MIDI clip open in the piano roll.
     piano: Option<(usize, usize)>,
+    /// Audio clip editor (SPEC-039).
+    audio_edit: audio_editor::AudioEdit,
     note_drag: Option<NoteDrag>,
     /// Scroll the piano roll to middle C on the next frame.
     piano_scroll: bool,
@@ -347,6 +350,7 @@ struct App {
     audio_path: Option<PathBuf>,
     /// The audio settings window is open, with the device names last listed.
     audio_open: bool,
+    about_open: bool,
     outputs: Vec<String>,
     inputs: Vec<String>,
     /// Visible panels of the main window (SPEC-034).
@@ -418,6 +422,7 @@ impl App {
             drag: None,
             tool: Tool::Pointer,
             piano: None,
+            audio_edit: audio_editor::AudioEdit::default(),
             note_drag: None,
             piano_scroll: false,
             fx: None,
@@ -432,6 +437,7 @@ impl App {
             audio: AudioSettings::default(),
             audio_path: daw_app::audio_settings::default_path(),
             audio_open: false,
+            about_open: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
             layout: Layout::default(),
@@ -1023,6 +1029,12 @@ impl App {
                     self.duplicate_clip();
                 }
             });
+            ui.menu_button("Справка", |ui| {
+                if ui.button("О программе").clicked() {
+                    self.about_open = true;
+                    ui.close();
+                }
+            });
         });
     }
 
@@ -1579,10 +1591,7 @@ impl App {
                 {
                     clicked = Some((t, c));
                 }
-                if response.double_clicked()
-                    && clip.is_midi()
-                    && pointer.is_some_and(|p| rect.contains(p))
-                {
+                if response.double_clicked() && pointer.is_some_and(|p| rect.contains(p)) {
                     open_piano = Some((t, c));
                 }
             }
@@ -1649,7 +1658,7 @@ impl App {
         }
 
         if let Some(at) = open_piano {
-            self.open_piano(at);
+            self.open_clip_editor(at);
         }
         if !lane_owned && !ruler_owned {
             self.region_menu(&response);
@@ -2180,7 +2189,29 @@ impl App {
         }
     }
 
+    /// Piano roll for a MIDI clip, the audio editor otherwise.
+    fn open_clip_editor(&mut self, at: (usize, usize)) {
+        let midi = self
+            .editor
+            .session()
+            .tracks
+            .get(at.0)
+            .and_then(|track| track.clips.get(at.1))
+            .is_some_and(audio_core::session::Clip::is_midi);
+        if midi {
+            self.open_piano(at);
+        } else {
+            self.open_audio_editor(at);
+        }
+    }
+
+    fn close_piano(&mut self) {
+        self.piano = None;
+        self.note_drag = None;
+    }
+
     fn open_piano(&mut self, at: (usize, usize)) {
+        self.audio_edit = audio_editor::AudioEdit::default();
         self.piano = Some(at);
         self.note_drag = None;
         self.piano_scroll = true;
@@ -2452,8 +2483,10 @@ impl App {
             if selected.is_some() {
                 if midi {
                     item(ui, "Открыть в пиано-ролле", "", RegionAction::Piano);
-                    ui.separator();
+                } else {
+                    item(ui, "Открыть в редакторе", "", RegionAction::Piano);
                 }
+                ui.separator();
                 item(ui, "Копировать", "Ctrl+C", RegionAction::Copy);
                 item(ui, "Вставить", "Ctrl+V", RegionAction::Paste);
                 item(ui, "Дублировать", "Ctrl+D", RegionAction::Duplicate);
@@ -2482,7 +2515,7 @@ impl App {
         match action {
             Some(RegionAction::Piano) => {
                 if let Some(at) = selected {
-                    self.open_piano(at);
+                    self.open_clip_editor(at);
                 }
             }
             Some(RegionAction::Copy) => self.copy_clip(&response.ctx),
@@ -2942,6 +2975,22 @@ impl App {
         self.audio_open = true;
     }
 
+    /// About window: version and third-party credits (SPEC-039).
+    fn about_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("О программе")
+            .id(egui::Id::new("about"))
+            .open(&mut self.about_open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.heading(format!("Sound Pro {}", env!("CARGO_PKG_VERSION")));
+                ui.label("Открытая DAW для Linux и Windows.");
+                ui.separator();
+                ui.label(daw_app::piano::PIANO_CREDIT);
+            });
+    }
+
     /// The audio settings window (SPEC-033): output, input, buffer size.
     fn audio_window(&mut self, ctx: &egui::Context) {
         if !self.audio_open {
@@ -3264,6 +3313,7 @@ impl eframe::App for App {
         self.effects_window(ctx);
         self.buses_window(ctx);
         self.audio_window(ctx);
+        self.about_window(ctx);
 
         if self.confirm_quit {
             egui::Window::new("Несохранённые изменения")

@@ -973,19 +973,30 @@ impl App {
         });
     }
 
-    /// Editor tabs: piano roll of the open MIDI clip, the rest are stubs.
+    /// Editor tabs: piano roll of the open MIDI clip or the audio editor of
+    /// the open audio clip (SPEC-039); Score and Step Sequencer are stubs.
     fn editors(&mut self, ui: &mut egui::Ui) {
+        let audio = self.audio_clip().is_some();
         ui.horizontal(|ui| {
-            let _ = ui.selectable_label(true, "Piano Roll");
+            if ui.selectable_label(!audio, "Piano Roll").clicked() && audio {
+                self.audio_edit = super::audio_editor::AudioEdit::default();
+            }
             placeholder(ui, "Score");
             placeholder(ui, "Step Sequencer");
-            placeholder(ui, "Audio Track");
+            let _ = ui.selectable_label(audio, "Audio Track");
         });
         ui.separator();
-        if self.piano_clip().is_some() {
+        if self.audio_clip().is_some() {
+            self.audio_editor(ui);
+        } else if self.piano_clip().is_some() {
             self.piano_roll(ui);
         } else {
-            ui.label(RichText::new("Дважды щёлкните по MIDI-клипу, чтобы открыть ноты.").weak());
+            ui.label(
+                RichText::new(
+                    "Дважды щёлкните по MIDI-клипу, чтобы открыть ноты, или по аудиоклипу — чтобы открыть волну.",
+                )
+                .weak(),
+            );
         }
     }
 

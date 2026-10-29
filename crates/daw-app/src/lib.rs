@@ -30,6 +30,7 @@ use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
 pub mod audio_file;
 pub mod audio_settings;
 pub mod nodes;
+pub mod piano;
 
 /// Errors from assembling a session graph (SPEC-010).
 ///
@@ -628,15 +629,14 @@ pub fn load_session_cached(
                 let samples = match cache.notes(notes, rate, length) {
                     Some(hit) => hit,
                     None => {
-                        let fresh = std::sync::Arc::new(
-                            audio_core::render_notes(notes, rate, length).map_err(|source| {
-                                LoadError::Synth {
+                        let fresh =
+                            std::sync::Arc::new(piano::render_piano(notes, rate, length).map_err(
+                                |source| LoadError::Synth {
                                     track: track_index,
                                     clip: clip_index,
                                     source,
-                                }
-                            })?,
-                        );
+                                },
+                            )?);
                         cache.store_notes(notes, rate, length, std::sync::Arc::clone(&fresh));
                         fresh
                     }
