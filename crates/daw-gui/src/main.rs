@@ -20,8 +20,8 @@ use daw_gui::{
     snap_to_beat, x_to_samples,
 };
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
-    ViewportCommand,
+    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke,
+    StrokeKind, Vec2, ViewportCommand,
 };
 
 const TRACK_HEIGHT: f32 = 72.0;
@@ -149,25 +149,26 @@ enum TrackAction {
     Duplicate(usize),
 }
 
-/// Display colour of a track; `None` is the neutral default (SPEC-029).
-fn track_color(color: Option<u8>) -> Color32 {
+/// Display colour of the track at `index`; tracks without their own colour
+/// take one from the palette by position (SPEC-029, SPEC-036).
+fn track_color(color: Option<u8>, index: usize) -> Color32 {
     const PALETTE: [Color32; TRACK_COLORS as usize] = [
-        Color32::from_rgb(200, 70, 70),
-        Color32::from_rgb(220, 130, 50),
-        Color32::from_rgb(200, 180, 50),
-        Color32::from_rgb(80, 160, 80),
-        Color32::from_rgb(50, 160, 160),
-        Color32::from_rgb(60, 110, 200),
-        Color32::from_rgb(140, 90, 200),
-        Color32::from_rgb(200, 90, 160),
+        Color32::from_rgb(232, 82, 76),
+        Color32::from_rgb(240, 146, 54),
+        Color32::from_rgb(232, 200, 60),
+        Color32::from_rgb(98, 196, 92),
+        Color32::from_rgb(58, 196, 190),
+        Color32::from_rgb(70, 146, 236),
+        Color32::from_rgb(150, 110, 230),
+        Color32::from_rgb(226, 96, 176),
     ];
-    color
-        .and_then(|c| PALETTE.get(usize::from(c)).copied())
-        .unwrap_or(Color32::from_gray(90))
+    PALETTE[usize::from(daw_gui::layout::display_color(color, index)) % PALETTE.len()]
 }
 
 struct App {
     editor: Editor,
+    /// Frames drawn so far; used by the `SOUND_PRO_SCREENSHOT` self-snapshot.
+    frames: u32,
     #[cfg(feature = "audio")]
     recorder: Option<Recorder>,
     /// Playhead in samples while stopped; the player's position while playing.
@@ -294,6 +295,7 @@ impl App {
             inputs: Vec::new(),
             layout: Layout::default(),
             themed: false,
+            frames: 0,
         };
         if let Some(path) = &app.audio_path {
             app.audio = AudioSettings::load(path);
@@ -873,8 +875,26 @@ impl App {
                     let (mut mute, mut solo) = (track.mute, track.solo);
                     let (mut gain, mut pan) = (track.gain, track.pan);
                     let name = track.name.clone();
+                    let audio = track.clips.iter().any(|c| c.source.is_some());
+                    let color = track_color(track.color, index);
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
+                        let (icon, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                        ui.painter()
+                            .rect_filled(icon, 4.0, color.gamma_multiply(0.35));
+                        ui.painter().rect_stroke(
+                            icon,
+                            4.0,
+                            egui::Stroke::new(1.0_f32, color),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            icon.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if audio { "〰" } else { "♪" },
+                            egui::FontId::proportional(13.0),
+                            color,
+                        );
                         if let Some((_, text)) =
                             self.rename.as_mut().filter(|(track, _)| *track == index)
                         {
@@ -948,27 +968,54 @@ impl App {
                                     self.auto_drag = None;
                                 }
                             }
-                            let s = ui.toggle_value(&mut solo, "S").on_hover_text("Соло");
-                            let m = ui.toggle_value(&mut mute, "M").on_hover_text("Без звука");
-                            if s.changed() || m.changed() {
-                                if let Some(t) = self.editor.track_mut(index) {
-                                    t.mute = mute;
-                                    t.solo = solo;
-                                }
-                            }
                         });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(34.0);
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let m = shell::pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
+                            .on_hover_text("Без звука");
+                        let s = shell::pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
+                            .on_hover_text("Соло");
+                        shell::pill_stub(ui, "R");
+                        shell::pill_stub(ui, "I");
+                        if s.changed() || m.changed() {
+                            if let Some(t) = self.editor.track_mut(index) {
+                                t.mute = mute;
+                                t.solo = solo;
+                            }
+                        }
                     });
                     let automation = &self.editor.session().tracks[index].automation;
                     let (gain_free, pan_free) =
                         (automation.gain.is_empty(), automation.pan.is_empty());
-                    let g = ui.add_enabled(
-                        gain_free,
-                        egui::Slider::new(&mut gain, 0.0..=1.0).text("громк."),
-                    );
-                    let p = ui.add_enabled(
-                        pan_free,
-                        egui::Slider::new(&mut pan, -1.0..=1.0).text("пан."),
-                    );
+                    let (g, p) = ui
+                        .horizontal(|ui| {
+                            ui.add_space(30.0);
+                            ui.spacing_mut().slider_width =
+                                ((ui.available_width() - 60.0) * 0.6).max(40.0);
+                            let g = ui
+                                .add_enabled(
+                                    gain_free,
+                                    egui::Slider::new(&mut gain, 0.0..=1.0).show_value(false),
+                                )
+                                .on_hover_text(format!(
+                                    "Громкость {}",
+                                    daw_gui::layout::db_label(gain)
+                                ));
+                            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(30.0);
+                            let p = ui
+                                .add_enabled(
+                                    pan_free,
+                                    egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false),
+                                )
+                                .on_hover_text(format!(
+                                    "Панорама {}",
+                                    daw_gui::layout::pan_label(pan)
+                                ));
+                            (g, p)
+                        })
+                        .inner;
                     if g.changed() || p.changed() {
                         if let Some(t) = self.editor.track_mut(index) {
                             t.gain = gain;
@@ -980,7 +1027,7 @@ impl App {
             ui.painter().rect_filled(
                 Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height())),
                 0.0,
-                track_color(self.editor.session().tracks[index].color),
+                track_color(self.editor.session().tracks[index].color, index),
             );
             let click = response.interact(Sense::click());
             if click.clicked() {
@@ -993,7 +1040,7 @@ impl App {
                 }
                 ui.menu_button("Цвет", |ui| {
                     for color in 0..TRACK_COLORS {
-                        let swatch = egui::RichText::new("■■■■").color(track_color(Some(color)));
+                        let swatch = egui::RichText::new("■■■■").color(track_color(Some(color), 0));
                         if ui.button(swatch).clicked() {
                             action = Some(TrackAction::Color(index, Some(color)));
                             ui.close();
@@ -1232,42 +1279,52 @@ impl App {
                     Vec2::new(w, TRACK_HEIGHT - 6.0),
                 );
                 let selected = self.editor.selected_clip == Some((t, c));
-                let fill = if track.mute {
-                    Color32::from_rgb(70, 70, 70)
-                } else if track.color.is_some() {
-                    track_color(track.color)
-                } else if clip.is_midi() {
-                    Color32::from_rgb(60, 120, 70)
-                } else {
-                    Color32::from_rgb(44, 96, 140)
-                };
-                painter.rect_filled(rect, 4.0, fill);
+                let base = track_color(track.color, t);
+                let colors =
+                    daw_gui::layout::region_colors([base.r(), base.g(), base.b()], track.mute);
+                let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+                let header_h = 14.0_f32.min(rect.height() * 0.4);
+                painter.rect_filled(rect, 4.0, rgb(colors.body).gamma_multiply(0.92));
+                let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_h));
+                painter.rect_filled(
+                    header,
+                    CornerRadius {
+                        nw: 4,
+                        ne: 4,
+                        sw: 0,
+                        se: 0,
+                    },
+                    rgb(colors.header),
+                );
+                let body = Rect::from_min_max(Pos2::new(rect.min.x, header.max.y), rect.max);
+                let detail = rgb(colors.detail);
                 if let Some(notes) = &clip.notes {
                     let end = clip.offset_samples + clip.length_samples;
+                    let (lo, hi) = notes.iter().fold((127u8, 0u8), |(lo, hi), n| {
+                        (lo.min(n.pitch), hi.max(n.pitch))
+                    });
+                    let span = f32::from(hi.saturating_sub(lo).max(12));
+                    let mid = (f32::from(lo) + f32::from(hi)) / 2.0;
                     for n in notes {
                         if n.start + n.length <= clip.offset_samples || n.start >= end {
                             continue;
                         }
                         let from = n.start.max(clip.offset_samples) - clip.offset_samples;
                         let to = (n.start + n.length).min(end) - clip.offset_samples;
-                        let y =
-                            rect.max.y - 4.0 - f32::from(n.pitch) / 127.0 * (rect.height() - 8.0);
-                        painter.line_segment(
-                            [
-                                Pos2::new(rect.min.x + from as f32 * px_per_sample, y),
-                                Pos2::new(
-                                    (rect.min.x + to as f32 * px_per_sample)
-                                        .max(rect.min.x + from as f32 * px_per_sample + 2.0),
-                                    y,
-                                ),
-                            ],
-                            Stroke::new(2.0_f32, Color32::from_rgb(200, 240, 200)),
+                        let rel = (f32::from(n.pitch) - mid) / span + 0.5;
+                        let y = body.max.y - 5.0 - rel.clamp(0.0, 1.0) * (body.height() - 10.0);
+                        let x0 = rect.min.x + from as f32 * px_per_sample;
+                        let x1 = (rect.min.x + to as f32 * px_per_sample).max(x0 + 2.0);
+                        painter.rect_filled(
+                            Rect::from_min_max(Pos2::new(x0, y - 1.5), Pos2::new(x1, y + 1.5)),
+                            1.0,
+                            detail,
                         );
                     }
                 }
                 if let Some(peaks) = self.editor.peaks(clip) {
-                    let mid = rect.center().y;
-                    let half = rect.height() * 0.4;
+                    let mid = body.center().y;
+                    let half = body.height() * 0.45;
                     let columns = rect.width().ceil() as usize;
                     let per_px = clip.length_samples as f32 / rect.width();
                     for px in 0..columns {
@@ -1280,22 +1337,24 @@ impl App {
                                     Pos2::new(x, mid - hi.clamp(-1.0, 1.0) * half),
                                     Pos2::new(x, mid - lo.clamp(-1.0, 1.0) * half + 1.0),
                                 ],
-                                Stroke::new(1.0_f32, Color32::from_rgb(170, 210, 240)),
+                                Stroke::new(1.0_f32, detail),
                             );
                         }
                     }
                 }
-                painter.text(
-                    rect.min + Vec2::new(4.0, 2.0),
-                    Align2::LEFT_TOP,
-                    &clip.name,
-                    FontId::proportional(12.0),
-                    Color32::WHITE,
-                );
+                painter
+                    .with_clip_rect(header.intersect(painter.clip_rect()))
+                    .text(
+                        rect.min + Vec2::new(5.0, header_h / 2.0),
+                        Align2::LEFT_CENTER,
+                        &clip.name,
+                        FontId::proportional(11.0),
+                        Color32::from_gray(245),
+                    );
                 let border = if selected {
                     Stroke::new(2.0_f32, Color32::from_rgb(255, 200, 60))
                 } else {
-                    Stroke::new(1.0_f32, Color32::from_gray(10))
+                    Stroke::new(1.0_f32, Color32::from_black_alpha(140))
                 };
                 painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
                 rects.push(((t, c), rect));
@@ -2666,12 +2725,45 @@ enum FxAction {
     Set(usize, Effect),
 }
 
+impl App {
+    /// With `SOUND_PRO_SCREENSHOT=path.ppm` set, saves the window as a PPM
+    /// image a few frames after start and then closes it.
+    fn screenshot(&mut self, ctx: &egui::Context) {
+        let Some(path) = std::env::var_os("SOUND_PRO_SCREENSHOT") else {
+            return;
+        };
+        self.frames = self.frames.saturating_add(1);
+        ctx.request_repaint();
+        if self.frames == 20 {
+            ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
+        }
+        let image = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = image {
+            let [w, h] = image.size;
+            let mut out = format!("P6 {w} {h} 255\n").into_bytes();
+            for p in &image.pixels {
+                out.extend_from_slice(&[p.r(), p.g(), p.b()]);
+            }
+            if let Err(e) = std::fs::write(&path, out) {
+                eprintln!("screenshot: {e}");
+            }
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.themed {
             shell::apply_theme(ctx);
             self.themed = true;
         }
+        self.screenshot(ctx);
         self.poll_player(ctx);
         self.poll_recorder(ctx);
         self.poll_imports(ctx);
@@ -2720,7 +2812,8 @@ impl eframe::App for App {
         if self.layout.inspector {
             egui::SidePanel::left("inspector")
                 .resizable(true)
-                .default_width(170.0)
+                .default_width(176.0)
+                .min_width(176.0)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("inspector")

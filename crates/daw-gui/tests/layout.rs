@@ -1,6 +1,9 @@
 //! Acceptance tests for the main window layout (SPEC-034).
 
-use daw_gui::layout::{Bottom, Layout, db_label, lcd_position, pan_label};
+use daw_gui::layout::{
+    Bottom, FADER_FLOOR_DB, Layout, PALETTE_SIZE, db_label, display_color, fader_gain,
+    fader_position, lcd_position, pan_angle, pan_label, region_colors, shade,
+};
 
 const RATE: u32 = 48_000;
 
@@ -78,4 +81,74 @@ fn pan_label_values() {
     assert_eq!(pan_label(0.5), "R32");
     assert_eq!(pan_label(f32::NAN), "C");
     assert_eq!(pan_label(5.0), "R64");
+}
+
+#[test]
+fn tracks_get_palette_colors_by_position() {
+    assert_eq!(display_color(Some(3), 0), 3);
+    assert_eq!(display_color(None, 0), 0);
+    assert_eq!(display_color(None, 5), 5);
+    assert_eq!(display_color(None, 9), 1);
+    assert_eq!(display_color(Some(200), 2), 2);
+    for i in 0..40 {
+        assert!(display_color(None, i) < PALETTE_SIZE);
+    }
+}
+
+#[test]
+fn shade_darkens_and_lightens() {
+    assert_eq!(shade([200, 100, 50], 1.0), [200, 100, 50]);
+    assert_eq!(shade([200, 100, 50], 0.5), [100, 50, 25]);
+    assert_eq!(shade([200, 100, 50], 0.0), [0, 0, 0]);
+    assert_eq!(shade([200, 100, 50], 2.0), [255, 255, 255]);
+    assert_eq!(shade([200, 100, 50], f32::NAN), [200, 100, 50]);
+    assert_eq!(shade([0, 0, 0], 1.5), [128, 128, 128]);
+}
+
+#[test]
+fn region_header_darker_than_body_and_detail_darker_still() {
+    let c = region_colors([80, 160, 220], false);
+    assert_eq!(c.body, [80, 160, 220]);
+    for ch in 0..3 {
+        assert!(c.header[ch] < c.body[ch]);
+        assert!(c.detail[ch] < c.header[ch]);
+    }
+    let muted = region_colors([80, 160, 220], true);
+    assert_eq!(muted.body[0], muted.body[1]);
+    assert_eq!(muted.body[1], muted.body[2]);
+}
+
+#[test]
+fn fader_uses_decibel_scale() {
+    assert!((fader_position(1.0) - 1.0).abs() < 1e-6);
+    assert!(fader_position(0.0).abs() < 1e-6);
+    assert!(fader_position(f32::NAN).abs() < 1e-6);
+    assert!((fader_position(2.0) - 1.0).abs() < 1e-6);
+    let minus6 = fader_position(0.5);
+    assert!((minus6 - 0.9).abs() < 0.01, "{minus6}");
+    let floor = 10f32.powf(FADER_FLOOR_DB / 20.0);
+    assert!(fader_position(floor * 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn fader_gain_inverts_position() {
+    assert!(fader_gain(0.0).abs() < 1e-9);
+    assert!((fader_gain(1.0) - 1.0).abs() < 1e-6);
+    assert!(fader_gain(f32::NAN).abs() < 1e-9);
+    for gain in [0.01_f32, 0.1, 0.25, 0.5, 0.8, 1.0] {
+        let back = fader_gain(fader_position(gain));
+        assert!(
+            (back - gain).abs() < 1e-4 * gain.max(0.01),
+            "{gain} -> {back}"
+        );
+    }
+}
+
+#[test]
+fn pan_knob_angle() {
+    assert!(pan_angle(0.0).abs() < 1e-6);
+    assert!((pan_angle(-1.0) + 135f32.to_radians()).abs() < 1e-6);
+    assert!((pan_angle(1.0) - 135f32.to_radians()).abs() < 1e-6);
+    assert!((pan_angle(9.0) - 135f32.to_radians()).abs() < 1e-6);
+    assert!(pan_angle(f32::NAN).abs() < 1e-6);
 }

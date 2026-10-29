@@ -2,7 +2,9 @@
 //! with position display, library, inspector, browser and the bottom area
 //! with mixer, editor and smart controls. Placeholders are marked as such.
 
-use daw_gui::layout::{Bottom, db_label, lcd_position, pan_label};
+use daw_gui::layout::{
+    Bottom, db_label, fader_gain, fader_position, lcd_position, pan_angle, pan_label,
+};
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Stroke, Vec2};
 
 use super::{App, FxTarget, PIANO_HEIGHT, effect_title, track_color};
@@ -41,7 +43,230 @@ fn lcd_cell(ui: &mut egui::Ui, value: &str, caption: &str) {
 
 fn placeholder(ui: &mut egui::Ui, text: &str) {
     ui.add_enabled(false, egui::Button::new(text))
-        .on_disabled_hover_text("Заглушка: появится позже");
+        .on_disabled_hover_text("Скоро");
+}
+
+/// Greyed slot of a channel strip for a feature that is not ready yet.
+fn stub_slot(ui: &mut egui::Ui, text: &str) {
+    ui.add_enabled(
+        false,
+        egui::Button::new(RichText::new(text).size(10.0))
+            .min_size(Vec2::new(ui.available_width(), 16.0))
+            .corner_radius(CornerRadius::same(3)),
+    )
+    .on_disabled_hover_text("Скоро");
+}
+
+/// Small caption over a group of strip slots.
+fn strip_caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(9.0).color(Color32::from_gray(130)));
+}
+
+/// Rounded toggle like the M/S/R/I buttons of the reference.
+pub(crate) fn pill(ui: &mut egui::Ui, on: &mut bool, text: &str, color: Color32) -> egui::Response {
+    let size = Vec2::new(20.0, 15.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let hovered = response.hovered();
+    let (fill, ink) = if *on {
+        (color, Color32::BLACK)
+    } else if hovered {
+        (Color32::from_gray(80), Color32::from_gray(220))
+    } else {
+        (Color32::from_gray(62), Color32::from_gray(190))
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(4), fill);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(10.0),
+        ink,
+    );
+    response
+}
+
+/// Disabled rounded button with the same look as [`pill`].
+pub(crate) fn pill_stub(ui: &mut egui::Ui, text: &str) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(20.0, 15.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(4), Color32::from_gray(48));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(10.0),
+        Color32::from_gray(100),
+    );
+    response.on_hover_text("Скоро");
+}
+
+/// Drawn pan knob; dragging up/right turns it clockwise.
+fn pan_knob(ui: &mut egui::Ui, pan: &mut f32, enabled: bool) -> egui::Response {
+    let size = Vec2::splat(30.0);
+    let sense = if enabled {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    let (rect, mut response) = ui.allocate_exact_size(size, sense);
+    if response.dragged() {
+        let d = response.drag_delta();
+        *pan = (*pan + (d.x - d.y) * 0.01).clamp(-1.0, 1.0);
+        response.mark_changed();
+    }
+    if response.double_clicked() {
+        *pan = 0.0;
+        response.mark_changed();
+    }
+    let painter = ui.painter();
+    let c = rect.center();
+    let r = 12.0;
+    painter.circle_filled(c, r, Color32::from_gray(30));
+    painter.circle_stroke(c, r, Stroke::new(1.0_f32, Color32::from_gray(90)));
+    let angle = pan_angle(*pan);
+    let start = 0.0_f32;
+    let arc = |a: f32| c + Vec2::new(a.sin(), -a.cos()) * (r - 2.0);
+    let steps = 12;
+    #[allow(clippy::cast_precision_loss)]
+    let points: Vec<egui::Pos2> = (0..=steps)
+        .map(|i| arc(start + (angle - start) * i as f32 / steps as f32))
+        .collect();
+    let accent = if enabled {
+        Color32::from_rgb(90, 170, 255)
+    } else {
+        Color32::from_gray(110)
+    };
+    painter.add(egui::Shape::line(points, Stroke::new(2.5_f32, accent)));
+    painter.line_segment([c, arc(angle)], Stroke::new(2.0_f32, Color32::WHITE));
+    response.on_hover_text(format!(
+        "Панорама {}  (двойной щелчок — центр)",
+        pan_label(*pan)
+    ))
+}
+
+/// Drawn volume fader with a decorative level meter on the left.
+fn fader(
+    ui: &mut egui::Ui,
+    gain: &mut f32,
+    enabled: bool,
+    height: f32,
+    level: f32,
+) -> egui::Response {
+    let size = Vec2::new(40.0, height);
+    let sense = if enabled {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    let (rect, mut response) = ui.allocate_exact_size(size, sense);
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rect.center().x + 3.0, rect.top() + 6.0),
+        egui::pos2(rect.center().x + 7.0, rect.bottom() - 6.0),
+    );
+    if response.dragged() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let p = 1.0 - (pos.y - track.top()) / track.height();
+            *gain = fader_gain(p.clamp(0.0, 1.0));
+            response.mark_changed();
+        }
+    }
+    if response.double_clicked() {
+        *gain = 1.0;
+        response.mark_changed();
+    }
+    let painter = ui.painter();
+    let meter = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 4.0, track.top()),
+        egui::pos2(rect.left() + 10.0, track.bottom()),
+    );
+    painter.rect_filled(meter, CornerRadius::same(1), Color32::from_gray(20));
+    let lit = meter.height() * level.clamp(0.0, 1.0);
+    if lit > 0.0 {
+        let fill =
+            egui::Rect::from_min_max(egui::pos2(meter.left(), meter.bottom() - lit), meter.max);
+        painter.rect_filled(fill, CornerRadius::same(1), Color32::from_rgb(80, 210, 90));
+    }
+    for db in [0.0_f32, -6.0, -12.0, -24.0, -40.0] {
+        let y = track.bottom() - track.height() * fader_position(10f32.powf(db / 20.0));
+        painter.line_segment(
+            [
+                egui::pos2(meter.right() + 2.0, y),
+                egui::pos2(track.left() - 2.0, y),
+            ],
+            Stroke::new(1.0_f32, Color32::from_gray(80)),
+        );
+    }
+    painter.rect_filled(track, CornerRadius::same(2), Color32::from_gray(18));
+    let y = track.bottom() - track.height() * fader_position(*gain);
+    let cap = egui::Rect::from_center_size(egui::pos2(track.center().x, y), Vec2::new(22.0, 12.0));
+    let cap_fill = if enabled {
+        Color32::from_gray(200)
+    } else {
+        Color32::from_gray(110)
+    };
+    painter.rect_filled(cap, CornerRadius::same(2), cap_fill);
+    painter.line_segment(
+        [
+            egui::pos2(cap.left() + 2.0, y),
+            egui::pos2(cap.right() - 2.0, y),
+        ],
+        Stroke::new(1.0_f32, Color32::from_gray(40)),
+    );
+    response.on_hover_text(format!(
+        "Громкость {}  (двойной щелчок — 0 dB)",
+        db_label(*gain)
+    ))
+}
+
+/// Greyed EQ thumbnail (the channel EQ is not ready yet).
+fn eq_thumb(ui: &mut egui::Ui) {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(3), Color32::from_gray(26));
+    let mid = rect.center().y;
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 3.0, mid),
+            egui::pos2(rect.right() - 3.0, mid),
+        ],
+        Stroke::new(1.0_f32, Color32::from_gray(80)),
+    );
+    painter.text(
+        rect.right_top() + Vec2::new(-3.0, 2.0),
+        egui::Align2::RIGHT_TOP,
+        "EQ",
+        egui::FontId::proportional(8.0),
+        Color32::from_gray(90),
+    );
+    response.on_hover_text("Эквалайзер: скоро");
+}
+
+/// Coloured name plate at the bottom of a strip.
+fn name_plate(ui: &mut egui::Ui, name: &str, color: Color32) {
+    egui::Frame::new()
+        .fill(color)
+        .corner_radius(CornerRadius::same(3))
+        .inner_margin(2.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(name)
+                            .size(11.0)
+                            .strong()
+                            .color(Color32::BLACK),
+                    )
+                    .truncate(),
+                );
+            });
+        });
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -72,43 +297,88 @@ impl App {
             bottom_button(ui, Bottom::SmartControls, "🎛", "Быстрые регуляторы (B)");
             bottom_button(ui, Bottom::Mixer, "🎚", "Микшер (X)");
             bottom_button(ui, Bottom::Editor, "✏", "Редактор нот (E)");
-            ui.separator();
-            self.transport_buttons(ui);
-            ui.separator();
-            self.lcd(ui);
-            ui.separator();
-            self.mode_buttons(ui);
+            let full = ui.max_rect();
+            let center_width = 640.0_f32.min(full.width());
+            let center = egui::Rect::from_center_size(
+                egui::pos2(full.center().x, full.center().y),
+                Vec2::new(center_width, full.height()),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(center)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    self.transport_buttons(ui);
+                    ui.add_space(6.0);
+                    self.lcd(ui);
+                    ui.add_space(6.0);
+                    self.mode_buttons(ui);
+                },
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.toggle_value(&mut self.layout.browser, "🗁")
                     .on_hover_text("Браузер файлов (F)");
                 placeholder(ui, "📝");
-                placeholder(ui, "♫ Loops");
+                placeholder(ui, "♫");
+                placeholder(ui, "☰");
             });
         });
     }
 
     fn transport_buttons(&mut self, ui: &mut egui::Ui) {
-        if ui.button("⏮").on_hover_text("В начало (Home)").clicked() {
+        let big = |t: &str| RichText::new(t).size(15.0);
+        if ui
+            .add(egui::Button::new(big("⏮")).min_size(Vec2::new(28.0, 24.0)))
+            .on_hover_text("В начало (Home)")
+            .clicked()
+        {
             self.rewind();
         }
-        let label = if self.is_playing() { "⏸" } else { "▶" };
+        ui.add_enabled(
+            false,
+            egui::Button::new(big("⏪")).min_size(Vec2::new(28.0, 24.0)),
+        )
+        .on_disabled_hover_text("Скоро");
+        ui.add_enabled(
+            false,
+            egui::Button::new(big("⏩")).min_size(Vec2::new(28.0, 24.0)),
+        )
+        .on_disabled_hover_text("Скоро");
         if ui
-            .add(egui::Button::new(RichText::new(label).size(16.0)).selected(self.is_playing()))
+            .add(egui::Button::new(big("⏹")).min_size(Vec2::new(28.0, 24.0)))
+            .on_hover_text("Стоп")
+            .clicked()
+        {
+            self.stop();
+        }
+        let play = RichText::new("▶").size(15.0).color(if self.is_playing() {
+            Color32::from_rgb(90, 220, 110)
+        } else {
+            Color32::from_gray(220)
+        });
+        if ui
+            .add(
+                egui::Button::new(play)
+                    .selected(self.is_playing())
+                    .min_size(Vec2::new(28.0, 24.0)),
+            )
             .on_hover_text("Играть / пауза (пробел)")
             .clicked()
         {
             self.toggle_play();
         }
-        if ui.button("⏹").on_hover_text("Стоп").clicked() {
-            self.stop();
-        }
-        let rec = RichText::new("⏺").color(if self.is_recording() {
+        let rec = RichText::new("⏺").size(15.0).color(if self.is_recording() {
             Color32::RED
         } else {
-            Color32::from_rgb(200, 80, 80)
+            Color32::from_rgb(220, 70, 70)
         });
         if ui
-            .add(egui::Button::new(rec).selected(self.is_recording()))
+            .add(
+                egui::Button::new(rec)
+                    .selected(self.is_recording())
+                    .min_size(Vec2::new(28.0, 24.0)),
+            )
             .on_hover_text("Запись с микрофона (R)")
             .clicked()
         {
@@ -120,8 +390,9 @@ impl App {
     fn lcd(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new()
             .fill(LCD_BG)
-            .corner_radius(CornerRadius::same(4))
-            .inner_margin(egui::Margin::symmetric(10, 2))
+            .corner_radius(CornerRadius::same(8))
+            .stroke(Stroke::new(1.0_f32, Color32::from_gray(60)))
+            .inner_margin(egui::Margin::symmetric(12, 2))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let session = self.editor.session();
@@ -167,8 +438,8 @@ impl App {
         {
             self.toggle_cycle();
         }
-        placeholder(ui, "Tuner");
-        placeholder(ui, "Count-in");
+        placeholder(ui, "🎤");
+        placeholder(ui, "1234");
         let click = egui::Button::new("🎵").selected(self.editor.metronome);
         if ui.add(click).on_hover_text("Метроном (K)").clicked() {
             self.toggle_metronome();
@@ -267,18 +538,22 @@ impl App {
         egui::CollapsingHeader::new("Регион")
             .default_open(false)
             .show(ui, |ui| {
-                ui.label("Без петли, транспонирование 0");
-                ui.label(RichText::new("(заглушка)").weak());
+                ui.label(RichText::new("Петля, транспонирование: скоро").weak());
             });
-        ui.label(
-            RichText::new(format!(
-                "Дорожка: {}",
-                self.editor.session().tracks[index].name
-            ))
-            .strong(),
-        );
+        egui::CollapsingHeader::new(
+            RichText::new(&self.editor.session().tracks[index].name).strong(),
+        )
+        .id_salt("inspector_track")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(RichText::new("Параметры дорожки: скоро").weak());
+        });
         ui.add_space(4.0);
-        self.channel_strip(ui, index, true);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            self.channel_strip(ui, index, true);
+            self.master_strip(ui, 150.0);
+        });
     }
 
     /// One channel strip; `full` adds effect slots and sends.
@@ -287,52 +562,54 @@ impl App {
         let track = self.editor.session().tracks[index].clone();
         let selected = self.editor.selected_track == Some(index);
         let fill = if selected {
-            Color32::from_gray(58)
+            Color32::from_gray(56)
         } else {
-            Color32::from_gray(46)
+            Color32::from_gray(44)
         };
+        let playing = self.is_playing();
         let response = egui::Frame::new()
             .fill(fill)
-            .corner_radius(CornerRadius::same(3))
+            .stroke(Stroke::new(1.0_f32, Color32::from_gray(28)))
+            .corner_radius(CornerRadius::same(4))
             .inner_margin(4.0)
             .show(ui, |ui| {
-                ui.set_width(if full {
-                    ui.available_width()
-                } else {
-                    STRIP_WIDTH
-                });
+                ui.set_width(STRIP_WIDTH);
+                ui.spacing_mut().item_spacing.y = 3.0;
                 ui.vertical_centered(|ui| {
-                    ui.add_enabled(false, egui::Button::new("Settings").small())
-                        .on_disabled_hover_text("Заглушка");
-                    ui.add_enabled(false, egui::Button::new("EQ").small())
-                        .on_disabled_hover_text("Заглушка");
+                    stub_slot(ui, "Settings");
+                    eq_thumb(ui);
                     if full {
-                        ui.label(RichText::new("Audio FX").size(10.0).weak());
+                        strip_caption(ui, "MIDI FX");
+                        stub_slot(ui, "");
+                        strip_caption(ui, "Audio FX");
                         for effect in &track.effects {
-                            let text = if effect.bypass {
-                                format!("({})", effect_title(&effect.kind))
+                            let title = effect_title(&effect.kind);
+                            let color = if effect.bypass {
+                                Color32::from_gray(120)
                             } else {
-                                effect_title(&effect.kind).to_owned()
+                                Color32::from_rgb(150, 200, 255)
                             };
-                            if ui.button(text).clicked() {
+                            let button =
+                                egui::Button::new(RichText::new(title).size(10.0).color(color))
+                                    .min_size(Vec2::new(ui.available_width(), 16.0))
+                                    .fill(Color32::from_gray(30));
+                            if ui.add(button).clicked() {
                                 self.fx = Some(FxTarget::Track(index));
                             }
                         }
-                        if ui
-                            .small_button("+")
-                            .on_hover_text("Добавить эффект")
-                            .clicked()
-                        {
+                        let add = egui::Button::new(RichText::new("+").size(10.0))
+                            .min_size(Vec2::new(ui.available_width(), 16.0));
+                        if ui.add(add).on_hover_text("Добавить эффект").clicked() {
                             self.fx = Some(FxTarget::Track(index));
                         }
-                        ui.label(RichText::new("Sends").size(10.0).weak());
+                        strip_caption(ui, "Sends");
                         let buses = self.editor.session().buses.clone();
                         for (bus, b) in buses.iter().enumerate() {
                             let mut level = track.send_level(bus);
                             if ui
                                 .add(
                                     egui::Slider::new(&mut level, 0.0..=1.0)
-                                        .text(&b.name)
+                                        .text(RichText::new(&b.name).size(9.0))
                                         .show_value(false),
                                 )
                                 .changed()
@@ -340,39 +617,48 @@ impl App {
                                 let _ = self.editor.set_send(index, bus, level);
                             }
                         }
-                        if buses.is_empty() && ui.small_button("+ шина").clicked() {
+                        let add = egui::Button::new(RichText::new("+ шина").size(10.0))
+                            .min_size(Vec2::new(ui.available_width(), 16.0));
+                        if ui.add(add).clicked() {
                             self.buses_open = true;
                         }
-                        ui.label(RichText::new("Stereo Out").size(10.0).weak());
+                        strip_caption(ui, "Output");
+                        stub_slot(ui, "Stereo Out");
                     } else {
                         let count = track.effects.len();
                         let label = if count == 0 {
-                            "FX".to_owned()
+                            "Audio FX".to_owned()
                         } else {
-                            format!("FX {count}")
+                            format!("FX ×{count}")
                         };
-                        if ui.small_button(label).clicked() {
+                        let button = egui::Button::new(RichText::new(label).size(10.0))
+                            .min_size(Vec2::new(ui.available_width(), 16.0));
+                        if ui.add(button).clicked() {
                             self.fx = Some(FxTarget::Track(index));
                         }
                     }
+                    ui.add_space(2.0);
                     let mut pan = track.pan;
-                    let p = ui.add_enabled(
-                        track.automation.pan.is_empty(),
-                        egui::DragValue::new(&mut pan)
-                            .range(-1.0..=1.0)
-                            .speed(0.01)
-                            .custom_formatter(|v, _| {
-                                #[allow(clippy::cast_possible_truncation)]
-                                pan_label(v as f32)
-                            }),
+                    let p = pan_knob(ui, &mut pan, track.automation.pan.is_empty());
+                    ui.label(
+                        RichText::new(db_label(track.gain))
+                            .monospace()
+                            .size(10.0)
+                            .color(Color32::from_gray(210)),
                     );
-                    ui.label(RichText::new(db_label(track.gain)).monospace().size(11.0));
                     let mut gain = track.gain;
-                    let g = ui.add_enabled(
+                    let level = if playing && !track.mute {
+                        fader_position(gain) * 0.85
+                    } else {
+                        0.0
+                    };
+                    let height = if full { 150.0 } else { 130.0 };
+                    let g = fader(
+                        ui,
+                        &mut gain,
                         track.automation.gain.is_empty(),
-                        egui::Slider::new(&mut gain, 0.0..=1.0)
-                            .vertical()
-                            .show_value(false),
+                        height,
+                        level,
                     );
                     if g.changed() || p.changed() {
                         if let Some(t) = self.editor.track_mut(index) {
@@ -382,8 +668,12 @@ impl App {
                     }
                     let (mut mute, mut solo) = (track.mute, track.solo);
                     ui.horizontal(|ui| {
-                        let m = ui.toggle_value(&mut mute, "M").on_hover_text("Без звука");
-                        let s = ui.toggle_value(&mut solo, "S").on_hover_text("Соло");
+                        ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let m = pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
+                            .on_hover_text("Без звука");
+                        let s = pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
+                            .on_hover_text("Соло");
                         if m.changed() || s.changed() {
                             if let Some(t) = self.editor.track_mut(index) {
                                 t.mute = mute;
@@ -391,15 +681,7 @@ impl App {
                             }
                         }
                     });
-                    let name = RichText::new(&track.name).size(11.0).color(Color32::BLACK);
-                    egui::Frame::new()
-                        .fill(track_color(track.color).gamma_multiply(1.4))
-                        .corner_radius(CornerRadius::same(2))
-                        .inner_margin(2.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(egui::Label::new(name).truncate());
-                        });
+                    name_plate(ui, &track.name, track_color(track.color, index));
                 });
             })
             .response;
@@ -408,63 +690,92 @@ impl App {
         }
     }
 
-    /// Master channel strip at the right of the mixer.
-    fn master_strip(&mut self, ui: &mut egui::Ui) {
+    /// Master channel strip (Stereo Out).
+    fn master_strip(&mut self, ui: &mut egui::Ui, height: f32) {
+        let playing = self.is_playing();
         egui::Frame::new()
-            .fill(Color32::from_gray(50))
-            .corner_radius(CornerRadius::same(3))
+            .fill(Color32::from_gray(48))
+            .stroke(Stroke::new(1.0_f32, Color32::from_gray(28)))
+            .corner_radius(CornerRadius::same(4))
             .inner_margin(4.0)
             .show(ui, |ui| {
                 ui.set_width(STRIP_WIDTH);
+                ui.spacing_mut().item_spacing.y = 3.0;
                 ui.vertical_centered(|ui| {
+                    stub_slot(ui, "Settings");
+                    eq_thumb(ui);
+                    strip_caption(ui, "Audio FX");
+                    stub_slot(ui, "");
+                    ui.add_space(34.0);
                     let mut master = self.editor.session().master_gain;
-                    ui.label(RichText::new(db_label(master)).monospace().size(11.0));
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut master, 0.0..=1.0)
-                                .vertical()
-                                .show_value(false),
-                        )
-                        .changed()
-                    {
+                    ui.label(
+                        RichText::new(db_label(master))
+                            .monospace()
+                            .size(10.0)
+                            .color(Color32::from_gray(210)),
+                    );
+                    let level = if playing {
+                        fader_position(master) * 0.85
+                    } else {
+                        0.0
+                    };
+                    if fader(ui, &mut master, true, height, level).changed() {
                         self.editor.set_master_gain(master);
                     }
-                    ui.label(RichText::new("Stereo Out").strong().size(11.0));
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        pill_stub(ui, "M");
+                        pill_stub(ui, "D");
+                    });
+                    name_plate(ui, "Stereo Out", Color32::from_gray(170));
                 });
             });
     }
 
     fn bus_strip(&mut self, ui: &mut egui::Ui, index: usize) {
         let bus = self.editor.session().buses[index].clone();
+        let playing = self.is_playing();
         egui::Frame::new()
-            .fill(Color32::from_gray(44))
-            .corner_radius(CornerRadius::same(3))
+            .fill(Color32::from_gray(42))
+            .stroke(Stroke::new(1.0_f32, Color32::from_gray(28)))
+            .corner_radius(CornerRadius::same(4))
             .inner_margin(4.0)
             .show(ui, |ui| {
                 ui.set_width(STRIP_WIDTH);
+                ui.spacing_mut().item_spacing.y = 3.0;
                 ui.vertical_centered(|ui| {
+                    stub_slot(ui, "Settings");
+                    eq_thumb(ui);
                     let count = bus.effects.len();
                     let label = if count == 0 {
-                        "FX".to_owned()
+                        "Audio FX".to_owned()
                     } else {
-                        format!("FX {count}")
+                        format!("FX ×{count}")
                     };
-                    if ui.small_button(label).clicked() {
+                    let button = egui::Button::new(RichText::new(label).size(10.0))
+                        .min_size(Vec2::new(ui.available_width(), 16.0));
+                    if ui.add(button).clicked() {
                         self.fx = Some(FxTarget::Bus(index));
                     }
+                    ui.add_space(34.0);
                     let mut gain = bus.gain;
-                    ui.label(RichText::new(db_label(gain)).monospace().size(11.0));
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut gain, 0.0..=1.0)
-                                .vertical()
-                                .show_value(false),
-                        )
-                        .changed()
-                    {
+                    ui.label(
+                        RichText::new(db_label(gain))
+                            .monospace()
+                            .size(10.0)
+                            .color(Color32::from_gray(210)),
+                    );
+                    let level = if playing {
+                        fader_position(gain) * 0.6
+                    } else {
+                        0.0
+                    };
+                    if fader(ui, &mut gain, true, 130.0, level).changed() {
                         let _ = self.editor.set_bus_gain(index, gain);
                     }
-                    ui.add(egui::Label::new(RichText::new(&bus.name).size(11.0)).truncate());
+                    ui.add_space(18.0);
+                    name_plate(ui, &bus.name, Color32::from_rgb(140, 150, 170));
                 });
             });
     }
@@ -491,7 +802,7 @@ impl App {
                     for index in 0..self.editor.session().buses.len() {
                         self.bus_strip(ui, index);
                     }
-                    self.master_strip(ui);
+                    self.master_strip(ui, 130.0);
                 });
             });
     }
