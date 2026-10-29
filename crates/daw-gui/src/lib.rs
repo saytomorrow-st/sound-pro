@@ -63,7 +63,15 @@ pub enum EditorError {
         /// Decoder error.
         source: audio_core::WavError,
     },
-    /// The WAV file holds no audio.
+    /// The MP3 file could not be decoded (SPEC-032).
+    #[error("{path}: {message}")]
+    Decode {
+        /// File path.
+        path: PathBuf,
+        /// Decoder message.
+        message: String,
+    },
+    /// The file holds no audio.
     #[error("{path}: the file has no audio")]
     EmptyFile {
         /// File path.
@@ -319,6 +327,24 @@ impl Editor {
     ///
     /// File and limit errors (see [`EditorError`]); `self` is unchanged.
     pub fn import_wav(&mut self, path: &Path) -> Result<(usize, usize), EditorError> {
+        self.import_audio_at(path, self.selected_track, None)
+    }
+
+    /// Puts a WAV or MP3 file on `track` at `start` (SPEC-032 drag and drop).
+    ///
+    /// `track = None` (or past the last track) makes a new track named
+    /// after the file; `start = None` places the clip after the track's last
+    /// clip. One undo step; the new clip is selected.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Editor::import_wav`]; nothing changes on error.
+    pub fn import_audio_at(
+        &mut self,
+        path: &Path,
+        track: Option<usize>,
+        start: Option<u64>,
+    ) -> Result<(usize, usize), EditorError> {
         let path = std::path::absolute(path).map_err(|source| EditorError::Read {
             path: path.to_path_buf(),
             source,
@@ -333,7 +359,7 @@ impl Editor {
         }
         let name = clip_name(&path);
         let mut session = self.project.session.clone();
-        let track_index = match self.selected_track.filter(|&t| t < session.tracks.len()) {
+        let track_index = match track.filter(|&t| t < session.tracks.len()) {
             Some(t) => t,
             None => {
                 session.tracks.push(Track::new(&name));
@@ -348,7 +374,7 @@ impl Editor {
             }
             .into());
         }
-        let mut clip = Clip::full(track.length_samples(), peaks.frames);
+        let mut clip = Clip::full(start.unwrap_or(track.length_samples()), peaks.frames);
         clip.name = name;
         clip.source = Some(source.clone());
         track.clips.push(clip);
@@ -361,6 +387,36 @@ impl Editor {
         self.selected_clip = Some((track_index, clip_index));
         self.dirty = true;
         Ok((track_index, clip_index))
+    }
+
+    /// Drops audio files on the timeline (SPEC-032).
+    ///
+    /// Files that are not WAV or MP3 are skipped. The first audio file goes
+    /// on `track` at `start` (a new track when `track` is `None`); the rest
+    /// follow it on the same track. Returns the number of clips added and
+    /// the first error, after which the remaining files are not imported.
+    pub fn drop_audio_files(
+        &mut self,
+        paths: &[PathBuf],
+        track: Option<usize>,
+        start: u64,
+    ) -> (usize, Option<EditorError>) {
+        let mut added = 0;
+        let mut target = track;
+        for path in paths
+            .iter()
+            .filter(|p| daw_app::audio_file::is_audio_file(p))
+        {
+            let at = (added == 0).then_some(start);
+            match self.import_audio_at(path, target, at) {
+                Ok((t, _)) => {
+                    target = Some(t);
+                    added += 1;
+                }
+                Err(e) => return (added, Some(e)),
+            }
+        }
+        (added, None)
     }
 
     /// Adds a microphone take as a clip at `start` (SPEC-020).
@@ -1791,38 +1847,25 @@ pub fn bars_in(samples: u64, rate: u32, tempo_bpm: f64, beats_per_bar: u32) -> S
     format!("{}.{}", beat / per_bar + 1, beat % per_bar + 1)
 }
 
-/// Reads a WAV file as peaks of its mono average at `rate` (SPEC-019).
+/// Reads a WAV or MP3 file as peaks of its mono average at `rate`
+/// (SPEC-019, SPEC-032).
 fn read_mono(path: &Path, rate: u32) -> Result<Peaks, EditorError> {
-    let (spec, buffer) = audio_core::wav::read_wav_mono(path).map_err(|source| match source {
-        audio_core::WavError::Empty => EditorError::EmptyFile {
-            path: path.to_path_buf(),
-        },
-        source => EditorError::Wav {
-            path: path.to_path_buf(),
-            source,
-        },
-    })?;
-    let channels = buffer.channels().max(1);
-    let mut mono = buffer.channel(0).to_vec();
-    for ch in 1..channels {
-        for (out, sample) in mono.iter_mut().zip(buffer.channel(ch)) {
-            *out += sample;
-        }
-    }
-    if channels > 1 {
-        #[allow(clippy::cast_precision_loss)]
-        let scale = 1.0 / channels as f32;
-        for out in &mut mono {
-            *out *= scale;
-        }
-    }
-    if spec.sample_rate != rate {
-        mono = audio_core::resample(&mono, spec.sample_rate, rate).map_err(|_| {
+    use daw_app::audio_file::AudioFileError;
+    let mono = daw_app::audio_file::read_mono_at(path, rate).map_err(|e| match e {
+        AudioFileError::Empty | AudioFileError::Wav(audio_core::WavError::Empty) => {
             EditorError::EmptyFile {
                 path: path.to_path_buf(),
             }
-        })?;
-    }
+        }
+        AudioFileError::Wav(source) => EditorError::Wav {
+            path: path.to_path_buf(),
+            source,
+        },
+        AudioFileError::Mp3(message) => EditorError::Decode {
+            path: path.to_path_buf(),
+            message,
+        },
+    })?;
     Ok(Peaks::from_samples(&mono))
 }
 

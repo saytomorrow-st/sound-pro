@@ -27,6 +27,7 @@ use audio_core::synth::{Envelope, Synth};
 use audio_core::transport::{DEFAULT_SAMPLE_RATE, Transport, TransportCommand};
 use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
 
+pub mod audio_file;
 pub mod nodes;
 
 /// Errors from assembling a session graph (SPEC-010).
@@ -479,6 +480,14 @@ pub enum LoadError {
         /// Underlying error.
         source: audio_core::WavError,
     },
+    /// A clip's MP3 file could not be decoded (SPEC-032).
+    #[error("{path}: {message}")]
+    Decode {
+        /// Resolved file path.
+        path: PathBuf,
+        /// Decoder message.
+        message: String,
+    },
     /// A MIDI clip's notes could not be rendered (SPEC-021).
     #[error("track {track} clip {clip}: {source}")]
     Synth {
@@ -596,25 +605,14 @@ fn load_clip_file(
         path: path.to_path_buf(),
         source,
     };
-    let (spec, buffer) = audio_core::wav::read_wav_mono(path).map_err(wav_error)?;
-    let channels = usize::from(spec.channels).max(1);
-    let mut mono = buffer.channel(0).to_vec();
-    if channels > 1 {
-        for ch in 1..channels {
-            for (out, sample) in mono.iter_mut().zip(buffer.channel(ch)) {
-                *out += sample;
-            }
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let scale = 1.0 / channels as f32;
-        for out in &mut mono {
-            *out *= scale;
-        }
-    }
-    if spec.sample_rate != sample_rate {
-        mono = audio_core::resample(&mono, spec.sample_rate, sample_rate)
-            .map_err(|_| wav_error(audio_core::WavError::Empty))?;
-    }
+    let mono = audio_file::read_mono_at(path, sample_rate).map_err(|e| match e {
+        audio_file::AudioFileError::Wav(source) => wav_error(source),
+        audio_file::AudioFileError::Empty => wav_error(audio_core::WavError::Empty),
+        audio_file::AudioFileError::Mp3(message) => LoadError::Decode {
+            path: path.to_path_buf(),
+            message,
+        },
+    })?;
     let file_frames = mono.len() as u64;
     if file_frames < source_length {
         return Err(LoadError::SourceTooShort {
@@ -623,6 +621,7 @@ fn load_clip_file(
             source_length,
         });
     }
+    let mut mono = mono;
     // `source_length <= mono.len()`, so it fits in usize.
     #[allow(clippy::cast_possible_truncation)]
     mono.truncate(source_length as usize);
