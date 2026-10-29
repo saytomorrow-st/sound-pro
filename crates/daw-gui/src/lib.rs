@@ -123,6 +123,10 @@ pub enum EditorError {
     /// A split point must lie strictly inside the clip (SPEC-027).
     #[error("the split point is outside the clip")]
     SplitOutside,
+    /// The clip has no next clip, or the two cannot form one region
+    /// (SPEC-038).
+    #[error("these clips cannot be joined")]
+    CannotJoin,
     /// Nothing has been copied yet (SPEC-027).
     #[error("nothing to paste")]
     EmptyClipboard,
@@ -228,6 +232,8 @@ pub struct Editor {
     pub metronome: bool,
     /// Clip copied with [`Self::copy_clip`]; not saved (SPEC-027).
     clipboard: Option<Clip>,
+    /// Track armed for recording; not saved (SPEC-038).
+    armed: Option<usize>,
 }
 
 impl Default for Editor {
@@ -263,6 +269,7 @@ impl Editor {
             cycle: None,
             cycle_enabled: false,
             metronome: false,
+            armed: None,
             clipboard: None,
         }
     }
@@ -327,6 +334,7 @@ impl Editor {
             cycle_enabled: false,
             metronome: self.metronome,
             clipboard: None,
+            armed: None,
         };
         Ok(())
     }
@@ -484,7 +492,11 @@ impl Editor {
             return Err(EditorError::EmptyRecording);
         }
         let mut session = self.project.session.clone();
-        let track_index = match self.selected_track.filter(|&t| t < session.tracks.len()) {
+        let track_index = match self
+            .armed_track()
+            .or(self.selected_track)
+            .filter(|&t| t < session.tracks.len())
+        {
             Some(t) => t,
             None => {
                 session.tracks.push(Track::new("Запись"));
@@ -778,6 +790,7 @@ impl Editor {
         edited.start_samples = start;
         edited.offset_samples = offset;
         edited.length_samples = right - start;
+        fit_fades(edited);
         self.commit(session, (track, clip))
     }
 
@@ -792,7 +805,9 @@ impl Editor {
         let longest = c.source_length - c.offset_samples;
         let length = end.saturating_sub(c.start_samples).clamp(1, longest);
         let mut session = self.project.session.clone();
-        session.tracks[track].clips[clip].length_samples = length;
+        let edited = &mut session.tracks[track].clips[clip];
+        edited.length_samples = length;
+        fit_fades(edited);
         self.commit(session, (track, clip))
     }
 
@@ -819,12 +834,130 @@ impl Editor {
         right.start_samples = at;
         right.offset_samples += head;
         right.length_samples -= head;
+        right.fade_in_samples = 0;
+        right.fade_out_samples = c.fade_out_samples.min(right.length_samples);
         let mut session = self.project.session.clone();
-        session.tracks[track].clips[clip].length_samples = head;
+        let left = &mut session.tracks[track].clips[clip];
+        left.length_samples = head;
+        left.fade_in_samples = left.fade_in_samples.min(head);
+        left.fade_out_samples = 0;
         session.tracks[track].clips.insert(clip + 1, right);
         let at = (track, clip + 1);
         self.commit(session, at)?;
         Ok(at)
+    }
+
+    /// Sets a clip's fades, each limited so that both fit in the clip
+    /// (SPEC-038 §6). One undo step; the clip becomes selected.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; `self` is unchanged.
+    pub fn set_fades(
+        &mut self,
+        track: usize,
+        clip: usize,
+        fade_in: u64,
+        fade_out: u64,
+    ) -> Result<(), EditorError> {
+        let c = self.clip_ref(track, clip)?;
+        let length = c.length_samples;
+        let fade_in = fade_in.min(length);
+        let fade_out = fade_out.min(length - fade_in);
+        if (c.fade_in_samples, c.fade_out_samples) == (fade_in, fade_out) {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        let c = &mut session.tracks[track].clips[clip];
+        c.fade_in_samples = fade_in;
+        c.fade_out_samples = fade_out;
+        self.commit(session, (track, clip))
+    }
+
+    /// Index of the clip that starts next after `clip` on its track.
+    fn next_clip(&self, track: usize, clip: usize) -> Option<usize> {
+        let clips = &self.project.session.tracks.get(track)?.clips;
+        let first = clips.get(clip)?;
+        clips
+            .iter()
+            .enumerate()
+            .filter(|&(i, c)| {
+                i != clip
+                    && (c.start_samples > first.start_samples
+                        || (c.start_samples == first.start_samples && i > clip))
+            })
+            .min_by_key(|&(i, c)| (c.start_samples, i))
+            .map(|(i, _)| i)
+    }
+
+    /// Joins a clip with the next clip on its track into one region
+    /// (SPEC-038 §5). Returns the joined clip's `(track, clip)`, which
+    /// becomes selected. One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::CannotJoin`]
+    /// when there is no next clip or the two do not continue one another;
+    /// `self` is unchanged.
+    pub fn join_clips(&mut self, track: usize, clip: usize) -> Result<(usize, usize), EditorError> {
+        let a = self.clip_ref(track, clip)?.clone();
+        let next = self.next_clip(track, clip).ok_or(EditorError::CannotJoin)?;
+        let b = self.project.session.tracks[track].clips[next].clone();
+        let joined = match (&a.notes, &b.notes) {
+            (Some(first), Some(second)) => {
+                let length = b
+                    .end_samples()
+                    .max(a.end_samples())
+                    .checked_sub(a.start_samples)
+                    .ok_or(EditorError::CannotJoin)?;
+                let mut notes = visible_notes(first, &a, 0);
+                notes.extend(visible_notes(second, &b, b.start_samples - a.start_samples));
+                notes.sort_by_key(|n| (n.start, n.pitch));
+                Clip {
+                    length_samples: length,
+                    offset_samples: 0,
+                    source_length: length,
+                    notes: Some(notes),
+                    fade_out_samples: b.fade_out_samples,
+                    ..a.clone()
+                }
+            }
+            (None, None)
+                if a.source.is_some()
+                    && a.source == b.source
+                    && a.gain.to_bits() == b.gain.to_bits()
+                    && b.start_samples == a.end_samples()
+                    && b.offset_samples == a.offset_samples + a.length_samples =>
+            {
+                Clip {
+                    length_samples: a.length_samples + b.length_samples,
+                    fade_out_samples: b.fade_out_samples,
+                    ..a.clone()
+                }
+            }
+            _ => return Err(EditorError::CannotJoin),
+        };
+        let mut joined = joined;
+        fit_fades(&mut joined);
+        let mut session = self.project.session.clone();
+        let clips = &mut session.tracks[track].clips;
+        clips[clip] = joined;
+        clips.remove(next);
+        let at = (track, if next < clip { clip - 1 } else { clip });
+        self.commit(session, at)?;
+        Ok(at)
+    }
+
+    /// Track armed for recording, if any (SPEC-038 §9).
+    #[must_use]
+    pub fn armed_track(&self) -> Option<usize> {
+        self.armed
+            .filter(|&t| t < self.project.session.tracks.len())
+    }
+
+    /// Arms one track for recording, or none; the project is untouched.
+    pub fn arm_track(&mut self, track: Option<usize>) {
+        self.armed = track.filter(|&t| t < self.project.session.tracks.len());
     }
 
     /// Copies a clip to the window's clipboard; the project is untouched.
@@ -1559,6 +1692,17 @@ impl Editor {
         let moved = session.tracks.remove(from);
         session.tracks.insert(to, moved);
         self.commit_track(session, to)?;
+        self.armed = self.armed.map(|a| {
+            if a == from {
+                to
+            } else if from < a && a <= to {
+                a - 1
+            } else if to <= a && a < from {
+                a + 1
+            } else {
+                a
+            }
+        });
         self.selected_clip = None;
         Ok(())
     }
@@ -1583,6 +1727,7 @@ impl Editor {
         }
         session.tracks.insert(track + 1, copy);
         self.commit_track(session, track + 1)?;
+        self.armed = self.armed.map(|a| if a > track { a + 1 } else { a });
         self.selected_clip = None;
         Ok(track + 1)
     }
@@ -1592,6 +1737,11 @@ impl Editor {
         if track < self.project.session.tracks.len() {
             self.record();
             self.project.session.tracks.remove(track);
+            self.armed = match self.armed {
+                Some(a) if a == track => None,
+                Some(a) if a > track => Some(a - 1),
+                other => other,
+            };
             self.selected_track = None;
             self.selected_clip = None;
             self.dirty = true;
@@ -1790,6 +1940,30 @@ fn midi_notes(
         .notes
         .as_mut()
         .ok_or(EditorError::InvalidNote)
+}
+
+/// Shortens a clip's fades so both fit in its length (SPEC-038).
+fn fit_fades(clip: &mut Clip) {
+    clip.fade_in_samples = clip.fade_in_samples.min(clip.length_samples);
+    clip.fade_out_samples = clip
+        .fade_out_samples
+        .min(clip.length_samples - clip.fade_in_samples);
+}
+
+/// Notes of `clip` heard on the timeline, moved so that the clip's visible
+/// start sits at `shift` and cut at the clip's end (SPEC-038 §5).
+fn visible_notes(notes: &[Note], clip: &Clip, shift: u64) -> Vec<Note> {
+    let from = clip.offset_samples;
+    let to = from + clip.length_samples;
+    notes
+        .iter()
+        .filter(|n| n.start >= from && n.start < to)
+        .map(|n| Note {
+            start: n.start - from + shift,
+            length: n.length.min(to - n.start),
+            ..*n
+        })
+        .collect()
 }
 
 fn insert_note(notes: &mut Vec<Note>, note: Note) -> usize {

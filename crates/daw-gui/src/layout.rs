@@ -162,7 +162,8 @@ pub fn shade(rgb: [u8; 3], factor: f32) -> [u8; 3] {
     })
 }
 
-/// Region colours from the track colour; muted tracks are grey.
+/// Region colours from the track colour; silent tracks (muted, or left out
+/// by another track's solo) are grey.
 #[must_use]
 pub fn region_colors(base: [u8; 3], muted: bool) -> RegionColors {
     let body = if muted { [86, 86, 86] } else { base };
