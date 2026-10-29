@@ -10,6 +10,7 @@
 ```
 crates/audio-core   движок: часы, буферы, граф, renderer, offline, WAV, MIDI
 crates/daw-app      оболочка: CLI smoke-инструменты, фича realtime (CPAL)
+crates/daw-gui      окно приложения `sound-pro` (egui)
 specs/              спецификации; агенты реализуют только то, что здесь описано
 docs/               REALTIME.md, MIDI.md (SMF), SYNTH.md (голоса), SESSION.md (клипы), AI-WORKFLOW.md
 clean-room/         журнал метода чистой комнаты
@@ -22,6 +23,19 @@ AGENTS.md           правила для ИИ-агентов (читать пе
 
 См. `docs/DEVSETUP.md`: инструменты, расширения VS Code, как подключить
 инструкции и промпты GitHub Copilot, первый запуск и типовые ошибки.
+
+## Окно приложения
+
+```bash
+cargo run --release --bin sound-pro              # пустой проект
+cargo run --release --bin sound-pro -- song.json # открыть проект
+```
+
+Файл → Импорт WAV добавляет дорожку с клипом (или клип на выбранную дорожку),
+слева — громкость, панорама, M/S, внизу — мастер. Клик выбирает клип, `Delete`
+удаляет, `Ctrl`+колесо — масштаб, `Ctrl+S/O/I` — сохранить/открыть/импорт.
+Файл → Экспорт сведения пишет стерео WAV. Звука в окне пока нет (SPEC-016).
+Linux (X11/Wayland) и Windows, системные библиотеки для сборки не нужны.
 
 ## Быстрый старт
 
@@ -56,14 +70,11 @@ cargo build -p daw-app --features realtime
   (`daw render-session`) — SPEC-010.
 - Клипы из WAV-файлов и сведение сохранённого проекта
   (`daw session render <project.json> <out.wav>`) — SPEC-014.
+- Окно `sound-pro`: таймлайн, микшер, проект, импорт и экспорт — SPEC-015.
 
 ## Что дальше
 
-См. `docs/AI-WORKFLOW.md` → «Первые 5 задач для агента» и `specs/000-template.md`.
-[SPEC-007](specs/007-midi-event-scheduler.md) отдаёт события в узел,
-[SPEC-008](specs/008-project-document.md) сохраняет сессию, а
-[SPEC-009](specs/009-polyphonic-synth.md) играет их настоящими голосами.
-Ближайшее — следующий номер в `specs/`.
+План до рабочего прототипа — [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Лицензия
 
