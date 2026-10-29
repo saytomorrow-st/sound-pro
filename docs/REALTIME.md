@@ -136,6 +136,21 @@ while let Some(event) = schedule.next_event(&mut cursor, ctx.position, ctx.frame
 `Synth::reset()` и перемотка курсора при seek назад происходят в `process`
 (пересоздание `ScheduleCursor` — это копия двух полей, не аллокация).
 
+## Сторож аллокаций (SPEC-011)
+
+`crates/daw-app/tests/hot_path.rs` ставит `#[global_allocator]`-счётчик
+(thread-local, чтобы параллельные тесты не мешали друг другу) и требует ноль
+аллокаций за 1000 квантов `Renderer::render` для `Tone`, `MidiPlayer`,
+`Strip`, `Track` и графа сессии. Генераторы пишут прямо в выходной буфер:
+например, `Tone` вызывает `wav::sine_into(..., &mut dst)`, а не `wav::sine`,
+которая возвращает `Vec`.
+
+Известное ограничение: `Renderer::new` и первый `render` пока аллоцируют
+(ленивая инициализация), поэтому сторож прогревает рендер одним квантом вне
+окна замера. Это вынесено в отдельную спеку.
+
+Новый узел — новый тест в `hot_path.rs`.
+
 ## Чек-лист ревью для агента
 
 - [ ] Нет `Vec::new`, `push`, `Box::new`, `format!`, `to_string`, `collect` в
