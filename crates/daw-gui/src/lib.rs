@@ -212,7 +212,7 @@ impl Editor {
                 let Some(source) = clip.source.as_mut() else {
                     continue;
                 };
-                let resolved = base.join(&*source);
+                let resolved = resolve_source(base, source);
                 if let Some(text) = resolved.to_str() {
                     *source = text.to_owned();
                 }
@@ -476,6 +476,16 @@ fn truncate(name: &str) -> String {
 
 /// `source` relative to `base` with `/` separators, or unchanged when it
 /// lies outside `base`.
+/// Saved relative sources always use `/`; rebuild them with native separators.
+fn resolve_source(base: &Path, source: &str) -> PathBuf {
+    if Path::new(source).is_absolute() {
+        return PathBuf::from(source);
+    }
+    let mut path = base.to_path_buf();
+    path.extend(source.split('/').filter(|part| !part.is_empty()));
+    path
+}
+
 fn relative_source(base: &Path, source: &str) -> String {
     let Ok(rest) = Path::new(source).strip_prefix(base) else {
         return source.to_owned();
