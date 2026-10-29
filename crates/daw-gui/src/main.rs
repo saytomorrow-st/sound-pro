@@ -165,6 +165,18 @@ struct App {
     auto_drag: Option<usize>,
     /// Anchor of the cycle region being drawn on the ruler (SPEC-025).
     cycle_drag: Option<u64>,
+    /// Marker being dragged and where it would land (SPEC-030).
+    marker_drag: Option<(usize, u64)>,
+    /// Marker whose name is being edited and the text typed so far (SPEC-030).
+    marker_rename: Option<(usize, String)>,
+}
+
+/// What the user asked to do with a marker flag (SPEC-030).
+enum MarkerAction {
+    Seek(u64),
+    Move(usize, u64),
+    Rename(usize),
+    Delete(usize),
 }
 
 impl App {
@@ -191,6 +203,8 @@ impl App {
             auto_lane: Lane::Gain,
             auto_drag: None,
             cycle_drag: None,
+            marker_drag: None,
+            marker_rename: None,
         };
         if let Some(path) = start {
             app.open(path);
@@ -495,6 +509,13 @@ impl App {
             let click = egui::Button::new("🎵").selected(self.editor.metronome);
             if ui.add(click).on_hover_text("Метроном (K)").clicked() {
                 self.toggle_metronome();
+            }
+            if ui
+                .button("+ Маркер")
+                .on_hover_text("Метка в позиции курсора (M). «,» и «.» — к соседним меткам.")
+                .clicked()
+            {
+                self.add_marker();
             }
             let buses = egui::Button::new("Шины").selected(self.buses_open);
             if ui
@@ -1016,6 +1037,8 @@ impl App {
             );
         }
 
+        let on_flag = self.markers(ui, area, ruler);
+
         let px_per_sample = self.zoom / rate as f32;
         let mut clicked = None;
         let mut open_piano = None;
@@ -1132,9 +1155,10 @@ impl App {
             || response.clicked()
             || response.secondary_clicked()
             || response.drag_stopped();
-        let press_on_ruler = ui
-            .input(|i| i.pointer.press_origin())
-            .is_some_and(|p| ruler.contains(p));
+        let press_on_ruler = !on_flag
+            && ui
+                .input(|i| i.pointer.press_origin())
+                .is_some_and(|p| ruler.contains(p));
         let ruler_owned = self.drag.is_none()
             && self.auto_drag.is_none()
             && (self.cycle_drag.is_some() || (response.drag_started() && press_on_ruler));
@@ -1155,7 +1179,7 @@ impl App {
 
         if ruler_owned {
             self.draw_cycle(ui, &response, area);
-        } else if response.clicked() && pointer.is_some_and(|p| ruler.contains(p)) {
+        } else if response.clicked() && !on_flag && pointer.is_some_and(|p| ruler.contains(p)) {
             if let Some(p) = pointer {
                 self.seek(x_to_samples(p.x - area.min.x, rate_u32, self.zoom));
             }
@@ -1187,6 +1211,162 @@ impl App {
             if ctrl && scroll != 0.0 {
                 self.zoom = (self.zoom * (1.0 + scroll * 0.002)).clamp(MIN_ZOOM, MAX_ZOOM);
             }
+        }
+    }
+
+    /// Marker flags on the ruler and their clicks, drags and menus (SPEC-030).
+    /// Returns whether the current press started on a flag.
+    fn markers(&mut self, ui: &egui::Ui, area: Rect, ruler: Rect) -> bool {
+        let session = self.editor.session();
+        let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+        let free = ui.input(|i| i.modifiers.shift) || !self.snap;
+        let painter = ui.painter_at(area);
+        let color = Color32::from_rgb(120, 200, 255);
+        let mut action = None;
+        let mut flags = Vec::new();
+        for (index, marker) in session.markers.iter().enumerate() {
+            let position = match self.marker_drag {
+                Some((dragged, to)) if dragged == index => to,
+                _ => marker.position,
+            };
+            let x = area.min.x + samples_to_x(position, rate, self.zoom);
+            painter.line_segment(
+                [Pos2::new(x, ruler.max.y), Pos2::new(x, area.max.y)],
+                Stroke::new(1.0_f32, color.gamma_multiply(0.5)),
+            );
+            let galley = painter.layout_no_wrap(
+                marker.name.clone(),
+                FontId::proportional(11.0),
+                Color32::BLACK,
+            );
+            let flag = Rect::from_min_size(
+                Pos2::new(x, ruler.min.y + RULER_HEIGHT * 0.45),
+                Vec2::new(galley.size().x + 8.0, RULER_HEIGHT * 0.55),
+            );
+            painter.rect_filled(flag, 2.0, color);
+            painter.galley(flag.min + Vec2::new(4.0, 0.5), galley, Color32::BLACK);
+            flags.push((index, marker.position, flag));
+        }
+        let origin = ui.input(|i| i.pointer.press_origin());
+        let on_flag = self.marker_drag.is_some()
+            || origin.is_some_and(|p| flags.iter().any(|(_, _, flag)| flag.contains(p)));
+        for (index, position, flag) in flags {
+            let id = ui.id().with(("marker", index));
+            let response = ui
+                .interact(flag, id, Sense::click_and_drag())
+                .on_hover_cursor(egui::CursorIcon::Grab);
+            if response.clicked() {
+                action = Some(MarkerAction::Seek(position));
+            }
+            if response.dragged()
+                && let Some(p) = ui.input(|i| i.pointer.latest_pos())
+            {
+                let samples = x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom);
+                let to = if free {
+                    samples
+                } else {
+                    snap_to_beat(samples, rate, tempo)
+                };
+                self.marker_drag = Some((index, to));
+            }
+            if response.drag_stopped()
+                && let Some((dragged, to)) = self.marker_drag.take()
+            {
+                action = Some(MarkerAction::Move(dragged, to));
+            }
+            response.context_menu(|ui| {
+                if ui.button("Переименовать").clicked() {
+                    action = Some(MarkerAction::Rename(index));
+                    ui.close();
+                }
+                if ui.button("Удалить").clicked() {
+                    action = Some(MarkerAction::Delete(index));
+                    ui.close();
+                }
+            });
+            if self
+                .marker_rename
+                .as_ref()
+                .is_some_and(|(m, _)| *m == index)
+            {
+                self.marker_name_field(ui, flag);
+            }
+        }
+        match action {
+            Some(MarkerAction::Seek(position)) => self.seek(position),
+            Some(MarkerAction::Move(index, to)) => {
+                self.status = match self.editor.move_marker(index, to) {
+                    Ok(_) => "Метка перенесена".into(),
+                    Err(e) => format!("Не удалось перенести метку: {e}"),
+                };
+            }
+            Some(MarkerAction::Rename(index)) => {
+                let name = self.editor.session().markers[index].name.clone();
+                self.marker_rename = Some((index, name));
+            }
+            Some(MarkerAction::Delete(index)) => {
+                self.marker_rename = None;
+                self.status = match self.editor.delete_marker(index) {
+                    Ok(()) => "Метка удалена".into(),
+                    Err(e) => format!("Не удалось удалить метку: {e}"),
+                };
+            }
+            None => {}
+        }
+        on_flag
+    }
+
+    /// Text field over a marker flag while it is being renamed (SPEC-030).
+    fn marker_name_field(&mut self, ui: &egui::Ui, flag: Rect) {
+        let mut done = None;
+        egui::Area::new(ui.id().with("marker_rename"))
+            .fixed_pos(flag.min)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                let Some((_, text)) = self.marker_rename.as_mut() else {
+                    return;
+                };
+                let field = ui.add(egui::TextEdit::singleline(text).desired_width(140.0));
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    done = Some(false);
+                } else if field.lost_focus() {
+                    done = Some(true);
+                }
+            });
+        match done {
+            Some(true) => {
+                if let Some((index, text)) = self.marker_rename.take() {
+                    self.status = match self.editor.rename_marker(index, &text) {
+                        Ok(()) => "Метка переименована".into(),
+                        Err(e) => format!("Не удалось переименовать: {e}"),
+                    };
+                }
+            }
+            Some(false) => self.marker_rename = None,
+            None => {}
+        }
+    }
+
+    /// Adds a marker at the play cursor (SPEC-030).
+    fn add_marker(&mut self) {
+        self.status = match self.editor.add_marker(self.playhead) {
+            Ok(index) => format!("Добавлена {}", self.editor.session().markers[index].name),
+            Err(e) => format!("Не удалось добавить метку: {e}"),
+        };
+    }
+
+    /// Moves the cursor to the previous or next marker (SPEC-030).
+    fn jump_marker(&mut self, forward: bool) {
+        let target = if forward {
+            self.editor.next_marker(self.playhead)
+        } else {
+            self.editor.previous_marker(self.playhead)
+        };
+        if let Some(position) = target {
+            self.seek(position);
         }
     }
 
@@ -1752,6 +1932,19 @@ impl App {
                     i.consume_key(egui::Modifiers::NONE, Key::K),
                 )
             });
+            let (marker, back, forward) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, Key::M),
+                    i.consume_key(egui::Modifiers::NONE, Key::Comma),
+                    i.consume_key(egui::Modifiers::NONE, Key::Period),
+                )
+            });
+            if marker {
+                self.add_marker();
+            }
+            if back || forward {
+                self.jump_marker(forward);
+            }
             let (split, duplicate, copy, paste) = ctx.input_mut(|i| {
                 let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
                 let paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));

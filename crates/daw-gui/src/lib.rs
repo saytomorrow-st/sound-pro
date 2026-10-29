@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track};
 use audio_core::{
-    Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Project, ProjectError,
-    SessionError,
+    Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Marker, Project,
+    ProjectError, SessionError,
 };
 
 /// Sample rate of a new project.
@@ -118,6 +118,12 @@ pub enum EditorError {
     /// A track name must not be blank (SPEC-029).
     #[error("the name is empty")]
     EmptyName,
+    /// The marker index does not exist (SPEC-030).
+    #[error("no such marker")]
+    NoMarker,
+    /// Another marker already sits at that position (SPEC-030).
+    #[error("a marker is already there")]
+    MarkerExists,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -1221,6 +1227,122 @@ impl Editor {
         self.selected_track = Some(track);
         self.dirty = true;
         Ok(())
+    }
+
+    /// Adds "Маркер N" at `position` in order and returns its index
+    /// (SPEC-030); N is the lowest number not used by another marker.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::MarkerExists`] when the position is taken,
+    /// [`EditorError::Session`] past [`audio_core::MAX_MARKERS`].
+    pub fn add_marker(&mut self, position: u64) -> Result<usize, EditorError> {
+        let markers = &self.project.session.markers;
+        let index = markers.partition_point(|m| m.position < position);
+        if markers.get(index).is_some_and(|m| m.position == position) {
+            return Err(EditorError::MarkerExists);
+        }
+        let number = (1..)
+            .find(|n| !markers.iter().any(|m| m.name == format!("Маркер {n}")))
+            .unwrap_or(1);
+        let mut session = self.project.session.clone();
+        session.markers.insert(
+            index,
+            Marker {
+                name: format!("Маркер {number}"),
+                position,
+            },
+        );
+        self.commit_session(session)?;
+        Ok(index)
+    }
+
+    /// Renames a marker; surrounding spaces are trimmed (SPEC-030).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoMarker`], [`EditorError::EmptyName`] or
+    /// [`EditorError::Session`] for a too long name.
+    pub fn rename_marker(&mut self, index: usize, name: &str) -> Result<(), EditorError> {
+        let name = name.trim();
+        let current = &self
+            .project
+            .session
+            .markers
+            .get(index)
+            .ok_or(EditorError::NoMarker)?
+            .name;
+        if name.is_empty() {
+            return Err(EditorError::EmptyName);
+        }
+        if current == name {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        name.clone_into(&mut session.markers[index].name);
+        self.commit_session(session)
+    }
+
+    /// Moves a marker and keeps the list sorted; returns its new index
+    /// (SPEC-030).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoMarker`], or [`EditorError::MarkerExists`] when
+    /// another marker sits at `position`.
+    pub fn move_marker(&mut self, index: usize, position: u64) -> Result<usize, EditorError> {
+        let markers = &self.project.session.markers;
+        let marker = markers.get(index).ok_or(EditorError::NoMarker)?;
+        if marker.position == position {
+            return Ok(index);
+        }
+        if markers.iter().any(|m| m.position == position) {
+            return Err(EditorError::MarkerExists);
+        }
+        let mut session = self.project.session.clone();
+        let mut moved = session.markers.remove(index);
+        moved.position = position;
+        let to = session.markers.partition_point(|m| m.position < position);
+        session.markers.insert(to, moved);
+        self.commit_session(session)?;
+        Ok(to)
+    }
+
+    /// Removes a marker (SPEC-030).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoMarker`] for a bad index.
+    pub fn delete_marker(&mut self, index: usize) -> Result<(), EditorError> {
+        if index >= self.project.session.markers.len() {
+            return Err(EditorError::NoMarker);
+        }
+        let mut session = self.project.session.clone();
+        session.markers.remove(index);
+        self.commit_session(session)
+    }
+
+    /// Position of the first marker strictly after `position` (SPEC-030).
+    #[must_use]
+    pub fn next_marker(&self, position: u64) -> Option<u64> {
+        self.project
+            .session
+            .markers
+            .iter()
+            .map(|m| m.position)
+            .find(|&p| p > position)
+    }
+
+    /// Position of the last marker strictly before `position` (SPEC-030).
+    #[must_use]
+    pub fn previous_marker(&self, position: u64) -> Option<u64> {
+        self.project
+            .session
+            .markers
+            .iter()
+            .rev()
+            .map(|m| m.position)
+            .find(|&p| p < position)
     }
 
     /// Renames a track; surrounding spaces are trimmed (SPEC-029).

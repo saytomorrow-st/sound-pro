@@ -13,6 +13,9 @@ use crate::transport::TimeSignature;
 /// Most tracks a session may hold.
 pub const MAX_TRACKS: usize = 32;
 
+/// Most markers a session may hold (SPEC-030).
+pub const MAX_MARKERS: usize = 256;
+
 /// Size of the track colour palette; [`Track::color`] indexes it (SPEC-029).
 pub const TRACK_COLORS: u8 = 8;
 
@@ -166,6 +169,13 @@ pub enum SessionError {
         /// Index of the offending track.
         track: usize,
     },
+    /// A marker name is too long, markers are out of order or share a
+    /// position, or there are more than [`MAX_MARKERS`] (SPEC-030).
+    InvalidMarker {
+        /// Index of the offending marker; [`MAX_MARKERS`] when there are too
+        /// many.
+        marker: usize,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -223,6 +233,7 @@ impl fmt::Display for SessionError {
                 write!(f, "track {track}: send {send} is invalid")
             }
             Self::InvalidColor { track } => write!(f, "track {track}: colour is invalid"),
+            Self::InvalidMarker { marker } => write!(f, "marker {marker} is invalid"),
         }
     }
 }
@@ -567,6 +578,17 @@ pub struct Session {
     pub tracks: Vec<Track>,
     /// Effect buses fed by track sends (SPEC-028).
     pub buses: Vec<Bus>,
+    /// Named positions on the timeline, sorted by position (SPEC-030).
+    pub markers: Vec<Marker>,
+}
+
+/// A named position on the timeline; display only (SPEC-030).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Marker {
+    /// Label shown on the ruler.
+    pub name: String,
+    /// Position in project samples.
+    pub position: u64,
 }
 
 impl Session {
@@ -581,6 +603,7 @@ impl Session {
             time_signature: TimeSignature::default(),
             tracks: Vec::new(),
             buses: Vec::new(),
+            markers: Vec::new(),
         }
     }
 
@@ -647,6 +670,7 @@ impl Session {
             return Err(SessionError::TooManyTracks { max: MAX_TRACKS });
         }
         self.validate_buses()?;
+        self.validate_markers()?;
         for (track_index, track) in self.tracks.iter().enumerate() {
             if track.name.len() > MAX_NAME_BYTES {
                 return Err(SessionError::NameTooLong);
@@ -725,6 +749,22 @@ impl Session {
             validate_effects(&track.effects, track_index)?;
             validate_automation(&track.automation, track_index)?;
             validate_sends(&track.sends, self.buses.len(), track_index)?;
+        }
+        Ok(())
+    }
+
+    /// SPEC-030 checks for the marker list.
+    fn validate_markers(&self) -> Result<(), SessionError> {
+        if self.markers.len() > MAX_MARKERS {
+            return Err(SessionError::InvalidMarker {
+                marker: MAX_MARKERS,
+            });
+        }
+        for (index, marker) in self.markers.iter().enumerate() {
+            let ordered = index == 0 || self.markers[index - 1].position < marker.position;
+            if marker.name.len() > MAX_NAME_BYTES || !ordered {
+                return Err(SessionError::InvalidMarker { marker: index });
+            }
         }
         Ok(())
     }
