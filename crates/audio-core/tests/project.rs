@@ -607,11 +607,11 @@ fn an_unknown_key_inside_a_clip_is_rejected() {
     let (graph, _) = demo_graph();
     let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
         .to_json()
-        .replace("\"source_length\"", "\"source\"");
+        .replace("\"source_length\"", "\"src_length\"");
     assert_eq!(
         Project::from_json(&text).unwrap_err(),
         ProjectError::UnknownField {
-            field: "source".to_owned()
+            field: "src_length".to_owned()
         }
     );
 }
@@ -827,4 +827,68 @@ fn mixer_values_out_of_range_are_session_errors() {
         Project::from_json(&text.replace("\"master_gain\": 1", "\"master_gain\": 2")).unwrap_err(),
         ProjectError::Session(SessionError::InvalidMasterGain)
     );
+}
+
+// --- SPEC-014: clip source paths -------------------------------------------
+
+fn sourced_session() -> audio_core::Session {
+    let mut session = demo_session();
+    session.tracks[0].clips[0].source = Some("audio/take 1 — №1.wav".to_owned());
+    session
+}
+
+#[test]
+fn a_clip_source_survives_the_round_trip_as_the_last_clip_key() {
+    let (graph, _) = demo_graph();
+    let project = Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        sourced_session(),
+    );
+    let text = project.to_json();
+    assert_eq!(Project::from_json(&text).unwrap(), project);
+    assert!(
+        text.contains(
+            "\"name\": \"take 1\",\n            \"source\": \"audio/take 1 — №1.wav\"\n          }"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn documents_without_a_source_key_load_and_save_unchanged() {
+    let (graph, _) = demo_graph();
+    let project =
+        Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session());
+    let text = project.to_json();
+    assert!(!text.contains("\"source\""));
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session().tracks[0].clips[0].source, None);
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn a_bad_source_path_is_rejected() {
+    use audio_core::{MAX_SOURCE_BYTES, SessionError};
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        sourced_session(),
+    )
+    .to_json();
+    let invalid = ProjectError::Session(SessionError::InvalidSource { track: 0, clip: 0 });
+    assert_eq!(
+        Project::from_json(&text.replace("audio/take 1 — №1.wav", "")).unwrap_err(),
+        invalid
+    );
+    let long = "a".repeat(MAX_SOURCE_BYTES + 1);
+    assert_eq!(
+        Project::from_json(&text.replace("audio/take 1 — №1.wav", &long)).unwrap_err(),
+        invalid
+    );
+    let exact = "a".repeat(MAX_SOURCE_BYTES);
+    assert!(Project::from_json(&text.replace("audio/take 1 — №1.wav", &exact)).is_ok());
+    assert!(matches!(
+        Project::from_json(&text.replace("\"audio/take 1 — №1.wav\"", "5")).unwrap_err(),
+        ProjectError::Malformed { .. }
+    ));
 }

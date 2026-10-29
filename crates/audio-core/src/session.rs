@@ -14,6 +14,9 @@ pub const MAX_TRACKS: usize = 32;
 /// Most clips a single track may hold.
 pub const MAX_CLIPS_PER_TRACK: usize = 128;
 
+/// Longest accepted clip source path, in bytes.
+pub const MAX_SOURCE_BYTES: usize = 4096;
+
 /// Why a session (or one of its clips) is inconsistent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -34,6 +37,13 @@ pub enum SessionError {
         track: usize,
         /// Accepted maximum.
         max: usize,
+    },
+    /// A clip's source path is empty or longer than [`MAX_SOURCE_BYTES`].
+    InvalidSource {
+        /// Index of the track holding the clip.
+        track: usize,
+        /// Index of the clip inside the track.
+        clip: usize,
     },
     /// A clip has zero visible length.
     EmptyClip {
@@ -94,6 +104,10 @@ impl fmt::Display for SessionError {
             Self::TooManyClips { track, max } => {
                 write!(f, "track {track} holds more than {max} clips")
             }
+            Self::InvalidSource { track, clip } => write!(
+                f,
+                "track {track} clip {clip}: source path is empty or longer than {MAX_SOURCE_BYTES} bytes"
+            ),
             Self::EmptyClip { track, clip } => {
                 write!(f, "clip {clip} of track {track} has zero length")
             }
@@ -138,6 +152,10 @@ pub struct Clip {
     pub gain: f32,
     /// Optional label.
     pub name: String,
+    /// Path to the clip's audio file, if the clip refers to one.
+    ///
+    /// The engine never opens it; the shell resolves it (SPEC-014).
+    pub source: Option<String>,
 }
 
 impl Clip {
@@ -151,6 +169,7 @@ impl Clip {
             source_length,
             gain: 1.0,
             name: String::new(),
+            source: None,
         }
     }
 
@@ -333,6 +352,16 @@ impl Session {
             for (clip_index, clip) in track.clips.iter().enumerate() {
                 if clip.name.len() > MAX_NAME_BYTES {
                     return Err(SessionError::NameTooLong);
+                }
+                if clip
+                    .source
+                    .as_ref()
+                    .is_some_and(|path| path.is_empty() || path.len() > MAX_SOURCE_BYTES)
+                {
+                    return Err(SessionError::InvalidSource {
+                        track: track_index,
+                        clip: clip_index,
+                    });
                 }
                 if !valid_gain(clip.gain) {
                     return Err(SessionError::InvalidClipGain {
@@ -562,6 +591,7 @@ mod tests {
             source_length: 200,
             gain: 1.0,
             name: String::new(),
+            source: None,
         };
         assert!(!clip.covers(99));
         assert!(clip.covers(100));

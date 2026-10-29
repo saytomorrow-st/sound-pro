@@ -42,7 +42,8 @@ pub use project::{MAX_NAME_BYTES, ParamState, Project, ProjectError};
 pub use render::{RenderStats, Renderer};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
-    Clip, MAX_CLIPS_PER_TRACK, MAX_TRACKS, Session, SessionError, Track as SessionTrack,
+    Clip, MAX_CLIPS_PER_TRACK, MAX_SOURCE_BYTES, MAX_TRACKS, Session, SessionError,
+    Track as SessionTrack,
 };
 pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};

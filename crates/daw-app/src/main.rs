@@ -148,7 +148,8 @@ fn usage() {
         "usage:\n  daw bounce <out.wav> [seconds] [--split <samples>]\n  \
          daw play [seconds]\n  daw selftest\n  daw project save <path>\n  \
          daw project show <path>\n  daw render-midi <in.mid> <out.wav> [--tempo BPM] [--seconds S]\n  \
-         daw session show <path>\n  daw render-session <out.wav> [--seconds S]\n\n\
+         daw session show <path>\n  daw session render <project.json> <out.wav> [--seconds S]\n  \
+         daw render-session <out.wav> [--seconds S]\n\n\
          --split <samples> writes part-01.wav, part-02.wav, ... each at most\n\
          <samples> long (samples, not frames; mono).\n\n\
          `daw play` needs `--features realtime`; without it the command exits 2.\n\
@@ -275,7 +276,7 @@ fn save_session_project(path: &std::path::Path) -> ExitCode {
 /// `daw session show`: print the session embedded in a project document.
 fn session(mut args: impl Iterator<Item = String>) -> ExitCode {
     let Some(action) = args.next() else {
-        eprintln!("session requires `show <path>`");
+        eprintln!("session requires `save|show <path>` or `render <project.json> <out.wav>`");
         return ExitCode::FAILURE;
     };
     let Some(path) = args.next().map(PathBuf::from) else {
@@ -284,6 +285,9 @@ fn session(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     if action == "save" {
         return save_session_project(&path);
+    }
+    if action == "render" {
+        return render_session_project(&path, args);
     }
     if action != "show" {
         eprintln!("unknown session action: {action}");
@@ -327,6 +331,28 @@ fn session(mut args: impl Iterator<Item = String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `daw session render`: load a project and its WAV files, then mix it down.
+fn render_session_project(
+    project: &std::path::Path,
+    mut args: impl Iterator<Item = String>,
+) -> ExitCode {
+    let Some(output) = args.next().map(PathBuf::from) else {
+        eprintln!("usage: daw session render <project.json> <out.wav> [--seconds S]");
+        return ExitCode::FAILURE;
+    };
+    let seconds = match parse_seconds(args) {
+        Ok(seconds) => seconds,
+        Err(code) => return code,
+    };
+    match daw_app::load_session_project(project, output) {
+        Ok(job) => finish_session_render(job, seconds, "session render"),
+        Err(e) => {
+            eprintln!("session render failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `daw render-session`: render the in-memory demo session to stereo WAV.
 fn render_session(mut args: impl Iterator<Item = String>) -> ExitCode {
     let Some(output) = args.next().map(PathBuf::from) else {
@@ -334,28 +360,10 @@ fn render_session(mut args: impl Iterator<Item = String>) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let sample_rate = audio_core::transport::DEFAULT_SAMPLE_RATE;
-    let mut seconds = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--seconds" => {
-                let Some(value) = args.next() else {
-                    eprintln!("--seconds requires a value");
-                    return ExitCode::from(2);
-                };
-                match value.parse::<f64>() {
-                    Ok(s) if s.is_finite() && s > 0.0 => seconds = Some(s),
-                    _ => {
-                        eprintln!("--seconds expects a positive number, got {value}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            other => {
-                eprintln!("unexpected argument: {other}");
-                return ExitCode::from(2);
-            }
-        }
-    }
+    let seconds = match parse_seconds(args) {
+        Ok(seconds) => seconds,
+        Err(code) => return code,
+    };
     let mut job = match daw_app::build_demo_session(sample_rate) {
         Ok(job) => job,
         Err(e) => {
@@ -363,11 +371,48 @@ fn render_session(mut args: impl Iterator<Item = String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    job.output = output.clone();
+    job.output = output;
+    finish_session_render(job, seconds, "render-session")
+}
+
+/// Parses the optional `--seconds S` tail shared by the session renders.
+fn parse_seconds(mut args: impl Iterator<Item = String>) -> Result<Option<f64>, ExitCode> {
+    let mut seconds = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--seconds" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--seconds requires a value");
+                    return Err(ExitCode::from(2));
+                };
+                match value.parse::<f64>() {
+                    Ok(s) if s.is_finite() && s > 0.0 => seconds = Some(s),
+                    _ => {
+                        eprintln!("--seconds expects a positive number, got {value}");
+                        return Err(ExitCode::from(2));
+                    }
+                }
+            }
+            other => {
+                eprintln!("unexpected argument: {other}");
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    Ok(seconds)
+}
+
+/// Applies `--seconds`, renders `job` and prints the report.
+fn finish_session_render(
+    mut job: daw_app::SessionJob,
+    seconds: Option<f64>,
+    command: &str,
+) -> ExitCode {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     if let Some(s) = seconds {
-        job.frames = Some((s * f64::from(sample_rate)).round() as u64);
+        job.frames = Some((s * f64::from(job.sample_rate)).round() as u64);
     }
+    let output = job.output.clone();
     match daw_app::render_session(job) {
         Ok(report) => {
             println!(
@@ -380,7 +425,7 @@ fn render_session(mut args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("render-session failed: {e}");
+            eprintln!("{command} failed: {e}");
             ExitCode::FAILURE
         }
     }

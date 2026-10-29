@@ -17,6 +17,7 @@ fn clip(start: u64, length: u64, source: u64) -> Clip {
         source_length: source,
         gain: 1.0,
         name: String::new(),
+        source: None,
     }
 }
 
@@ -288,5 +289,30 @@ fn validation_is_not_shadowed_by_a_clean_display_string() {
         SessionError::EmptyClip { track: 3, clip: 7 }
             .to_string()
             .contains('3')
+    );
+}
+
+#[test]
+fn source_paths_are_checked_after_the_clip_name_and_before_gain() {
+    let mut bad = clip(0, 10, 10);
+    bad.source = Some(String::new());
+    bad.gain = 2.0;
+    let session = session_with(vec![bad.clone()]);
+    assert_eq!(
+        session.validate(),
+        Err(SessionError::InvalidSource { track: 0, clip: 0 })
+    );
+    bad.name = "x".repeat(audio_core::MAX_NAME_BYTES + 1);
+    assert_eq!(
+        session_with(vec![bad]).validate(),
+        Err(SessionError::NameTooLong)
+    );
+    let mut good = clip(0, 10, 10);
+    good.source = Some("a.wav".to_owned());
+    assert_eq!(session_with(vec![good]).validate(), Ok(()));
+    assert!(
+        SessionError::InvalidSource { track: 1, clip: 2 }
+            .to_string()
+            .contains("source")
     );
 }

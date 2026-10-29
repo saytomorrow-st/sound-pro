@@ -402,6 +402,10 @@ fn write_session(out: &mut String, session: &Session) {
             out.push_str(&format_number(f64::from(clip.gain)));
             out.push_str(",\n            \"name\": ");
             write_string(out, &clip.name);
+            if let Some(source) = &clip.source {
+                out.push_str(",\n            \"source\": ");
+                write_string(out, source);
+            }
             out.push_str("\n          }");
         }
         if track.clips.is_empty() {
@@ -553,6 +557,7 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
     let mut source_length = None;
     let mut gain = None;
     let mut name = None;
+    let mut source = None;
     for (key, value) in entries {
         match key.as_str() {
             "start" => start = Some(require_u64(value)?),
@@ -561,6 +566,7 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
             "source_length" => source_length = Some(require_u64(value)?),
             "gain" => gain = Some(require_f32(value)?),
             "name" => name = Some(require_string(value)?),
+            "source" => source = Some(require_string(value)?),
             other => {
                 return Err(ProjectError::UnknownField {
                     field: other.to_owned(),
@@ -587,6 +593,7 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
         name: name.ok_or(ProjectError::MissingField {
             field: "session.tracks[].clips[].name",
         })?,
+        source,
     })
 }
 
