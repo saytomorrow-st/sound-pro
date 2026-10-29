@@ -542,3 +542,79 @@ fn a_reverb_rings_after_the_dry_sound_stops() {
     let tail = &buf.channel(0)[RATE as usize / 10..];
     assert!(peak(tail) > 1e-4, "tail peak {}", peak(tail));
 }
+
+// --- SPEC-023: automation ------------------------------------------------
+
+fn automated(gain: Vec<(u64, f32)>, pan: Vec<(u64, f32)>) -> SessionTrack {
+    let point = |(time, value)| audio_core::AutoPoint { time, value };
+    let mut track = SessionTrack::new("auto");
+    track.automation.gain = gain.into_iter().map(point).collect();
+    track.automation.pan = pan.into_iter().map(point).collect();
+    track
+}
+
+#[test]
+fn empty_automation_leaves_the_mix_bit_identical() {
+    let mut scratch = Scratch::new("auto-empty");
+    let source = ramp(300);
+    let mut track = automated(vec![], vec![]);
+    track.pan = 0.5;
+    track.gain = 0.5;
+    let buf = render_mix(&mut scratch, vec![(track, source.clone())], 0.5);
+    assert_eq!(
+        buf.channel(0),
+        scaled(&source, 0.5 * (0.5 * 0.5)).as_slice()
+    );
+    assert_eq!(buf.channel(1), scaled(&source, 0.5 * 0.5).as_slice());
+}
+
+#[test]
+fn a_single_gain_point_overrides_the_slider() {
+    let mut scratch = Scratch::new("auto-one");
+    let source = vec![1.0; 200];
+    let mut track = automated(vec![(50, 0.5)], vec![]);
+    track.gain = 0.0;
+    let buf = render_mix(&mut scratch, vec![(track, source)], 1.0);
+    assert!(buf.channel(0).iter().all(|&s| s == 0.5));
+    assert!(buf.channel(1).iter().all(|&s| s == 0.5));
+}
+
+#[test]
+fn a_gain_lane_ramps_linearly() {
+    let mut scratch = Scratch::new("auto-ramp");
+    let source = vec![1.0; 300];
+    let track = automated(vec![(100, 0.0), (200, 1.0)], vec![]);
+    let buf = render_mix(&mut scratch, vec![(track, source)], 1.0);
+    let left = buf.channel(0);
+    assert!(left[..=100].iter().all(|&s| s == 0.0));
+    assert!((left[150] - 0.5).abs() < 1e-6);
+    assert!(left[100..=200].windows(2).all(|w| w[0] <= w[1]));
+    assert!(left[200..].iter().all(|&s| s == 1.0));
+    assert_eq!(buf.channel(0), buf.channel(1));
+}
+
+#[test]
+fn a_pan_lane_moves_the_sound_and_the_master_still_applies() {
+    let mut scratch = Scratch::new("auto-pan");
+    let source = vec![1.0; 200];
+    let track = automated(vec![], vec![(0, -1.0), (100, -1.0), (101, 1.0)]);
+    let buf = render_mix(&mut scratch, vec![(track, source)], 0.5);
+    assert!(buf.channel(0)[..=100].iter().all(|&s| s == 0.5));
+    assert!(buf.channel(1)[..=100].iter().all(|&s| s == 0.0));
+    assert!(buf.channel(0)[101..].iter().all(|&s| s == 0.0));
+    assert!(buf.channel(1)[101..].iter().all(|&s| s == 0.5));
+}
+
+#[test]
+fn mute_silences_an_automated_track() {
+    let mut scratch = Scratch::new("auto-mute");
+    let mut track = automated(vec![(0, 1.0)], vec![(0, 0.0)]);
+    track.mute = true;
+    let buf = render_mix(&mut scratch, vec![(track, vec![1.0; 100])], 1.0);
+    assert!(
+        buf.channel(0)
+            .iter()
+            .chain(buf.channel(1))
+            .all(|&s| s == 0.0)
+    );
+}

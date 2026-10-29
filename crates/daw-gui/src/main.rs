@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use audio_core::{Effect, EffectKind, MAX_EFFECTS_PER_TRACK, Note};
+use audio_core::{AutoPoint, Effect, EffectKind, Lane, MAX_EFFECTS_PER_TRACK, Note};
 use daw_app::playback::PlaybackControl;
 use daw_gui::{Editor, bars, clock, samples_to_x, sixteenth_samples, snap_to_beat, x_to_samples};
 use eframe::egui::{
@@ -121,6 +121,11 @@ struct App {
     piano_scroll: bool,
     /// Track whose effects window is open (SPEC-022).
     fx: Option<usize>,
+    /// Track whose automation lane is shown (SPEC-023).
+    auto: Option<usize>,
+    auto_lane: Lane,
+    /// Index of the automation point being dragged.
+    auto_drag: Option<usize>,
 }
 
 impl App {
@@ -141,6 +146,9 @@ impl App {
             note_drag: None,
             piano_scroll: false,
             fx: None,
+            auto: None,
+            auto_lane: Lane::Gain,
+            auto_drag: None,
         };
         if let Some(path) = start {
             app.open(path);
@@ -567,6 +575,32 @@ impl App {
                                     Some(index)
                                 };
                             }
+                            if ui
+                                .selectable_label(self.auto == Some(index), "A")
+                                .on_hover_text("Автоматизация")
+                                .clicked()
+                            {
+                                self.auto = if self.auto == Some(index) {
+                                    None
+                                } else {
+                                    Some(index)
+                                };
+                                self.auto_drag = None;
+                            }
+                            if self.auto == Some(index) {
+                                let other = match self.auto_lane {
+                                    Lane::Gain => Lane::Pan,
+                                    Lane::Pan => Lane::Gain,
+                                };
+                                if ui
+                                    .button(lane_label(self.auto_lane))
+                                    .on_hover_text("Какую линию показывать")
+                                    .clicked()
+                                {
+                                    self.auto_lane = other;
+                                    self.auto_drag = None;
+                                }
+                            }
                             let s = ui.toggle_value(&mut solo, "S").on_hover_text("Соло");
                             let m = ui.toggle_value(&mut mute, "M").on_hover_text("Без звука");
                             if s.changed() || m.changed() {
@@ -577,8 +611,17 @@ impl App {
                             }
                         });
                     });
-                    let g = ui.add(egui::Slider::new(&mut gain, 0.0..=1.0).text("громк."));
-                    let p = ui.add(egui::Slider::new(&mut pan, -1.0..=1.0).text("пан."));
+                    let automation = &self.editor.session().tracks[index].automation;
+                    let (gain_free, pan_free) =
+                        (automation.gain.is_empty(), automation.pan.is_empty());
+                    let g = ui.add_enabled(
+                        gain_free,
+                        egui::Slider::new(&mut gain, 0.0..=1.0).text("громк."),
+                    );
+                    let p = ui.add_enabled(
+                        pan_free,
+                        egui::Slider::new(&mut pan, -1.0..=1.0).text("пан."),
+                    );
                     if g.changed() || p.changed() {
                         if let Some(t) = self.editor.track_mut(index) {
                             t.gain = gain;
@@ -593,6 +636,8 @@ impl App {
         }
         if let Some(index) = delete {
             self.fx = None;
+            self.auto = None;
+            self.auto_drag = None;
             self.editor.delete_track(index);
             self.status = "Дорожка удалена".into();
         }
@@ -747,6 +792,29 @@ impl App {
             }
         }
 
+        let auto_row = self.auto.filter(|&t| t < tracks).map(|t| {
+            let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
+            Rect::from_min_max(
+                Pos2::new(area.min.x, top),
+                Pos2::new(area.max.x, top + TRACK_HEIGHT),
+            )
+        });
+        if let (Some(t), Some(row)) = (self.auto.filter(|&t| t < tracks), auto_row) {
+            self.draw_lane(&painter, area, row, t);
+        }
+        // While a lane is shown, presses inside its row edit the lane, not clips.
+        let pressed = response.is_pointer_button_down_on()
+            || response.clicked()
+            || response.secondary_clicked()
+            || response.drag_stopped();
+        let lane_owned = self.drag.is_none()
+            && (self.auto_drag.is_some()
+                || (pressed
+                    && auto_row.is_some_and(|row| {
+                        ui.input(|i| i.pointer.press_origin())
+                            .is_some_and(|p| row.contains(p))
+                    })));
+
         let rate_u32 = self.editor.session().sample_rate;
         let cursor = area.min.x + samples_to_x(self.playhead, rate_u32, self.zoom);
         painter.line_segment(
@@ -757,6 +825,10 @@ impl App {
         if response.clicked() && pointer.is_some_and(|p| ruler.contains(p)) {
             if let Some(p) = pointer {
                 self.seek(x_to_samples(p.x - area.min.x, rate_u32, self.zoom));
+            }
+        } else if lane_owned {
+            if let (Some(t), Some(row)) = (self.auto, auto_row) {
+                self.edit_lane(ui, &response, area, row, t);
             }
         } else if response.clicked() {
             self.editor.selected_clip = clicked;
@@ -773,12 +845,131 @@ impl App {
             self.open_piano(at);
         }
 
-        self.drag_clips(ui, &response, area, &rects);
+        if !lane_owned {
+            self.drag_clips(ui, &response, area, &rects);
+        }
 
         if response.hovered() || ui.rect_contains_pointer(ui.clip_rect()) {
             let (ctrl, scroll) = ui.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
             if ctrl && scroll != 0.0 {
                 self.zoom = (self.zoom * (1.0 + scroll * 0.002)).clamp(MIN_ZOOM, MAX_ZOOM);
+            }
+        }
+    }
+
+    /// Draws one track's automation lane over its clips (SPEC-023).
+    #[allow(clippy::cast_precision_loss)]
+    fn draw_lane(&self, painter: &egui::Painter, area: Rect, row: Rect, track: usize) {
+        let rate = self.editor.session().sample_rate;
+        let t = &self.editor.session().tracks[track];
+        let points = t.automation.lane(self.auto_lane);
+        let color = Color32::from_rgb(250, 180, 60);
+        painter.rect_filled(row, 0.0, Color32::from_black_alpha(90));
+        if points.is_empty() {
+            let fixed = match self.auto_lane {
+                Lane::Gain => t.gain,
+                Lane::Pan => t.pan,
+            };
+            let y = value_to_y(self.auto_lane, fixed, row);
+            let mut x = row.min.x;
+            while x < row.max.x {
+                painter.line_segment(
+                    [Pos2::new(x, y), Pos2::new((x + 6.0).min(row.max.x), y)],
+                    Stroke::new(1.0_f32, color),
+                );
+                x += 12.0;
+            }
+            return;
+        }
+        let at = |p: &AutoPoint| {
+            Pos2::new(
+                area.min.x + samples_to_x(p.time, rate, self.zoom),
+                value_to_y(self.auto_lane, p.value, row),
+            )
+        };
+        let first = at(&points[0]);
+        let last = at(&points[points.len() - 1]);
+        let mut line = vec![Pos2::new(row.min.x, first.y)];
+        line.extend(points.iter().map(at));
+        line.push(Pos2::new(row.max.x, last.y));
+        painter.add(egui::Shape::line(line, Stroke::new(2.0_f32, color)));
+        for p in points {
+            painter.circle_filled(at(p), POINT_RADIUS, color);
+        }
+    }
+
+    /// Mouse editing of the shown automation lane: click adds a point, drag
+    /// moves one, right click removes one (SPEC-023).
+    fn edit_lane(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        area: Rect,
+        row: Rect,
+        track: usize,
+    ) {
+        let rate = self.editor.session().sample_rate;
+        let tempo = self.editor.session().tempo_bpm;
+        let lane = self.auto_lane;
+        let snap = self.snap && !ui.input(|i| i.modifiers.shift);
+        let zoom = self.zoom;
+        let to_point = |p: Pos2| {
+            let time = x_to_samples((p.x - area.min.x).max(0.0), rate, zoom);
+            AutoPoint {
+                time: if snap {
+                    snap_to_beat(time, rate, tempo)
+                } else {
+                    time
+                },
+                value: y_to_value(lane, p.y, row),
+            }
+        };
+        let points = self.editor.session().tracks[track]
+            .automation
+            .lane(lane)
+            .to_vec();
+        let hit = |p: Pos2| -> Option<usize> {
+            points.iter().position(|point| {
+                let x = area.min.x + samples_to_x(point.time, rate, zoom);
+                let y = value_to_y(lane, point.value, row);
+                Pos2::new(x, y).distance(p) <= POINT_RADIUS + 3.0
+            })
+        };
+
+        if response.secondary_clicked() {
+            if let Some(index) = response.interact_pointer_pos().and_then(hit) {
+                let result = self.editor.remove_point(track, lane, index);
+                self.report(result, "Точка удалена");
+            }
+            return;
+        }
+        if response.clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                if hit(p).is_none() {
+                    let result = self.editor.add_point(track, lane, to_point(p));
+                    self.report(result, "Точка добавлена");
+                }
+            }
+            return;
+        }
+        if response.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            self.auto_drag = origin.and_then(|p| {
+                hit(p).or_else(|| self.editor.add_point(track, lane, to_point(p)).ok())
+            });
+        }
+        let Some(index) = self.auto_drag else { return };
+        if response.drag_stopped() {
+            self.auto_drag = None;
+            self.status = "Автоматизация изменена".into();
+            return;
+        }
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        if let Some(p) = response.interact_pointer_pos() {
+            let point = to_point(Pos2::new(p.x, p.y.clamp(row.min.y, row.max.y)));
+            if let Err(e) = self.editor.move_point(track, lane, index, point) {
+                self.status = format!("Ошибка: {e}");
+                self.auto_drag = None;
             }
         }
     }
@@ -1434,4 +1625,29 @@ impl eframe::App for App {
             self.title = title;
         }
     }
+}
+
+/// Radius of an automation point in pixels.
+const POINT_RADIUS: f32 = 4.0;
+
+fn lane_label(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Gain => "Громк.",
+        Lane::Pan => "Пан.",
+    }
+}
+
+/// Maps a lane value to a y inside the track row: top is the maximum.
+fn value_to_y(lane: Lane, value: f32, row: Rect) -> f32 {
+    let (lo, hi) = lane.range();
+    let norm = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let (top, bottom) = (row.min.y + POINT_RADIUS, row.max.y - POINT_RADIUS);
+    bottom - norm * (bottom - top)
+}
+
+fn y_to_value(lane: Lane, y: f32, row: Rect) -> f32 {
+    let (lo, hi) = lane.range();
+    let (top, bottom) = (row.min.y + POINT_RADIUS, row.max.y - POINT_RADIUS);
+    let norm = ((bottom - y) / (bottom - top)).clamp(0.0, 1.0);
+    lo + norm * (hi - lo)
 }

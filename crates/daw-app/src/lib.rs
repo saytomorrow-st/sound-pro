@@ -413,7 +413,8 @@ pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error:
     for (index, source) in job.tracks.into_iter().enumerate() {
         let node = nodes::Track::new(&source.track, source.clips)?
             .with_mix(job.session.is_audible(index), job.session.master_gain)
-            .with_effects(&source.track.effects, job.sample_rate);
+            .with_effects(&source.track.effects, job.sample_rate)
+            .with_automation(&source.track.automation);
         let name = track_label(&source.track.name);
         graph.add_node(name, node)?;
     }

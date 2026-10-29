@@ -16,7 +16,8 @@ use crate::fx::{Effect, EffectKind, MAX_EFFECTS_PER_TRACK};
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
-    Clip, MAX_CLIPS_PER_TRACK, MAX_NOTES_PER_CLIP, MAX_TRACKS, Note, Session, SessionError, Track,
+    AutoPoint, Automation, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_CLIPS_PER_TRACK,
+    MAX_NOTES_PER_CLIP, MAX_TRACKS, Note, Session, SessionError, Track,
 };
 
 /// Longest accepted `name`, in bytes.
@@ -422,6 +423,9 @@ fn write_session(out: &mut String, session: &Session) {
         if !track.effects.is_empty() {
             write_effects(out, &track.effects);
         }
+        if !track.automation.is_empty() {
+            write_automation(out, &track.automation);
+        }
         out.push_str("\n      }");
     }
     if session.tracks.is_empty() {
@@ -502,9 +506,11 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut solo = None;
     let mut clips = None;
     let mut effects = None;
+    let mut automation = None;
     for (key, value) in entries {
         match key.as_str() {
             "effects" => effects = Some(effects_from_value(value)?),
+            "automation" => automation = Some(automation_from_value(value)?),
             "name" => name = Some(require_string(value)?),
             "gain" => gain = Some(require_f32(value)?),
             "pan" => pan = Some(require_f32(value)?),
@@ -550,6 +556,97 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
         })?,
         // Optional since SPEC-022.
         effects: effects.unwrap_or_default(),
+        // Optional since SPEC-023.
+        automation: automation.unwrap_or_default(),
+    })
+}
+
+/// Appends a track's `"automation"` object; empty lanes are skipped
+/// (SPEC-023).
+fn write_automation(out: &mut String, automation: &Automation) {
+    out.push_str(",\n        \"automation\": {");
+    let mut first = true;
+    for lane in [Lane::Gain, Lane::Pan] {
+        let points = automation.lane(lane);
+        if points.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str("\n          ");
+        write_string(out, &lane.to_string());
+        out.push_str(": [");
+        for (index, point) in points.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{{\"time\": {}, \"value\": ", point.time);
+            out.push_str(&format_number(f64::from(point.value)));
+            out.push('}');
+        }
+        out.push(']');
+    }
+    out.push_str("\n        }");
+}
+
+fn automation_from_value(value: &Value) -> Result<Automation, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut automation = Automation::default();
+    for (key, value) in entries {
+        let lane = match key.as_str() {
+            "gain" => Lane::Gain,
+            "pan" => Lane::Pan,
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        };
+        let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+        // Cap before decoding, like tracks, clips, notes and effects.
+        if items.len() > MAX_AUTOMATION_POINTS {
+            return Err(ProjectError::Session(SessionError::InvalidAutomation {
+                track: 0,
+                lane,
+                point: MAX_AUTOMATION_POINTS,
+            }));
+        }
+        *automation.lane_mut(lane) = items
+            .iter()
+            .map(point_from_value)
+            .collect::<Result<_, _>>()?;
+    }
+    Ok(automation)
+}
+
+fn point_from_value(value: &Value) -> Result<AutoPoint, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut time = None;
+    let mut point_value = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "time" => time = Some(require_u64(value)?),
+            "value" => point_value = Some(require_f32(value)?),
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(AutoPoint {
+        time: time.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].automation[].time",
+        })?,
+        value: point_value.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].automation[].value",
+        })?,
     })
 }
 

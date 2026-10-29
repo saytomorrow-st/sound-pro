@@ -46,8 +46,9 @@ pub use render::{RenderStats, Renderer};
 pub use resample::{ResampleError, resample};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
-    Clip, MAX_CLIPS_PER_TRACK, MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES, MAX_TRACKS, Note, Session,
-    SessionError, Track as SessionTrack,
+    AutoPoint, Automation, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_CLIPS_PER_TRACK,
+    MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES, MAX_TRACKS, Note, Session, SessionError,
+    Track as SessionTrack, pan_law,
 };
 pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz, render_notes};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};

@@ -21,6 +21,9 @@ pub const MAX_SOURCE_BYTES: usize = 4096;
 /// Most notes a single MIDI clip may hold (SPEC-021).
 pub const MAX_NOTES_PER_CLIP: usize = 4096;
 
+/// Most points one automation lane may hold (SPEC-023).
+pub const MAX_AUTOMATION_POINTS: usize = 1024;
+
 /// Why a session (or one of its clips) is inconsistent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -116,6 +119,17 @@ pub enum SessionError {
         /// are too many.
         effect: usize,
     },
+    /// An automation point is out of order or out of range, or the lane is
+    /// longer than [`MAX_AUTOMATION_POINTS`] (SPEC-023).
+    InvalidAutomation {
+        /// Index of the offending track.
+        track: usize,
+        /// Which lane.
+        lane: Lane,
+        /// Index of the offending point; [`MAX_AUTOMATION_POINTS`] when there
+        /// are too many.
+        point: usize,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -160,6 +174,12 @@ impl fmt::Display for SessionError {
             }
             Self::InvalidEffect { track, effect } => {
                 write!(f, "track {track}: effect {effect} is invalid")
+            }
+            Self::InvalidAutomation { track, lane, point } => {
+                write!(
+                    f,
+                    "track {track}: {lane} automation point {point} is invalid"
+                )
             }
         }
     }
@@ -277,6 +297,116 @@ impl Clip {
     }
 }
 
+/// Balance-law multipliers `(left, right)` for `pan` in `-1.0..=1.0`; both
+/// are exactly `1.0` at centre (SPEC-013).
+#[must_use]
+pub fn pan_law(pan: f32) -> (f32, f32) {
+    let left = if pan <= 0.0 { 1.0 } else { 1.0 - pan };
+    let right = if pan >= 0.0 { 1.0 } else { 1.0 + pan };
+    (left, right)
+}
+
+/// Which automated track parameter (SPEC-023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// Track gain, `0.0..=1.0`.
+    Gain,
+    /// Track pan, `-1.0..=1.0`.
+    Pan,
+}
+
+impl Lane {
+    /// Inclusive range of accepted values.
+    #[must_use]
+    pub const fn range(self) -> (f32, f32) {
+        match self {
+            Self::Gain => (0.0, 1.0),
+            Self::Pan => (-1.0, 1.0),
+        }
+    }
+
+    /// Whether `value` is finite and inside [`Lane::range`].
+    #[must_use]
+    pub fn accepts(self, value: f32) -> bool {
+        let (low, high) = self.range();
+        value.is_finite() && (low..=high).contains(&value)
+    }
+}
+
+impl fmt::Display for Lane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Gain => "gain",
+            Self::Pan => "pan",
+        })
+    }
+}
+
+/// One breakpoint of an automation lane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoPoint {
+    /// Timeline position in samples.
+    pub time: u64,
+    /// Parameter value at `time`.
+    pub value: f32,
+}
+
+/// Breakpoint lanes for one track; points are strictly ordered by time.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Automation {
+    /// Gain lane.
+    pub gain: Vec<AutoPoint>,
+    /// Pan lane.
+    pub pan: Vec<AutoPoint>,
+}
+
+impl Automation {
+    /// `true` when neither lane has a point.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.gain.is_empty() && self.pan.is_empty()
+    }
+
+    /// Points of one lane.
+    #[must_use]
+    pub fn lane(&self, lane: Lane) -> &[AutoPoint] {
+        match lane {
+            Lane::Gain => &self.gain,
+            Lane::Pan => &self.pan,
+        }
+    }
+
+    /// Mutable points of one lane.
+    pub fn lane_mut(&mut self, lane: Lane) -> &mut Vec<AutoPoint> {
+        match lane {
+            Lane::Gain => &mut self.gain,
+            Lane::Pan => &mut self.pan,
+        }
+    }
+
+    /// Lane value at `time`: held before the first and after the last point,
+    /// linear in between; `None` for an empty lane. Allocation-free.
+    #[must_use]
+    pub fn value_at(points: &[AutoPoint], time: u64) -> Option<f32> {
+        let first = points.first()?;
+        let next = points.partition_point(|point| point.time <= time);
+        if next == 0 {
+            return Some(first.value);
+        }
+        let before = points[next - 1];
+        let Some(after) = points.get(next) else {
+            return Some(before.value);
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let fraction = (time - before.time) as f64 / (after.time - before.time) as f64;
+        #[allow(clippy::cast_possible_truncation)]
+        let value =
+            f64::from(before.value) + (f64::from(after.value) - f64::from(before.value)) * fraction;
+        #[allow(clippy::cast_possible_truncation)]
+        Some(value as f32)
+    }
+}
+
 /// A horizontal lane holding clips.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
@@ -295,6 +425,8 @@ pub struct Track {
     /// Insert effects, processed in order after the clips are summed and
     /// before gain and pan (SPEC-022).
     pub effects: Vec<Effect>,
+    /// Gain and pan lanes; a non-empty lane overrides the slider (SPEC-023).
+    pub automation: Automation,
 }
 
 impl Track {
@@ -309,6 +441,7 @@ impl Track {
             solo: false,
             clips: Vec::new(),
             effects: Vec::new(),
+            automation: Automation::default(),
         }
     }
 
@@ -316,9 +449,7 @@ impl Track {
     /// centre.
     #[must_use]
     pub fn pan_gains(&self) -> (f32, f32) {
-        let left = if self.pan <= 0.0 { 1.0 } else { 1.0 - self.pan };
-        let right = if self.pan >= 0.0 { 1.0 } else { 1.0 + self.pan };
-        (left, right)
+        pan_law(self.pan)
     }
 
     /// Timeline position where the last clip of this track stops sounding.
@@ -488,6 +619,7 @@ impl Session {
                 }
             }
             validate_effects(&track.effects, track_index)?;
+            validate_automation(&track.automation, track_index)?;
         }
         Ok(())
     }
@@ -532,6 +664,24 @@ fn validate_effects(effects: &[Effect], track: usize) -> Result<(), SessionError
         Some(effect) => Err(SessionError::InvalidEffect { track, effect }),
         None => Ok(()),
     }
+}
+
+/// SPEC-023 checks for one track's automation lanes.
+fn validate_automation(automation: &Automation, track: usize) -> Result<(), SessionError> {
+    for lane in [Lane::Gain, Lane::Pan] {
+        let points = automation.lane(lane);
+        let error = |point| SessionError::InvalidAutomation { track, lane, point };
+        if points.len() > MAX_AUTOMATION_POINTS {
+            return Err(error(MAX_AUTOMATION_POINTS));
+        }
+        for (index, point) in points.iter().enumerate() {
+            let ordered = index == 0 || points[index - 1].time < point.time;
+            if !ordered || !lane.accepts(point.value) {
+                return Err(error(index));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Finite and inside `[0, 1]`.
