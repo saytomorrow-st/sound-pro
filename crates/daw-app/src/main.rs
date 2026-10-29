@@ -307,10 +307,12 @@ fn session(mut args: impl Iterator<Item = String>) -> ExitCode {
     let session = project.session();
     for (index, track) in session.tracks.iter().enumerate() {
         println!(
-            "{index} {} gain={} mute={} clips={}",
+            "{index} {} gain={} pan={} mute={} solo={} clips={}",
             track.name,
             track.gain,
+            track.pan,
             track.mute,
+            track.solo,
             track.clips.len()
         );
         for (clip_index, clip) in track.clips.iter().enumerate() {
@@ -320,11 +322,12 @@ fn session(mut args: impl Iterator<Item = String>) -> ExitCode {
             );
         }
     }
+    println!("master_gain={}", session.master_gain);
     println!("session_frames={}", session.length_samples());
     ExitCode::SUCCESS
 }
 
-/// `daw render-session`: render the in-memory demo session to mono WAV.
+/// `daw render-session`: render the in-memory demo session to stereo WAV.
 fn render_session(mut args: impl Iterator<Item = String>) -> ExitCode {
     let Some(output) = args.next().map(PathBuf::from) else {
         eprintln!("usage: daw render-session <out.wav> [--seconds S]");

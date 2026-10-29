@@ -191,7 +191,48 @@ fn a_two_track_session_graph_does_not_allocate() {
     // Everything above is built with the counter disarmed: sources, labels
     // and the graph itself are setup, not render.
     let mut renderer = renderer_for(build_session_graph(job()).unwrap());
-    let mut mix = AudioBuffer::new(1, BLOCK);
+    // Session graphs are stereo since SPEC-013.
+    let mut mix = AudioBuffer::new(2, BLOCK);
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "session graph allocated {count} times");
+}
+
+#[test]
+fn a_panned_soloed_stereo_session_does_not_allocate() {
+    let mut left = overlapping_track();
+    left.pan = -0.75;
+    left.solo = true;
+    let mut right = overlapping_track();
+    right.pan = 0.4;
+    let mut session = Session::new("s", RATE, 120.0);
+    session.master_gain = 0.8;
+    session.tracks.push(left.clone());
+    session.tracks.push(right.clone());
+    let job = SessionJob {
+        session,
+        tracks: vec![
+            TrackSource {
+                track: left,
+                clips: sources(),
+            },
+            TrackSource {
+                track: right,
+                clips: sources(),
+            },
+        ],
+        sample_rate: RATE,
+        block_frames: BLOCK,
+        frames: None,
+        output: std::path::PathBuf::new(),
+    };
+    let mut renderer = renderer_for(build_session_graph(job).unwrap());
+    let mut mix = AudioBuffer::new(2, BLOCK);
+    // The clips end long before QUANTA blocks, so check the sound up front.
+    renderer.render(BLOCK, &mut mix).unwrap();
+    assert!(
+        mix.channel(0).iter().any(|&s| s != 0.0),
+        "solo track sounds"
+    );
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(count, 0, "stereo mixer allocated {count} times");
 }

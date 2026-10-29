@@ -13,13 +13,16 @@ pub struct Session {
     pub name: String,
     pub sample_rate: u32,
     pub tempo_bpm: f64,
+    pub master_gain: f32, // 0.0..=1.0, SPEC-013
     pub tracks: Vec<Track>,
 }
 
 pub struct Track {
     pub name: String,
     pub gain: f32,   // 0.0..=1.0
+    pub pan: f32,    // -1.0..=1.0, SPEC-013
     pub mute: bool,
+    pub solo: bool,  // SPEC-013
     pub clips: Vec<Clip>,
 }
 
@@ -55,11 +58,14 @@ pub struct Clip {
     "name": "demo",
     "sample_rate": 48000,
     "tempo_bpm": 120.0,
+    "master_gain": 1.0,
     "tracks": [
       {
         "name": "low",
         "gain": 1.0,
+        "pan": -0.5,
         "mute": false,
+        "solo": false,
         "clips": [
           {
             "name": "440",
@@ -78,7 +84,9 @@ pub struct Clip {
 
 Порядок полей фиксирован; лишние поля и неизвестные типы отвергаются с
 указанием пути (`session.tracks[0].clips[1].length`). Слишком длинный список
-отвергается до декодирования элементов.
+отвергается до декодирования элементов. `master_gain`, `pan` и `solo`
+необязательны при чтении (умолчания `1`, `0`, `false`), поэтому файлы до
+SPEC-013 открываются как прежде; записываются всегда.
 
 ## Рендер
 
@@ -88,10 +96,21 @@ pub struct Clip {
 - монтирует по одному узлу `nodes::Track` на дорожку, `MonoClip` (или любой
   `ClipSource`) на клип;
 - играет с нулевого кадра; по умолчанию длина — `Session::length_samples()`;
-- пишет mono float32 WAV и возвращает `SessionReport { frames, session_frames, tracks }`.
+- пишет **стерео** float32 WAV и возвращает `SessionReport { frames, session_frames, tracks }`.
 
 Клипы одной дорожки микшируются с clip gain в порядке `Vec`, затем
-умножаются на gain дорожки; `mute` делает дорожку тишиной. На горячем пути нет
+умножаются на gain дорожки; `mute` делает дорожку тишиной.
+
+## Микшер (SPEC-013)
+
+- **Панорама** — закон баланса: `left = pan <= 0 ? 1 : 1 - pan`,
+  `right = pan >= 0 ? 1 : 1 + pan`. В центре оба множителя ровно `1`, поэтому
+  сессия без панорамы в каждом канале бит-в-бит равна прежнему моно.
+- **Solo**: если хоть одна дорожка в solo, звучат только solo-дорожки.
+  `mute` сильнее `solo`. Решение принимает `Session::is_audible` при
+  построении графа, не в `process`.
+- **Мастер**: `master_gain` умножается в каждой дорожке до суммы — линейно
+  то же, что после. На горячем пути нет
 аллокаций, блокировок и I/O: источники создаются до старта транспорта, а
 `process` только читает сэмплы по индексу.
 
@@ -103,8 +122,9 @@ cargo run -q --bin daw -- session show /tmp/demo.json
 cargo run -q --bin daw -- render-session /tmp/s.wav [--seconds 0.5]
 ```
 
-`render-session` рендерит встроенную демо-сессию: 440 Гц полсекунды в начале и
-660 Гц четверть секунды, начиная с четверти секунды. Короче `--seconds` —
+`render-session` рендерит встроенную демо-сессию: 440 Гц полсекунды в начале
+(pan −0.5) и 660 Гц четверть секунды, начиная с четверти секунды (pan 0.5).
+`session show` печатает `pan=`, `solo=` и `master_gain=`. Короче `--seconds` —
 срез, длиннее — тишина в хвосте.
 
 ## Вне области
