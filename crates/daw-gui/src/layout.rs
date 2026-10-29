@@ -114,3 +114,99 @@ pub fn pan_label(pan: f32) -> String {
         _ => format!("R{amount}"),
     }
 }
+
+/// Number of colours in the track palette.
+pub const PALETTE_SIZE: u8 = 8;
+
+/// Palette slot of a track: its own colour, or one picked by position so new
+/// tracks are colourful like in a classic DAW (SPEC-036).
+#[must_use]
+pub fn display_color(color: Option<u8>, index: usize) -> u8 {
+    match color {
+        Some(c) if c < PALETTE_SIZE => c,
+        #[allow(clippy::cast_possible_truncation)]
+        _ => (index % usize::from(PALETTE_SIZE)) as u8,
+    }
+}
+
+/// Colours of a region drawn on the timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionColors {
+    /// Title strip with the region name, darker than the body.
+    pub header: [u8; 3],
+    /// Region body, the track colour.
+    pub body: [u8; 3],
+    /// Waveform or notes inside, a dark tint of the track colour.
+    pub detail: [u8; 3],
+}
+
+/// Multiplies each channel by `factor` (`< 1` darker); `> 1` mixes towards
+/// white instead, so `2.0` is white and `0.0` is black.
+#[must_use]
+pub fn shade(rgb: [u8; 3], factor: f32) -> [u8; 3] {
+    let factor = if factor.is_finite() {
+        factor.clamp(0.0, 2.0)
+    } else {
+        1.0
+    };
+    rgb.map(|c| {
+        let c = f32::from(c);
+        let v = if factor <= 1.0 {
+            c * factor
+        } else {
+            c + (255.0 - c) * (factor - 1.0)
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let v = v.round().clamp(0.0, 255.0) as u8;
+        v
+    })
+}
+
+/// Region colours from the track colour; muted tracks are grey.
+#[must_use]
+pub fn region_colors(base: [u8; 3], muted: bool) -> RegionColors {
+    let body = if muted { [86, 86, 86] } else { base };
+    RegionColors {
+        header: shade(body, 0.72),
+        body,
+        detail: shade(body, 0.38),
+    }
+}
+
+/// Lowest level on the fader scale, in dB; below it the fader is at the
+/// bottom (silence).
+pub const FADER_FLOOR_DB: f32 = -60.0;
+
+/// Fader travel `0..=1` for a gain `0..=1`: equal steps in dB from
+/// [`FADER_FLOOR_DB`] to 0 dB, so -6 dB sits high on the fader.
+#[must_use]
+pub fn fader_position(gain: f32) -> f32 {
+    if !gain.is_finite() || gain <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * gain.min(1.0).log10();
+    ((db - FADER_FLOOR_DB) / -FADER_FLOOR_DB).clamp(0.0, 1.0)
+}
+
+/// Gain for a fader travel; inverse of [`fader_position`]. The bottom is
+/// silence.
+#[must_use]
+pub fn fader_gain(position: f32) -> f32 {
+    if !position.is_finite() || position <= 0.0 {
+        return 0.0;
+    }
+    let db = FADER_FLOOR_DB * (1.0 - position.min(1.0));
+    10f32.powf(db / 20.0)
+}
+
+/// Pan knob pointer angle in radians from straight up: `-135°` for hard
+/// left, `+135°` for hard right.
+#[must_use]
+pub fn pan_angle(pan: f32) -> f32 {
+    let pan = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    pan * 135f32.to_radians()
+}
