@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use audio_core::{
     AutoPoint, Effect, EffectKind, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note, TRACK_COLORS,
 };
+use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
 use daw_gui::{
     Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
@@ -170,6 +171,14 @@ struct App {
     marker_drag: Option<(usize, u64)>,
     /// Marker whose name is being edited and the text typed so far (SPEC-030).
     marker_rename: Option<(usize, String)>,
+    /// Sound devices and buffer size (SPEC-033).
+    audio: AudioSettings,
+    /// Where `audio` is saved; `None` when no config folder is known.
+    audio_path: Option<PathBuf>,
+    /// The audio settings window is open, with the device names last listed.
+    audio_open: bool,
+    outputs: Vec<String>,
+    inputs: Vec<String>,
 }
 
 /// What the user asked to do with a marker flag (SPEC-030).
@@ -178,6 +187,32 @@ enum MarkerAction {
     Move(usize, u64),
     Rename(usize),
     Delete(usize),
+}
+
+/// Device picker: "Системный" plus every listed name. A saved device that
+/// is not plugged in stays visible, marked as missing.
+fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, names: &[String]) {
+    let shown = match value.as_deref() {
+        None => "Системный".to_owned(),
+        Some(name) if names.iter().any(|n| n == name) => name.to_owned(),
+        Some(name) => format!("{name} (не найдено)"),
+    };
+    egui::ComboBox::from_id_salt(id)
+        .width(260.0)
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "Системный");
+            for name in names {
+                ui.selectable_value(value, Some(name.clone()), name);
+            }
+        });
+}
+
+fn buffer_label(frames: u32, rate: u32) -> String {
+    format!(
+        "{frames} ({:.1} мс)",
+        daw_app::audio_settings::buffer_ms(frames, rate)
+    )
 }
 
 impl App {
@@ -206,7 +241,15 @@ impl App {
             cycle_drag: None,
             marker_drag: None,
             marker_rename: None,
+            audio: AudioSettings::default(),
+            audio_path: daw_app::audio_settings::default_path(),
+            audio_open: false,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
         };
+        if let Some(path) = &app.audio_path {
+            app.audio = AudioSettings::load(path);
+        }
         if let Some(path) = start {
             app.open(path);
         }
@@ -246,7 +289,7 @@ impl App {
         #[cfg(feature = "audio")]
         {
             let rate = control.sample_rate();
-            match daw_app::realtime::start_output(engine, rate) {
+            match daw_app::realtime::start_output_with(engine, rate, &self.audio) {
                 Ok(stream) => {
                     self.player = Some(Player {
                         control,
@@ -292,7 +335,7 @@ impl App {
     #[cfg(feature = "audio")]
     fn start_recording(&mut self) {
         let rate = self.editor.session().sample_rate;
-        match daw_app::realtime::start_input(rate, 30) {
+        match daw_app::realtime::start_input_with(rate, 30, &self.audio) {
             Ok((control, stream)) => {
                 let start = self.playhead;
                 if !self.editor.session().tracks.is_empty() {
@@ -689,6 +732,10 @@ impl App {
                 }
                 if ui.button("Экспорт сведения…").clicked() {
                     self.export_dialog();
+                }
+                ui.separator();
+                if ui.button("Настройки звука…").clicked() {
+                    self.open_audio_settings();
                 }
                 ui.separator();
                 if ui.button("Выход").clicked() {
@@ -2264,6 +2311,101 @@ impl App {
         }
     }
 
+    fn open_audio_settings(&mut self) {
+        #[cfg(feature = "audio")]
+        {
+            self.outputs = daw_app::realtime::output_device_names();
+            self.inputs = daw_app::realtime::input_device_names();
+        }
+        self.audio_open = true;
+    }
+
+    /// The audio settings window (SPEC-033): output, input, buffer size.
+    fn audio_window(&mut self, ctx: &egui::Context) {
+        if !self.audio_open {
+            return;
+        }
+        let mut open = true;
+        let before = self.audio.clone();
+        egui::Window::new("Настройки звука")
+            .id(egui::Id::new("audio-settings"))
+            .open(&mut open)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| self.audio_ui(ui));
+        if !open {
+            self.audio_open = false;
+        }
+        if self.audio != before {
+            self.apply_audio_settings();
+        }
+    }
+
+    fn audio_ui(&mut self, ui: &mut egui::Ui) {
+        if !cfg!(feature = "audio") {
+            ui.label("Звук выключен в этой сборке (соберите с --features audio).");
+            ui.add_space(6.0);
+        }
+        let rate = self.editor.session().sample_rate;
+        egui::Grid::new("audio-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Выход");
+                device_combo(ui, "audio-out", &mut self.audio.output, &self.outputs);
+                ui.end_row();
+                ui.label("Вход");
+                device_combo(ui, "audio-in", &mut self.audio.input, &self.inputs);
+                ui.end_row();
+                ui.label("Буфер");
+                let shown = self
+                    .audio
+                    .buffer_frames
+                    .map_or_else(|| "Системный".to_owned(), |n| buffer_label(n, rate));
+                egui::ComboBox::from_id_salt("audio-buffer")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.audio.buffer_frames, None, "Системный");
+                        for n in BUFFER_SIZES {
+                            ui.selectable_value(
+                                &mut self.audio.buffer_frames,
+                                Some(n),
+                                buffer_label(n, rate),
+                            );
+                        }
+                    });
+                ui.end_row();
+                ui.label("Частота");
+                ui.label(format!("{rate} Гц (частота проекта)"));
+                ui.end_row();
+            });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Обновить список").clicked() {
+                self.open_audio_settings();
+            }
+            if ui.button("По умолчанию").clicked() {
+                self.audio = AudioSettings::default();
+            }
+        });
+        ui.small("Меньший буфер — меньше задержка, но выше нагрузка.");
+    }
+
+    /// Saves the settings and restarts playback on the new device.
+    fn apply_audio_settings(&mut self) {
+        if let Some(path) = &self.audio_path
+            && let Err(e) = self.audio.save(path)
+        {
+            self.status = format!("Не удалось сохранить настройки звука: {e}");
+            return;
+        }
+        self.status = "Настройки звука сохранены".into();
+        if self.player.is_some() {
+            self.pause();
+            self.play();
+        }
+    }
+
     /// The buses window (SPEC-028): bus list and the selected track's sends.
     fn buses_window(&mut self, ctx: &egui::Context) {
         if !self.buses_open {
@@ -2437,6 +2579,7 @@ impl eframe::App for App {
 
         self.effects_window(ctx);
         self.buses_window(ctx);
+        self.audio_window(ctx);
 
         if self.confirm_quit {
             egui::Window::new("Несохранённые изменения")

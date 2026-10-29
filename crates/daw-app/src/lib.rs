@@ -28,6 +28,7 @@ use audio_core::transport::{DEFAULT_SAMPLE_RATE, Transport, TransportCommand};
 use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
 
 pub mod audio_file;
+pub mod audio_settings;
 pub mod nodes;
 
 /// Errors from assembling a session graph (SPEC-010).
