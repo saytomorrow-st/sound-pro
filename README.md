@@ -52,8 +52,8 @@ cargo build -p daw-app --features realtime
 ## Что дальше
 
 См. `docs/AI-WORKFLOW.md` → «Первые 5 задач для агента» и `specs/000-template.md`.
-Ближайшее — [SPEC-006](specs/006-live-parameter-channel.md): живой канал
-параметров.
+Ближайшее — [SPEC-007](specs/007-midi-event-scheduler.md): планировщик
+MIDI-событий (тик → сэмпл, опрос в узле).
 
 ## Лицензия
 

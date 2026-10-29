@@ -25,6 +25,7 @@ pub mod midi;
 pub mod offline;
 pub mod params;
 pub mod render;
+pub mod schedule;
 pub mod transport;
 pub mod wav;
 
@@ -35,6 +36,7 @@ pub use midi::{MidiError, MidiEvent, MidiFile, MidiMessage, parse_smf};
 pub use offline::{OfflineError, OfflineRenderer};
 pub use params::{MAX_SMOOTHING_MS, ParamError, ParamHandle, ParamId, ParamSpec};
 pub use render::{RenderStats, Renderer};
+pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
 pub use wav::{Recorder, WavError, WavSpec, read_wav_mono, write_wav_mono};
 
