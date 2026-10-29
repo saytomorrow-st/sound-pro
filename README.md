@@ -54,6 +54,8 @@ cargo build -p daw-app --features realtime
   WAV (`daw render-midi`) — SPEC-009.
 - [Сессии и клипы](docs/SESSION.md): дорожки, окна в источники, рендер суммы
   (`daw render-session`) — SPEC-010.
+- Клипы из WAV-файлов и сведение сохранённого проекта
+  (`daw session render <project.json> <out.wav>`) — SPEC-014.
 
 ## Что дальше
 

@@ -417,6 +417,162 @@ pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error:
     Ok(graph)
 }
 
+/// Errors from loading a project document and its clip files (SPEC-014).
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    /// The project file could not be read.
+    #[error("cannot read {path}: {source}")]
+    Read {
+        /// Project path.
+        path: PathBuf,
+        /// Underlying error.
+        source: std::io::Error,
+    },
+    /// The project document is invalid.
+    #[error("{path}: {source}")]
+    Project {
+        /// Project path.
+        path: PathBuf,
+        /// Parse or validation error.
+        source: audio_core::ProjectError,
+    },
+    /// A clip has no `source` path, so there is nothing to play.
+    #[error("track {track} clip {clip} has no source file")]
+    MissingSource {
+        /// Track index.
+        track: usize,
+        /// Clip index inside the track.
+        clip: usize,
+    },
+    /// A clip's WAV file could not be read.
+    #[error("{path}: {source}")]
+    Wav {
+        /// Resolved file path.
+        path: PathBuf,
+        /// Underlying error.
+        source: audio_core::WavError,
+    },
+    /// A clip's WAV file runs at a different rate than the session.
+    #[error("{path}: sample rate {file} Hz, session runs at {session} Hz")]
+    SampleRate {
+        /// Resolved file path.
+        path: PathBuf,
+        /// Rate stored in the file.
+        file: u32,
+        /// Session rate.
+        session: u32,
+    },
+    /// A clip's WAV file holds fewer frames than its `source_length`.
+    #[error("{path}: {file_frames} frame(s), clip needs source_length {source_length}")]
+    SourceTooShort {
+        /// Resolved file path.
+        path: PathBuf,
+        /// Frames in the file.
+        file_frames: u64,
+        /// Frames the clip declares.
+        source_length: u64,
+    },
+}
+
+/// Loads a project document and every clip's WAV file into a [`SessionJob`].
+///
+/// Relative `source` paths are resolved against the project file's folder.
+/// Multi-channel files are averaged to mono; frames past `source_length`
+/// are dropped. All I/O happens here, before any rendering starts.
+///
+/// # Errors
+///
+/// See [`LoadError`]; the first failing clip, in session order, is reported.
+pub fn load_session_project(
+    path: &std::path::Path,
+    output: PathBuf,
+) -> Result<SessionJob, LoadError> {
+    let text = std::fs::read_to_string(path).map_err(|source| LoadError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let project = audio_core::Project::from_json(&text).map_err(|source| LoadError::Project {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let session = project.session().clone();
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let mut tracks = Vec::with_capacity(session.tracks.len());
+    for (track_index, track) in session.tracks.iter().enumerate() {
+        let mut clips: Vec<Box<dyn nodes::ClipSource + Send>> =
+            Vec::with_capacity(track.clips.len());
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            let source = clip.source.as_deref().ok_or(LoadError::MissingSource {
+                track: track_index,
+                clip: clip_index,
+            })?;
+            let file = base.join(source);
+            clips.push(Box::new(load_clip_file(
+                &file,
+                session.sample_rate,
+                clip.source_length,
+            )?));
+        }
+        tracks.push(TrackSource {
+            track: track.clone(),
+            clips,
+        });
+    }
+    Ok(SessionJob {
+        sample_rate: session.sample_rate,
+        session,
+        tracks,
+        block_frames: BLOCK_FRAMES,
+        frames: None,
+        output,
+    })
+}
+
+/// Reads `path` as mono content of exactly `source_length` frames.
+fn load_clip_file(
+    path: &std::path::Path,
+    sample_rate: u32,
+    source_length: u64,
+) -> Result<Vec<f32>, LoadError> {
+    let (spec, buffer) = audio_core::wav::read_wav_mono(path).map_err(|source| LoadError::Wav {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if spec.sample_rate != sample_rate {
+        return Err(LoadError::SampleRate {
+            path: path.to_path_buf(),
+            file: spec.sample_rate,
+            session: sample_rate,
+        });
+    }
+    let file_frames = buffer.channel(0).len() as u64;
+    let too_short = || LoadError::SourceTooShort {
+        path: path.to_path_buf(),
+        file_frames,
+        source_length,
+    };
+    if file_frames < source_length {
+        return Err(too_short());
+    }
+    let frames = usize::try_from(source_length).map_err(|_| too_short())?;
+    let channels = usize::from(spec.channels).max(1);
+    if channels == 1 {
+        return Ok(buffer.channel(0)[..frames].to_vec());
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let scale = 1.0 / channels as f32;
+    let mut mono = vec![0.0_f32; frames];
+    for ch in 0..channels {
+        for (out, sample) in mono.iter_mut().zip(buffer.channel(ch)) {
+            *out += sample;
+        }
+    }
+    for out in &mut mono {
+        *out *= scale;
+    }
+    Ok(mono)
+}
+
 /// A `&'static str` label for the track node, truncated to keep it short.
 fn track_label(name: &str) -> &'static str {
     let mut label = String::from("track:");

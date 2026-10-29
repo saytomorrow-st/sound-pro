@@ -33,13 +33,15 @@ pub struct Clip {
     pub source_length: u64,   // длина источника
     pub gain: f32,            // 0.0..=1.0
     pub name: String,
+    pub source: Option<String>, // путь к WAV, SPEC-014
 }
 ```
 
 Ограничения: `MAX_TRACKS = 32`, `MAX_CLIPS_PER_TRACK = 128`, имена — до
 `MAX_NAME_BYTES`. `Session::validate` — единственная точка проверки; ошибки
 (`SessionError`) перечисляют конкретную дорожку и клип. Порядок проверок внутри
-клипа: имя → gain → `length == 0` (`EmptyClip`) → `source_length == 0`
+клипа: имя → `source` (пустой или длиннее `MAX_SOURCE_BYTES = 4096` —
+`InvalidSource`) → gain → `length == 0` (`EmptyClip`) → `source_length == 0`
 (`EmptySource`) → переполнение таймлайна (`TimelineOverflow`) → выход за
 источник (`ClipOutOfSource`).
 
@@ -88,6 +90,19 @@ pub struct Clip {
 необязательны при чтении (умолчания `1`, `0`, `false`), поэтому файлы до
 SPEC-013 открываются как прежде; записываются всегда.
 
+`source` (SPEC-014) — необязательный последний ключ клипа: пишется только если
+путь задан, так что документы без него сохраняются байт-в-байт как раньше.
+
+## Файлы клипов (SPEC-014)
+
+`daw_app::load_session_project(project, out)` читает документ и WAV каждого
+клипа до начала рендера. Относительный `source` считается от каталога файла
+проекта, абсолютный — как есть. Частота файла должна совпадать с
+`session.sample_rate` (ресемплинга нет), файл должен быть не короче
+`source_length`; лишний хвост отбрасывается, многоканальный файл сводится в
+моно средним. Ошибки — `LoadError`: `Read`, `Project`, `MissingSource`, `Wav`,
+`SampleRate`, `SourceTooShort`, все с путём.
+
 ## Рендер
 
 `daw_app::render_session(SessionJob)`:
@@ -120,7 +135,10 @@ SPEC-013 открываются как прежде; записываются в
 cargo run -q --bin daw -- session save /tmp/demo.json   # демо-сессия
 cargo run -q --bin daw -- session show /tmp/demo.json
 cargo run -q --bin daw -- render-session /tmp/s.wav [--seconds 0.5]
+cargo run -q --bin daw -- session render song.json /tmp/mix.wav [--seconds 2]
 ```
+
+`session render` сводит проект с клипами из WAV-файлов в стерео WAV.
 
 `render-session` рендерит встроенную демо-сессию: 440 Гц полсекунды в начале
 (pan −0.5) и 660 Гц четверть секунды, начиная с четверти секунды (pan 0.5).
