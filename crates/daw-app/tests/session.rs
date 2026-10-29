@@ -618,3 +618,129 @@ fn mute_silences_an_automated_track() {
             .all(|&s| s == 0.0)
     );
 }
+
+/// Renders `tracks` (each one full clip over its source) with `buses`.
+fn render_bused(
+    scratch: &mut Scratch,
+    tracks: Vec<(SessionTrack, Vec<f32>)>,
+    buses: Vec<audio_core::Bus>,
+    master_gain: f32,
+) -> AudioBuffer {
+    let mut session = Session::new("bus", RATE, 120.0);
+    session.master_gain = master_gain;
+    session.buses = buses;
+    let mut sources = Vec::new();
+    for (mut track, source) in tracks {
+        track.clips.push(Clip::full(0, source.len() as u64));
+        session.tracks.push(track.clone());
+        sources.push(TrackSource {
+            track,
+            clips: vec![Box::new(source)],
+        });
+    }
+    session.validate().unwrap();
+    let output = scratch.path();
+    render_session(SessionJob {
+        session,
+        tracks: sources,
+        sample_rate: RATE,
+        block_frames: 64,
+        frames: None,
+        output: output.clone(),
+    })
+    .unwrap();
+    let (_, buf) = audio_core::wav::read_wav_mono(&output).unwrap();
+    buf
+}
+
+fn sending(level: f32) -> SessionTrack {
+    let mut track = panned(-1.0);
+    track.sends.push(audio_core::BusSend { bus: 0, level });
+    track
+}
+
+#[test]
+fn a_bus_without_sends_leaves_the_mix_unchanged() {
+    let mut scratch = Scratch::new("busidle");
+    let source = ramp(300);
+    let plain = render_mix(&mut scratch, vec![(panned(-1.0), source.clone())], 0.5);
+    let bused = render_bused(
+        &mut scratch,
+        vec![(panned(-1.0), source)],
+        vec![audio_core::Bus::new("Aux")],
+        0.5,
+    );
+    assert_eq!(bused.channel(0), plain.channel(0));
+    assert_eq!(bused.channel(1), plain.channel(1));
+}
+
+#[test]
+fn a_send_adds_the_scaled_track_through_the_bus() {
+    let mut scratch = Scratch::new("bussend");
+    let source = ramp(300);
+    let mut bus = audio_core::Bus::new("Aux");
+    bus.gain = 0.5;
+    let out = render_bused(
+        &mut scratch,
+        vec![(sending(0.5), source.clone())],
+        vec![bus],
+        1.0,
+    );
+    let expected: Vec<f32> = source.iter().map(|s| s + s * 0.5 * 0.5).collect();
+    for (got, want) in out.channel(0).iter().zip(&expected) {
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    }
+    assert!(out.channel(1).iter().all(|&s| s == 0.0));
+}
+
+#[test]
+fn the_master_gain_applies_once_to_dry_and_returned_signal() {
+    let mut scratch = Scratch::new("busmaster");
+    let source = ramp(300);
+    let out = render_bused(
+        &mut scratch,
+        vec![(sending(1.0), source.clone())],
+        vec![audio_core::Bus::new("Aux")],
+        0.5,
+    );
+    for (got, s) in out.channel(0).iter().zip(&source) {
+        assert!((got - s * 2.0 * 0.5).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn a_muted_track_sends_nothing() {
+    let mut scratch = Scratch::new("busmute");
+    let mut track = sending(1.0);
+    track.mute = true;
+    let out = render_bused(
+        &mut scratch,
+        vec![(track, ramp(300))],
+        vec![audio_core::Bus::new("Aux")],
+        1.0,
+    );
+    assert!(out.channel(0).iter().all(|&s| s == 0.0));
+}
+
+#[test]
+fn bus_effects_shape_only_the_sent_part() {
+    let mut scratch = Scratch::new("busfx");
+    let source: Vec<f32> = (0..4800).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+    let mut bus = audio_core::Bus::new("Verb");
+    bus.effects
+        .push(audio_core::Effect::new(audio_core::EffectKind::reverb()));
+    let wet = render_bused(
+        &mut scratch,
+        vec![(sending(0.5), source.clone())],
+        vec![bus.clone()],
+        1.0,
+    );
+    let dry = render_bused(
+        &mut scratch,
+        vec![(sending(0.0), source.clone())],
+        vec![bus],
+        1.0,
+    );
+    assert_eq!(dry.channel(0), source.as_slice());
+    assert_ne!(wet.channel(0), dry.channel(0));
+}

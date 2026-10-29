@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track};
 use audio_core::{
-    Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Project, ProjectError, SessionError,
+    Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Project, ProjectError,
+    SessionError,
 };
 
 /// Sample rate of a new project.
@@ -99,6 +100,9 @@ pub enum EditorError {
     /// The track or automation point index does not exist (SPEC-023).
     #[error("no such track or automation point")]
     NoPoint,
+    /// The bus, track or bus effect index does not exist (SPEC-028).
+    #[error("no such bus, track or bus effect")]
+    NoBus,
     /// A cycle region must not be empty (SPEC-025).
     #[error("the cycle region is empty")]
     EmptyCycle,
@@ -1056,6 +1060,157 @@ impl Editor {
         self.commit_track(session, track)
     }
 
+    /// Appends a bus named `name` with unity gain and returns its index
+    /// (SPEC-028).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::Session`] when the bus list is full or the name is
+    /// invalid; `self` is unchanged.
+    pub fn add_bus(&mut self, name: &str) -> Result<usize, EditorError> {
+        let mut session = self.project.session.clone();
+        session.buses.push(Bus::new(name));
+        let index = session.buses.len() - 1;
+        self.commit_session(session)?;
+        Ok(index)
+    }
+
+    /// Removes a bus, every send to it, and shifts sends to later buses down
+    /// by one.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for a bad index; `self` is unchanged.
+    pub fn remove_bus(&mut self, bus: usize) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        if bus >= session.buses.len() {
+            return Err(EditorError::NoBus);
+        }
+        session.buses.remove(bus);
+        for track in &mut session.tracks {
+            track.sends.retain(|send| send.bus != bus);
+            for send in &mut track.sends {
+                if send.bus > bus {
+                    send.bus -= 1;
+                }
+            }
+        }
+        self.commit_session(session)
+    }
+
+    /// Sets a bus's return gain. Setting the current value records no undo
+    /// step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for a bad index, [`EditorError::Session`] for
+    /// a gain outside `0..=1`; `self` is unchanged.
+    pub fn set_bus_gain(&mut self, bus: usize, gain: f32) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let slot = &mut session.buses.get_mut(bus).ok_or(EditorError::NoBus)?.gain;
+        if slot.to_bits() == gain.to_bits() {
+            return Ok(());
+        }
+        *slot = gain;
+        self.commit_session(session)
+    }
+
+    /// Sets the level of `track`'s send to `bus`; `0` removes the send.
+    /// Setting the current level records no undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for a bad track or bus index,
+    /// [`EditorError::Session`] for a level outside `0..=1`; `self` is
+    /// unchanged.
+    pub fn set_send(&mut self, track: usize, bus: usize, level: f32) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        if bus >= session.buses.len() {
+            return Err(EditorError::NoBus);
+        }
+        let sends = &mut session
+            .tracks
+            .get_mut(track)
+            .ok_or(EditorError::NoBus)?
+            .sends;
+        let current = sends.iter().position(|send| send.bus == bus);
+        match current {
+            Some(index) if level == 0.0 => {
+                sends.remove(index);
+            }
+            Some(index) => {
+                if sends[index].level.to_bits() == level.to_bits() {
+                    return Ok(());
+                }
+                sends[index].level = level;
+            }
+            None if level == 0.0 => return Ok(()),
+            None => sends.push(BusSend { bus, level }),
+        }
+        self.commit_track(session, track)
+    }
+
+    /// Appends an effect with default settings to a bus and returns its
+    /// index.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for a bad bus index, [`EditorError::Session`]
+    /// when the chain is full; `self` is unchanged.
+    pub fn add_bus_effect(&mut self, bus: usize, kind: EffectKind) -> Result<usize, EditorError> {
+        let mut session = self.project.session.clone();
+        let effects = &mut session
+            .buses
+            .get_mut(bus)
+            .ok_or(EditorError::NoBus)?
+            .effects;
+        effects.push(Effect::new(kind));
+        let index = effects.len() - 1;
+        self.commit_session(session)?;
+        Ok(index)
+    }
+
+    /// Removes one effect from a bus.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for bad indices; `self` is unchanged.
+    pub fn remove_bus_effect(&mut self, bus: usize, index: usize) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        bus_effects_mut(&mut session, bus, index)?.remove(index);
+        self.commit_session(session)
+    }
+
+    /// Replaces one bus effect's settings. Setting the current value records
+    /// no undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for bad indices, [`EditorError::Session`] for
+    /// an out-of-range value; `self` is unchanged.
+    pub fn set_bus_effect(
+        &mut self,
+        bus: usize,
+        index: usize,
+        effect: Effect,
+    ) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let slot = &mut bus_effects_mut(&mut session, bus, index)?[index];
+        if *slot == effect {
+            return Ok(());
+        }
+        *slot = effect;
+        self.commit_session(session)
+    }
+
+    fn commit_session(&mut self, session: Session) -> Result<(), EditorError> {
+        session.validate()?;
+        self.record();
+        self.project.session = session;
+        self.dirty = true;
+        Ok(())
+    }
+
     fn commit_track(&mut self, session: Session, track: usize) -> Result<(), EditorError> {
         session.validate()?;
         self.record();
@@ -1287,6 +1442,19 @@ fn lane_mut(
         .get_mut(track)
         .map(|track| track.automation.lane_mut(lane))
         .ok_or(EditorError::NoPoint)
+}
+
+fn bus_effects_mut(
+    session: &mut Session,
+    bus: usize,
+    index: usize,
+) -> Result<&mut Vec<Effect>, EditorError> {
+    session
+        .buses
+        .get_mut(bus)
+        .map(|b| &mut b.effects)
+        .filter(|effects| index < effects.len())
+        .ok_or(EditorError::NoBus)
 }
 
 fn effects_mut(

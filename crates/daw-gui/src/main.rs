@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use audio_core::{AutoPoint, Effect, EffectKind, Lane, MAX_EFFECTS_PER_TRACK, Note};
+use audio_core::{AutoPoint, Effect, EffectKind, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note};
 use daw_app::playback::PlaybackControl;
 use daw_gui::{
     Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
@@ -124,8 +124,10 @@ struct App {
     note_drag: Option<NoteDrag>,
     /// Scroll the piano roll to middle C on the next frame.
     piano_scroll: bool,
-    /// Track whose effects window is open (SPEC-022).
-    fx: Option<usize>,
+    /// Track or bus whose effects window is open (SPEC-022, SPEC-028).
+    fx: Option<FxTarget>,
+    /// The buses window is open (SPEC-028).
+    buses_open: bool,
     /// Track whose automation lane is shown (SPEC-023).
     auto: Option<usize>,
     auto_lane: Lane,
@@ -153,6 +155,7 @@ impl App {
             note_drag: None,
             piano_scroll: false,
             fx: None,
+            buses_open: false,
             auto: None,
             auto_lane: Lane::Gain,
             auto_drag: None,
@@ -462,6 +465,14 @@ impl App {
             if ui.add(click).on_hover_text("Метроном (K)").clicked() {
                 self.toggle_metronome();
             }
+            let buses = egui::Button::new("Шины").selected(self.buses_open);
+            if ui
+                .add(buses)
+                .on_hover_text("Общие эффекты для нескольких дорожек")
+                .clicked()
+            {
+                self.buses_open = !self.buses_open;
+            }
             ui.separator();
             let session = self.editor.session();
             let text = format!(
@@ -704,14 +715,14 @@ impl App {
                                 format!("FX {effects}")
                             };
                             if ui
-                                .selectable_label(self.fx == Some(index), label)
+                                .selectable_label(self.fx == Some(FxTarget::Track(index)), label)
                                 .on_hover_text("Эффекты дорожки")
                                 .clicked()
                             {
-                                self.fx = if self.fx == Some(index) {
+                                self.fx = if self.fx == Some(FxTarget::Track(index)) {
                                     None
                                 } else {
-                                    Some(index)
+                                    Some(FxTarget::Track(index))
                                 };
                             }
                             if ui
@@ -1729,34 +1740,39 @@ fn effect_sliders(ui: &mut egui::Ui, kind: &mut EffectKind) -> bool {
 }
 
 impl App {
-    /// The effects window of the track chosen with its «FX» button.
+    /// The effects window of the track or bus chosen with its «FX» button.
     fn effects_window(&mut self, ctx: &egui::Context) {
-        let Some(track) = self.fx else {
+        let Some(target) = self.fx else {
             return;
         };
-        let Some(name) = self
-            .editor
-            .session()
-            .tracks
-            .get(track)
-            .map(|t| t.name.clone())
-        else {
+        let session = self.editor.session();
+        let title = match target {
+            FxTarget::Track(index) => session
+                .tracks
+                .get(index)
+                .map(|t| format!("Эффекты — {}", t.name)),
+            FxTarget::Bus(index) => session
+                .buses
+                .get(index)
+                .map(|b| format!("Эффекты шины — {}", b.name)),
+        };
+        let Some(title) = title else {
             self.fx = None;
             return;
         };
         let mut open = true;
-        egui::Window::new(format!("Эффекты — {name}"))
+        egui::Window::new(title)
             .id(egui::Id::new("effects"))
             .open(&mut open)
             .resizable(true)
             .default_width(320.0)
-            .show(ctx, |ui| self.effects_ui(ui, track));
+            .show(ctx, |ui| self.effects_ui(ui, target));
         if !open {
             self.fx = None;
         }
     }
 
-    fn effects_ui(&mut self, ui: &mut egui::Ui, track: usize) {
+    fn effects_ui(&mut self, ui: &mut egui::Ui, target: FxTarget) {
         ui.horizontal(|ui| {
             let mut add = None;
             if ui.button("+ EQ").clicked() {
@@ -1769,13 +1785,21 @@ impl App {
                 add = Some(EffectKind::reverb());
             }
             if let Some(kind) = add {
-                self.status = match self.editor.add_effect(track, kind) {
+                let added = match target {
+                    FxTarget::Track(track) => self.editor.add_effect(track, kind),
+                    FxTarget::Bus(bus) => self.editor.add_bus_effect(bus, kind),
+                };
+                self.status = match added {
                     Ok(_) => "Эффект добавлен".into(),
-                    Err(_) => format!("Не больше {MAX_EFFECTS_PER_TRACK} эффектов на дорожке"),
+                    Err(_) => format!("Не больше {MAX_EFFECTS_PER_TRACK} эффектов"),
                 };
             }
         });
-        let effects = self.editor.session().tracks[track].effects.clone();
+        let session = self.editor.session();
+        let (effects, movable) = match target {
+            FxTarget::Track(track) => (session.tracks[track].effects.clone(), true),
+            FxTarget::Bus(bus) => (session.buses[bus].effects.clone(), false),
+        };
         if effects.is_empty() {
             ui.label("Эффектов нет. Звук идёт без обработки.");
         }
@@ -1792,17 +1816,19 @@ impl App {
                         if ui.small_button("✕").on_hover_text("Удалить").clicked() {
                             action = Some(FxAction::Remove(index));
                         }
-                        if ui
-                            .add_enabled(index < last, egui::Button::new("▼").small())
-                            .clicked()
-                        {
-                            action = Some(FxAction::Move(index, index + 1));
-                        }
-                        if ui
-                            .add_enabled(index > 0, egui::Button::new("▲").small())
-                            .clicked()
-                        {
-                            action = Some(FxAction::Move(index, index - 1));
+                        if movable {
+                            if ui
+                                .add_enabled(index < last, egui::Button::new("▼").small())
+                                .clicked()
+                            {
+                                action = Some(FxAction::Move(index, index + 1));
+                            }
+                            if ui
+                                .add_enabled(index > 0, egui::Button::new("▲").small())
+                                .clicked()
+                            {
+                                action = Some(FxAction::Move(index, index - 1));
+                            }
                         }
                         changed |= ui.checkbox(&mut edited.bypass, "Обход").changed();
                     });
@@ -1815,16 +1841,136 @@ impl App {
                 }
             }
         });
-        let result = match action {
-            None => return,
-            Some(FxAction::Remove(index)) => self.editor.remove_effect(track, index),
-            Some(FxAction::Move(from, to)) => self.editor.move_effect(track, from, to),
-            Some(FxAction::Set(index, effect)) => self.editor.set_effect(track, index, effect),
+        let Some(action) = action else {
+            return;
+        };
+        let result = match (target, action) {
+            (FxTarget::Track(track), FxAction::Remove(index)) => {
+                self.editor.remove_effect(track, index)
+            }
+            (FxTarget::Track(track), FxAction::Move(from, to)) => {
+                self.editor.move_effect(track, from, to)
+            }
+            (FxTarget::Track(track), FxAction::Set(index, effect)) => {
+                self.editor.set_effect(track, index, effect)
+            }
+            (FxTarget::Bus(bus), FxAction::Remove(index)) => {
+                self.editor.remove_bus_effect(bus, index)
+            }
+            (FxTarget::Bus(_), FxAction::Move(..)) => Ok(()),
+            (FxTarget::Bus(bus), FxAction::Set(index, effect)) => {
+                self.editor.set_bus_effect(bus, index, effect)
+            }
         };
         if let Err(error) = result {
             self.status = error.to_string();
         }
     }
+
+    /// The buses window (SPEC-028): bus list and the selected track's sends.
+    fn buses_window(&mut self, ctx: &egui::Context) {
+        if !self.buses_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Шины")
+            .id(egui::Id::new("buses"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(320.0)
+            .show(ctx, |ui| self.buses_ui(ui));
+        if !open {
+            self.buses_open = false;
+        }
+    }
+
+    fn buses_ui(&mut self, ui: &mut egui::Ui) {
+        let buses = self.editor.session().buses.clone();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(buses.len() < MAX_BUSES, egui::Button::new("+ Шина"))
+                .clicked()
+            {
+                let name = format!("Шина {}", buses.len() + 1);
+                if let Ok(index) = self.editor.add_bus(&name) {
+                    // A new bus usually exists to hold a shared reverb.
+                    let _ = self.editor.add_bus_effect(index, EffectKind::reverb());
+                    self.status = format!("{name} добавлена, на ней реверб");
+                }
+            }
+            ui.label(format!("до {MAX_BUSES}"));
+        });
+        if buses.is_empty() {
+            ui.label("Шин нет. Шина — общий эффект, например реверб, для нескольких дорожек.");
+            return;
+        }
+        let mut remove = None;
+        for (index, bus) in buses.iter().enumerate() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&bus.name).strong());
+                let mut gain = bus.gain;
+                if ui
+                    .add(egui::Slider::new(&mut gain, 0.0..=1.0).text("громкость"))
+                    .changed()
+                {
+                    let _ = self.editor.set_bus_gain(index, gain);
+                }
+                let label = if bus.effects.is_empty() {
+                    "FX".to_owned()
+                } else {
+                    format!("FX {}", bus.effects.len())
+                };
+                let target = Some(FxTarget::Bus(index));
+                if ui
+                    .selectable_label(self.fx == target, label)
+                    .on_hover_text("Эффекты шины")
+                    .clicked()
+                {
+                    self.fx = if self.fx == target { None } else { target };
+                }
+                if ui.small_button("✕").on_hover_text("Удалить шину").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            if matches!(self.fx, Some(FxTarget::Bus(_))) {
+                self.fx = None;
+            }
+            if let Err(error) = self.editor.remove_bus(index) {
+                self.status = error.to_string();
+            }
+            return;
+        }
+        ui.separator();
+        let Some(track) = self
+            .editor
+            .selected_track
+            .filter(|&t| t < self.editor.session().tracks.len())
+        else {
+            ui.label("Выберите дорожку слева, чтобы настроить её посылы.");
+            return;
+        };
+        let name = self.editor.session().tracks[track].name.clone();
+        ui.label(format!("Посылы дорожки «{name}»:"));
+        for (index, bus) in buses.iter().enumerate() {
+            let mut level = self.editor.session().tracks[track].send_level(index);
+            if ui
+                .add(egui::Slider::new(&mut level, 0.0..=1.0).text(&bus.name))
+                .changed()
+            {
+                let _ = self.editor.set_send(track, index, level);
+            }
+        }
+    }
+}
+
+/// What the effects window edits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FxTarget {
+    Track(usize),
+    Bus(usize),
 }
 
 /// One change requested in the effects window, applied after drawing it.
@@ -1893,6 +2039,7 @@ impl eframe::App for App {
         });
 
         self.effects_window(ctx);
+        self.buses_window(ctx);
 
         if self.confirm_quit {
             egui::Window::new("Несохранённые изменения")

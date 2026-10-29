@@ -410,13 +410,36 @@ pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error:
     // Sources are moved into the graph one by one, so the job is consumed:
     // rendering the same session twice means building the job twice, which is
     // what the determinism test does.
+    // SPEC-028: without buses every track stays its own node, exactly as
+    // before; with buses one mixer node renders tracks, sends and returns.
+    let with_buses = !job.session.buses.is_empty();
+    let master = if with_buses {
+        1.0
+    } else {
+        job.session.master_gain
+    };
+    let mut mixed = Vec::new();
     for (index, source) in job.tracks.into_iter().enumerate() {
         let node = nodes::Track::new(&source.track, source.clips)?
-            .with_mix(job.session.is_audible(index), job.session.master_gain)
+            .with_mix(job.session.is_audible(index), master)
             .with_effects(&source.track.effects, job.sample_rate)
             .with_automation(&source.track.automation);
-        let name = track_label(&source.track.name);
-        graph.add_node(name, node)?;
+        if with_buses {
+            mixed.push((node, source.track.sends.clone()));
+        } else {
+            let name = track_label(&source.track.name);
+            graph.add_node(name, node)?;
+        }
+    }
+    if with_buses {
+        let mixer = nodes::Mixer::new(
+            mixed,
+            &job.session.buses,
+            job.session.master_gain,
+            job.sample_rate,
+            job.block_frames.next_power_of_two(),
+        );
+        graph.add_node("mixer", mixer)?;
     }
     Ok(graph)
 }

@@ -32,6 +32,9 @@ pub const MAX_NOTES_PER_CLIP: usize = 4096;
 /// Most points one automation lane may hold (SPEC-023).
 pub const MAX_AUTOMATION_POINTS: usize = 1024;
 
+/// Most buses a session may hold (SPEC-028).
+pub const MAX_BUSES: usize = 4;
+
 /// Why a session (or one of its clips) is inconsistent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -141,6 +144,20 @@ pub enum SessionError {
         /// are too many.
         point: usize,
     },
+    /// A bus gain is out of range, its name is too long, one of its effects
+    /// is invalid, or there are more than [`MAX_BUSES`] buses (SPEC-028).
+    InvalidBus {
+        /// Index of the offending bus; [`MAX_BUSES`] when there are too many.
+        bus: usize,
+    },
+    /// A send points at a missing bus, repeats a bus, has a level outside
+    /// `[0, 1]`, or the track has more than [`MAX_BUSES`] sends (SPEC-028).
+    InvalidSend {
+        /// Index of the track holding the send.
+        track: usize,
+        /// Index of the offending send; [`MAX_BUSES`] when there are too many.
+        send: usize,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -192,6 +209,10 @@ impl fmt::Display for SessionError {
                     f,
                     "track {track}: {lane} automation point {point} is invalid"
                 )
+            }
+            Self::InvalidBus { bus } => write!(f, "bus {bus} is invalid"),
+            Self::InvalidSend { track, send } => {
+                write!(f, "track {track}: send {send} is invalid")
             }
         }
     }
@@ -439,6 +460,41 @@ pub struct Track {
     pub effects: Vec<Effect>,
     /// Gain and pan lanes; a non-empty lane overrides the slider (SPEC-023).
     pub automation: Automation,
+    /// Post-fader sends to the session's buses (SPEC-028).
+    pub sends: Vec<BusSend>,
+}
+
+/// A post-fader copy of a track's sound sent to one bus (SPEC-028).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BusSend {
+    /// Index into [`Session::buses`].
+    pub bus: usize,
+    /// Linear send level, `0.0..=1.0`.
+    pub level: f32,
+}
+
+/// A shared effects return: tracks send to it, it adds its processed sum to
+/// the master (SPEC-028).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bus {
+    /// Display name.
+    pub name: String,
+    /// Linear return gain, `0.0..=1.0`.
+    pub gain: f32,
+    /// Effects applied to the summed sends, in order.
+    pub effects: Vec<Effect>,
+}
+
+impl Bus {
+    /// Bus at unity gain with no effects.
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            gain: 1.0,
+            effects: Vec::new(),
+        }
+    }
 }
 
 impl Track {
@@ -454,7 +510,17 @@ impl Track {
             clips: Vec::new(),
             effects: Vec::new(),
             automation: Automation::default(),
+            sends: Vec::new(),
         }
+    }
+
+    /// Send level to `bus`, `0.0` when the track does not send there.
+    #[must_use]
+    pub fn send_level(&self, bus: usize) -> f32 {
+        self.sends
+            .iter()
+            .find(|send| send.bus == bus)
+            .map_or(0.0, |send| send.level)
     }
 
     /// Balance-law multipliers `(left, right)`; both are exactly `1.0` at
@@ -486,6 +552,8 @@ pub struct Session {
     pub time_signature: TimeSignature,
     /// Tracks in session order.
     pub tracks: Vec<Track>,
+    /// Effect buses fed by track sends (SPEC-028).
+    pub buses: Vec<Bus>,
 }
 
 impl Session {
@@ -499,6 +567,7 @@ impl Session {
             master_gain: 1.0,
             time_signature: TimeSignature::default(),
             tracks: Vec::new(),
+            buses: Vec::new(),
         }
     }
 
@@ -564,6 +633,7 @@ impl Session {
         if self.tracks.len() > MAX_TRACKS {
             return Err(SessionError::TooManyTracks { max: MAX_TRACKS });
         }
+        self.validate_buses()?;
         for (track_index, track) in self.tracks.iter().enumerate() {
             if track.name.len() > MAX_NAME_BYTES {
                 return Err(SessionError::NameTooLong);
@@ -638,9 +708,42 @@ impl Session {
             }
             validate_effects(&track.effects, track_index)?;
             validate_automation(&track.automation, track_index)?;
+            validate_sends(&track.sends, self.buses.len(), track_index)?;
         }
         Ok(())
     }
+
+    /// SPEC-028 checks for the bus list.
+    fn validate_buses(&self) -> Result<(), SessionError> {
+        if self.buses.len() > MAX_BUSES {
+            return Err(SessionError::InvalidBus { bus: MAX_BUSES });
+        }
+        for (bus_index, bus) in self.buses.iter().enumerate() {
+            let effects_ok = bus.effects.len() <= MAX_EFFECTS_PER_TRACK
+                && bus.effects.iter().all(|effect| effect.kind.is_valid());
+            if bus.name.len() > MAX_NAME_BYTES || !valid_gain(bus.gain) || !effects_ok {
+                return Err(SessionError::InvalidBus { bus: bus_index });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// SPEC-028 checks for one track's sends.
+fn validate_sends(sends: &[BusSend], buses: usize, track: usize) -> Result<(), SessionError> {
+    if sends.len() > MAX_BUSES {
+        return Err(SessionError::InvalidSend {
+            track,
+            send: MAX_BUSES,
+        });
+    }
+    for (index, send) in sends.iter().enumerate() {
+        let repeated = sends[..index].iter().any(|other| other.bus == send.bus);
+        if send.bus >= buses || repeated || !valid_gain(send.level) {
+            return Err(SessionError::InvalidSend { track, send: index });
+        }
+    }
+    Ok(())
 }
 
 /// SPEC-021 checks for one MIDI clip.
