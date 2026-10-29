@@ -308,3 +308,31 @@ fn a_clip_count_mismatch_is_reported() {
         .to_string()
     );
 }
+
+#[test]
+fn a_clip_claiming_more_source_than_exists_renders_silence_past_the_real_end() {
+    use audio_core::{Graph, Renderer, Transport, TransportCommand};
+
+    // The model claims 1 000 frames of content; the source holds only 100.
+    // `Track` must not trust the claim: past the real end it plays silence.
+    let mut track = SessionTrack::new("t");
+    track.clips.push(Clip::full(0, 1_000));
+    let source = ramp(100);
+    let node = daw_app::nodes::Track::new(&track, vec![Box::new(source.clone())]).unwrap();
+
+    let mut graph = Graph::with_capacity(RATE, 1, 64, 1, 0);
+    graph.add_node("t", node).unwrap();
+    let mut transport = Transport::new(RATE);
+    transport.apply(TransportCommand::Play);
+    let mut renderer = Renderer::new(graph, transport, 64);
+
+    let mut rendered = Vec::new();
+    let mut mix = AudioBuffer::new(1, 64);
+    for _ in 0..(1_024 / 64) {
+        renderer.render(64, &mut mix).unwrap();
+        rendered.extend_from_slice(&mix.channel(0)[..64]);
+    }
+
+    assert_eq!(&rendered[..100], &source[..]);
+    assert!(rendered[100..].iter().all(|&s| s == 0.0));
+}

@@ -414,19 +414,32 @@ impl Recorder {
     }
 }
 
-/// Fills a buffer with a unit test sine wave. Deterministic bit-for-bit, so it
-/// is safe to compare across platforms.
-#[must_use]
-pub fn sine(freq_hz: f64, sample_rate: u32, offset: u64, frames: usize) -> Vec<Sample> {
-    let mut out = Vec::with_capacity(frames);
-    for i in 0..frames {
-        let sample_index = offset + i as u64;
+/// Writes a unit test sine wave into `out`. Deterministic bit-for-bit, so it is
+/// safe to compare across platforms.
+///
+/// This is the allocation-free form: callers on the audio path pass their own
+/// buffer instead of receiving a fresh `Vec` (SPEC-011 §1).
+pub fn sine_into(freq_hz: f64, sample_rate: u32, offset: u64, out: &mut [Sample]) {
+    for (i, slot) in out.iter_mut().enumerate() {
+        let sample_index = offset.saturating_add(i as u64);
         #[allow(clippy::cast_precision_loss)]
         let phase =
             std::f64::consts::TAU * freq_hz * (sample_index as f64) / f64::from(sample_rate);
         #[allow(clippy::cast_possible_truncation)]
-        out.push(phase.sin() as Sample);
+        let sample = phase.sin() as Sample;
+        *slot = sample;
     }
+}
+
+/// Returns a unit test sine wave of `frames` samples.
+///
+/// Convenience wrapper over [`sine_into`] for setup code and tests. Offline
+/// only: it allocates, so it must never be called from `Graph::process` or an
+/// audio callback.
+#[must_use]
+pub fn sine(freq_hz: f64, sample_rate: u32, offset: u64, frames: usize) -> Vec<Sample> {
+    let mut out = vec![0.0; frames];
+    sine_into(freq_hz, sample_rate, offset, &mut out);
     out
 }
 
@@ -452,6 +465,23 @@ mod tests {
         assert_eq!(read_spec, spec);
         assert_eq!(read, buf);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn sine_into_matches_sine() {
+        for &freq in &[1.0, 100.0, 440.0, 1_000.0] {
+            for &offset in &[0_u64, 1, 8, 47_999] {
+                for &frames in &[0_usize, 1, 7, 64, 1_024] {
+                    let mut out = vec![0.0_f32; frames];
+                    sine_into(freq, 48_000, offset, &mut out);
+                    assert_eq!(
+                        out,
+                        sine(freq, 48_000, offset, frames),
+                        "f={freq} o={offset} n={frames}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

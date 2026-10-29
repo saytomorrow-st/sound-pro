@@ -4,7 +4,7 @@ use audio_core::graph::{NodeProcessor, NodeView, ProcessContext};
 use audio_core::params::ParamHandle;
 use audio_core::schedule::{Schedule, ScheduleCursor};
 use audio_core::synth::{Envelope, Synth, SynthError};
-use audio_core::wav::sine;
+use audio_core::wav::{sine, sine_into};
 
 /// Steady sine whose amplitude is driven by a live parameter.
 ///
@@ -37,10 +37,17 @@ impl std::fmt::Debug for Tone {
 impl NodeProcessor for Tone {
     fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
         let level = self.level.next(ctx.frames, ctx.sample_rate);
-        let block = sine(self.freq_hz, ctx.sample_rate, ctx.position, ctx.frames);
         let dst = output.channel_mut(0);
-        for (i, sample) in block.iter().enumerate() {
-            dst[i] = sample * level;
+        // Generate straight into the output buffer: no temporary `Vec`, so
+        // nothing allocates here (SPEC-011 §1).
+        sine_into(
+            self.freq_hz,
+            ctx.sample_rate,
+            ctx.position,
+            &mut dst[..ctx.frames],
+        );
+        for slot in &mut dst[..ctx.frames] {
+            *slot *= level;
         }
     }
 }
@@ -270,32 +277,6 @@ impl ClipSource for Vec<f32> {
     }
 }
 
-/// One clip as the mixer sees it: timeline window, content window, gain.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PlacedClip {
-    start: u64,
-    length: u64,
-    offset: u64,
-    gain: f32,
-}
-
-impl PlacedClip {
-    fn new(clip: &audio_core::session::Clip) -> Self {
-        Self {
-            start: clip.start_samples,
-            length: clip.length_samples,
-            offset: clip.offset_samples,
-            gain: clip.gain,
-        }
-    }
-
-    /// The content index for timeline position `position`, if it sounds.
-    fn source_index(&self, position: u64) -> Option<u64> {
-        let within = position.checked_sub(self.start)?;
-        (within < self.length).then(|| self.offset + within)
-    }
-}
-
 /// A session track: its clips placed on the timeline, summed, gain and mute
 /// applied (SPEC-010 §3).
 ///
@@ -303,7 +284,9 @@ impl PlacedClip {
 /// no panics. A clip whose `source_length` does not match its source simply
 /// stops early instead of reading out of bounds.
 pub struct Track {
-    clips: Vec<PlacedClip>,
+    // The model's clips, kept as they are: a second copy of the fields would
+    // let the node and the model drift apart silently (SPEC-011 §2).
+    clips: Vec<audio_core::session::Clip>,
     sources: Vec<Box<dyn ClipSource + Send>>,
     gain: f32,
     mute: bool,
@@ -328,7 +311,7 @@ impl Track {
             });
         }
         Ok(Self {
-            clips: track.clips.iter().map(PlacedClip::new).collect(),
+            clips: track.clips.clone(),
             sources,
             gain: track.gain,
             mute: track.mute,
@@ -340,7 +323,7 @@ impl Track {
     pub fn length_samples(&self) -> u64 {
         self.clips
             .iter()
-            .map(|clip| clip.start.saturating_add(clip.length))
+            .map(audio_core::session::Clip::end_samples)
             .max()
             .unwrap_or(0)
     }
@@ -366,18 +349,20 @@ impl NodeProcessor for Track {
         }
         let track_gain = self.gain;
         for (clip, source) in self.clips.iter().zip(&self.sources) {
-            if clip.gain == 0.0 || clip.length == 0 {
+            if clip.gain == 0.0 || clip.length_samples == 0 {
                 continue;
             }
             let content = source.channel(0);
             for (index, slot) in dst[..ctx.frames].iter_mut().enumerate() {
-                let position = ctx.position + index as u64;
-                let Some(source_index) = clip.source_index(position) else {
+                let position = ctx.position.saturating_add(index as u64);
+                if !clip.covers(position) {
+                    continue;
+                }
+                let Ok(source_index) = usize::try_from(clip.source_index(position)) else {
                     continue;
                 };
-                let Ok(source_index) = usize::try_from(source_index) else {
-                    continue;
-                };
+                // `source_length` is only a claim about `content`: trust the
+                // slice, not the model, so a mismatch is silence, not a panic.
                 if let Some(sample) = content.get(source_index) {
                     *slot += sample * clip.gain;
                 }
