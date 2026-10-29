@@ -1,0 +1,170 @@
+//! Reading audio files for clips: WAV through `audio_core::wav`, MP3 through
+//! `symphonia` (SPEC-032). Never called on the audio path.
+
+use std::path::Path;
+
+use audio_core::buffer::AudioBuffer;
+use audio_core::wav::WavSpec;
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+
+/// Extensions the importer accepts, lower case.
+pub const AUDIO_EXTENSIONS: [&str; 2] = ["wav", "mp3"];
+
+/// Why an audio file could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum AudioFileError {
+    /// The WAV reader failed.
+    #[error(transparent)]
+    Wav(#[from] audio_core::WavError),
+    /// The MP3 file could not be opened or decoded.
+    #[error("cannot decode mp3: {0}")]
+    Mp3(String),
+    /// The file decoded to zero frames.
+    #[error("the file has no audio")]
+    Empty,
+}
+
+/// True for a path whose extension is in [`AUDIO_EXTENSIONS`] (any case).
+#[must_use]
+pub fn is_audio_file(path: &Path) -> bool {
+    extension(path).is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.as_str()))
+}
+
+fn extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+/// Reads `path` as planar `f32`: MP3 by extension, everything else as WAV.
+///
+/// # Errors
+///
+/// See [`AudioFileError`].
+pub fn read_audio(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
+    if extension(path).as_deref() == Some("mp3") {
+        read_mp3(path)
+    } else {
+        match audio_core::wav::read_wav_mono(path) {
+            Err(audio_core::WavError::Empty) => Err(AudioFileError::Empty),
+            other => Ok(other?),
+        }
+    }
+}
+
+/// Reads `path` and mixes its channels down to one at `rate`.
+///
+/// # Errors
+///
+/// See [`AudioFileError`]; a failed rate conversion is [`AudioFileError::Empty`].
+pub fn read_mono_at(path: &Path, rate: u32) -> Result<Vec<f32>, AudioFileError> {
+    let (spec, buffer) = read_audio(path)?;
+    let channels = buffer.channels().max(1);
+    let mut mono = buffer.channel(0).to_vec();
+    if channels > 1 {
+        for ch in 1..channels {
+            for (out, sample) in mono.iter_mut().zip(buffer.channel(ch)) {
+                *out += sample;
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / channels as f32;
+        for out in &mut mono {
+            *out *= scale;
+        }
+    }
+    if spec.sample_rate != rate {
+        mono = audio_core::resample(&mono, spec.sample_rate, rate)
+            .map_err(|_| AudioFileError::Empty)?;
+    }
+    if mono.is_empty() {
+        return Err(AudioFileError::Empty);
+    }
+    Ok(mono)
+}
+
+fn read_mp3(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
+    let mp3 = |e: &dyn std::fmt::Display| AudioFileError::Mp3(e.to_string());
+    let file = std::fs::File::open(path).map_err(|e| mp3(&e))?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| mp3(&e))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| AudioFileError::Mp3("no audio track".into()))?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| mp3(&e))?;
+
+    let mut rate = track.codec_params.sample_rate.unwrap_or(0);
+    let mut channels: Vec<Vec<f32>> = Vec::new();
+    let mut samples: Option<SampleBuffer<f32>> = None;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(SymphoniaError::ResetRequired) => break,
+            Err(e) => return Err(mp3(&e)),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            // A damaged frame is skipped, like any player does.
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(e) => return Err(mp3(&e)),
+        };
+        let spec = *decoded.spec();
+        rate = spec.rate;
+        let count = spec.channels.count().max(1);
+        if channels.is_empty() {
+            channels = vec![Vec::new(); count];
+        }
+        let needed = decoded.capacity() as u64;
+        let buffer = match samples.as_mut() {
+            Some(buffer) if buffer.capacity() as u64 >= needed * count as u64 => buffer,
+            _ => samples.insert(SampleBuffer::new(needed, spec)),
+        };
+        buffer.copy_interleaved_ref(decoded);
+        for frame in buffer.samples().chunks_exact(count) {
+            for (ch, out) in channels.iter_mut().enumerate() {
+                out.push(frame.get(ch).copied().unwrap_or(0.0));
+            }
+        }
+    }
+
+    let frames = channels.first().map_or(0, Vec::len);
+    if frames == 0 || rate == 0 {
+        return Err(AudioFileError::Empty);
+    }
+    let mut buffer = AudioBuffer::new(channels.len(), frames);
+    for (ch, data) in channels.iter().enumerate() {
+        buffer.channel_mut(ch).copy_from_slice(data);
+    }
+    let spec = WavSpec {
+        sample_rate: rate,
+        channels: u16::try_from(channels.len()).unwrap_or(u16::MAX),
+    };
+    Ok((spec, buffer))
+}

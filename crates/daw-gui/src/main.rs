@@ -79,7 +79,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sound Pro")
             .with_inner_size([1200.0, 700.0])
-            .with_min_inner_size([640.0, 360.0]),
+            .with_min_inner_size([640.0, 360.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     let start = std::env::args_os().nth(1).map(PathBuf::from);
@@ -633,7 +634,7 @@ impl App {
 
     fn import_dialog(&mut self) {
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("WAV", &["wav", "WAV"])
+            .add_filter("WAV, MP3", &["wav", "WAV", "mp3", "MP3"])
             .pick_files()
         else {
             return;
@@ -963,6 +964,60 @@ impl App {
     }
 
     #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    /// Drag and drop of WAV/MP3 files onto the timeline (SPEC-032).
+    fn handle_drop(&mut self, ui: &egui::Ui, area: Rect, tracks: usize) {
+        let (hovering, dropped, pointer) = ui.ctx().input(|i| {
+            (
+                !i.raw.hovered_files.is_empty(),
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect::<Vec<_>>(),
+                i.pointer.latest_pos(),
+            )
+        });
+        let row_at = |p: Pos2| {
+            let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
+            (row >= 0.0 && (row as usize) < tracks).then_some(row as usize)
+        };
+        if hovering {
+            let painter = ui.painter_at(area);
+            let band = match pointer.and_then(row_at) {
+                Some(t) => {
+                    let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
+                    Rect::from_min_size(
+                        Pos2::new(area.min.x, top),
+                        Vec2::new(area.width(), TRACK_HEIGHT),
+                    )
+                }
+                None => {
+                    let top = area.min.y + RULER_HEIGHT + tracks as f32 * TRACK_HEIGHT;
+                    Rect::from_min_max(Pos2::new(area.min.x, top), area.max)
+                }
+            };
+            painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(80, 140, 255, 40));
+            self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        let rate = self.editor.session().sample_rate;
+        let (track, start) = match pointer.filter(|p| area.contains(*p)) {
+            Some(p) => (
+                row_at(p),
+                x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom),
+            ),
+            None => (None, 0),
+        };
+        let (added, error) = self.editor.drop_audio_files(&dropped, track, start);
+        self.status = match (added, error) {
+            (_, Some(e)) => format!("Ошибка: {e}"),
+            (0, None) => "Можно перетаскивать только WAV и MP3".into(),
+            (n, None) => format!("Добавлено файлов: {n}"),
+        };
+    }
+
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let rate = f64::from(self.editor.session().sample_rate);
         let session_seconds = self.editor.session().length_samples() as f64 / rate;
@@ -974,6 +1029,7 @@ impl App {
             ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 0.0, Color32::from_gray(24));
+        self.handle_drop(ui, area, tracks);
 
         // Ruler: one line per beat, labels on bar starts (SPEC-026).
         let beat_seconds = 60.0 / self.editor.session().tempo_bpm;
