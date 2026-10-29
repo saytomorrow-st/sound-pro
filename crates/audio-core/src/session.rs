@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::fx::{Effect, MAX_EFFECTS_PER_TRACK};
+use crate::fx::{Effect, EffectParam, MAX_EFFECTS_PER_TRACK};
 use crate::project::MAX_NAME_BYTES;
 use crate::transport::TimeSignature;
 
@@ -449,6 +449,13 @@ pub enum Lane {
     Gain,
     /// Track pan, `-1.0..=1.0`.
     Pan,
+    /// One parameter of the effect in chain slot `slot` (SPEC-041).
+    Effect {
+        /// Index in the track's effect chain.
+        slot: u8,
+        /// Which parameter of that effect.
+        param: EffectParam,
+    },
 }
 
 impl Lane {
@@ -458,6 +465,7 @@ impl Lane {
         match self {
             Self::Gain => (0.0, 1.0),
             Self::Pan => (-1.0, 1.0),
+            Self::Effect { param, .. } => param.range(),
         }
     }
 
@@ -471,10 +479,11 @@ impl Lane {
 
 impl fmt::Display for Lane {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Gain => "gain",
-            Self::Pan => "pan",
-        })
+        match self {
+            Self::Gain => f.write_str("gain"),
+            Self::Pan => f.write_str("pan"),
+            Self::Effect { slot, param } => write!(f, "effect {slot} {}", param.name()),
+        }
     }
 }
 
@@ -487,6 +496,20 @@ pub struct AutoPoint {
     pub value: f32,
 }
 
+/// Most effect lanes one track may hold: every parameter of a full chain.
+pub const MAX_EFFECT_LANES: usize = MAX_EFFECTS_PER_TRACK * EffectParam::ALL.len();
+
+/// Breakpoints of one effect parameter (SPEC-041).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectLane {
+    /// Index in the track's effect chain.
+    pub slot: u8,
+    /// Which parameter of that effect.
+    pub param: EffectParam,
+    /// Points strictly ordered by time.
+    pub points: Vec<AutoPoint>,
+}
+
 /// Breakpoint lanes for one track; points are strictly ordered by time.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Automation {
@@ -494,30 +517,80 @@ pub struct Automation {
     pub gain: Vec<AutoPoint>,
     /// Pan lane.
     pub pan: Vec<AutoPoint>,
+    /// Effect parameter lanes, at most one per slot and parameter (SPEC-041).
+    pub effects: Vec<EffectLane>,
 }
 
 impl Automation {
-    /// `true` when neither lane has a point.
+    /// `true` when no lane has a point.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.gain.is_empty() && self.pan.is_empty()
+        self.gain.is_empty()
+            && self.pan.is_empty()
+            && self.effects.iter().all(|lane| lane.points.is_empty())
     }
 
-    /// Points of one lane.
+    /// `true` when some effect lane has a point.
+    #[must_use]
+    pub fn has_effect_points(&self) -> bool {
+        self.effects.iter().any(|lane| !lane.points.is_empty())
+    }
+
+    /// Points of one lane; a missing effect lane is empty.
     #[must_use]
     pub fn lane(&self, lane: Lane) -> &[AutoPoint] {
         match lane {
             Lane::Gain => &self.gain,
             Lane::Pan => &self.pan,
+            Lane::Effect { slot, param } => self
+                .effects
+                .iter()
+                .find(|lane| lane.slot == slot && lane.param == param)
+                .map_or(&[], |lane| &lane.points),
         }
     }
 
-    /// Mutable points of one lane.
+    /// Mutable points of one lane; a missing effect lane is created empty.
     pub fn lane_mut(&mut self, lane: Lane) -> &mut Vec<AutoPoint> {
         match lane {
             Lane::Gain => &mut self.gain,
             Lane::Pan => &mut self.pan,
+            Lane::Effect { slot, param } => {
+                let found = self
+                    .effects
+                    .iter()
+                    .position(|lane| lane.slot == slot && lane.param == param);
+                let index = found.unwrap_or_else(|| {
+                    self.effects.push(EffectLane {
+                        slot,
+                        param,
+                        points: Vec::new(),
+                    });
+                    self.effects.len() - 1
+                });
+                &mut self.effects[index].points
+            }
         }
+    }
+
+    /// Drops effect lanes without points.
+    pub fn prune(&mut self) {
+        self.effects.retain(|lane| !lane.points.is_empty());
+    }
+
+    /// Every lane with its points: gain, pan, then the effect lanes.
+    pub fn lanes(&self) -> impl Iterator<Item = (Lane, &[AutoPoint])> {
+        [(Lane::Gain, &self.gain[..]), (Lane::Pan, &self.pan[..])]
+            .into_iter()
+            .chain(self.effects.iter().map(|lane| {
+                (
+                    Lane::Effect {
+                        slot: lane.slot,
+                        param: lane.param,
+                    },
+                    &lane.points[..],
+                )
+            }))
     }
 
     /// Lane value at `time`: held before the first and after the last point,
@@ -777,7 +850,7 @@ impl Session {
                 validate_clip(clip, track_index, clip_index)?;
             }
             validate_effects(&track.effects, track_index)?;
-            validate_automation(&track.automation, track_index)?;
+            validate_automation(&track.automation, &track.effects, track_index)?;
             validate_sends(&track.sends, self.buses.len(), track_index)?;
         }
         Ok(())
@@ -942,10 +1015,42 @@ fn validate_effects(effects: &[Effect], track: usize) -> Result<(), SessionError
     }
 }
 
-/// SPEC-023 checks for one track's automation lanes.
-fn validate_automation(automation: &Automation, track: usize) -> Result<(), SessionError> {
-    for lane in [Lane::Gain, Lane::Pan] {
-        let points = automation.lane(lane);
+/// SPEC-023/041 checks for one track's automation lanes.
+fn validate_automation(
+    automation: &Automation,
+    effects: &[Effect],
+    track: usize,
+) -> Result<(), SessionError> {
+    if automation.effects.len() > MAX_EFFECT_LANES {
+        let last = &automation.effects[MAX_EFFECT_LANES];
+        return Err(SessionError::InvalidAutomation {
+            track,
+            lane: Lane::Effect {
+                slot: last.slot,
+                param: last.param,
+            },
+            point: 0,
+        });
+    }
+    for (index, lane) in automation.effects.iter().enumerate() {
+        let fits = effects
+            .get(usize::from(lane.slot))
+            .is_some_and(|effect| lane.param.get(&effect.kind).is_some());
+        let unique = automation.effects[..index]
+            .iter()
+            .all(|other| (other.slot, other.param) != (lane.slot, lane.param));
+        if !fits || !unique {
+            return Err(SessionError::InvalidAutomation {
+                track,
+                lane: Lane::Effect {
+                    slot: lane.slot,
+                    param: lane.param,
+                },
+                point: 0,
+            });
+        }
+    }
+    for (lane, points) in automation.lanes() {
         let error = |point| SessionError::InvalidAutomation { track, lane, point };
         if points.len() > MAX_AUTOMATION_POINTS {
             return Err(error(MAX_AUTOMATION_POINTS));

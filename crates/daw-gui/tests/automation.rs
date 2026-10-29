@@ -136,3 +136,86 @@ fn out_of_range_values_are_session_errors() {
     ));
     assert_eq!(editor.session(), &before);
 }
+
+// SPEC-041: effect lanes follow their effect through chain edits.
+
+fn effect_lane(slot: u8, param: audio_core::EffectParam) -> Lane {
+    Lane::Effect { slot, param }
+}
+
+fn chain_editor() -> Editor {
+    use audio_core::EffectKind;
+    let mut editor = editor_with_track();
+    editor.add_effect(0, EffectKind::eq()).unwrap();
+    editor.add_effect(0, EffectKind::compressor()).unwrap();
+    editor.add_effect(0, EffectKind::reverb()).unwrap();
+    editor
+        .add_point(
+            0,
+            effect_lane(0, audio_core::EffectParam::MidHz),
+            p(0, 500.0),
+        )
+        .unwrap();
+    editor
+        .add_point(0, effect_lane(1, audio_core::EffectParam::Ratio), p(0, 4.0))
+        .unwrap();
+    editor
+        .add_point(0, effect_lane(2, audio_core::EffectParam::Mix), p(0, 0.5))
+        .unwrap();
+    editor
+}
+
+fn slots(editor: &Editor) -> Vec<(u8, audio_core::EffectParam)> {
+    editor.session().tracks[0]
+        .automation
+        .effects
+        .iter()
+        .map(|lane| (lane.slot, lane.param))
+        .collect()
+}
+
+#[test]
+fn removing_an_effect_drops_its_lanes_and_shifts_the_rest() {
+    use audio_core::EffectParam::{MidHz, Mix};
+    let mut editor = chain_editor();
+    editor.remove_effect(0, 1).unwrap();
+    assert_eq!(slots(&editor), vec![(0, MidHz), (1, Mix)]);
+    editor.session().validate().unwrap();
+    assert!(editor.undo());
+    assert_eq!(slots(&editor).len(), 3);
+}
+
+#[test]
+fn moving_an_effect_moves_its_lanes() {
+    use audio_core::EffectParam::{MidHz, Mix, Ratio};
+    let mut editor = chain_editor();
+    editor.move_effect(0, 0, 2).unwrap();
+    let mut got = slots(&editor);
+    got.sort_by_key(|(slot, _)| *slot);
+    assert_eq!(got, vec![(0, Ratio), (1, Mix), (2, MidHz)]);
+    editor.session().validate().unwrap();
+    editor.move_effect(0, 2, 0).unwrap();
+    let mut got = slots(&editor);
+    got.sort_by_key(|(slot, _)| *slot);
+    assert_eq!(got, vec![(0, MidHz), (1, Ratio), (2, Mix)]);
+}
+
+#[test]
+fn emptied_effect_lanes_are_pruned() {
+    use audio_core::EffectParam::{MidHz, Mix, Ratio};
+    let mut editor = chain_editor();
+    editor.remove_point(0, effect_lane(1, Ratio), 0).unwrap();
+    editor.clear_lane(0, effect_lane(2, Mix)).unwrap();
+    assert_eq!(slots(&editor), vec![(0, MidHz)]);
+}
+
+#[test]
+fn a_wrong_effect_param_is_a_session_error() {
+    let mut editor = chain_editor();
+    let before = editor.session().clone();
+    assert!(matches!(
+        editor.add_point(0, effect_lane(0, audio_core::EffectParam::Mix), p(0, 0.5)),
+        Err(EditorError::Session(_))
+    ));
+    assert_eq!(editor.session(), &before);
+}

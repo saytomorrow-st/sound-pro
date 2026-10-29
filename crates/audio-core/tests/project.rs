@@ -1483,3 +1483,82 @@ fn too_many_markers_are_rejected() {
         })
     );
 }
+
+// --- SPEC-041: effect automation -------------------------------------------
+
+fn effect_automation_session() -> audio_core::Session {
+    use audio_core::{AutoPoint, Effect, EffectKind, EffectParam, Lane};
+    let mut session = demo_session();
+    session.tracks[0]
+        .effects
+        .push(Effect::new(EffectKind::reverb()));
+    *session.tracks[0].automation.lane_mut(Lane::Effect {
+        slot: 0,
+        param: EffectParam::Mix,
+    }) = vec![
+        AutoPoint {
+            time: 0,
+            value: 0.0,
+        },
+        AutoPoint {
+            time: 48_000,
+            value: 0.8,
+        },
+    ];
+    session
+}
+
+fn effect_automation_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        effect_automation_session(),
+    )
+    .to_json()
+}
+
+#[test]
+fn effect_lanes_survive_the_round_trip() {
+    let text = effect_automation_json();
+    assert!(text.contains("\"param\": \"mix\""), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &effect_automation_session());
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn an_unknown_effect_param_is_rejected() {
+    let text = effect_automation_json().replace("\"param\": \"mix\"", "\"param\": \"wobble\"");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "wobble".to_owned()
+        }
+    );
+}
+
+#[test]
+fn an_unknown_effect_lane_key_is_rejected() {
+    let text = effect_automation_json().replace("\"slot\": 0,", "\"slot\": 0, \"curve\": 1,");
+    assert!(Project::from_json(&text).is_err());
+}
+
+#[test]
+fn an_effect_lane_on_a_missing_slot_fails_validation() {
+    let text = effect_automation_json().replace("\"slot\": 0,", "\"slot\": 3,");
+    assert!(Project::from_json(&text).is_err());
+}
+
+#[test]
+fn empty_effect_lanes_are_not_written() {
+    use audio_core::{EffectParam, Lane};
+    let mut session = demo_session();
+    session.tracks[0].automation.lane_mut(Lane::Effect {
+        slot: 0,
+        param: EffectParam::Mix,
+    });
+    let (graph, _) = demo_graph();
+    let text =
+        Project::with_session(Project::capture("demo", SR, 120.0, &graph), session).to_json();
+    assert!(!text.contains("automation"), "{text}");
+}

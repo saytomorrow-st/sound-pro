@@ -1268,6 +1268,16 @@ impl Editor {
         let mut session = self.project.session.clone();
         let effects = effects_mut(&mut session, track, index)?;
         effects.remove(index);
+        // SPEC-041: the removed effect's lanes go, the ones above shift down.
+        let automation = &mut session.tracks[track].automation;
+        automation
+            .effects
+            .retain(|lane| usize::from(lane.slot) != index);
+        for lane in &mut automation.effects {
+            if usize::from(lane.slot) > index {
+                lane.slot -= 1;
+            }
+        }
         self.commit_track(session, track)
     }
 
@@ -1310,6 +1320,10 @@ impl Editor {
         }
         let effect = effects.remove(from);
         effects.insert(to, effect);
+        // SPEC-041: lanes follow their effect to its new slot.
+        for lane in &mut session.tracks[track].automation.effects {
+            lane.slot = moved_slot(lane.slot, from, to);
+        }
         self.commit_track(session, track)
     }
 
@@ -1398,6 +1412,7 @@ impl Editor {
             return Err(EditorError::NoPoint);
         }
         points.remove(index);
+        session.tracks[track].automation.prune();
         self.commit_track(session, track)
     }
 
@@ -1413,6 +1428,7 @@ impl Editor {
             return Ok(());
         }
         points.clear();
+        session.tracks[track].automation.prune();
         self.commit_track(session, track)
     }
 
@@ -2038,6 +2054,21 @@ fn insert_note(notes: &mut Vec<Note>, note: Note) -> usize {
 }
 
 /// A track's effect chain, provided `index` is inside it.
+/// Where chain slot `slot` lands when the effect at `from` moves to `to`.
+fn moved_slot(slot: u8, from: usize, to: usize) -> u8 {
+    let index = usize::from(slot);
+    let moved = if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    };
+    u8::try_from(moved).unwrap_or(slot)
+}
+
 fn lane_mut(
     session: &mut Session,
     track: usize,

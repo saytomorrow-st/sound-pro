@@ -318,6 +318,9 @@ impl ClipSource for Vec<f32> {
     }
 }
 
+/// Frames between two updates of automated effect parameters (SPEC-041).
+pub const EFFECT_AUTOMATION_STEP: usize = 32;
+
 /// A session track: its clips placed on the timeline, summed, gain and mute
 /// applied (SPEC-010 §3), then panned and scaled by the master into two
 /// channels (SPEC-013).
@@ -336,6 +339,10 @@ pub struct Track {
     right: f32,
     // SPEC-022: the insert chain, built once; processing never allocates.
     effects: Vec<audio_core::EffectProcessor>,
+    // SPEC-041: the chain's base parameters and a scratch copy that the
+    // effect lanes write into, both sized at build time.
+    kinds: Vec<audio_core::EffectKind>,
+    scratch: Vec<audio_core::EffectKind>,
     // SPEC-023: lanes copied at build time; `master` is kept apart from
     // `left`/`right` so an automated pan can be re-scaled per sample.
     automation: audio_core::Automation,
@@ -369,6 +376,8 @@ impl Track {
             left,
             right,
             effects: Vec::new(),
+            kinds: Vec::new(),
+            scratch: Vec::new(),
             automation: audio_core::Automation::default(),
             master: 1.0,
         })
@@ -382,6 +391,8 @@ impl Track {
             .iter()
             .map(|effect| audio_core::EffectProcessor::new(effect, sample_rate))
             .collect();
+        self.kinds = effects.iter().map(|effect| effect.kind).collect();
+        self.scratch.clone_from(&self.kinds);
         self
     }
 
@@ -396,11 +407,13 @@ impl Track {
         self
     }
 
-    /// Copies the track's gain and pan lanes (SPEC-023). A non-empty lane
-    /// replaces the matching slider; empty lanes leave the sound untouched.
+    /// Copies the track's lanes (SPEC-023/041). A non-empty lane replaces
+    /// the matching slider or effect parameter; empty lanes leave the sound
+    /// untouched.
     #[must_use]
     pub fn with_automation(mut self, automation: &audio_core::Automation) -> Self {
         self.automation = automation.clone();
+        self.automation.prune();
         self
     }
 
@@ -514,10 +527,14 @@ impl Track {
             }
             *slot = sum;
         }
-        for effect in &mut self.effects {
-            effect.process(dst);
+        if self.automation.effects.is_empty() {
+            for effect in &mut self.effects {
+                effect.process(dst);
+            }
+        } else {
+            self.process_automated_effects(position, dst);
         }
-        if !self.automation.is_empty() {
+        if !(self.automation.gain.is_empty() && self.automation.pan.is_empty()) {
             self.apply_automation(position, dst, right);
             return;
         }
@@ -530,6 +547,38 @@ impl Track {
         let gain = self.gain * self.left;
         for slot in &mut dst[..frames] {
             *slot *= gain;
+        }
+    }
+
+    /// Runs the insert chain in steps of [`EFFECT_AUTOMATION_STEP`] frames,
+    /// setting every automated parameter at the start of each step
+    /// (SPEC-041); allocation-free.
+    fn process_automated_effects(&mut self, position: u64, dst: &mut [f32]) {
+        use audio_core::Automation;
+        // Steps sit on a grid of absolute frames, so the sound does not
+        // depend on the block size.
+        let mut start = position;
+        let mut rest = dst;
+        while !rest.is_empty() {
+            let into = usize::try_from(start % EFFECT_AUTOMATION_STEP as u64).unwrap_or(0);
+            let len = (EFFECT_AUTOMATION_STEP - into).min(rest.len());
+            let (chunk, tail) = rest.split_at_mut(len);
+            rest = tail;
+            self.scratch.copy_from_slice(&self.kinds);
+            for lane in &self.automation.effects {
+                let (Some(kind), Some(value)) = (
+                    self.scratch.get_mut(usize::from(lane.slot)),
+                    Automation::value_at(&lane.points, start - into as u64),
+                ) else {
+                    continue;
+                };
+                lane.param.set(kind, value);
+            }
+            for (effect, kind) in self.effects.iter_mut().zip(&self.scratch) {
+                effect.update(kind);
+                effect.process(chunk);
+            }
+            start = start.saturating_add(len as u64);
         }
     }
 

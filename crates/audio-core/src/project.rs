@@ -12,13 +12,13 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use crate::fx::{Effect, EffectKind, MAX_EFFECTS_PER_TRACK};
+use crate::fx::{Effect, EffectKind, EffectParam, MAX_EFFECTS_PER_TRACK};
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
-    AutoPoint, Automation, Bus, BusSend, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
-    MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker, Note, Session,
-    SessionError, Track,
+    AutoPoint, Automation, Bus, BusSend, Clip, EffectLane, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
+    MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker,
+    Note, Session, SessionError, Track,
 };
 use crate::transport::TimeSignature;
 
@@ -811,18 +811,45 @@ fn write_automation(out: &mut String, automation: &Automation) {
         first = false;
         out.push_str("\n          ");
         write_string(out, &lane.to_string());
-        out.push_str(": [");
-        for (index, point) in points.iter().enumerate() {
+        out.push_str(": ");
+        write_points(out, points);
+    }
+    if automation.has_effect_points() {
+        if !first {
+            out.push(',');
+        }
+        out.push_str("\n          \"effects\": [");
+        let lanes = automation
+            .effects
+            .iter()
+            .filter(|lane| !lane.points.is_empty());
+        for (index, lane) in lanes.enumerate() {
             if index > 0 {
-                out.push_str(", ");
+                out.push(',');
             }
-            let _ = write!(out, "{{\"time\": {}, \"value\": ", point.time);
-            out.push_str(&format_number(f64::from(point.value)));
+            let _ = write!(out, "\n            {{\"slot\": {}, \"param\": ", lane.slot);
+            write_string(out, lane.param.name());
+            out.push_str(", \"points\": ");
+            write_points(out, &lane.points);
             out.push('}');
         }
-        out.push(']');
+        out.push_str("\n          ]");
     }
     out.push_str("\n        }");
+}
+
+/// Appends `[{"time": .., "value": ..}, ..]`.
+fn write_points(out: &mut String, points: &[AutoPoint]) {
+    out.push('[');
+    for (index, point) in points.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{{\"time\": {}, \"value\": ", point.time);
+        out.push_str(&format_number(f64::from(point.value)));
+        out.push('}');
+    }
+    out.push(']');
 }
 
 fn automation_from_value(value: &Value) -> Result<Automation, ProjectError> {
@@ -834,6 +861,10 @@ fn automation_from_value(value: &Value) -> Result<Automation, ProjectError> {
         let lane = match key.as_str() {
             "gain" => Lane::Gain,
             "pan" => Lane::Pan,
+            "effects" => {
+                automation.effects = effect_lanes_from_value(value)?;
+                continue;
+            }
             other => {
                 return Err(ProjectError::UnknownField {
                     field: other.to_owned(),
@@ -849,12 +880,74 @@ fn automation_from_value(value: &Value) -> Result<Automation, ProjectError> {
                 point: MAX_AUTOMATION_POINTS,
             }));
         }
-        *automation.lane_mut(lane) = items
-            .iter()
-            .map(point_from_value)
-            .collect::<Result<_, _>>()?;
+        *automation.lane_mut(lane) = points_from_items(items)?;
     }
     Ok(automation)
+}
+
+fn points_from_items(items: &[Value]) -> Result<Vec<AutoPoint>, ProjectError> {
+    items.iter().map(point_from_value).collect()
+}
+
+/// The `"effects"` array of an automation object (SPEC-041).
+fn effect_lanes_from_value(value: &Value) -> Result<Vec<EffectLane>, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    if items.len() > MAX_EFFECT_LANES {
+        return Err(ProjectError::Session(SessionError::InvalidAutomation {
+            track: 0,
+            lane: Lane::Gain,
+            point: 0,
+        }));
+    }
+    items.iter().map(effect_lane_from_value).collect()
+}
+
+fn effect_lane_from_value(value: &Value) -> Result<EffectLane, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut slot = None;
+    let mut param = None;
+    let mut points = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "slot" => slot = Some(require_u8(value)?),
+            "param" => {
+                let name = require_string(value)?;
+                param = Some(
+                    EffectParam::from_name(&name)
+                        .ok_or(ProjectError::UnknownField { field: name })?,
+                );
+            }
+            "points" => {
+                let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+                if items.len() > MAX_AUTOMATION_POINTS {
+                    return Err(ProjectError::Session(SessionError::InvalidAutomation {
+                        track: 0,
+                        lane: Lane::Gain,
+                        point: MAX_AUTOMATION_POINTS,
+                    }));
+                }
+                points = Some(points_from_items(items)?);
+            }
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(EffectLane {
+        slot: slot.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].automation.effects[].slot",
+        })?,
+        param: param.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].automation.effects[].param",
+        })?,
+        points: points.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].automation.effects[].points",
+        })?,
+    })
 }
 
 fn point_from_value(value: &Value) -> Result<AutoPoint, ProjectError> {

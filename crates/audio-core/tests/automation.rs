@@ -125,3 +125,122 @@ fn the_error_names_the_lane() {
     .to_string();
     assert!(text.contains("pan") && text.contains('3'), "{text}");
 }
+
+// --- SPEC-041: effect parameter lanes --------------------------------------
+
+use audio_core::{Effect, EffectKind, EffectLane, EffectParam, MAX_EFFECT_LANES};
+
+const MIX: Lane = Lane::Effect {
+    slot: 0,
+    param: EffectParam::Mix,
+};
+
+fn reverb_session(lane: Lane, points: Vec<AutoPoint>) -> Session {
+    let mut session = session_with(lane, points);
+    session.tracks[0]
+        .effects
+        .push(Effect::new(EffectKind::reverb()));
+    session
+}
+
+#[test]
+fn an_effect_lane_validates_against_its_effect() {
+    let session = reverb_session(MIX, vec![p(0, 0.0), p(10, 1.0)]);
+    assert_eq!(session.validate(), Ok(()));
+}
+
+#[test]
+fn an_effect_lane_without_its_slot_or_param_is_rejected() {
+    let missing = Lane::Effect {
+        slot: 1,
+        param: EffectParam::Mix,
+    };
+    let wrong = Lane::Effect {
+        slot: 0,
+        param: EffectParam::Ratio,
+    };
+    for lane in [missing, wrong] {
+        assert_eq!(
+            reverb_session(lane, vec![p(0, 1.0)]).validate(),
+            Err(SessionError::InvalidAutomation {
+                track: 0,
+                lane,
+                point: 0
+            })
+        );
+    }
+}
+
+#[test]
+fn effect_lane_points_follow_the_parameter_range() {
+    assert_eq!(
+        reverb_session(MIX, vec![p(0, 0.5), p(10, 1.5)]).validate(),
+        Err(SessionError::InvalidAutomation {
+            track: 0,
+            lane: MIX,
+            point: 1
+        })
+    );
+    let hz = Lane::Effect {
+        slot: 0,
+        param: EffectParam::MidHz,
+    };
+    let mut session = session_with(hz, vec![p(0, 5_000.0)]);
+    session.tracks[0]
+        .effects
+        .push(Effect::new(EffectKind::eq()));
+    assert_eq!(session.validate(), Ok(()));
+    assert_eq!(hz.range(), EffectParam::MidHz.range());
+    assert!(hz.accepts(5_000.0));
+}
+
+#[test]
+fn duplicate_effect_lanes_are_rejected() {
+    let mut session = reverb_session(MIX, vec![p(0, 0.5)]);
+    session.tracks[0].automation.effects.push(EffectLane {
+        slot: 0,
+        param: EffectParam::Mix,
+        points: vec![p(5, 0.5)],
+    });
+    assert_eq!(
+        session.validate(),
+        Err(SessionError::InvalidAutomation {
+            track: 0,
+            lane: MIX,
+            point: 0
+        })
+    );
+}
+
+#[test]
+fn too_many_effect_lanes_are_rejected() {
+    let mut session = reverb_session(MIX, vec![p(0, 0.5)]);
+    for _ in 0..MAX_EFFECT_LANES {
+        session.tracks[0].automation.effects.push(EffectLane {
+            slot: 0,
+            param: EffectParam::Room,
+            points: vec![p(0, 0.5)],
+        });
+    }
+    assert!(session.validate().is_err());
+}
+
+#[test]
+fn effect_lane_access_creates_and_prunes() {
+    let mut automation = Automation::default();
+    assert!(automation.lane(MIX).is_empty());
+    assert!(automation.lane_mut(MIX).is_empty());
+    assert_eq!(automation.effects.len(), 1);
+    assert!(automation.is_empty());
+    automation.lane_mut(MIX).push(p(0, 0.3));
+    assert!(!automation.is_empty());
+    assert!(automation.has_effect_points());
+    assert_eq!(automation.lane(MIX), &[p(0, 0.3)]);
+    automation.lane_mut(Lane::Effect {
+        slot: 2,
+        param: EffectParam::Room,
+    });
+    automation.prune();
+    assert_eq!(automation.effects.len(), 1);
+    assert_eq!(MIX.to_string(), "effect 0 mix");
+}

@@ -133,6 +133,140 @@ impl EffectKind {
     }
 }
 
+/// One automatable parameter of a stock effect (SPEC-041). Names match the
+/// keys of the effect in project files and are unique across effect types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EffectParam {
+    /// EQ low shelf gain, dB.
+    LowDb,
+    /// EQ peak gain, dB.
+    MidDb,
+    /// EQ peak centre, Hz.
+    MidHz,
+    /// EQ high shelf gain, dB.
+    HighDb,
+    /// Compressor threshold, dBFS.
+    ThresholdDb,
+    /// Compressor ratio.
+    Ratio,
+    /// Compressor attack, ms.
+    AttackMs,
+    /// Compressor release, ms.
+    ReleaseMs,
+    /// Compressor make-up gain, dB.
+    MakeupDb,
+    /// Reverb room size.
+    Room,
+    /// Reverb damping.
+    Damp,
+    /// Reverb wet share.
+    Mix,
+}
+
+impl EffectParam {
+    /// Every parameter, EQ first, then compressor, then reverb.
+    pub const ALL: [Self; 12] = [
+        Self::LowDb,
+        Self::MidDb,
+        Self::MidHz,
+        Self::HighDb,
+        Self::ThresholdDb,
+        Self::Ratio,
+        Self::AttackMs,
+        Self::ReleaseMs,
+        Self::MakeupDb,
+        Self::Room,
+        Self::Damp,
+        Self::Mix,
+    ];
+
+    /// Key used in project files, e.g. `"mix"`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::LowDb => "low_db",
+            Self::MidDb => "mid_db",
+            Self::MidHz => "mid_hz",
+            Self::HighDb => "high_db",
+            Self::ThresholdDb => "threshold_db",
+            Self::Ratio => "ratio",
+            Self::AttackMs => "attack_ms",
+            Self::ReleaseMs => "release_ms",
+            Self::MakeupDb => "makeup_db",
+            Self::Room => "room",
+            Self::Damp => "damp",
+            Self::Mix => "mix",
+        }
+    }
+
+    /// The parameter called `name`, if any.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|param| param.name() == name)
+    }
+
+    /// Inclusive range accepted by [`EffectKind::is_valid`].
+    #[must_use]
+    pub const fn range(self) -> (f32, f32) {
+        match self {
+            Self::LowDb | Self::MidDb | Self::HighDb => (-24.0, 24.0),
+            Self::MidHz => (100.0, 10_000.0),
+            Self::ThresholdDb => (-60.0, 0.0),
+            Self::Ratio => (1.0, 20.0),
+            Self::AttackMs => (0.1, 100.0),
+            Self::ReleaseMs => (10.0, 1000.0),
+            Self::MakeupDb => (0.0, 24.0),
+            Self::Room | Self::Damp | Self::Mix => (0.0, 1.0),
+        }
+    }
+
+    /// Parameters of the effect type of `kind`, in display order.
+    #[must_use]
+    pub fn of(kind: &EffectKind) -> &'static [Self] {
+        match kind {
+            EffectKind::Eq { .. } => &Self::ALL[0..4],
+            EffectKind::Compressor { .. } => &Self::ALL[4..9],
+            EffectKind::Reverb { .. } => &Self::ALL[9..12],
+        }
+    }
+
+    /// Current value in `kind`; `None` when `kind` has no such parameter.
+    #[must_use]
+    pub fn get(self, kind: &EffectKind) -> Option<f32> {
+        let mut copy = *kind;
+        self.slot(&mut copy).map(|value| *value)
+    }
+
+    /// Writes `value` into `kind`; `false` when `kind` has no such parameter.
+    pub fn set(self, kind: &mut EffectKind, value: f32) -> bool {
+        match self.slot(kind) {
+            Some(slot) => {
+                *slot = value;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn slot(self, kind: &mut EffectKind) -> Option<&mut f32> {
+        match (self, kind) {
+            (Self::LowDb, EffectKind::Eq { low_db, .. }) => Some(low_db),
+            (Self::MidDb, EffectKind::Eq { mid_db, .. }) => Some(mid_db),
+            (Self::MidHz, EffectKind::Eq { mid_hz, .. }) => Some(mid_hz),
+            (Self::HighDb, EffectKind::Eq { high_db, .. }) => Some(high_db),
+            (Self::ThresholdDb, EffectKind::Compressor { threshold_db, .. }) => Some(threshold_db),
+            (Self::Ratio, EffectKind::Compressor { ratio, .. }) => Some(ratio),
+            (Self::AttackMs, EffectKind::Compressor { attack_ms, .. }) => Some(attack_ms),
+            (Self::ReleaseMs, EffectKind::Compressor { release_ms, .. }) => Some(release_ms),
+            (Self::MakeupDb, EffectKind::Compressor { makeup_db, .. }) => Some(makeup_db),
+            (Self::Room, EffectKind::Reverb { room, .. }) => Some(room),
+            (Self::Damp, EffectKind::Reverb { damp, .. }) => Some(damp),
+            (Self::Mix, EffectKind::Reverb { mix, .. }) => Some(mix),
+            _ => None,
+        }
+    }
+}
+
 /// One slot in a track's effect chain.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Effect {
@@ -245,6 +379,16 @@ impl Biquad {
             z1: 0.0,
             z2: 0.0,
         }
+    }
+
+    /// New coefficients, same `z1`/`z2` state.
+    fn retune(&mut self, shape: Shape, f0: f32, db: f32, sample_rate: u32) {
+        let fresh = Self::design(shape, f0, db, sample_rate);
+        *self = Self {
+            z1: self.z1,
+            z2: self.z2,
+            ..fresh
+        };
     }
 
     fn process(&mut self, samples: &mut [f32]) {
@@ -424,6 +568,14 @@ impl Reverb {
         }
     }
 
+    /// New parameters, same delay lines.
+    fn retune(&mut self, room: f32, damp: f32, mix: f32) {
+        self.feedback = 0.28f32.mul_add(room, 0.7);
+        self.damp = 0.4 * damp;
+        self.wet = mix * REVERB_WET_SCALE;
+        self.dry = 1.0 - mix;
+    }
+
     fn process(&mut self, samples: &mut [f32]) {
         if self.wet == 0.0 {
             return;
@@ -446,14 +598,32 @@ impl Reverb {
 #[derive(Debug, Clone)]
 pub struct EffectProcessor {
     state: State,
+    sample_rate: u32,
+}
+
+/// The three EQ bands in processing order.
+#[derive(Debug, Clone, Copy)]
+struct Eq {
+    bands: [Biquad; 3],
+    /// A 0 dB band is skipped, so a flat EQ stays bit-exact.
+    active: [bool; 3],
 }
 
 #[derive(Debug, Clone)]
 enum State {
     Bypass,
-    Eq(Vec<Biquad>),
+    Eq(Eq),
     Compressor(Compressor),
     Reverb(Reverb),
+}
+
+/// `(shape, frequency, gain)` of each EQ band.
+const fn eq_bands(low_db: f32, mid_db: f32, mid_hz: f32, high_db: f32) -> [(Shape, f32, f32); 3] {
+    [
+        (Shape::LowShelf, EQ_LOW_HZ, low_db),
+        (Shape::Peak, mid_hz, mid_db),
+        (Shape::HighShelf, EQ_HIGH_HZ, high_db),
+    ]
 }
 
 impl EffectProcessor {
@@ -472,17 +642,14 @@ impl EffectProcessor {
                     mid_db,
                     mid_hz,
                     high_db,
-                } => State::Eq(
-                    [
-                        (Shape::LowShelf, EQ_LOW_HZ, low_db),
-                        (Shape::Peak, mid_hz, mid_db),
-                        (Shape::HighShelf, EQ_HIGH_HZ, high_db),
-                    ]
-                    .into_iter()
-                    .filter(|&(_, _, db)| db != 0.0)
-                    .map(|(shape, hz, db)| Biquad::design(shape, hz, db, sample_rate))
-                    .collect(),
-                ),
+                } => {
+                    let bands = eq_bands(low_db, mid_db, mid_hz, high_db);
+                    State::Eq(Eq {
+                        bands: bands
+                            .map(|(shape, hz, db)| Biquad::design(shape, hz, db, sample_rate)),
+                        active: bands.map(|(_, _, db)| db != 0.0),
+                    })
+                }
                 EffectKind::Compressor {
                     threshold_db,
                     ratio,
@@ -502,16 +669,68 @@ impl EffectProcessor {
                 }
             }
         };
-        Self { state }
+        Self { state, sample_rate }
+    }
+
+    /// Applies new parameters in place (SPEC-041), keeping filter state,
+    /// the compressor envelope and the reverb tail. A different effect type
+    /// or a bypassed slot is left unchanged. Real-time safe.
+    pub fn update(&mut self, kind: &EffectKind) {
+        let rate = self.sample_rate;
+        match (&mut self.state, *kind) {
+            (
+                State::Eq(eq),
+                EffectKind::Eq {
+                    low_db,
+                    mid_db,
+                    mid_hz,
+                    high_db,
+                },
+            ) => {
+                let bands = eq_bands(low_db, mid_db, mid_hz, high_db);
+                for ((band, active), (shape, hz, db)) in
+                    eq.bands.iter_mut().zip(&mut eq.active).zip(bands)
+                {
+                    band.retune(shape, hz, db, rate);
+                    if !*active {
+                        // A skipped band starts clean, not from stale state.
+                        band.z1 = 0.0;
+                        band.z2 = 0.0;
+                    }
+                    *active = db != 0.0;
+                }
+            }
+            (
+                State::Compressor(compressor),
+                EffectKind::Compressor {
+                    threshold_db,
+                    ratio,
+                    attack_ms,
+                    release_ms,
+                    makeup_db,
+                },
+            ) => {
+                let envelope = compressor.envelope;
+                *compressor =
+                    Compressor::new(threshold_db, ratio, attack_ms, release_ms, makeup_db, rate);
+                compressor.envelope = envelope;
+            }
+            (State::Reverb(reverb), EffectKind::Reverb { room, damp, mix }) => {
+                reverb.retune(room, damp, mix);
+            }
+            _ => {}
+        }
     }
 
     /// Processes a mono block in place. Real-time safe.
     pub fn process(&mut self, samples: &mut [f32]) {
         match &mut self.state {
             State::Bypass => {}
-            State::Eq(bands) => {
-                for band in bands {
-                    band.process(samples);
+            State::Eq(eq) => {
+                for (band, active) in eq.bands.iter_mut().zip(eq.active) {
+                    if active {
+                        band.process(samples);
+                    }
                 }
             }
             State::Compressor(compressor) => compressor.process(samples),
@@ -744,5 +963,116 @@ mod tests {
         let mut block = sine(440.0, 0.5, 8000);
         processor.process(&mut block);
         assert!(block.iter().all(|s| s.is_finite() && s.abs() < 10.0));
+    }
+
+    #[test]
+    fn param_names_round_trip_and_ranges_match_validation() {
+        for param in EffectParam::ALL {
+            assert_eq!(EffectParam::from_name(param.name()), Some(param));
+        }
+        assert_eq!(EffectParam::from_name("nope"), None);
+        for kind in [
+            EffectKind::eq(),
+            EffectKind::compressor(),
+            EffectKind::reverb(),
+        ] {
+            for &param in EffectParam::of(&kind) {
+                let (low, high) = param.range();
+                for (value, ok) in [(low, true), (high, true), (high + 1.0, false)] {
+                    let mut changed = kind;
+                    assert!(param.set(&mut changed, value));
+                    assert_eq!(param.get(&changed), Some(value));
+                    assert_eq!(changed.is_valid(), ok, "{param:?} = {value}");
+                }
+            }
+        }
+        let mut reverb = EffectKind::reverb();
+        assert!(!EffectParam::LowDb.set(&mut reverb, 1.0));
+        assert_eq!(EffectParam::LowDb.get(&reverb), None);
+    }
+
+    #[test]
+    fn update_matches_a_fresh_processor_on_silence_history() {
+        let input = sine(440.0, 0.5, 2048);
+        for (from, to) in [
+            (EffectKind::eq(), eq(6.0, -3.0, 2000.0, 4.0)),
+            (
+                EffectKind::compressor(),
+                EffectKind::Compressor {
+                    threshold_db: -30.0,
+                    ratio: 8.0,
+                    attack_ms: 1.0,
+                    release_ms: 50.0,
+                    makeup_db: 3.0,
+                },
+            ),
+            (
+                EffectKind::reverb(),
+                EffectKind::Reverb {
+                    room: 0.9,
+                    damp: 0.1,
+                    mix: 0.7,
+                },
+            ),
+        ] {
+            let mut updated = EffectProcessor::new(&Effect::new(from), 48_000);
+            updated.update(&to);
+            let mut a = input.clone();
+            updated.process(&mut a);
+            assert_eq!(a, run(to, &input), "{to:?}");
+        }
+    }
+
+    #[test]
+    fn update_keeps_the_reverb_tail() {
+        let mut processor = EffectProcessor::new(&Effect::new(EffectKind::reverb()), 48_000);
+        let mut impulse = vec![0.0; 256];
+        impulse[0] = 1.0;
+        processor.process(&mut impulse);
+        processor.update(&EffectKind::Reverb {
+            room: 0.5,
+            damp: 0.5,
+            mix: 1.0,
+        });
+        let mut tail = vec![0.0; 4096];
+        processor.process(&mut tail);
+        assert!(peak(&tail) > 0.0, "the tail survives a parameter change");
+    }
+
+    #[test]
+    fn update_ignores_another_type_and_bypass() {
+        let input = sine(440.0, 0.5, 512);
+        let mut processor = EffectProcessor::new(&Effect::new(EffectKind::eq()), 48_000);
+        processor.update(&EffectKind::reverb());
+        let mut out = input.clone();
+        processor.process(&mut out);
+        assert_eq!(out, input);
+        let mut bypassed = EffectProcessor::new(
+            &Effect {
+                bypass: true,
+                kind: EffectKind::reverb(),
+            },
+            48_000,
+        );
+        bypassed.update(&EffectKind::Reverb {
+            room: 1.0,
+            damp: 0.0,
+            mix: 1.0,
+        });
+        let mut out = input.clone();
+        bypassed.process(&mut out);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn eq_back_to_flat_is_bit_exact() {
+        let input = sine(440.0, 0.5, 512);
+        let mut processor = EffectProcessor::new(&Effect::new(eq(6.0, 0.0, 1000.0, 0.0)), 48_000);
+        let mut warm = input.clone();
+        processor.process(&mut warm);
+        processor.update(&EffectKind::eq());
+        let mut out = input.clone();
+        processor.process(&mut out);
+        assert_eq!(out, input);
     }
 }
