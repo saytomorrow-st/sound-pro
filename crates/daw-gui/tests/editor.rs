@@ -80,7 +80,7 @@ fn a_new_editor_is_an_empty_clean_project() {
 #[test]
 fn importing_a_wav_adds_a_named_track_with_one_full_clip() {
     let dir = Scratch::new("import");
-    let wav = dir.join("audio/kick drum.wav");
+    let wav = dir.join("audio").join("kick drum.wav");
     write_wav(&wav, RATE, &ramp(1000));
     let mut editor = Editor::new();
 
@@ -103,8 +103,8 @@ fn importing_a_wav_adds_a_named_track_with_one_full_clip() {
 #[test]
 fn importing_onto_a_selected_track_appends_after_its_last_clip() {
     let dir = Scratch::new("append");
-    let a = dir.join("audio/a.wav");
-    let b = dir.join("audio/b.wav");
+    let a = dir.join("audio").join("a.wav");
+    let b = dir.join("audio").join("b.wav");
     write_wav(&a, RATE, &ramp(300));
     write_wav(&b, RATE, &ramp(200));
     let mut editor = Editor::new();
@@ -122,9 +122,9 @@ fn importing_onto_a_selected_track_appends_after_its_last_clip() {
 #[test]
 fn import_errors_leave_the_project_unchanged() {
     let dir = Scratch::new("import-errors");
-    let slow = dir.join("audio/slow.wav");
-    let empty = dir.join("audio/empty.wav");
-    let missing = dir.join("audio/missing.wav");
+    let slow = dir.join("audio").join("slow.wav");
+    let empty = dir.join("audio").join("empty.wav");
+    let missing = dir.join("audio").join("missing.wav");
     write_wav(&slow, 44_100, &ramp(100));
     write_empty_wav(&empty);
     let mut editor = Editor::new();
@@ -152,7 +152,7 @@ fn import_errors_leave_the_project_unchanged() {
 #[test]
 fn the_track_limit_is_enforced_on_import() {
     let dir = Scratch::new("limit");
-    let wav = dir.join("audio/x.wav");
+    let wav = dir.join("audio").join("x.wav");
     write_wav(&wav, RATE, &ramp(10));
     let mut editor = Editor::new();
     for _ in 0..MAX_TRACKS {
@@ -170,10 +170,10 @@ fn the_track_limit_is_enforced_on_import() {
 #[test]
 fn saving_writes_sources_inside_the_project_folder_as_relative_paths() {
     let dir = Scratch::new("save");
-    let inside = dir.join("audio/in.wav");
+    let inside = dir.join("audio").join("in.wav");
     write_wav(&inside, RATE, &ramp(100));
     let outside_dir = Scratch::new("save-outside");
-    let outside = outside_dir.join("audio/out.wav");
+    let outside = outside_dir.join("audio").join("out.wav");
     write_wav(&outside, RATE, &ramp(100));
 
     let mut editor = Editor::new();
@@ -206,7 +206,7 @@ fn saving_writes_sources_inside_the_project_folder_as_relative_paths() {
 #[test]
 fn a_saved_project_reopens_with_its_waveforms() {
     let dir = Scratch::new("reopen");
-    let wav = dir.join("audio/a.wav");
+    let wav = dir.join("audio").join("a.wav");
     write_wav(&wav, RATE, &ramp(600));
     let mut editor = Editor::new();
     editor.import_wav(&wav).unwrap();
@@ -227,7 +227,7 @@ fn a_saved_project_reopens_with_its_waveforms() {
 #[test]
 fn a_clip_whose_file_is_gone_opens_without_a_waveform() {
     let dir = Scratch::new("gone");
-    let wav = dir.join("audio/a.wav");
+    let wav = dir.join("audio").join("a.wav");
     write_wav(&wav, RATE, &ramp(100));
     let mut editor = Editor::new();
     editor.import_wav(&wav).unwrap();
@@ -244,7 +244,7 @@ fn a_clip_whose_file_is_gone_opens_without_a_waveform() {
 #[test]
 fn a_bad_project_file_keeps_the_current_project() {
     let dir = Scratch::new("bad-open");
-    let wav = dir.join("audio/a.wav");
+    let wav = dir.join("audio").join("a.wav");
     write_wav(&wav, RATE, &ramp(100));
     let bad = dir.join("bad.json");
     std::fs::write(&bad, "{ not json").unwrap();
@@ -266,7 +266,7 @@ fn a_bad_project_file_keeps_the_current_project() {
 #[test]
 fn deleting_clips_and_tracks_marks_the_project_changed() {
     let dir = Scratch::new("delete");
-    let wav = dir.join("audio/a.wav");
+    let wav = dir.join("audio").join("a.wav");
     write_wav(&wav, RATE, &ramp(100));
     let mut editor = Editor::new();
     editor.import_wav(&wav).unwrap();
@@ -301,8 +301,8 @@ fn master_gain_is_clamped() {
 #[test]
 fn export_matches_rendering_the_saved_project_from_the_command_line() {
     let dir = Scratch::new("export");
-    let a = dir.join("audio/a.wav");
-    let b = dir.join("audio/b.wav");
+    let a = dir.join("audio").join("a.wav");
+    let b = dir.join("audio").join("b.wav");
     write_wav(&a, RATE, &ramp(700));
     write_wav(&b, RATE, &ramp(300));
     let mut editor = Editor::new();
