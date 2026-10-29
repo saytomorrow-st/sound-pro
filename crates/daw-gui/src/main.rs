@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use audio_core::{AutoPoint, Effect, EffectKind, Lane, MAX_EFFECTS_PER_TRACK, Note};
 use daw_app::playback::PlaybackControl;
 use daw_gui::{
-    Editor, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples, snap_to_beat,
-    x_to_samples,
+    Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
+    snap_to_beat, x_to_samples,
 };
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
@@ -643,6 +643,24 @@ impl App {
                 let redo = egui::Button::new("Повторить").shortcut_text("Ctrl+Shift+Z");
                 if ui.add_enabled(self.editor.can_redo(), redo).clicked() {
                     self.redo();
+                }
+                ui.separator();
+                let has_clip = self.editor.selected_clip.is_some();
+                let split = egui::Button::new("Разрезать по курсору").shortcut_text("S");
+                if ui.add_enabled(has_clip, split).clicked() {
+                    self.split_clip();
+                }
+                let copy = egui::Button::new("Копировать клип").shortcut_text("Ctrl+C");
+                if ui.add_enabled(has_clip, copy).clicked() {
+                    self.copy_clip(ui.ctx());
+                }
+                let paste = egui::Button::new("Вставить клип").shortcut_text("Ctrl+V");
+                if ui.add_enabled(self.editor.has_clipboard(), paste).clicked() {
+                    self.paste_clip();
+                }
+                let duplicate = egui::Button::new("Дублировать клип").shortcut_text("Ctrl+D");
+                if ui.add_enabled(has_clip, duplicate).clicked() {
+                    self.duplicate_clip();
                 }
             });
         });
@@ -1510,6 +1528,62 @@ impl App {
         };
     }
 
+    fn split_clip(&mut self) {
+        let Some((t, c)) = self.editor.selected_clip else {
+            self.status = "Выберите клип".into();
+            return;
+        };
+        self.drag = None;
+        self.note_drag = None;
+        self.status = match self.editor.split_clip(t, c, self.playhead) {
+            Ok(_) => "Клип разрезан".into(),
+            Err(EditorError::SplitOutside) => "Курсор вне клипа".into(),
+            Err(e) => format!("Не удалось разрезать: {e}"),
+        };
+    }
+
+    fn copy_clip(&mut self, ctx: &egui::Context) {
+        let Some((t, c)) = self.editor.selected_clip else {
+            self.status = "Выберите клип".into();
+            return;
+        };
+        self.status = match self.editor.copy_clip(t, c) {
+            Ok(()) => {
+                // egui only reports Ctrl+V when the system clipboard holds text.
+                ctx.copy_text("Sound Pro: клип".into());
+                "Скопировано".into()
+            }
+            Err(e) => format!("Не удалось скопировать: {e}"),
+        };
+    }
+
+    fn paste_clip(&mut self) {
+        let Some(track) = self.editor.selected_track else {
+            self.status = "Выберите дорожку".into();
+            return;
+        };
+        self.drag = None;
+        self.note_drag = None;
+        self.status = match self.editor.paste_clip(track, self.playhead) {
+            Ok(_) => "Вставлено".into(),
+            Err(EditorError::EmptyClipboard) => "Буфер пуст".into(),
+            Err(e) => format!("Не удалось вставить: {e}"),
+        };
+    }
+
+    fn duplicate_clip(&mut self) {
+        let Some((t, c)) = self.editor.selected_clip else {
+            self.status = "Выберите клип".into();
+            return;
+        };
+        self.drag = None;
+        self.note_drag = None;
+        self.status = match self.editor.duplicate_clip(t, c) {
+            Ok(_) => "Продублировано".into(),
+            Err(e) => format!("Не удалось дублировать: {e}"),
+        };
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if !ctx.wants_keyboard_input() {
             let (space, home, record, cycle, click) = ctx.input_mut(|i| {
@@ -1521,6 +1595,28 @@ impl App {
                     i.consume_key(egui::Modifiers::NONE, Key::K),
                 )
             });
+            let (split, duplicate, copy, paste) = ctx.input_mut(|i| {
+                let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                let paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+                (
+                    i.consume_key(egui::Modifiers::NONE, Key::S),
+                    i.consume_key(egui::Modifiers::COMMAND, Key::D),
+                    copy || i.consume_key(egui::Modifiers::COMMAND, Key::C),
+                    paste || i.consume_key(egui::Modifiers::COMMAND, Key::V),
+                )
+            });
+            if split {
+                self.split_clip();
+            }
+            if duplicate {
+                self.duplicate_clip();
+            }
+            if copy {
+                self.copy_clip(ctx);
+            }
+            if paste {
+                self.paste_clip();
+            }
             if click {
                 self.toggle_metronome();
             }
