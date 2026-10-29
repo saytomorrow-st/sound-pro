@@ -78,11 +78,10 @@ fn renderer_for(graph: Graph) -> Renderer {
     Renderer::new(graph, transport, BLOCK)
 }
 
-/// Renders `frames` quanta of noise-free audio through `renderer`.
+/// Renders `frames` quanta through `renderer`.
 ///
-/// One warm-up quantum runs before the caller arms the counter: `Renderer` and
-/// `Graph` allocate a little on their very first `render` (lazy setup), which
-/// is a separate defect, not the one this file guards.
+/// No warm-up: the very first `render` must be allocation-free too. Only
+/// construction (`Renderer::new`, `Graph::with_capacity`) may allocate.
 fn run_quanta(renderer: &mut Renderer, mix: &mut AudioBuffer, frames: usize) {
     for _ in 0..frames {
         renderer.render(BLOCK, mix).unwrap();
@@ -135,7 +134,6 @@ fn sources() -> Vec<Box<dyn ClipSource + Send>> {
 fn tone_renders_without_allocating() {
     let mut renderer = renderer_for(graph_with(Tone::new(440.0, param("level"))));
     let mut mix = AudioBuffer::new(1, BLOCK);
-    run_quanta(&mut renderer, &mut mix, 1);
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "Tone::process allocated {count} times");
 }
@@ -144,7 +142,6 @@ fn tone_renders_without_allocating() {
 fn midi_player_with_a_busy_schedule_does_not_allocate() {
     let mut renderer = renderer_for(graph_with(MidiPlayer::new(busy_schedule(), param("seen"))));
     let mut mix = AudioBuffer::new(1, BLOCK);
-    run_quanta(&mut renderer, &mut mix, 1);
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "MidiPlayer::process allocated {count} times");
 }
@@ -154,7 +151,6 @@ fn strip_does_not_allocate() {
     let strip = Strip::new(Box::new(MonoClip::sine(220.0, RATE, 10_000)), 1_234, 0.5);
     let mut renderer = renderer_for(graph_with(strip));
     let mut mix = AudioBuffer::new(1, BLOCK);
-    run_quanta(&mut renderer, &mut mix, 1);
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "Strip::process allocated {count} times");
 }
@@ -164,7 +160,6 @@ fn a_session_track_does_not_allocate() {
     let track = daw_app::nodes::Track::new(&overlapping_track(), sources()).unwrap();
     let mut renderer = renderer_for(graph_with(track));
     let mut mix = AudioBuffer::new(1, BLOCK);
-    run_quanta(&mut renderer, &mut mix, 1);
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "Track::process allocated {count} times");
 }
@@ -197,7 +192,6 @@ fn a_two_track_session_graph_does_not_allocate() {
     // and the graph itself are setup, not render.
     let mut renderer = renderer_for(build_session_graph(job()).unwrap());
     let mut mix = AudioBuffer::new(1, BLOCK);
-    run_quanta(&mut renderer, &mut mix, 1);
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "session graph allocated {count} times");
 }
