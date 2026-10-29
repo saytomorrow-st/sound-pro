@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use std::f64::consts::TAU;
+
 use audio_core::AudioBuffer;
 use audio_core::Graph;
 use audio_core::{CommandConsumer, CommandQueue};
@@ -30,6 +32,27 @@ struct Shared {
     /// Cycle region packed as `start << 32 | end`; `end <= start` is off
     /// (SPEC-025). One atomic, so a region is never read half-updated.
     cycle: AtomicU64,
+    /// Metronome switch (SPEC-026).
+    metronome: AtomicBool,
+    /// Tempo (`f32` bits) and beats per bar packed as `tempo << 32 | beats`.
+    meter: AtomicU64,
+}
+
+/// Tempo and beats per bar a new pair starts with.
+const DEFAULT_METER: (f32, u32) = (120.0, 4);
+/// Click length in seconds.
+const CLICK_SECONDS: f64 = 0.03;
+/// Frequency and amplitude of the first beat of a bar and of the others.
+const ACCENT: (f64, f64) = (1_500.0, 0.5);
+const NORMAL: (f64, f64) = (1_000.0, 0.3);
+
+fn pack_meter(tempo: f32, beats: u32) -> u64 {
+    u64::from(tempo.to_bits()) << 32 | u64::from(beats)
+}
+
+fn unpack_meter(packed: u64) -> (f64, u64) {
+    let tempo = f32::from_bits((packed >> 32) as u32);
+    (f64::from(tempo), packed & 0xFFFF_FFFF)
 }
 
 fn pack_cycle(start: u64, end: u64) -> u64 {
@@ -100,6 +123,30 @@ impl PlaybackControl {
         unpack_cycle(self.shared.cycle.load(Ordering::Relaxed))
     }
 
+    /// Turns the metronome click on or off (SPEC-026). It sounds only while
+    /// playing and is mixed into every channel.
+    pub fn set_metronome(&mut self, on: bool) {
+        self.shared.metronome.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the metronome is on.
+    #[must_use]
+    pub fn metronome(&self) -> bool {
+        self.shared.metronome.load(Ordering::Relaxed)
+    }
+
+    /// Sets the click tempo in BPM and the beats per bar. A tempo that is
+    /// not finite and positive, or zero beats, is ignored.
+    pub fn set_meter(&mut self, tempo_bpm: f64, beats_per_bar: u32) {
+        let tempo = tempo_bpm as f32;
+        if !tempo.is_finite() || tempo <= 0.0 || beats_per_bar == 0 {
+            return;
+        }
+        self.shared
+            .meter
+            .store(pack_meter(tempo, beats_per_bar), Ordering::Relaxed);
+    }
+
     /// Last position published by the audio thread.
     #[must_use]
     pub fn position(&self) -> u64 {
@@ -137,6 +184,16 @@ pub struct PlaybackEngine {
     scratch: AudioBuffer,
     shared: Arc<Shared>,
     end: u64,
+    sample_rate: u32,
+    click: Click,
+}
+
+/// The click being played: frames since its start and its kind.
+#[derive(Debug, Default, Clone, Copy)]
+struct Click {
+    elapsed: usize,
+    left: usize,
+    accent: bool,
 }
 
 impl std::fmt::Debug for PlaybackEngine {
@@ -167,6 +224,10 @@ pub fn playback(
     let scratch = AudioBuffer::new(renderer.channels().max(1), block);
     let shared = Arc::new(Shared::default());
     shared.position.store(start, Ordering::Relaxed);
+    shared.meter.store(
+        pack_meter(DEFAULT_METER.0, DEFAULT_METER.1),
+        Ordering::Relaxed,
+    );
     (
         PlaybackControl {
             commands,
@@ -181,6 +242,8 @@ pub fn playback(
             scratch,
             shared,
             end,
+            sample_rate,
+            click: Click::default(),
         },
     )
 }
@@ -197,6 +260,8 @@ impl PlaybackEngine {
             return;
         }
         let cycle = unpack_cycle(self.shared.cycle.load(Ordering::Relaxed));
+        let metronome = self.shared.metronome.load(Ordering::Relaxed);
+        let meter = unpack_meter(self.shared.meter.load(Ordering::Relaxed));
         let frames = out.len() / channels;
         let mut offset = 0usize;
         while offset < frames {
@@ -208,7 +273,9 @@ impl PlaybackEngine {
             }
             let transport = self.renderer.transport();
             let mut wrap = None;
-            if transport.is_playing() {
+            let playing = transport.is_playing();
+            let from = transport.position();
+            if playing {
                 let position = transport.position();
                 if let Some((start, end)) = cycle
                     && position < end
@@ -236,6 +303,11 @@ impl PlaybackEngine {
             }
             let dst = &mut out[offset * channels..(offset + n) * channels];
             interleave_into(&self.scratch, n, channels, dst);
+            if playing && metronome {
+                self.add_click(dst, channels, from, meter);
+            } else {
+                self.click = Click::default();
+            }
             offset += n;
         }
         out[offset * channels..].fill(0.0);
@@ -249,5 +321,51 @@ impl PlaybackEngine {
         self.shared
             .playing
             .store(transport.is_playing(), Ordering::Relaxed);
+    }
+
+    /// Mixes the metronome into `dst`, whose first frame is at `from`.
+    /// Beat `k` starts on frame `ceil(k · rate · 60 / tempo)`.
+    fn add_click(&mut self, dst: &mut [f32], channels: usize, from: u64, meter: (f64, u64)) {
+        let (tempo, beats) = meter;
+        let rate = f64::from(self.sample_rate);
+        let beat = rate * 60.0 / tempo;
+        let length = (rate * CLICK_SECONDS).round() as usize;
+        let starts = |k: u64| (k as f64 * beat).ceil() as u64;
+        // First beat starting at or after `from`.
+        let mut k = if from == 0 {
+            0
+        } else {
+            ((from - 1) as f64 / beat).floor() as u64 + 1
+        };
+        while k > 0 && starts(k - 1) >= from {
+            k -= 1;
+        }
+        while starts(k) < from {
+            k += 1;
+        }
+        let mut next = starts(k);
+        for (i, frame) in dst.chunks_exact_mut(channels).enumerate() {
+            if from + i as u64 == next {
+                self.click = Click {
+                    elapsed: 0,
+                    left: length,
+                    accent: k % beats == 0,
+                };
+                k += 1;
+                next = starts(k);
+            }
+            if self.click.left == 0 {
+                continue;
+            }
+            let (freq, amp) = if self.click.accent { ACCENT } else { NORMAL };
+            let t = self.click.elapsed as f64;
+            let fade = 1.0 - t / length as f64;
+            let sample = (amp * fade * (TAU * freq * t / rate).cos()) as f32;
+            for s in frame.iter_mut() {
+                *s += sample;
+            }
+            self.click.elapsed += 1;
+            self.click.left -= 1;
+        }
     }
 }

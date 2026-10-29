@@ -19,6 +19,7 @@ use crate::session::{
     AutoPoint, Automation, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_CLIPS_PER_TRACK,
     MAX_NOTES_PER_CLIP, MAX_TRACKS, Note, Session, SessionError, Track,
 };
+use crate::transport::TimeSignature;
 
 /// Longest accepted `name`, in bytes.
 pub const MAX_NAME_BYTES: usize = 128;
@@ -374,6 +375,15 @@ fn write_session(out: &mut String, session: &Session) {
     out.push_str(&format_number(session.tempo_bpm));
     out.push_str(",\n    \"master_gain\": ");
     out.push_str(&format_number(f64::from(session.master_gain)));
+    // Written only when it differs from 4/4, so older documents keep their
+    // exact text (SPEC-026).
+    if session.time_signature != TimeSignature::default() {
+        out.push_str(",\n    \"time_signature\": [");
+        out.push_str(&session.time_signature.numerator.to_string());
+        out.push_str(", ");
+        out.push_str(&session.time_signature.denominator.to_string());
+        out.push(']');
+    }
     out.push_str(",\n    \"tracks\": [");
     for (track_index, track) in session.tracks.iter().enumerate() {
         if track_index > 0 {
@@ -445,6 +455,7 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut sample_rate = None;
     let mut tempo_bpm = None;
     let mut master_gain = None;
+    let mut time_signature = None;
     let mut tracks = None;
     for (key, value) in entries {
         match key.as_str() {
@@ -452,6 +463,7 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
             "sample_rate" => sample_rate = Some(require_u32(value)?),
             "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
             "master_gain" => master_gain = Some(require_f32(value)?),
+            "time_signature" => time_signature = Some(time_signature_from_value(value)?),
             "tracks" => {
                 let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
                 // Reject an over-long session while parsing rather than after
@@ -489,9 +501,22 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         })?,
         // Optional since SPEC-013 so older documents keep loading.
         master_gain: master_gain.unwrap_or(1.0),
+        // Optional since SPEC-026; absent means 4/4.
+        time_signature: time_signature.unwrap_or_default(),
         tracks: tracks.ok_or(ProjectError::MissingField {
             field: "session.tracks",
         })?,
+    })
+}
+
+fn time_signature_from_value(value: &Value) -> Result<TimeSignature, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    let [numerator, denominator] = items else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    Ok(TimeSignature {
+        numerator: require_u8(numerator)?,
+        denominator: require_u8(denominator)?,
     })
 }
 

@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use audio_core::{AutoPoint, Effect, EffectKind, Lane, MAX_EFFECTS_PER_TRACK, Note};
 use daw_app::playback::PlaybackControl;
-use daw_gui::{Editor, bars, clock, samples_to_x, sixteenth_samples, snap_to_beat, x_to_samples};
+use daw_gui::{
+    Editor, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples, snap_to_beat,
+    x_to_samples,
+};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
     ViewportCommand,
@@ -375,6 +378,31 @@ impl App {
         }
     }
 
+    /// Passes the metronome switch, tempo and meter to a running player;
+    /// cheap, so it runs every frame and also follows undo (SPEC-026).
+    fn sync_metronome(&mut self) {
+        let session = self.editor.session();
+        let (tempo, beats) = (
+            session.tempo_bpm,
+            u32::from(session.time_signature.numerator),
+        );
+        let on = self.editor.metronome;
+        if let Some(player) = self.player.as_mut() {
+            player.control.set_metronome(on);
+            player.control.set_meter(tempo, beats);
+        }
+    }
+
+    fn toggle_metronome(&mut self) {
+        self.editor.metronome = !self.editor.metronome;
+        self.status = if self.editor.metronome {
+            "Метроном включён".into()
+        } else {
+            "Метроном выключен".into()
+        };
+        self.sync_metronome();
+    }
+
     fn toggle_cycle(&mut self) {
         if self.editor.cycle().is_none() {
             self.status = "Протяните мышью по линейке, чтобы задать цикл".into();
@@ -430,18 +458,76 @@ impl App {
             {
                 self.toggle_cycle();
             }
+            let click = egui::Button::new("🎵").selected(self.editor.metronome);
+            if ui.add(click).on_hover_text("Метроном (K)").clicked() {
+                self.toggle_metronome();
+            }
             ui.separator();
             let session = self.editor.session();
             let text = format!(
                 "{}   такт {}",
                 clock(self.playhead, session.sample_rate),
-                bars(self.playhead, session.sample_rate, session.tempo_bpm)
+                bars_in(
+                    self.playhead,
+                    session.sample_rate,
+                    session.tempo_bpm,
+                    u32::from(session.time_signature.numerator),
+                )
             );
             ui.label(egui::RichText::new(text).monospace().size(16.0));
+            ui.separator();
+            self.meter_fields(ui);
             ui.separator();
             ui.checkbox(&mut self.snap, "Сетка")
                 .on_hover_text("Привязка клипов к долям. Shift при перетаскивании отключает.");
         });
+    }
+
+    /// Tempo and time signature fields of the transport bar (SPEC-026).
+    fn meter_fields(&mut self, ui: &mut egui::Ui) {
+        let session = self.editor.session();
+        let mut tempo = session.tempo_bpm;
+        let signature = session.time_signature;
+        let response = ui
+            .add(
+                egui::DragValue::new(&mut tempo)
+                    .range(MIN_TEMPO..=MAX_TEMPO)
+                    .speed(0.5)
+                    .max_decimals(2)
+                    .suffix(" BPM"),
+            )
+            .on_hover_text("Темп");
+        if response.drag_started() {
+            self.editor.begin_group();
+        }
+        if response.changed() {
+            self.editor.set_tempo(tempo);
+        }
+        if response.drag_stopped() {
+            self.editor.end_group();
+        }
+        let mut numerator = signature.numerator;
+        let mut denominator = signature.denominator;
+        ui.add(
+            egui::DragValue::new(&mut numerator)
+                .range(1..=16)
+                .speed(0.1),
+        )
+        .on_hover_text("Долей в такте");
+        ui.label("/");
+        egui::ComboBox::from_id_salt("denominator")
+            .width(40.0)
+            .selected_text(denominator.to_string())
+            .show_ui(ui, |ui| {
+                for d in [2u8, 4, 8, 16] {
+                    ui.selectable_value(&mut denominator, d, d.to_string());
+                }
+            });
+        if (numerator, denominator) != (signature.numerator, signature.denominator) {
+            let result = self.editor.set_time_signature(numerator, denominator);
+            self.report(result, &format!("Размер {numerator}/{denominator}"));
+        }
+        self.sync_metronome();
     }
 
     fn open(&mut self, path: PathBuf) {
@@ -694,11 +780,13 @@ impl App {
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 0.0, Color32::from_gray(24));
 
-        // Ruler: one line per beat, labels on bar starts (4/4).
+        // Ruler: one line per beat, labels on bar starts (SPEC-026).
         let beat_seconds = 60.0 / self.editor.session().tempo_bpm;
+        let per_bar = usize::from(self.editor.session().time_signature.numerator.max(1));
         let beat_px = beat_seconds as f32 * self.zoom;
-        let bar_step = if beat_px * 4.0 < 40.0 {
-            ((40.0 / (beat_px * 4.0)).ceil() as usize).max(1)
+        let bar_px = beat_px * per_bar as f32;
+        let bar_step = if bar_px < 40.0 {
+            ((40.0 / bar_px).ceil() as usize).max(1)
         } else {
             1
         };
@@ -707,8 +795,8 @@ impl App {
         let beats = (width / beat_px.max(0.01)).ceil() as usize;
         for beat in 0..=beats.min(100_000) {
             let x = area.min.x + beat as f32 * beat_px;
-            let bar = beat / 4;
-            if beat % 4 == 0 && bar % bar_step == 0 {
+            let bar = beat / per_bar;
+            if beat % per_bar == 0 && bar % bar_step == 0 {
                 painter.line_segment(
                     [Pos2::new(x, area.min.y), Pos2::new(x, area.max.y)],
                     Stroke::new(1.0_f32, Color32::from_gray(60)),
@@ -931,6 +1019,7 @@ impl App {
     fn draw_cycle(&mut self, ui: &egui::Ui, response: &egui::Response, area: Rect) {
         let session = self.editor.session();
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+        let per_bar = u32::from(session.time_signature.numerator);
         let free = ui.input(|i| i.modifiers.shift) || !self.snap;
         let at = |x: f32| {
             let samples = x_to_samples(x - area.min.x, rate, self.zoom);
@@ -956,8 +1045,8 @@ impl App {
             if let Some((from, to)) = self.editor.cycle() {
                 self.status = format!(
                     "Цикл: такт {} – {}",
-                    bars(from, rate, tempo),
-                    bars(to, rate, tempo)
+                    bars_in(from, rate, tempo, per_bar),
+                    bars_in(to, rate, tempo, per_bar)
                 );
             }
         }
@@ -1423,14 +1512,18 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if !ctx.wants_keyboard_input() {
-            let (space, home, record, cycle) = ctx.input_mut(|i| {
+            let (space, home, record, cycle, click) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, Key::Space),
                     i.consume_key(egui::Modifiers::NONE, Key::Home),
                     i.consume_key(egui::Modifiers::NONE, Key::R),
                     i.consume_key(egui::Modifiers::NONE, Key::C),
+                    i.consume_key(egui::Modifiers::NONE, Key::K),
                 )
             });
+            if click {
+                self.toggle_metronome();
+            }
             if cycle {
                 self.toggle_cycle();
             }

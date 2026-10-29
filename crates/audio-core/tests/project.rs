@@ -1137,3 +1137,77 @@ fn too_many_points_are_rejected_before_decoding() {
             if point == audio_core::MAX_AUTOMATION_POINTS
     ));
 }
+
+// ---- SPEC-026: time signature ----
+
+#[test]
+fn a_four_four_session_writes_no_time_signature() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert!(!text.contains("time_signature"), "{text}");
+}
+
+#[test]
+fn a_time_signature_survives_the_round_trip() {
+    let (graph, _) = demo_graph();
+    let mut session = demo_session();
+    session.time_signature = audio_core::TimeSignature {
+        numerator: 7,
+        denominator: 8,
+    };
+    let project = Project::with_session(Project::capture("demo", SR, 120.0, &graph), session);
+    let text = project.to_json();
+    assert!(text.contains("\"time_signature\": [7, 8]"), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back, project);
+    assert_eq!(back.session().time_signature.numerator, 7);
+}
+
+#[test]
+fn a_document_without_a_time_signature_is_four_four() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(
+        back.session().time_signature,
+        audio_core::TimeSignature::default()
+    );
+}
+
+#[test]
+fn an_unsupported_time_signature_is_a_session_error() {
+    use audio_core::SessionError;
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json()
+        .replace(
+            "\"master_gain\": 1",
+            "\"master_gain\": 1,\n    \"time_signature\": [4, 3]",
+        );
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(SessionError::InvalidTimeSignature)
+    );
+}
+
+#[test]
+fn a_malformed_time_signature_is_rejected() {
+    let (graph, _) = demo_graph();
+    let base = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    for bad in ["[4]", "[4, 4, 4]", "4", "[4, 300]", "[\"4\", 4]"] {
+        let text = base.replace(
+            "\"master_gain\": 1",
+            &format!("\"master_gain\": 1,\n    \"time_signature\": {bad}"),
+        );
+        assert!(
+            matches!(
+                Project::from_json(&text).unwrap_err(),
+                ProjectError::Malformed { .. }
+            ),
+            "{bad}"
+        );
+    }
+}
