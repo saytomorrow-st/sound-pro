@@ -1,10 +1,12 @@
-//! Sound Pro window (SPEC-015). All editing goes through [`daw_gui::Editor`].
+//! Sound Pro window (SPEC-015, SPEC-016). All editing goes through
+//! [`daw_gui::Editor`].
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
-use daw_gui::Editor;
+use daw_app::playback::PlaybackControl;
+use daw_gui::{Editor, bars, clock, samples_to_x, x_to_samples};
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
     ViewportCommand,
@@ -31,8 +33,18 @@ fn main() -> eframe::Result {
     )
 }
 
+/// A running playback: the control side and, with sound, the open stream.
+struct Player {
+    control: PlaybackControl,
+    #[cfg(feature = "audio")]
+    _stream: daw_app::realtime::RealtimeHandle,
+}
+
 struct App {
     editor: Editor,
+    /// Playhead in samples while stopped; the player's position while playing.
+    playhead: u64,
+    player: Option<Player>,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -44,6 +56,8 @@ impl App {
     fn new(start: Option<PathBuf>) -> Self {
         let mut app = Self {
             editor: Editor::new(),
+            playhead: 0,
+            player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
             title: String::new(),
@@ -68,7 +82,135 @@ impl App {
         }
     }
 
+    fn is_playing(&self) -> bool {
+        self.player.as_ref().is_some_and(|p| p.control.is_playing())
+    }
+
+    fn play(&mut self) {
+        self.player = None;
+        let started = self
+            .editor
+            .playback(self.playhead)
+            .map(|(mut control, engine)| {
+                control.play();
+                (control, engine)
+            });
+        let Some((control, engine)) = self.report(started, "Играет") else {
+            return;
+        };
+        self.playhead = control.position();
+        #[cfg(feature = "audio")]
+        {
+            let rate = control.sample_rate();
+            match daw_app::realtime::start_output(engine, rate) {
+                Ok(stream) => {
+                    self.player = Some(Player {
+                        control,
+                        _stream: stream,
+                    });
+                }
+                Err(e) => self.status = format!("Ошибка звука: {e}"),
+            }
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            drop((control, engine));
+            self.status = "Звук выключен в этой сборке (соберите с --features audio)".into();
+        }
+    }
+
+    fn pause(&mut self) {
+        if let Some(player) = self.player.take() {
+            self.playhead = player.control.position();
+        }
+        self.status = "Пауза".into();
+    }
+
+    fn toggle_play(&mut self) {
+        if self.is_playing() {
+            self.pause();
+        } else {
+            self.play();
+        }
+    }
+
+    /// First press pauses; pressing again while stopped goes to the start.
+    fn stop(&mut self) {
+        if self.is_playing() {
+            self.pause();
+        } else {
+            self.player = None;
+            self.playhead = 0;
+            self.status = "Стоп".into();
+        }
+    }
+
+    fn rewind(&mut self) {
+        self.seek(0);
+    }
+
+    fn seek(&mut self, samples: u64) {
+        let end = self.editor.session().length_samples();
+        let samples = samples.min(end);
+        match self.player.as_mut() {
+            Some(player) if player.control.is_playing() => {
+                player.control.seek(samples);
+            }
+            _ => {
+                self.player = None;
+                self.playhead = samples;
+            }
+        }
+    }
+
+    /// Follows the audio thread; drops a player that reached the end.
+    fn poll_player(&mut self, ctx: &egui::Context) {
+        let Some(player) = self.player.as_ref() else {
+            return;
+        };
+        self.playhead = player.control.position();
+        if player.control.is_playing() {
+            ctx.request_repaint();
+        } else {
+            self.player = None;
+            self.status = "Конец".into();
+        }
+    }
+
+    fn reset_playback(&mut self) {
+        self.player = None;
+        self.playhead = 0;
+    }
+
+    fn transport(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("⏮").on_hover_text("В начало (Home)").clicked() {
+                self.rewind();
+            }
+            let label = if self.is_playing() { "⏸" } else { "▶" };
+            if ui
+                .button(label)
+                .on_hover_text("Играть / пауза (пробел)")
+                .clicked()
+            {
+                self.toggle_play();
+            }
+            if ui.button("⏹").on_hover_text("Стоп").clicked() {
+                self.stop();
+            }
+            ui.separator();
+            let session = self.editor.session();
+            let text = format!(
+                "{}   такт {}",
+                clock(self.playhead, session.sample_rate),
+                bars(self.playhead, session.sample_rate, session.tempo_bpm)
+            );
+            ui.label(egui::RichText::new(text).monospace().size(16.0));
+        });
+    }
+
     fn open(&mut self, path: PathBuf) {
+        self.reset_playback();
         let result = self.editor.open(&path);
         self.report(result, &format!("Открыт {}", path.display()));
     }
@@ -142,6 +284,7 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Файл", |ui| {
                 if ui.button("Новый").clicked() {
+                    self.reset_playback();
                     self.editor = Editor::new();
                     self.status = "Новый проект".into();
                 }
@@ -344,7 +487,18 @@ impl App {
             }
         }
 
-        if response.clicked() {
+        let rate_u32 = self.editor.session().sample_rate;
+        let cursor = area.min.x + samples_to_x(self.playhead, rate_u32, self.zoom);
+        painter.line_segment(
+            [Pos2::new(cursor, area.min.y), Pos2::new(cursor, area.max.y)],
+            Stroke::new(1.5_f32, Color32::from_rgb(255, 90, 70)),
+        );
+
+        if response.clicked() && pointer.is_some_and(|p| ruler.contains(p)) {
+            if let Some(p) = pointer {
+                self.seek(x_to_samples(p.x - area.min.x, rate_u32, self.zoom));
+            }
+        } else if response.clicked() {
             self.editor.selected_clip = clicked;
             if let Some((t, _)) = clicked {
                 self.editor.selected_track = Some(t);
@@ -364,6 +518,20 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if !ctx.wants_keyboard_input() {
+            let (space, home) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, Key::Space),
+                    i.consume_key(egui::Modifiers::NONE, Key::Home),
+                )
+            });
+            if space {
+                self.toggle_play();
+            }
+            if home {
+                self.rewind();
+            }
+        }
         let (delete, save, open, import) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, Key::Delete),
@@ -392,6 +560,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_player(ctx);
         self.shortcuts(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && self.editor.is_dirty() {
@@ -400,6 +569,7 @@ impl eframe::App for App {
         }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu(ui));
+        egui::TopBottomPanel::top("transport").show(ctx, |ui| self.transport(ui));
 
         egui::TopBottomPanel::bottom("status")
             .exact_height(30.0)
@@ -445,6 +615,7 @@ impl eframe::App for App {
                             self.confirm_quit = false;
                         }
                         if ui.button("Выйти").clicked() {
+                            self.reset_playback();
                             self.editor = Editor::new();
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }

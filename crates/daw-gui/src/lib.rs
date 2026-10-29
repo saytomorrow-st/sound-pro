@@ -349,6 +349,37 @@ impl Editor {
         daw_app::render_session(job).map_err(|e| EditorError::Render(e.to_string()))
     }
 
+    /// Builds a stopped playback pair for the current project, positioned
+    /// at `start` — or at 0 when `start` is at or past the end (SPEC-016).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::Empty`] for a project with no audio, load or graph
+    /// errors otherwise.
+    pub fn playback(
+        &self,
+        start: u64,
+    ) -> Result<
+        (
+            daw_app::playback::PlaybackControl,
+            daw_app::playback::PlaybackEngine,
+        ),
+        EditorError,
+    > {
+        let end = self.project.session.length_samples();
+        if end == 0 {
+            return Err(EditorError::Empty);
+        }
+        let mut job =
+            daw_app::load_session(self.project.session.clone(), Path::new(""), PathBuf::new())?;
+        job.block_frames = daw_app::playback::PLAYBACK_BLOCK;
+        let rate = job.sample_rate;
+        let graph =
+            daw_app::build_session_graph(job).map_err(|e| EditorError::Render(e.to_string()))?;
+        let start = if start >= end { 0 } else { start };
+        Ok(daw_app::playback::playback(graph, rate, start, end))
+    }
+
     /// Removes one clip; out-of-range indices do nothing.
     pub fn delete_clip(&mut self, track: usize, clip: usize) {
         let Some(t) = self.project.session.tracks.get_mut(track) else {
@@ -426,6 +457,56 @@ impl Editor {
     }
 }
 
+/// Horizontal offset of `samples` at `zoom` pixels per second.
+#[must_use]
+pub fn samples_to_x(samples: u64, rate: u32, zoom: f32) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let seconds = samples as f64 / f64::from(rate.max(1));
+    #[allow(clippy::cast_possible_truncation)]
+    let x = (seconds * f64::from(zoom)) as f32;
+    x
+}
+
+/// Sample position under a horizontal offset `x` at `zoom` pixels per
+/// second; negative offsets give 0.
+#[must_use]
+pub fn x_to_samples(x: f32, rate: u32, zoom: f32) -> u64 {
+    if !x.is_finite() || x <= 0.0 || !zoom.is_finite() || zoom <= 0.0 {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let samples = (f64::from(x) / f64::from(zoom) * f64::from(rate)).round() as u64;
+    samples
+}
+
+/// Clock time `m:ss.mmm` of a sample position.
+#[must_use]
+pub fn clock(samples: u64, rate: u32) -> String {
+    let rate = u64::from(rate.max(1));
+    let millis = samples * 1000 / rate;
+    format!(
+        "{}:{:02}.{:03}",
+        millis / 60_000,
+        millis / 1000 % 60,
+        millis % 1000
+    )
+}
+
+/// Musical position `bar.beat` in 4/4, both counted from 1.
+#[must_use]
+pub fn bars(samples: u64, rate: u32, tempo_bpm: f64) -> String {
+    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
+        tempo_bpm
+    } else {
+        DEFAULT_TEMPO
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let beats = samples as f64 / f64::from(rate.max(1)) * tempo / 60.0;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let beat = (beats + 1e-9).floor() as u64;
+    format!("{}.{}", beat / 4 + 1, beat % 4 + 1)
+}
+
 /// Reads a WAV file as `(rate, peaks of its mono average)`.
 fn read_mono(path: &Path) -> Result<(u32, Peaks), EditorError> {
     let (spec, buffer) = audio_core::wav::read_wav_mono(path).map_err(|source| match source {
@@ -474,8 +555,6 @@ fn truncate(name: &str) -> String {
     out
 }
 
-/// `source` relative to `base` with `/` separators, or unchanged when it
-/// lies outside `base`.
 /// Saved relative sources always use `/`; rebuild them with native separators.
 fn resolve_source(base: &Path, source: &str) -> PathBuf {
     if Path::new(source).is_absolute() {
@@ -486,6 +565,8 @@ fn resolve_source(base: &Path, source: &str) -> PathBuf {
     path
 }
 
+/// `source` relative to `base` with `/` separators, or unchanged when it
+/// lies outside `base`.
 fn relative_source(base: &Path, source: &str) -> String {
     let Ok(rest) = Path::new(source).strip_prefix(base) else {
         return source.to_owned();
