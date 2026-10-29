@@ -14,12 +14,16 @@ use std::fmt::Write as _;
 
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
+use crate::session::{Clip, MAX_CLIPS_PER_TRACK, MAX_TRACKS, Session, SessionError, Track};
 
 /// Longest accepted `name`, in bytes.
 pub const MAX_NAME_BYTES: usize = 128;
 
 /// Deepest object/array nesting accepted by the parser.
-const MAX_DEPTH: usize = 8;
+///
+/// SPEC-010 nests four levels (`session` → track → clip → value), so the
+/// SPEC-008 limit of 8 was raised to leave the same headroom it had before.
+const MAX_DEPTH: usize = 12;
 
 /// Why a project document could not be read or validated.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +70,8 @@ pub enum ProjectError {
         /// The missing id.
         id: u32,
     },
+    /// The embedded session does not hold together.
+    Session(SessionError),
 }
 
 impl fmt::Display for ProjectError {
@@ -87,11 +93,18 @@ impl fmt::Display for ProjectError {
             }
             Self::DuplicateParam { id } => write!(f, "parameter {id} is declared twice"),
             Self::UnknownParam { id } => write!(f, "parameter {id} is not in the graph"),
+            Self::Session(error) => write!(f, "session: {error}"),
         }
     }
 }
 
 impl std::error::Error for ProjectError {}
+
+impl From<SessionError> for ProjectError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
 
 /// One parameter as it should be restored.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +137,8 @@ pub struct Project {
     pub tempo_bpm: f64,
     /// Parameters in session order.
     pub params: Vec<ParamState>,
+    /// Tracks and clips; serialised last, under `"session"`.
+    pub session: Session,
 }
 
 impl Project {
@@ -161,7 +176,20 @@ impl Project {
             sample_rate,
             tempo_bpm,
             params,
+            session: Session::new_untitled(sample_rate, tempo_bpm),
         }
+    }
+
+    /// Replaces the empty session [`Self::capture`] stores with `session`.
+    #[must_use]
+    pub fn with_session(project: Self, session: Session) -> Self {
+        Self { session, ..project }
+    }
+
+    /// The session stored in this document.
+    #[must_use]
+    pub const fn session(&self) -> &Session {
+        &self.session
     }
 
     /// Writes the stored values into the parameters the graph already has.
@@ -222,10 +250,13 @@ impl Project {
             out.push_str("\n    }");
         }
         if self.params.is_empty() {
-            out.push_str("]\n}\n");
+            out.push(']');
         } else {
-            out.push_str("\n  ]\n}\n");
+            out.push_str("\n  ]");
         }
+        out.push_str(",\n  \"session\": ");
+        write_session(&mut out, &self.session);
+        out.push_str("\n}\n");
         out
     }
 
@@ -283,6 +314,7 @@ impl Project {
                 return Err(ProjectError::InvalidParam { id: param.id });
             }
         }
+        self.session.validate()?;
         Ok(())
     }
 }
@@ -324,6 +356,220 @@ fn write_string(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+/// Writes a session object at the two-space indent used inside `"session"`.
+///
+/// Nested one level deeper than `params`: `session` → track → clip → field.
+fn write_session(out: &mut String, session: &Session) {
+    out.push_str("{\n    \"name\": ");
+    write_string(out, &session.name);
+    out.push_str(",\n    \"sample_rate\": ");
+    out.push_str(&session.sample_rate.to_string());
+    out.push_str(",\n    \"tempo_bpm\": ");
+    out.push_str(&format_number(session.tempo_bpm));
+    out.push_str(",\n    \"tracks\": [");
+    for (track_index, track) in session.tracks.iter().enumerate() {
+        if track_index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n      {\n        \"name\": ");
+        write_string(out, &track.name);
+        out.push_str(",\n        \"gain\": ");
+        out.push_str(&format_number(f64::from(track.gain)));
+        out.push_str(",\n        \"mute\": ");
+        out.push_str(if track.mute { "true" } else { "false" });
+        out.push_str(",\n        \"clips\": [");
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            if clip_index > 0 {
+                out.push(',');
+            }
+            out.push_str("\n          {\n            \"start\": ");
+            out.push_str(&clip.start_samples.to_string());
+            out.push_str(",\n            \"length\": ");
+            out.push_str(&clip.length_samples.to_string());
+            out.push_str(",\n            \"offset\": ");
+            out.push_str(&clip.offset_samples.to_string());
+            out.push_str(",\n            \"source_length\": ");
+            out.push_str(&clip.source_length.to_string());
+            out.push_str(",\n            \"gain\": ");
+            out.push_str(&format_number(f64::from(clip.gain)));
+            out.push_str(",\n            \"name\": ");
+            write_string(out, &clip.name);
+            out.push_str("\n          }");
+        }
+        if track.clips.is_empty() {
+            out.push(']');
+        } else {
+            out.push_str("\n        ]");
+        }
+        out.push_str("\n      }");
+    }
+    if session.tracks.is_empty() {
+        out.push(']');
+    } else {
+        out.push_str("\n    ]");
+    }
+    out.push_str("\n  }");
+}
+
+/// Rebuilds a [`Session`] from its object, rejecting stray keys.
+fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut name = None;
+    let mut sample_rate = None;
+    let mut tempo_bpm = None;
+    let mut tracks = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "name" => name = Some(require_string(value)?),
+            "sample_rate" => sample_rate = Some(require_u32(value)?),
+            "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
+            "tracks" => {
+                let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+                // Reject an over-long session while parsing rather than after
+                // decoding every track: a hand-written file with 10^5 tracks is
+                // the cheapest denial-of-service there is, and the limit is the
+                // same one `Session::validate` enforces (SPEC-010).
+                if items.len() > MAX_TRACKS {
+                    return Err(ProjectError::Session(SessionError::TooManyTracks {
+                        max: MAX_TRACKS,
+                    }));
+                }
+                tracks = Some(
+                    items
+                        .iter()
+                        .map(track_from_value)
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(Session {
+        name: name.ok_or(ProjectError::MissingField {
+            field: "session.name",
+        })?,
+        sample_rate: sample_rate.ok_or(ProjectError::MissingField {
+            field: "session.sample_rate",
+        })?,
+        tempo_bpm: tempo_bpm.ok_or(ProjectError::MissingField {
+            field: "session.tempo_bpm",
+        })?,
+        tracks: tracks.ok_or(ProjectError::MissingField {
+            field: "session.tracks",
+        })?,
+    })
+}
+
+fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut name = None;
+    let mut gain = None;
+    let mut mute = None;
+    let mut clips = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "name" => name = Some(require_string(value)?),
+            "gain" => gain = Some(require_f32(value)?),
+            "mute" => {
+                let Value::Bool(flag) = value else {
+                    return Err(ProjectError::Malformed { at: 0 });
+                };
+                mute = Some(*flag);
+            }
+            "clips" => {
+                let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+                // Same reasoning as for tracks: cap before decoding.
+                if items.len() > MAX_CLIPS_PER_TRACK {
+                    return Err(ProjectError::Session(SessionError::TooManyClips {
+                        track: 0,
+                        max: MAX_CLIPS_PER_TRACK,
+                    }));
+                }
+                clips = Some(
+                    items
+                        .iter()
+                        .map(clip_from_value)
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(Track {
+        name: name.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].name",
+        })?,
+        gain: gain.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].gain",
+        })?,
+        mute: mute.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].mute",
+        })?,
+        clips: clips.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].clips",
+        })?,
+    })
+}
+
+fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut start = None;
+    let mut length = None;
+    let mut offset = None;
+    let mut source_length = None;
+    let mut gain = None;
+    let mut name = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "start" => start = Some(require_u64(value)?),
+            "length" => length = Some(require_u64(value)?),
+            "offset" => offset = Some(require_u64(value)?),
+            "source_length" => source_length = Some(require_u64(value)?),
+            "gain" => gain = Some(require_f32(value)?),
+            "name" => name = Some(require_string(value)?),
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(Clip {
+        start_samples: start.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].clips[].start",
+        })?,
+        length_samples: length.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].clips[].length",
+        })?,
+        offset_samples: offset.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].clips[].offset",
+        })?,
+        source_length: source_length.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].clips[].source_length",
+        })?,
+        gain: gain.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].clips[].gain",
+        })?,
+        name: name.ok_or(ProjectError::MissingField {
+            field: "session.tracks[].clips[].name",
+        })?,
+    })
 }
 
 /// The subset of JSON values the codec can hold.
@@ -371,9 +617,17 @@ impl Parser<'_> {
             return Err(ProjectError::Malformed { at: 0 });
         }
         let value = self.parse_value(0)?;
-        self.skip_whitespace();
-        if self.pos != self.bytes.len() {
-            return Err(ProjectError::Malformed { at: self.pos });
+        // Anything left over, whitespace included, is a syntax error. Checking
+        // only whether the rest is whitespace keeps this linear: trimming the
+        // tail frame by frame would be quadratic on a long trailing comment
+        // of spaces (a 1 MB hostile input is a spec case).
+        if let Some(offset) = self.bytes[self.pos..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+        {
+            return Err(ProjectError::Malformed {
+                at: self.pos + offset,
+            });
         }
         Ok(value)
     }
@@ -561,12 +815,14 @@ fn project_from_object(entries: &[(String, Value)]) -> Result<Project, ProjectEr
     let mut sample_rate = None;
     let mut tempo_bpm = None;
     let mut params = None;
+    let mut session = None;
     for (key, value) in entries {
         match key.as_str() {
             "name" => name = Some(require_string(value)?),
             "sample_rate" => sample_rate = Some(require_u32(value)?),
             "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
             "params" => params = Some(params_from_array(value)?),
+            "session" => session = Some(session_from_value(value)?),
             other => {
                 return Err(ProjectError::UnknownField {
                     field: other.to_owned(),
@@ -581,6 +837,7 @@ fn project_from_object(entries: &[(String, Value)]) -> Result<Project, ProjectEr
         })?,
         tempo_bpm: tempo_bpm.ok_or(ProjectError::MissingField { field: "tempo_bpm" })?,
         params: params.ok_or(ProjectError::MissingField { field: "params" })?,
+        session: session.ok_or(ProjectError::MissingField { field: "session" })?,
     })
 }
 
@@ -603,6 +860,20 @@ fn require_u32(value: &Value) -> Result<u32, ProjectError> {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let out = number as u32;
+    Ok(out)
+}
+
+fn require_u64(value: &Value) -> Result<u64, ProjectError> {
+    let number = value.as_f64().ok_or(ProjectError::Malformed { at: 0 })?;
+    if !number.is_finite()
+        || number < 0.0
+        || number.fract() != 0.0
+        || number > 9.007_199_254_740_992e15
+    {
+        return Err(ProjectError::Malformed { at: 0 });
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let out = number as u64;
     Ok(out)
 }
 
@@ -682,6 +953,7 @@ mod tests {
             sample_rate: 48_000,
             tempo_bpm: 120.0,
             params: vec![param(0, 0.25), param(1, 1.0)],
+            session: Session::new("demo", 48_000, 120.0),
         }
     }
 
