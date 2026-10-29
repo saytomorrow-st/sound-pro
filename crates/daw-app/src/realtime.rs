@@ -110,7 +110,7 @@ pub fn choose_config(
     if configs.is_empty() {
         return Err(RealtimeError::NoDevice);
     }
-    let mut best: Option<(u32, ChosenConfig)> = None;
+    let mut best: Option<((u32, u8), ChosenConfig)> = None;
     let mut any_f32 = false;
     for cfg in configs {
         if !cfg.is_f32 {
@@ -129,13 +129,15 @@ pub fn choose_config(
             sample_rate: rate,
             channels: cfg.channels,
         };
+        // Rate distance first, then stereo over more channels over mono
+        // (SPEC-037): a mono stream would fold the pan back into one
+        // channel. Equal keys keep the earlier config.
+        let key = (distance, channel_rank(cfg.channels));
         match best {
-            // An exact in-range match (distance 0) short-circuits immediately.
-            Some((0, _)) => {}
-            Some((d, _)) if d <= distance => {}
-            _ => best = Some((distance, chosen)),
+            Some((k, _)) if k <= key => {}
+            _ => best = Some((key, chosen)),
         }
-        if distance == 0 {
+        if key == (0, 0) {
             break;
         }
     }
@@ -145,6 +147,16 @@ pub fn choose_config(
     match best {
         Some((_, cfg)) => Ok(cfg),
         None => Err(RealtimeError::NoF32Config),
+    }
+}
+
+/// How well a channel count carries the stereo mix: 0 for stereo, 1 for
+/// more channels (extra ones repeat the right), 2 for mono or none.
+const fn channel_rank(channels: u16) -> u8 {
+    match channels {
+        2 => 0,
+        3.. => 1,
+        _ => 2,
     }
 }
 
@@ -711,6 +723,25 @@ mod tests {
             channels,
             is_f32: true,
         }
+    }
+
+    #[test]
+    fn choose_prefers_stereo_over_a_mono_config_listed_first() {
+        let cfgs = [f32_cfg(8_000, 192_000, 1), f32_cfg(8_000, 192_000, 2)];
+        let chosen = choose_config(&cfgs, DEFAULT_SAMPLE_RATE).unwrap();
+        assert_eq!(chosen.channels, 2);
+        let cfgs = [f32_cfg(48_000, 48_000, 1), f32_cfg(48_000, 48_000, 6)];
+        assert_eq!(
+            choose_config(&cfgs, DEFAULT_SAMPLE_RATE).unwrap().channels,
+            6
+        );
+    }
+
+    #[test]
+    fn choose_still_puts_the_rate_before_stereo() {
+        let cfgs = [f32_cfg(48_000, 48_000, 1), f32_cfg(44_100, 44_100, 2)];
+        let chosen = choose_config(&cfgs, DEFAULT_SAMPLE_RATE).unwrap();
+        assert_eq!((chosen.sample_rate, chosen.channels), (48_000, 1));
     }
 
     #[test]

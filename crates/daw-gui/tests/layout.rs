@@ -152,3 +152,32 @@ fn pan_knob_angle() {
     assert!((pan_angle(9.0) - 135f32.to_radians()).abs() < 1e-6);
     assert!(pan_angle(f32::NAN).abs() < 1e-6);
 }
+
+#[test]
+fn zoom_keeps_the_anchor_in_place() {
+    use daw_gui::layout::zoom_offset;
+    // The point 300 px into the view sits at content x = 500 before; at
+    // double zoom it is at 1000, so the view must start at 700.
+    assert!((zoom_offset(100.0, 200.0, 200.0, 300.0) - 700.0).abs() < 1e-3);
+    // Zooming back out returns to the original offset.
+    assert!((zoom_offset(200.0, 100.0, 700.0, 300.0) - 200.0).abs() < 1e-3);
+    // An anchor at the left edge with no scroll stays at zero.
+    assert!(zoom_offset(100.0, 400.0, 0.0, 0.0).abs() < 1e-3);
+}
+
+#[test]
+fn zoom_offset_never_goes_negative_or_nan() {
+    use daw_gui::layout::zoom_offset;
+    assert!(zoom_offset(100.0, 10.0, 50.0, 400.0) >= 0.0);
+    assert!((zoom_offset(0.0, 10.0, 50.0, 400.0) - 50.0).abs() < 1e-3);
+    assert!((zoom_offset(f32::NAN, 10.0, 50.0, 400.0) - 50.0).abs() < 1e-3);
+}
+
+#[test]
+fn slider_zoom_anchors_to_a_visible_playhead() {
+    use daw_gui::layout::slider_anchor;
+    assert!((slider_anchor(450.0, 200.0, 800.0) - 250.0).abs() < 1e-3);
+    // Off screen: the middle of the view.
+    assert!((slider_anchor(50.0, 200.0, 800.0) - 400.0).abs() < 1e-3);
+    assert!((slider_anchor(5_000.0, 200.0, 800.0) - 400.0).abs() < 1e-3);
+}

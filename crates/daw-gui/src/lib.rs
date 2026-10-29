@@ -905,6 +905,20 @@ impl Editor {
         playhead - playhead % bar
     }
 
+    /// Where and how long a new MIDI region is (SPEC-037): over the active
+    /// cycle when one is on, so a region made while looping lands inside
+    /// the loop; otherwise four bars from [`Self::new_clip_start`].
+    #[must_use]
+    pub fn new_midi_region(&self, playhead: u64) -> (u64, u64) {
+        if let Some((from, to)) = self.active_cycle() {
+            return (from, to - from);
+        }
+        let session = &self.project.session;
+        let beats = u64::from(session.time_signature.numerator.max(1));
+        let bar = sixteenth_samples(session.sample_rate, session.tempo_bpm) * 4 * beats;
+        (self.new_clip_start(playhead), bar * 4)
+    }
+
     /// Adds a track named "MIDI" holding one empty MIDI clip at `start`
     /// (SPEC-021). Returns `(track, clip)`, which becomes selected.
     ///

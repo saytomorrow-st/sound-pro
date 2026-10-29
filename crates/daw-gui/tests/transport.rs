@@ -224,3 +224,20 @@ fn new_clip_start_snaps_to_the_bar() {
     assert_eq!(editor.new_clip_start(bar * 2 + bar / 2), bar * 2);
     assert_eq!(editor.new_clip_start(bar * 4), 0);
 }
+
+/// SPEC-037: a MIDI region made while looping covers the cycle, wherever
+/// the moving playhead happens to be.
+#[test]
+fn new_midi_region_fills_the_active_cycle() {
+    let mut editor = Editor::new();
+    let rate = u64::from(editor.session().sample_rate);
+    let bar = rate * 2; // 4/4 at 120 bpm
+    assert_eq!(editor.new_midi_region(bar + 5), (bar, bar * 4));
+
+    editor.set_cycle(bar * 2, bar * 6).unwrap();
+    assert_eq!(editor.new_midi_region(bar * 3 + 17), (bar * 2, bar * 4));
+    assert_eq!(editor.new_midi_region(0), (bar * 2, bar * 4));
+
+    editor.cycle_enabled = false;
+    assert_eq!(editor.new_midi_region(bar * 3 + 17).0, bar * 3);
+}
