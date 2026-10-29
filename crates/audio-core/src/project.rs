@@ -756,19 +756,20 @@ impl Parser<'_> {
                     }
                     self.pos += 1;
                 }
-                // Multi-byte UTF-8 passes through: only the quote and the
-                // backslash are special, everything else is raw.
                 0x00..=0x1f => return Err(ProjectError::Malformed { at: self.pos }),
+                // Copy the whole run up to the next special byte at once.
+                // Every special byte is ASCII, so the run ends on a char
+                // boundary and multi-byte UTF-8 passes through unchanged.
+                // Decoding only the run keeps this linear (SPEC-012).
                 _ => {
-                    let rest = &self.bytes[self.pos..];
-                    let Some(ch) = std::str::from_utf8(rest)
-                        .ok()
-                        .and_then(|text| text.chars().next())
-                    else {
-                        return Err(ProjectError::Malformed { at: self.pos });
-                    };
-                    out.push(ch);
-                    self.pos += ch.len_utf8();
+                    let start = self.pos;
+                    while matches!(self.peek(), Some(byte) if byte >= 0x20 && byte != b'"' && byte != b'\\')
+                    {
+                        self.pos += 1;
+                    }
+                    let run = std::str::from_utf8(&self.bytes[start..self.pos])
+                        .map_err(|_| ProjectError::Malformed { at: start })?;
+                    out.push_str(run);
                 }
             }
         }

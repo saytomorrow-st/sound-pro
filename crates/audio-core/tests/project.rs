@@ -686,3 +686,65 @@ fn a_long_hand_written_session_is_still_rejected_fast() {
         started.elapsed()
     );
 }
+
+// ---- SPEC-012: parsing time is linear in the input size ----
+
+const ONE_MB: usize = 1024 * 1024;
+
+fn assert_fast(what: &str, text: &str) -> ProjectError {
+    let started = std::time::Instant::now();
+    let error = Project::from_json(text).unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{what} took {:?}",
+        started.elapsed()
+    );
+    error
+}
+
+#[test]
+fn a_megabyte_ascii_name_is_rejected_fast() {
+    let text = format!(
+        r#"{{"name": "{}", "sample_rate": 48000}}"#,
+        "a".repeat(ONE_MB)
+    );
+    let error = assert_fast("a 1 MB ASCII name", &text);
+    assert_eq!(error, ProjectError::MissingField { field: "tempo_bpm" });
+}
+
+#[test]
+fn a_megabyte_cyrillic_name_is_rejected_fast() {
+    // Two bytes per letter: ~1 MB of multi-byte UTF-8.
+    let text = format!(
+        r#"{{"name": "{}", "sample_rate": 48000}}"#,
+        "ж".repeat(ONE_MB / 2)
+    );
+    let error = assert_fast("a 1 MB Cyrillic name", &text);
+    assert_eq!(error, ProjectError::MissingField { field: "tempo_bpm" });
+}
+
+#[test]
+fn a_megabyte_unterminated_string_is_malformed_fast() {
+    let text = format!(r#"{{"name": "{}"#, "a".repeat(ONE_MB));
+    let error = assert_fast("a 1 MB unterminated string", &text);
+    assert_eq!(error, ProjectError::Malformed { at: text.len() });
+}
+
+#[test]
+fn a_megabyte_array_of_numbers_is_rejected_fast() {
+    let text = format!(r#"{{"params": [{}1]}}"#, "1, ".repeat(ONE_MB / 3));
+    let error = assert_fast("a 1 MB array of numbers", &text);
+    assert!(matches!(error, ProjectError::Malformed { .. }), "{error:?}");
+}
+
+#[test]
+fn multi_byte_names_round_trip_unchanged() {
+    let mut project = Project::from_json(
+        r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": [],
+            "session": {"name": "s", "sample_rate": 48000, "tempo_bpm": 120, "tracks": []}}"#,
+    )
+    .unwrap();
+    project.name = "Песня №1 — 日本 🎹".to_owned();
+    let back = Project::from_json(&project.to_json()).unwrap();
+    assert_eq!(back, project);
+}
