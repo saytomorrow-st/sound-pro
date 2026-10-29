@@ -826,3 +826,53 @@ fn clip_fades_shape_the_rendered_sound() {
     assert!((out[899] - 0.5).abs() < 1e-2);
     assert_eq!(out[999], 0.0);
 }
+
+#[test]
+fn a_fade_over_another_clip_reveals_it() {
+    // SPEC-040 §1: the upper clip's fade-in uncovers the clip below.
+    let mut scratch = Scratch::new("fadeover");
+    let mut upper = Clip::full(2_000, 4_000);
+    upper.fade_in_samples = 1_000;
+    let out = render_track(
+        &mut scratch,
+        vec![(Clip::full(0, 10_000), 1.0), (upper, 0.5)],
+    );
+    // At the very start of the fade only the lower clip sounds.
+    assert!((out[2_000] - 1.0).abs() < 1e-6, "{}", out[2_000]);
+    // Halfway through the fade: 0.5 * 0.5 + 0.5 * 1.0.
+    assert!((out[2_500] - 0.75).abs() < 1e-3, "{}", out[2_500]);
+    assert!((out[4_000] - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn fades_cross_through_three_layers() {
+    let mut scratch = Scratch::new("three");
+    let mut middle = Clip::full(1_000, 3_000);
+    middle.fade_out_samples = 1_000;
+    let mut top = Clip::full(3_000, 2_000);
+    top.fade_in_samples = 1_000;
+    let out = render_track(
+        &mut scratch,
+        vec![(Clip::full(0, 6_000), 1.0), (middle, 0.5), (top, 0.25)],
+    );
+    assert!((out[2_000] - 0.5).abs() < 1e-6);
+    // Top at 0, so its fade shows the fading middle over the bottom.
+    let m = 0.5 * (999.0 / 1_000.0) + 1.0 * (1.0 / 1_000.0);
+    assert!((out[3_000] - m).abs() < 1e-3, "{}", out[3_000]);
+    assert!((out[4_500] - 0.25).abs() < 1e-6);
+    // No click anywhere across the stack.
+    for pair in out[..6_000].windows(2) {
+        assert!((pair[1] - pair[0]).abs() < 0.01, "click: {pair:?}");
+    }
+}
+
+#[test]
+fn an_unfaded_clip_on_top_still_wins_exactly() {
+    let mut scratch = Scratch::new("exact");
+    let out = render_track(
+        &mut scratch,
+        vec![(Clip::full(0, 4_000), 0.3), (Clip::full(0, 4_000), 0.7)],
+    );
+    let ramp = audio_core::CROSSFADE_SAMPLES as usize;
+    assert!(out[ramp..4_000 - ramp].iter().all(|s| *s == 0.7));
+}

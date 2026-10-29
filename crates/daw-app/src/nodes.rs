@@ -448,8 +448,9 @@ impl NodeProcessor for Track {
     }
 }
 
-/// One clip's sample at timeline `position`, with its gain and fades; the
-/// caller has checked that the clip covers `position`.
+/// One clip's sample at timeline `position`, with its gain but without its
+/// fades (they are applied as layer weights); the caller has checked that
+/// the clip covers `position`.
 fn clip_sample(
     clip: &audio_core::session::Clip,
     source: &(dyn ClipSource + Send),
@@ -463,14 +464,10 @@ fn clip_sample(
     };
     // `source_length` is only a claim about the content: trust the slice,
     // not the model, so a mismatch is silence, not a panic.
-    source.channel(0).get(source_index).map_or(0.0, |sample| {
-        let fade = clip.fade_gain(position);
-        if fade >= 1.0 {
-            sample * clip.gain
-        } else {
-            sample * clip.gain * fade
-        }
-    })
+    source
+        .channel(0)
+        .get(source_index)
+        .map_or(0.0, |sample| sample * clip.gain)
 }
 
 impl Track {
@@ -486,8 +483,11 @@ impl Track {
         if self.mute || (self.automation.gain.is_empty() && self.gain == 0.0) {
             return;
         }
-        // SPEC-038: where clips overlap, the later one in the list wins, with
-        // an automatic crossfade at its edges over the clip right below it.
+        // SPEC-038/040: clips are layers, the later one in the list on top.
+        // Each layer covers what lies below it by its weight: its own fade
+        // times the automatic crossfade over the next covering layer. What a
+        // layer leaves uncovered shows the layers below, so a fade over
+        // another clip reveals it, through any number of layers.
         for (index, slot) in dst.iter_mut().enumerate() {
             let position = position.saturating_add(index as u64);
             let mut layers = self
@@ -495,23 +495,24 @@ impl Track {
                 .iter()
                 .zip(&self.sources)
                 .rev()
-                .filter(|(clip, _)| clip.covers(position));
-            let Some((top, top_source)) = layers.next() else {
-                continue;
-            };
-            let upper = clip_sample(top, top_source.as_ref(), position);
-            *slot = match layers.next() {
-                None => upper,
-                Some((below, below_source)) => {
-                    let weight = top.layer_weight(below, position);
-                    if weight >= 1.0 {
-                        upper
-                    } else {
-                        let lower = clip_sample(below, below_source.as_ref(), position);
-                        upper * weight + lower * (1.0 - weight)
-                    }
+                .filter(|(clip, _)| clip.covers(position))
+                .peekable();
+            let mut sum = 0.0_f32;
+            let mut remaining = 1.0_f32;
+            while let Some((clip, source)) = layers.next() {
+                let mut weight = clip.fade_gain(position);
+                if let Some((below, _)) = layers.peek() {
+                    weight *= clip.layer_weight(below, position);
                 }
-            };
+                if weight > 0.0 {
+                    sum += remaining * weight * clip_sample(clip, source.as_ref(), position);
+                }
+                remaining *= 1.0 - weight;
+                if remaining <= 0.0 {
+                    break;
+                }
+            }
+            *slot = sum;
         }
         for effect in &mut self.effects {
             effect.process(dst);

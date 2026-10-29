@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod layout;
+pub mod timeline;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -770,6 +771,44 @@ impl Editor {
         };
         self.commit(session, at)?;
         Ok(at)
+    }
+
+    /// Puts a clip on top of every other clip of its track (SPEC-040 §2):
+    /// where clips overlap, the top one is heard. Returns its new index,
+    /// which becomes selected. Already on top: no undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; `self` is unchanged.
+    pub fn bring_to_front(&mut self, track: usize, clip: usize) -> Result<usize, EditorError> {
+        self.clip_ref(track, clip)?;
+        let last = self.project.session.tracks[track].clips.len() - 1;
+        self.reorder(track, clip, last)
+    }
+
+    /// Puts a clip under every other clip of its track (SPEC-040 §2).
+    /// Returns its new index (`0`), which becomes selected.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; `self` is unchanged.
+    pub fn send_to_back(&mut self, track: usize, clip: usize) -> Result<usize, EditorError> {
+        self.clip_ref(track, clip)?;
+        self.reorder(track, clip, 0)
+    }
+
+    fn reorder(&mut self, track: usize, clip: usize, to: usize) -> Result<usize, EditorError> {
+        if clip == to {
+            self.selected_track = Some(track);
+            self.selected_clip = Some((track, to));
+            return Ok(to);
+        }
+        let mut session = self.project.session.clone();
+        let clips = &mut session.tracks[track].clips;
+        let moved = clips.remove(clip);
+        clips.insert(to, moved);
+        self.commit(session, (track, to))?;
+        Ok(to)
     }
 
     /// Moves a clip's left edge to `start`, keeping its right edge. The edge
