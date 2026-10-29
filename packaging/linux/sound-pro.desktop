@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sound Pro
+Comment=Open digital audio workstation
+Exec=sound-pro %f
+Icon=sound-pro
+Categories=AudioVideo;Audio;Midi;
+MimeType=application/json;
+Terminal=false
