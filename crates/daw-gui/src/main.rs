@@ -1,4 +1,4 @@
-//! Sound Pro window (SPEC-015 to SPEC-018). All editing goes through
+//! Sound Pro window (SPEC-015 to SPEC-020). All editing goes through
 //! [`daw_gui::Editor`].
 
 #![forbid(unsafe_code)]
@@ -70,8 +70,19 @@ struct Player {
     _stream: daw_app::realtime::RealtimeHandle,
 }
 
+/// A microphone take in progress (SPEC-020).
+#[cfg(feature = "audio")]
+struct Recorder {
+    control: daw_app::capture::CaptureControl,
+    _stream: daw_app::realtime::RealtimeHandle,
+    /// Timeline position where the take starts, in project samples.
+    start: u64,
+}
+
 struct App {
     editor: Editor,
+    #[cfg(feature = "audio")]
+    recorder: Option<Recorder>,
     /// Playhead in samples while stopped; the player's position while playing.
     playhead: u64,
     player: Option<Player>,
@@ -89,6 +100,8 @@ impl App {
     fn new(start: Option<PathBuf>) -> Self {
         let mut app = Self {
             editor: Editor::new(),
+            #[cfg(feature = "audio")]
+            recorder: None,
             playhead: 0,
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
@@ -161,7 +174,101 @@ impl App {
         self.status = "Пауза".into();
     }
 
+    #[cfg(feature = "audio")]
+    fn is_recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    const fn is_recording(&self) -> bool {
+        false
+    }
+
+    fn toggle_record(&mut self) {
+        if self.is_recording() {
+            self.finish_recording();
+        } else {
+            self.start_recording();
+        }
+    }
+
+    #[cfg(feature = "audio")]
+    fn start_recording(&mut self) {
+        let rate = self.editor.session().sample_rate;
+        match daw_app::realtime::start_input(rate, 30) {
+            Ok((control, stream)) => {
+                let start = self.playhead;
+                if !self.editor.session().tracks.is_empty() {
+                    self.play();
+                }
+                self.recorder = Some(Recorder {
+                    control,
+                    _stream: stream,
+                    start,
+                });
+                self.status = "Запись…".into();
+            }
+            Err(e) => self.status = format!("Ошибка микрофона: {e}"),
+        }
+    }
+
+    #[cfg(not(feature = "audio"))]
+    fn start_recording(&mut self) {
+        self.status = "Звук выключен в этой сборке (соберите с --features audio)".into();
+    }
+
+    #[cfg(feature = "audio")]
+    fn finish_recording(&mut self) {
+        let Some(recorder) = self.recorder.take() else {
+            return;
+        };
+        drop(recorder._stream);
+        if let Some(player) = self.player.take() {
+            self.playhead = player.control.position();
+        }
+        let take = recorder.control.finish();
+        let dir = self.editor.recordings_dir();
+        let added =
+            self.editor
+                .add_recording(&take.samples, take.sample_rate, recorder.start, &dir);
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = take.samples.len() as f64 / f64::from(take.sample_rate.max(1));
+        let mut ok = format!("Записано {seconds:.1} с");
+        if take.dropped > 0 {
+            ok.push_str(&format!(" (потеряно кадров: {})", take.dropped));
+        }
+        self.report(added, &ok);
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    const fn finish_recording(&mut self) {}
+
+    /// Moves the take into the window's buffer and the playhead forward.
+    #[cfg(feature = "audio")]
+    fn poll_recorder(&mut self, ctx: &egui::Context) {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        recorder.control.drain();
+        if self.player.is_none() {
+            let project = u64::from(self.editor.session().sample_rate);
+            let rate = u64::from(recorder.control.sample_rate().max(1));
+            self.playhead = recorder.start + recorder.control.frames() * project / rate;
+        }
+        ctx.request_repaint();
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    const fn poll_recorder(&mut self, _ctx: &egui::Context) {}
+
     fn toggle_play(&mut self) {
+        if self.is_recording() {
+            self.finish_recording();
+            return;
+        }
         if self.is_playing() {
             self.pause();
         } else {
@@ -171,7 +278,9 @@ impl App {
 
     /// First press pauses; pressing again while stopped goes to the start.
     fn stop(&mut self) {
-        if self.is_playing() {
+        if self.is_recording() {
+            self.finish_recording();
+        } else if self.is_playing() {
             self.pause();
         } else {
             self.player = None;
@@ -208,7 +317,9 @@ impl App {
             ctx.request_repaint();
         } else {
             self.player = None;
-            self.status = "Конец".into();
+            if !self.is_recording() {
+                self.status = "Конец".into();
+            }
         }
     }
 
@@ -232,6 +343,18 @@ impl App {
             }
             if ui.button("⏹").on_hover_text("Стоп").clicked() {
                 self.stop();
+            }
+            let rec = egui::RichText::new("⏺").color(if self.is_recording() {
+                Color32::RED
+            } else {
+                Color32::from_rgb(200, 80, 80)
+            });
+            if ui
+                .add(egui::Button::new(rec).selected(self.is_recording()))
+                .on_hover_text("Запись с микрофона (R)")
+                .clicked()
+            {
+                self.toggle_record();
             }
             ui.separator();
             let session = self.editor.session();
@@ -678,12 +801,16 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if !ctx.wants_keyboard_input() {
-            let (space, home) = ctx.input_mut(|i| {
+            let (space, home, record) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, Key::Space),
                     i.consume_key(egui::Modifiers::NONE, Key::Home),
+                    i.consume_key(egui::Modifiers::NONE, Key::R),
                 )
             });
+            if record {
+                self.toggle_record();
+            }
             if space {
                 self.toggle_play();
             }
@@ -734,6 +861,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_player(ctx);
+        self.poll_recorder(ctx);
         // Everything done during one mouse press is one undo step.
         if ctx.input(|i| i.pointer.any_down()) {
             self.editor.begin_group();

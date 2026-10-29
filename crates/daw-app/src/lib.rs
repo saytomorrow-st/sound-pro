@@ -183,6 +183,7 @@ pub fn interleave(src: &AudioBuffer, frames: usize, out: &mut [f32]) {
 
 /// Realtime CPAL backend (SPEC-005). Always compiled for its pure helpers;
 /// the device glue requires the `realtime` feature.
+pub mod capture;
 pub mod playback;
 pub mod realtime;
 

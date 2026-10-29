@@ -10,6 +10,7 @@ use audio_core::params::{ParamHandle, ParamId, ParamSpec};
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 use audio_core::session::{Clip, Session, Track as SessionTrack};
 use audio_core::{Graph, MidiEvent, MidiMessage, Renderer, Transport, TransportCommand};
+use daw_app::capture::capture;
 use daw_app::nodes::{ClipSource, MidiPlayer, MonoClip, Strip, Tone};
 use daw_app::{SessionJob, TrackSource, build_session_graph};
 
@@ -235,4 +236,20 @@ fn a_panned_soloed_stereo_session_does_not_allocate() {
     );
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "stereo mixer allocated {count} times");
+}
+
+#[test]
+fn capture_push_does_not_allocate() {
+    let (control, mut engine) = capture(RATE as usize, RATE);
+    let input = vec![0.25_f32; BLOCK * 2];
+    let count = allocations_of(|| {
+        for _ in 0..QUANTA {
+            engine.push(&input, 2);
+        }
+    });
+    assert_eq!(count, 0, "CaptureEngine::push allocated {count} times");
+    assert!(
+        control.dropped() > 0,
+        "the ring should overflow without allocating"
+    );
 }
