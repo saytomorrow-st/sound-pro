@@ -209,3 +209,229 @@ impl NodeProcessor for PolySynth {
         }
     }
 }
+
+/// PCM content a clip plays from (SPEC-010).
+///
+/// Read-only by interface, so a node can never damage the material it visits,
+/// and cheap to ask about: both methods are called on the audio thread.
+pub trait ClipSource {
+    /// Frames of content available, i.e. the clip's `source_length`.
+    fn frames(&self) -> u64;
+    /// Mono content for channel `ch`; empty if the channel does not exist.
+    fn channel(&self, ch: usize) -> &[f32];
+}
+
+/// Mono material for a clip, already at the session's sample rate.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MonoClip {
+    samples: Vec<f32>,
+}
+
+impl MonoClip {
+    /// Takes ownership of `samples` as the clip's content.
+    #[must_use]
+    pub fn new(samples: Vec<f32>) -> Self {
+        Self { samples }
+    }
+
+    /// A `freq_hz` sine of `frames` frames, generated off the audio thread.
+    #[must_use]
+    pub fn sine(freq_hz: f64, sample_rate: u32, frames: u64) -> Self {
+        let frames = usize::try_from(frames).unwrap_or(usize::MAX);
+        Self {
+            samples: sine(freq_hz, sample_rate, 0, frames),
+        }
+    }
+
+    /// The raw samples.
+    #[must_use]
+    pub fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+}
+
+impl ClipSource for MonoClip {
+    fn frames(&self) -> u64 {
+        self.samples.len() as u64
+    }
+
+    fn channel(&self, ch: usize) -> &[f32] {
+        if ch == 0 { &self.samples } else { &[] }
+    }
+}
+
+impl ClipSource for Vec<f32> {
+    fn frames(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn channel(&self, ch: usize) -> &[f32] {
+        if ch == 0 { self } else { &[] }
+    }
+}
+
+/// One clip as the mixer sees it: timeline window, content window, gain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PlacedClip {
+    start: u64,
+    length: u64,
+    offset: u64,
+    gain: f32,
+}
+
+impl PlacedClip {
+    fn new(clip: &audio_core::session::Clip) -> Self {
+        Self {
+            start: clip.start_samples,
+            length: clip.length_samples,
+            offset: clip.offset_samples,
+            gain: clip.gain,
+        }
+    }
+
+    /// The content index for timeline position `position`, if it sounds.
+    fn source_index(&self, position: u64) -> Option<u64> {
+        let within = position.checked_sub(self.start)?;
+        (within < self.length).then(|| self.offset + within)
+    }
+}
+
+/// A session track: its clips placed on the timeline, summed, gain and mute
+/// applied (SPEC-010 §3).
+///
+/// All the arithmetic is done on prepared slices: no allocation, no locking,
+/// no panics. A clip whose `source_length` does not match its source simply
+/// stops early instead of reading out of bounds.
+pub struct Track {
+    clips: Vec<PlacedClip>,
+    sources: Vec<Box<dyn ClipSource + Send>>,
+    gain: f32,
+    mute: bool,
+}
+
+impl Track {
+    /// Pairs each clip with the source holding its content, in the same order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`daw_app::SessionError::ClipCountMismatch`] when the lists
+    /// differ in length.
+    pub fn new(
+        track: &audio_core::session::Track,
+        sources: Vec<Box<dyn ClipSource + Send>>,
+    ) -> Result<Self, crate::SessionError> {
+        if track.clips.len() != sources.len() {
+            return Err(crate::SessionError::ClipCountMismatch {
+                track: track.name.clone(),
+                clips: track.clips.len(),
+                sources: sources.len(),
+            });
+        }
+        Ok(Self {
+            clips: track.clips.iter().map(PlacedClip::new).collect(),
+            sources,
+            gain: track.gain,
+            mute: track.mute,
+        })
+    }
+
+    /// Timeline length of the track in frames: the end of its last clip.
+    #[must_use]
+    pub fn length_samples(&self) -> u64 {
+        self.clips
+            .iter()
+            .map(|clip| clip.start.saturating_add(clip.length))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+impl std::fmt::Debug for Track {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Track")
+            .field("clips", &self.clips.len())
+            .field("gain", &self.gain)
+            .field("mute", &self.mute)
+            .field("length_samples", &self.length_samples())
+            .finish()
+    }
+}
+
+impl NodeProcessor for Track {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
+        let dst = output.channel_mut(0);
+        dst[..ctx.frames].fill(0.0);
+        if self.mute || self.gain == 0.0 {
+            return;
+        }
+        let track_gain = self.gain;
+        for (clip, source) in self.clips.iter().zip(&self.sources) {
+            if clip.gain == 0.0 || clip.length == 0 {
+                continue;
+            }
+            let content = source.channel(0);
+            for (index, slot) in dst[..ctx.frames].iter_mut().enumerate() {
+                let position = ctx.position + index as u64;
+                let Some(source_index) = clip.source_index(position) else {
+                    continue;
+                };
+                let Ok(source_index) = usize::try_from(source_index) else {
+                    continue;
+                };
+                if let Some(sample) = content.get(source_index) {
+                    *slot += sample * clip.gain;
+                }
+            }
+        }
+        for slot in &mut dst[..ctx.frames] {
+            *slot *= track_gain;
+        }
+    }
+}
+
+/// One loaded source with a known timeline offset (SPEC-010 §3).
+///
+/// The minimal vertical slice used to check summation in a graph: no clip
+/// windows, no gain staging, just "this material starts here".
+pub struct Strip {
+    source: Box<dyn ClipSource + Send>,
+    offset: u64,
+    gain: f32,
+}
+
+impl Strip {
+    /// Places `source` at `offset` frames on the timeline, scaled by `gain`.
+    #[must_use]
+    pub fn new(source: Box<dyn ClipSource + Send>, offset: u64, gain: f32) -> Self {
+        Self {
+            source,
+            offset,
+            gain,
+        }
+    }
+}
+
+impl std::fmt::Debug for Strip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Strip")
+            .field("frames", &self.source.frames())
+            .field("offset", &self.offset)
+            .field("gain", &self.gain)
+            .finish()
+    }
+}
+
+impl NodeProcessor for Strip {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
+        let content = self.source.channel(0);
+        let dst = output.channel_mut(0);
+        for (index, slot) in dst[..ctx.frames].iter_mut().enumerate() {
+            let position = ctx.position + index as u64;
+            let sample = position
+                .checked_sub(self.offset)
+                .and_then(|within| usize::try_from(within).ok())
+                .and_then(|within| content.get(within).copied());
+            *slot = sample.map_or(0.0, |sample| sample * self.gain);
+        }
+    }
+}

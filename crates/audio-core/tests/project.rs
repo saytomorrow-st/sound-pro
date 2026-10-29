@@ -56,13 +56,37 @@ fn many_param_graph(count: u32) -> Graph {
 }
 
 fn minimal(name: &str) -> String {
-    format!("{{\"name\": \"{name}\", \"sample_rate\": 48000, \"tempo_bpm\": 120, \"params\": []}}")
+    with_session(&format!(
+        "{{\"name\": \"{name}\", \"sample_rate\": 48000, \"tempo_bpm\": 120, \"params\": []}}"
+    ))
 }
+
+/// Appends an empty session to a document body built without one.
+fn with_session(body: &str) -> String {
+    let close = body.len() - 1;
+    let mut out = String::with_capacity(body.len() + EMPTY_SESSION.len() + 16);
+    out.push_str(&body[..close]);
+    out.push_str(", \"session\": ");
+    out.push_str(EMPTY_SESSION);
+    out.push('}');
+    out
+}
+
+/// Builds a document whose `params` array holds exactly `body`.
+fn with_params(body: &str) -> String {
+    with_session(&format!(
+        r#"{{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": [{body}]}}"#
+    ))
+}
+
+/// An empty session, as the document requires one (SPEC-010).
+const EMPTY_SESSION: &str =
+    r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "tracks": []}"#;
 
 fn param_json(fields: &str) -> String {
     format!(
         "{{\"name\": \"x\", \"sample_rate\": 48000, \"tempo_bpm\": 120, \
-         \"params\": [{{{fields}}}]}}"
+         \"params\": [{{{fields}}}], \"session\": {EMPTY_SESSION}}}"
     )
 }
 
@@ -178,12 +202,13 @@ fn apply_to_leaves_the_session_untouched_when_one_id_is_unknown() {
     let (mut target, level) = demo_graph();
     add_silent(&mut target);
     // Id 0 exists, id 9 does not: id 0 must not be applied half-way.
-    let text = r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": [
-        {"id": 0, "name": "tone.level", "min": 0, "max": 1, "default": 0.5,
+    let text = with_params(
+        r#"{"id": 0, "name": "tone.level", "min": 0, "max": 1, "default": 0.5,
          "smoothing_ms": 10, "value": 1},
         {"id": 9, "name": "ghost", "min": 0, "max": 1, "default": 0,
-         "smoothing_ms": 0, "value": 0}]}"#;
-    let project = Project::from_json(text).unwrap();
+         "smoothing_ms": 0, "value": 0}"#,
+    );
+    let project = Project::from_json(&text).unwrap();
     assert_eq!(
         project.apply_to(&target).unwrap_err(),
         ProjectError::UnknownParam { id: 9 }
@@ -209,9 +234,10 @@ fn empty_object_reports_the_first_missing_field() {
 
 #[test]
 fn a_typo_in_a_key_is_an_unknown_field() {
-    let text = r#"{"name": "x", "sample_rate": 48000, "tempoBPM": 120, "params": []}"#;
+    let text =
+        with_session(r#"{"name": "x", "sample_rate": 48000, "tempoBPM": 120, "params": []}"#);
     assert_eq!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::UnknownField {
             field: "tempoBPM".to_owned()
         }
@@ -220,28 +246,31 @@ fn a_typo_in_a_key_is_an_unknown_field() {
 
 #[test]
 fn null_is_unsupported() {
-    let text = r#"{"name": null, "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#;
+    let text =
+        with_session(r#"{"name": null, "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#);
     assert!(matches!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::Unsupported { .. }
     ));
 }
 
 #[test]
 fn exponents_are_unsupported() {
-    let text = r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 1e3, "params": []}"#;
+    let text =
+        with_session(r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 1e3, "params": []}"#);
     assert!(matches!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::Unsupported { .. }
     ));
 }
 
 #[test]
 fn deep_nesting_is_unsupported() {
-    // Nine levels of arrays inside the `name` position.
-    let nesting = format!("{}{}", "[".repeat(9), "]".repeat(9));
-    let text =
-        format!(r#"{{"name": {nesting}, "sample_rate": 48000, "tempo_bpm": 120, "params": []}}"#);
+    // Well past the parser's depth limit, inside the `name` position.
+    let nesting = format!("{}{}", "[".repeat(64), "]".repeat(64));
+    let text = with_session(&format!(
+        r#"{{"name": {nesting}, "sample_rate": 48000, "tempo_bpm": 120, "params": []}}"#
+    ));
     assert!(matches!(
         Project::from_json(&text).unwrap_err(),
         ProjectError::Unsupported { .. }
@@ -250,18 +279,20 @@ fn deep_nesting_is_unsupported() {
 
 #[test]
 fn an_unterminated_string_is_malformed() {
-    let text = r#"{"name": "x, "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#;
+    let text =
+        with_session(r#"{"name": "x, "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#);
     assert!(matches!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::Malformed { .. }
     ));
 }
 
 #[test]
 fn a_negative_sample_rate_is_malformed() {
-    let text = r#"{"name": "x", "sample_rate": -48000, "tempo_bpm": 120, "params": []}"#;
+    let text =
+        with_session(r#"{"name": "x", "sample_rate": -48000, "tempo_bpm": 120, "params": []}"#);
     assert!(matches!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::Malformed { .. }
     ));
 }
@@ -278,36 +309,40 @@ fn a_value_outside_its_range_is_rejected() {
 
 #[test]
 fn duplicate_ids_are_rejected() {
-    let text = r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": [
-        {"id": 3, "name": "a", "min": 0, "max": 1, "default": 0,
+    let text = with_params(
+        r#"{"id": 3, "name": "a", "min": 0, "max": 1, "default": 0,
          "smoothing_ms": 0, "value": 0},
         {"id": 3, "name": "b", "min": 0, "max": 1, "default": 0,
-         "smoothing_ms": 0, "value": 0}]}"#;
+         "smoothing_ms": 0, "value": 0}"#,
+    );
     assert_eq!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::DuplicateParam { id: 3 }
     );
 }
 
 #[test]
 fn zero_tempo_is_rejected() {
-    let text = r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 0, "params": []}"#;
+    let text = with_session(r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 0, "params": []}"#);
     assert_eq!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::InvalidTempo
     );
-    let text = r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": -1, "params": []}"#;
+    let text =
+        with_session(r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": -1, "params": []}"#);
     assert_eq!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::InvalidTempo
     );
 }
 
 #[test]
 fn unicode_escapes_are_unsupported() {
-    let text = r#"{"name": "a\u0041", "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#;
+    let text = with_session(
+        r#"{"name": "a\u0041", "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#,
+    );
     assert!(matches!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::Unsupported { .. }
     ));
 }
@@ -329,9 +364,9 @@ fn a_too_long_name_is_rejected() {
 
 #[test]
 fn zero_sample_rate_is_rejected() {
-    let text = r#"{"name": "x", "sample_rate": 0, "tempo_bpm": 120, "params": []}"#;
+    let text = with_session(r#"{"name": "x", "sample_rate": 0, "tempo_bpm": 120, "params": []}"#);
     assert_eq!(
-        Project::from_json(text).unwrap_err(),
+        Project::from_json(&text).unwrap_err(),
         ProjectError::InvalidSampleRate
     );
 }
@@ -353,7 +388,13 @@ fn a_hand_written_file_parses() {
               "smoothing_ms": 10,
               "value": 0.125
             }
-          ]
+          ],
+          "session": {
+            "name": "hand",
+            "sample_rate": 44100,
+            "tempo_bpm": 96.5,
+            "tracks": []
+          }
         }
     "#;
     let project = Project::from_json(text).unwrap();
@@ -372,6 +413,7 @@ fn a_hand_written_file_parses() {
                 smoothing_ms: 10,
                 value: 0.125,
             }],
+            session: audio_core::Session::new("hand", 44_100, 96.5),
         }
     );
 }
@@ -393,6 +435,7 @@ fn awkward_floats_survive_the_text_format_exactly() {
             sample_rate: SR,
             tempo_bpm: value,
             params: Vec::new(),
+            session: audio_core::Session::new("x", SR, value),
         };
         let text = project.to_json();
         // The writer relies on `Display` never using an exponent; check the
@@ -425,7 +468,11 @@ fn hostile_input_never_panics_and_stays_fast() {
     }
     let started = std::time::Instant::now();
     assert!(Project::from_json(&String::from_utf8_lossy(&buf)).is_err());
-    assert!(started.elapsed().as_secs() < 1);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a megabyte of garbage took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -437,5 +484,205 @@ fn a_plausible_header_with_garbage_and_deep_lists_is_rejected() {
     text.push_str(&"[".repeat(1024 * 1024));
     let started = std::time::Instant::now();
     assert!(Project::from_json(&text).is_err());
-    assert!(started.elapsed().as_secs() < 1);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a hand-written session with 4_000 tracks took {:?}",
+        started.elapsed()
+    );
+}
+
+// ---- SPEC-010: the session embedded in the document ----
+
+fn demo_session() -> audio_core::Session {
+    let mut clip = audio_core::Clip::full(240, 96_000);
+    clip.name = "take 1".to_owned();
+    clip.offset_samples = 120;
+    clip.length_samples = 48_000;
+    clip.gain = 0.75;
+    let mut track = audio_core::SessionTrack::new("lead");
+    track.gain = 0.5;
+    track.clips.push(clip);
+    let mut session = audio_core::Session::new("liners", SR, 120.0);
+    session.tracks.push(track);
+    session
+}
+
+#[test]
+fn capture_stores_an_empty_session_named_after_the_project() {
+    let (graph, _) = demo_graph();
+    let project = Project::capture("demo", SR, 120.0, &graph);
+    let session = project.session();
+    assert_eq!(session.name, "untitled");
+    assert_eq!(session.sample_rate, SR);
+    assert_eq!(session.tracks.len(), 0);
+    assert_eq!(session.length_samples(), 0);
+}
+
+#[test]
+fn a_session_survives_the_round_trip() {
+    let (graph, _) = demo_graph();
+    let project =
+        Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session());
+    let text = project.to_json();
+    assert_eq!(Project::from_json(&text).unwrap(), project);
+    assert_eq!(text.matches("\"session\"").count(), 1);
+    let session_at = text.find("\"session\"").unwrap();
+    assert!(
+        session_at > text.find("\"params\"").unwrap(),
+        "session is last"
+    );
+    assert!(text.ends_with("\n}\n"));
+}
+
+#[test]
+fn session_field_order_is_fixed() {
+    let (graph, _) = demo_graph();
+    let project =
+        Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session());
+    let text = project.to_json();
+    let after = &text[text.find("\"session\"").unwrap()..];
+    let positions: Vec<usize> = [
+        "\"tracks\"",
+        "\"clips\"",
+        "\"start\": ",
+        "\"length\"",
+        "\"offset\"",
+        "\"source_length\"",
+        "\"gain\": 0.75", // the clip's, not the track's 0.5 that comes earlier
+        "\"name\": \"take 1\"",
+    ]
+    .iter()
+    .map(|needle| after.find(needle).unwrap())
+    .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{positions:?}"
+    );
+}
+
+#[test]
+fn a_missing_session_key_is_named() {
+    let (graph, _) = demo_graph();
+    let text = Project::capture("demo", SR, 120.0, &graph)
+        .to_json()
+        .replace("\"session\"", "\"sesion\"");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "sesion".to_owned()
+        }
+    );
+}
+
+#[test]
+fn an_unknown_key_inside_a_track_is_rejected() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json()
+        .replace("\"mute\": false", "\"muted\": false");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "muted".to_owned()
+        }
+    );
+}
+
+#[test]
+fn an_invalid_session_is_reported_as_a_session_error() {
+    use audio_core::SessionError;
+    let (graph, _) = demo_graph();
+    let mut session = demo_session();
+    session.tracks[0].clips[0].offset_samples = 96_001;
+    let text =
+        Project::with_session(Project::capture("demo", SR, 120.0, &graph), session).to_json();
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(SessionError::ClipOutOfSource { track: 0, clip: 0 })
+    );
+}
+
+#[test]
+fn an_unknown_key_inside_a_clip_is_rejected() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json()
+        .replace("\"source_length\"", "\"source\"");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "source".to_owned()
+        }
+    );
+}
+
+#[test]
+fn an_empty_session_object_reports_the_nested_field() {
+    let text =
+        with_session(r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#)
+            .replace(EMPTY_SESSION, "{}");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::MissingField {
+            field: "session.name"
+        }
+    );
+}
+
+#[test]
+fn session_numbers_must_be_integers_in_range() {
+    let text =
+        with_session(r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#)
+            .replace(
+                EMPTY_SESSION,
+                r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "tracks": [
+                 {"name": "t", "gain": 1, "mute": false, "clips": [
+                   {"start": 0.5, "length": 1, "offset": 0,
+                    "source_length": 1, "gain": 1, "name": ""}]}]}"#,
+            );
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Malformed { .. }
+    ));
+}
+
+#[test]
+fn mute_is_a_boolean() {
+    let text =
+        with_session(r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#)
+            .replace(
+                EMPTY_SESSION,
+                r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "tracks": [
+                 {"name": "t", "gain": 1, "mute": 1, "clips": []}]}"#,
+            );
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Malformed { .. }
+    ));
+}
+
+#[test]
+fn a_long_hand_written_session_is_still_rejected_fast() {
+    let mut text =
+        with_session(r#"{"name": "x", "sample_rate": 48000, "tempo_bpm": 120, "params": []}"#);
+    // 4_000 tracks of ~60 bytes: far past the 32-track limit and big enough
+    // that a per-entry quadratic pass could not finish in a second. The parser
+    // must stop as soon as the track array proves too long, not after decoding
+    // all of it (`SessionError::TooManyTracks`).
+    use audio_core::SessionError;
+    let track = r#", {"name": "t", "gain": 1, "mute": false, "clips": []}"#.repeat(4_000);
+    text = text.replace(
+        r#""tracks": []"#,
+        &format!(r#""tracks": [{{"name": "t"}} {track}]"#),
+    );
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(SessionError::TooManyTracks { .. })
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a hand-written session with 4_000 tracks took {:?}",
+        started.elapsed()
+    );
 }

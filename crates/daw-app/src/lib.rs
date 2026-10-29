@@ -29,6 +29,35 @@ use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
 
 pub mod nodes;
 
+/// Errors from assembling a session graph (SPEC-010).
+///
+/// The session model itself is validated by
+/// [`audio_core::Session::validate`]; these two variants describe the
+/// mismatch between the model and the material the caller supplied for it,
+/// which only the shell can see.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    /// The job carried a different number of track sources than the session
+    /// has tracks.
+    #[error("session has {tracks} track(s), job carried {sources}")]
+    TrackCountMismatch {
+        /// Tracks in the session.
+        tracks: usize,
+        /// Entries in [`SessionJob::tracks`].
+        sources: usize,
+    },
+    /// A track has a different number of clips and clip sources.
+    #[error("track {track:?} has {clips} clip(s) but {sources} source(s)")]
+    ClipCountMismatch {
+        /// Track name, for the message.
+        track: String,
+        /// Clips on the track.
+        clips: usize,
+        /// Sources supplied for it.
+        sources: usize,
+    },
+}
+
 /// Render quantum used by the MIDI pass in [`render_midi`].
 const BLOCK_FRAMES: usize = 256;
 
@@ -296,4 +325,189 @@ fn voices_started(schedule: &Schedule, frames: u64, sample_rate: u32) -> u32 {
 /// wrongly.
 pub fn synth_gain_spec() -> Result<ParamSpec, Box<dyn std::error::Error>> {
     Ok(ParamSpec::new(ParamId(1), "synth.gain", 0.0, 1.0, 0.5, 10)?)
+}
+
+/// One track's material, ready to be mounted: the model plus one source per
+/// clip, in the clip's order (SPEC-010 §4).
+pub struct TrackSource {
+    /// The track's model: names, gain, mute and clip windows.
+    pub track: audio_core::session::Track,
+    /// Content for each clip, `track.clips[i]` ↔ `clips[i]`.
+    pub clips: Vec<Box<dyn nodes::ClipSource + Send>>,
+}
+
+impl std::fmt::Debug for TrackSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackSource")
+            .field("track", &self.track.name)
+            .field("sources", &self.clips.len())
+            .finish()
+    }
+}
+
+/// Everything `daw render-session` and the tests need to render a session.
+#[derive(Debug)]
+pub struct SessionJob {
+    /// The session model; validated before anything is built.
+    pub session: audio_core::session::Session,
+    /// Material for each track, in the session's order.
+    pub tracks: Vec<TrackSource>,
+    /// Sample rate of the graph.
+    pub sample_rate: u32,
+    /// Render quantum, in frames.
+    pub block_frames: usize,
+    /// Render this many frames instead of [`audio_core::Session::length_samples`].
+    pub frames: Option<u64>,
+    /// Destination WAV path.
+    pub output: PathBuf,
+}
+
+/// Result of [`render_session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReport {
+    /// Frames rendered and written.
+    pub frames: u64,
+    /// Frames the session itself covers; the rest of `frames` is silence.
+    pub session_frames: u64,
+    /// Track nodes mounted in the graph.
+    pub tracks: usize,
+}
+
+/// Mounts one node per track into a graph built for `job.sample_rate`.
+///
+/// The graph sums the nodes itself, so track mixing is not reimplemented here.
+/// Everything expensive — validation, source pairing, node construction —
+/// happens before the transport starts, never inside `process`.
+///
+/// Node names are short labels derived from the track name, formatted once
+/// here and leaked deliberately: a graph is built a handful of times per
+/// session, and `Graph::add_node` wants a `&'static str`. Leaking a few dozen
+/// short labels costs less than teaching the graph to own node names, and it
+/// never happens on the audio thread.
+///
+/// # Errors
+///
+/// Returns [`audio_core::SessionError`] when the model is invalid, [`SessionError`]
+/// when the job's tracks or clips do not line up, or a graph error.
+pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error::Error>> {
+    job.session.validate()?;
+    if job.tracks.len() != job.session.tracks.len() {
+        return Err(Box::new(SessionError::TrackCountMismatch {
+            tracks: job.session.tracks.len(),
+            sources: job.tracks.len(),
+        }));
+    }
+
+    let mut graph = Graph::with_capacity(
+        job.sample_rate,
+        1,
+        job.block_frames.next_power_of_two(),
+        4,
+        job.session.tracks.len().max(1),
+    );
+    // Sources are moved into the graph one by one, so the job is consumed:
+    // rendering the same session twice means building the job twice, which is
+    // what the determinism test does.
+    for source in job.tracks {
+        let node = nodes::Track::new(&source.track, source.clips)?;
+        let name = track_label(&source.track.name);
+        graph.add_node(name, node)?;
+    }
+    Ok(graph)
+}
+
+/// A `&'static str` label for the track node, truncated to keep it short.
+fn track_label(name: &str) -> &'static str {
+    let mut label = String::from("track:");
+    for ch in name.chars().take(48) {
+        label.push(ch);
+    }
+    Box::leak(label.into_boxed_str())
+}
+
+/// Renders `job` to mono WAV and reports what was written.
+///
+/// The session is rendered from frame 0 with the transport playing; the
+/// default length is the session's own length, so a shorter `frames` trims
+/// and a longer one pads with silence.
+///
+/// # Errors
+///
+/// Returns what [`build_session_graph`] returns, plus renderer and file
+/// errors.
+pub fn render_session(job: SessionJob) -> Result<SessionReport, Box<dyn std::error::Error>> {
+    if let Some(parent) = job.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let frames = job.frames.unwrap_or_else(|| job.session.length_samples());
+    let session_frames = job.session.length_samples();
+    let tracks = job.session.tracks.len();
+    let sample_rate = job.sample_rate;
+    let block_frames = job.block_frames;
+    let output = job.output.clone();
+    let graph = build_session_graph(job)?;
+    let mut transport = Transport::new(sample_rate);
+    transport.apply(TransportCommand::Play);
+    let renderer = Renderer::new(graph, transport, 1024);
+    let mut offline = OfflineRenderer::new(renderer, block_frames);
+    let mono = offline.bounce_mono(frames)?;
+    write_mono_slice(&output, sample_rate, &mono)?;
+    Ok(SessionReport {
+        frames,
+        session_frames,
+        tracks,
+    })
+}
+
+/// A two-track session built in memory for `daw render-session`: a 440 Hz
+/// sine for half a second at the start, and a 660 Hz sine for a quarter
+/// second starting a quarter of a second in (SPEC-010 §6).
+///
+/// The sines are generated once, here, on the control thread; the render path
+/// only reads them.
+///
+/// # Errors
+///
+/// Returns the boxed error of [`audio_core::session::SessionError`] if the
+/// built session did not validate — a constant shape, so this only trips if
+/// the constants below are edited wrongly.
+pub fn build_demo_session(sample_rate: u32) -> Result<SessionJob, Box<dyn std::error::Error>> {
+    let half = u64::from(sample_rate) / 2;
+    let quarter = u64::from(sample_rate) / 4;
+
+    let low = nodes::MonoClip::sine(440.0, sample_rate, half);
+    let high = nodes::MonoClip::sine(660.0, sample_rate, quarter);
+
+    let mut low_track = audio_core::SessionTrack::new("low");
+    low_track.clips.push(audio_core::Clip::full(0, half));
+
+    let mut high_track = audio_core::SessionTrack::new("high");
+    high_track
+        .clips
+        .push(audio_core::Clip::full(quarter, quarter));
+
+    let mut session = audio_core::Session::new("demo", sample_rate, 120.0);
+    session.tracks.push(low_track.clone());
+    session.tracks.push(high_track.clone());
+    session.validate()?;
+
+    Ok(SessionJob {
+        tracks: vec![
+            TrackSource {
+                track: low_track,
+                clips: vec![Box::new(low)],
+            },
+            TrackSource {
+                track: high_track,
+                clips: vec![Box::new(high)],
+            },
+        ],
+        session,
+        sample_rate,
+        block_frames: BLOCK_FRAMES,
+        frames: None,
+        output: PathBuf::from("session.wav"),
+    })
 }

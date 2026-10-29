@@ -6,6 +6,8 @@
 //! daw project save <path>          # write the demo session as JSON
 //! daw project show <path>          # print a session document
 //! daw render-midi <in.mid> <out.wav> [--tempo BPM] [--seconds S]
+//! daw session show <path>          # tracks and clips of a document's session
+//! daw render-session <out.wav> [--seconds S]
 //! ```
 
 #![forbid(unsafe_code)]
@@ -120,6 +122,8 @@ fn main() -> ExitCode {
         }
         "project" => project(args),
         "render-midi" => render_midi(args),
+        "session" => session(args),
+        "render-session" => render_session(args),
         "play" => {
             let seconds = args
                 .next()
@@ -143,7 +147,8 @@ fn usage() {
     eprintln!(
         "usage:\n  daw bounce <out.wav> [seconds] [--split <samples>]\n  \
          daw play [seconds]\n  daw selftest\n  daw project save <path>\n  \
-         daw project show <path>\n  daw render-midi <in.mid> <out.wav> [--tempo BPM] [--seconds S]\n\n\
+         daw project show <path>\n  daw render-midi <in.mid> <out.wav> [--tempo BPM] [--seconds S]\n  \
+         daw session show <path>\n  daw render-session <out.wav> [--seconds S]\n\n\
          --split <samples> writes part-01.wav, part-02.wav, ... each at most\n\
          <samples> long (samples, not frames; mono).\n\n\
          `daw play` needs `--features realtime`; without it the command exits 2.\n\
@@ -229,6 +234,150 @@ fn show_project(path: &std::path::Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("project show failed: {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `daw session save`: a project document whose session has the demo tracks,
+/// so `session show` has something to print and `docs/SESSION.md` has an
+/// example to point at.
+fn save_session_project(path: &std::path::Path) -> ExitCode {
+    let sample_rate = audio_core::transport::DEFAULT_SAMPLE_RATE;
+    let job = match daw_app::build_demo_session(sample_rate) {
+        Ok(job) => job,
+        Err(e) => {
+            eprintln!("session save failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let graph = audio_core::graph::Graph::with_capacity(sample_rate, 1, 1024, 4, 1);
+    let project = audio_core::Project::with_session(
+        audio_core::Project::capture("demo", sample_rate, 120.0, &graph),
+        job.session.clone(),
+    );
+    match std::fs::write(path, project.to_json()) {
+        Ok(()) => {
+            println!(
+                "saved session with {} track(s) to {}",
+                project.session().tracks.len(),
+                path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("session save failed: {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `daw session show`: print the session embedded in a project document.
+fn session(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let Some(action) = args.next() else {
+        eprintln!("session requires `show <path>`");
+        return ExitCode::FAILURE;
+    };
+    let Some(path) = args.next().map(PathBuf::from) else {
+        eprintln!("session {action} requires a path");
+        return ExitCode::FAILURE;
+    };
+    if action == "save" {
+        return save_session_project(&path);
+    }
+    if action != "show" {
+        eprintln!("unknown session action: {action}");
+        usage();
+        return ExitCode::from(2);
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("session show failed: {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let project = match audio_core::Project::from_json(&text) {
+        Ok(project) => project,
+        Err(e) => {
+            eprintln!("session show failed: {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let session = project.session();
+    for (index, track) in session.tracks.iter().enumerate() {
+        println!(
+            "{index} {} gain={} mute={} clips={}",
+            track.name,
+            track.gain,
+            track.mute,
+            track.clips.len()
+        );
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            println!(
+                "  {clip_index} {} start={} length={} offset={}",
+                clip.name, clip.start_samples, clip.length_samples, clip.offset_samples
+            );
+        }
+    }
+    println!("session_frames={}", session.length_samples());
+    ExitCode::SUCCESS
+}
+
+/// `daw render-session`: render the in-memory demo session to mono WAV.
+fn render_session(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let Some(output) = args.next().map(PathBuf::from) else {
+        eprintln!("usage: daw render-session <out.wav> [--seconds S]");
+        return ExitCode::FAILURE;
+    };
+    let sample_rate = audio_core::transport::DEFAULT_SAMPLE_RATE;
+    let mut seconds = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--seconds" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--seconds requires a value");
+                    return ExitCode::from(2);
+                };
+                match value.parse::<f64>() {
+                    Ok(s) if s.is_finite() && s > 0.0 => seconds = Some(s),
+                    _ => {
+                        eprintln!("--seconds expects a positive number, got {value}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("unexpected argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let mut job = match daw_app::build_demo_session(sample_rate) {
+        Ok(job) => job,
+        Err(e) => {
+            eprintln!("render-session failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    job.output = output.clone();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    if let Some(s) = seconds {
+        job.frames = Some((s * f64::from(sample_rate)).round() as u64);
+    }
+    match daw_app::render_session(job) {
+        Ok(report) => {
+            println!(
+                "rendered {} frames ({} session), {} track(s) to {}",
+                report.frames,
+                report.session_frames,
+                report.tracks,
+                output.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("render-session failed: {e}");
             ExitCode::FAILURE
         }
     }
