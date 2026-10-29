@@ -412,7 +412,8 @@ pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error:
     // what the determinism test does.
     for (index, source) in job.tracks.into_iter().enumerate() {
         let node = nodes::Track::new(&source.track, source.clips)?
-            .with_mix(job.session.is_audible(index), job.session.master_gain);
+            .with_mix(job.session.is_audible(index), job.session.master_gain)
+            .with_effects(&source.track.effects, job.sample_rate);
         let name = track_label(&source.track.name);
         graph.add_node(name, node)?;
     }

@@ -20,6 +20,7 @@
 
 pub mod buffer;
 pub mod commands;
+pub mod fx;
 pub mod graph;
 pub mod midi;
 pub mod offline;
@@ -35,6 +36,7 @@ pub mod wav;
 
 pub use buffer::{AudioBuffer, Sample};
 pub use commands::{CommandConsumer, CommandQueue};
+pub use fx::{Effect, EffectKind, EffectProcessor, MAX_EFFECTS_PER_TRACK};
 pub use graph::{Graph, GraphError, Node, NodeId, NodeProcessor};
 pub use midi::{MidiError, MidiEvent, MidiFile, MidiMessage, parse_smf};
 pub use offline::{OfflineError, OfflineRenderer};

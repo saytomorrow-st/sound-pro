@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use audio_core::Note;
+use audio_core::{Effect, EffectKind, MAX_EFFECTS_PER_TRACK, Note};
 use daw_app::playback::PlaybackControl;
 use daw_gui::{Editor, bars, clock, samples_to_x, sixteenth_samples, snap_to_beat, x_to_samples};
 use eframe::egui::{
@@ -119,6 +119,8 @@ struct App {
     note_drag: Option<NoteDrag>,
     /// Scroll the piano roll to middle C on the next frame.
     piano_scroll: bool,
+    /// Track whose effects window is open (SPEC-022).
+    fx: Option<usize>,
 }
 
 impl App {
@@ -138,6 +140,7 @@ impl App {
             piano: None,
             note_drag: None,
             piano_scroll: false,
+            fx: None,
         };
         if let Some(path) = start {
             app.open(path);
@@ -547,6 +550,23 @@ impl App {
                             {
                                 delete = Some(index);
                             }
+                            let effects = self.editor.session().tracks[index].effects.len();
+                            let label = if effects == 0 {
+                                "FX".to_owned()
+                            } else {
+                                format!("FX {effects}")
+                            };
+                            if ui
+                                .selectable_label(self.fx == Some(index), label)
+                                .on_hover_text("Эффекты дорожки")
+                                .clicked()
+                            {
+                                self.fx = if self.fx == Some(index) {
+                                    None
+                                } else {
+                                    Some(index)
+                                };
+                            }
                             let s = ui.toggle_value(&mut solo, "S").on_hover_text("Соло");
                             let m = ui.toggle_value(&mut mute, "M").on_hover_text("Без звука");
                             if s.changed() || m.changed() {
@@ -572,6 +592,7 @@ impl App {
             }
         }
         if let Some(index) = delete {
+            self.fx = None;
             self.editor.delete_track(index);
             self.status = "Дорожка удалена".into();
         }
@@ -1162,6 +1183,167 @@ impl App {
     }
 }
 
+/// Russian label of an effect type for the effects window.
+const fn effect_title(kind: &EffectKind) -> &'static str {
+    match kind {
+        EffectKind::Eq { .. } => "Эквалайзер",
+        EffectKind::Compressor { .. } => "Компрессор",
+        EffectKind::Reverb { .. } => "Реверб",
+    }
+}
+
+/// Sliders for every parameter of `kind`; `true` if one moved.
+fn effect_sliders(ui: &mut egui::Ui, kind: &mut EffectKind) -> bool {
+    let mut changed = false;
+    let mut slider = |ui: &mut egui::Ui,
+                      value: &mut f32,
+                      range: std::ops::RangeInclusive<f32>,
+                      text: &str,
+                      log: bool| {
+        changed |= ui
+            .add(egui::Slider::new(value, range).text(text).logarithmic(log))
+            .changed();
+    };
+    match kind {
+        EffectKind::Eq {
+            low_db,
+            mid_db,
+            mid_hz,
+            high_db,
+        } => {
+            slider(ui, low_db, -24.0..=24.0, "низ, дБ", false);
+            slider(ui, mid_db, -24.0..=24.0, "середина, дБ", false);
+            slider(ui, mid_hz, 100.0..=10_000.0, "середина, Гц", true);
+            slider(ui, high_db, -24.0..=24.0, "верх, дБ", false);
+        }
+        EffectKind::Compressor {
+            threshold_db,
+            ratio,
+            attack_ms,
+            release_ms,
+            makeup_db,
+        } => {
+            slider(ui, threshold_db, -60.0..=0.0, "порог, дБ", false);
+            slider(ui, ratio, 1.0..=20.0, "степень", true);
+            slider(ui, attack_ms, 0.1..=100.0, "атака, мс", true);
+            slider(ui, release_ms, 10.0..=1000.0, "спад, мс", true);
+            slider(ui, makeup_db, 0.0..=24.0, "усиление, дБ", false);
+        }
+        EffectKind::Reverb { room, damp, mix } => {
+            slider(ui, room, 0.0..=1.0, "комната", false);
+            slider(ui, damp, 0.0..=1.0, "глушение", false);
+            slider(ui, mix, 0.0..=1.0, "доля", false);
+        }
+    }
+    changed
+}
+
+impl App {
+    /// The effects window of the track chosen with its «FX» button.
+    fn effects_window(&mut self, ctx: &egui::Context) {
+        let Some(track) = self.fx else {
+            return;
+        };
+        let Some(name) = self
+            .editor
+            .session()
+            .tracks
+            .get(track)
+            .map(|t| t.name.clone())
+        else {
+            self.fx = None;
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("Эффекты — {name}"))
+            .id(egui::Id::new("effects"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(320.0)
+            .show(ctx, |ui| self.effects_ui(ui, track));
+        if !open {
+            self.fx = None;
+        }
+    }
+
+    fn effects_ui(&mut self, ui: &mut egui::Ui, track: usize) {
+        ui.horizontal(|ui| {
+            let mut add = None;
+            if ui.button("+ EQ").clicked() {
+                add = Some(EffectKind::eq());
+            }
+            if ui.button("+ Компрессор").clicked() {
+                add = Some(EffectKind::compressor());
+            }
+            if ui.button("+ Реверб").clicked() {
+                add = Some(EffectKind::reverb());
+            }
+            if let Some(kind) = add {
+                self.status = match self.editor.add_effect(track, kind) {
+                    Ok(_) => "Эффект добавлен".into(),
+                    Err(_) => format!("Не больше {MAX_EFFECTS_PER_TRACK} эффектов на дорожке"),
+                };
+            }
+        });
+        let effects = self.editor.session().tracks[track].effects.clone();
+        if effects.is_empty() {
+            ui.label("Эффектов нет. Звук идёт без обработки.");
+        }
+        let last = effects.len().saturating_sub(1);
+        let mut action = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (index, effect) in effects.into_iter().enumerate() {
+                ui.separator();
+                let mut edited = effect;
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(effect_title(&effect.kind)).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").on_hover_text("Удалить").clicked() {
+                            action = Some(FxAction::Remove(index));
+                        }
+                        if ui
+                            .add_enabled(index < last, egui::Button::new("▼").small())
+                            .clicked()
+                        {
+                            action = Some(FxAction::Move(index, index + 1));
+                        }
+                        if ui
+                            .add_enabled(index > 0, egui::Button::new("▲").small())
+                            .clicked()
+                        {
+                            action = Some(FxAction::Move(index, index - 1));
+                        }
+                        changed |= ui.checkbox(&mut edited.bypass, "Обход").changed();
+                    });
+                });
+                ui.add_enabled_ui(!edited.bypass, |ui| {
+                    changed |= effect_sliders(ui, &mut edited.kind);
+                });
+                if changed {
+                    action = Some(FxAction::Set(index, edited));
+                }
+            }
+        });
+        let result = match action {
+            None => return,
+            Some(FxAction::Remove(index)) => self.editor.remove_effect(track, index),
+            Some(FxAction::Move(from, to)) => self.editor.move_effect(track, from, to),
+            Some(FxAction::Set(index, effect)) => self.editor.set_effect(track, index, effect),
+        };
+        if let Err(error) = result {
+            self.status = error.to_string();
+        }
+    }
+}
+
+/// One change requested in the effects window, applied after drawing it.
+enum FxAction {
+    Remove(usize),
+    Move(usize, usize),
+    Set(usize, Effect),
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_player(ctx);
@@ -1219,6 +1401,8 @@ impl eframe::App for App {
                 .id_salt("timeline")
                 .show(ui, |ui| self.timeline(ui));
         });
+
+        self.effects_window(ctx);
 
         if self.confirm_quit {
             egui::Window::new("Несохранённые изменения")

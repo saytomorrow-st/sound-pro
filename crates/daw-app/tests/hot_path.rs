@@ -253,3 +253,38 @@ fn capture_push_does_not_allocate() {
         "the ring should overflow without allocating"
     );
 }
+
+#[test]
+fn a_track_with_an_effect_chain_does_not_allocate() {
+    use audio_core::{Effect, EffectKind};
+    let mut track = overlapping_track();
+    track.effects = vec![
+        Effect::new(EffectKind::Eq {
+            low_db: 4.0,
+            mid_db: -3.0,
+            mid_hz: 900.0,
+            high_db: 2.0,
+        }),
+        Effect::new(EffectKind::compressor()),
+        Effect::new(EffectKind::reverb()),
+    ];
+    let mut session = Session::new("s", RATE, 120.0);
+    session.tracks.push(track.clone());
+    let job = SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: sources(),
+        }],
+        sample_rate: RATE,
+        block_frames: BLOCK,
+        frames: None,
+        output: std::path::PathBuf::new(),
+    };
+    let mut renderer = renderer_for(build_session_graph(job).unwrap());
+    let mut mix = AudioBuffer::new(2, BLOCK);
+    renderer.render(BLOCK, &mut mix).unwrap();
+    assert!(mix.channel(0).iter().any(|&s| s != 0.0), "track sounds");
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(count, 0, "effect chain allocated {count} times");
+}
