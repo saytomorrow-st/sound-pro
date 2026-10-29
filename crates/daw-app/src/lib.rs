@@ -553,20 +553,95 @@ pub fn load_session(
     base: &std::path::Path,
     output: PathBuf,
 ) -> Result<SessionJob, LoadError> {
+    load_session_cached(session, base, output, &mut NoCache)
+}
+
+/// Decoded material a caller already holds, so loading a session does not
+/// read files or render notes again (SPEC-035).
+pub trait ClipCache {
+    /// Mono samples of file `source` at the session rate, if cached.
+    fn audio(&mut self, source: &str) -> Option<std::sync::Arc<Vec<f32>>>;
+    /// Rendered `notes` of `frames` frames at `rate`, if cached.
+    fn notes(
+        &mut self,
+        notes: &[audio_core::session::Note],
+        rate: u32,
+        frames: u64,
+    ) -> Option<std::sync::Arc<Vec<f32>>>;
+    /// Called after `notes` were rendered on a miss.
+    fn store_notes(
+        &mut self,
+        notes: &[audio_core::session::Note],
+        rate: u32,
+        frames: u64,
+        samples: std::sync::Arc<Vec<f32>>,
+    );
+}
+
+/// A cache that never hits: everything comes from disk or the synth.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoCache;
+
+impl ClipCache for NoCache {
+    fn audio(&mut self, _source: &str) -> Option<std::sync::Arc<Vec<f32>>> {
+        None
+    }
+    fn notes(
+        &mut self,
+        _notes: &[audio_core::session::Note],
+        _rate: u32,
+        _frames: u64,
+    ) -> Option<std::sync::Arc<Vec<f32>>> {
+        None
+    }
+    fn store_notes(
+        &mut self,
+        _notes: &[audio_core::session::Note],
+        _rate: u32,
+        _frames: u64,
+        _samples: std::sync::Arc<Vec<f32>>,
+    ) {
+    }
+}
+
+/// [`load_session`] that asks `cache` first and reads files or renders
+/// notes only on a miss (SPEC-035). Cached audio shorter than the clip's
+/// `source_length` is [`LoadError::SourceTooShort`], as from disk.
+///
+/// # Errors
+///
+/// As [`load_session`].
+pub fn load_session_cached(
+    session: audio_core::Session,
+    base: &std::path::Path,
+    output: PathBuf,
+    cache: &mut dyn ClipCache,
+) -> Result<SessionJob, LoadError> {
+    let rate = session.sample_rate;
     let mut tracks = Vec::with_capacity(session.tracks.len());
     for (track_index, track) in session.tracks.iter().enumerate() {
         let mut clips: Vec<Box<dyn nodes::ClipSource + Send>> =
             Vec::with_capacity(track.clips.len());
         for (clip_index, clip) in track.clips.iter().enumerate() {
+            let length = clip.source_length;
             if let Some(notes) = &clip.notes {
-                let samples =
-                    audio_core::render_notes(notes, session.sample_rate, clip.source_length)
-                        .map_err(|source| LoadError::Synth {
-                            track: track_index,
-                            clip: clip_index,
-                            source,
-                        })?;
-                clips.push(Box::new(samples));
+                let samples = match cache.notes(notes, rate, length) {
+                    Some(hit) => hit,
+                    None => {
+                        let fresh = std::sync::Arc::new(
+                            audio_core::render_notes(notes, rate, length).map_err(|source| {
+                                LoadError::Synth {
+                                    track: track_index,
+                                    clip: clip_index,
+                                    source,
+                                }
+                            })?,
+                        );
+                        cache.store_notes(notes, rate, length, std::sync::Arc::clone(&fresh));
+                        fresh
+                    }
+                };
+                clips.push(Box::new(nodes::SharedClip::whole(samples)));
                 continue;
             }
             let source = clip.source.as_deref().ok_or(LoadError::MissingSource {
@@ -574,11 +649,18 @@ pub fn load_session(
                 clip: clip_index,
             })?;
             let file = base.join(source);
-            clips.push(Box::new(load_clip_file(
-                &file,
-                session.sample_rate,
-                clip.source_length,
-            )?));
+            if let Some(samples) = cache.audio(source) {
+                let file_frames = samples.len() as u64;
+                let shared =
+                    nodes::SharedClip::new(samples, length).ok_or(LoadError::SourceTooShort {
+                        path: file,
+                        file_frames,
+                        source_length: length,
+                    })?;
+                clips.push(Box::new(shared));
+                continue;
+            }
+            clips.push(Box::new(load_clip_file(&file, rate, length)?));
         }
         tracks.push(TrackSource {
             track: track.clone(),

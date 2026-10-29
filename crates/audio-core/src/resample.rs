@@ -46,22 +46,59 @@ pub enum ResampleError {
 ///
 /// [`ResampleError::ZeroRate`] when either rate is zero.
 pub fn resample(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>, ResampleError> {
+    if from == to && from != 0 {
+        return Ok(input.to_vec());
+    }
+    let frames = resampled_len(input.len(), from, to)?;
+    resample_range(input, from, to, 0..frames)
+}
+
+/// Frames [`resample`] returns for `len` input frames: `ceil(len · to / from)`.
+///
+/// # Errors
+///
+/// [`ResampleError::ZeroRate`] when either rate is zero.
+pub fn resampled_len(len: usize, from: u32, to: u32) -> Result<usize, ResampleError> {
     if from == 0 || to == 0 {
         return Err(ResampleError::ZeroRate);
     }
+    let len = len as u64;
+    Ok(usize::try_from((len * u64::from(to)).div_ceil(u64::from(from))).unwrap_or(usize::MAX))
+}
+
+/// Output frames `range` of [`resample`], computed alone.
+///
+/// Every output frame depends only on `input`, so the pieces of a split
+/// range, joined in order, equal [`resample`] bit for bit. This lets callers
+/// convert long files on several threads. The range is clamped to
+/// [`resampled_len`]. Equal rates are converted like any other pair, which
+/// for them is an exact copy.
+///
+/// # Errors
+///
+/// [`ResampleError::ZeroRate`] when either rate is zero.
+pub fn resample_range(
+    input: &[f32],
+    from: u32,
+    to: u32,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<f32>, ResampleError> {
+    let out_len = resampled_len(input.len(), from, to)?;
     if from == to {
-        return Ok(input.to_vec());
+        let end = range.end.min(out_len);
+        return Ok(input[range.start.min(end)..end].to_vec());
     }
     let len = input.len() as u64;
     let (from64, to64) = (u64::from(from), u64::from(to));
-    let out_len = usize::try_from((len * to64).div_ceil(from64)).unwrap_or(usize::MAX);
     let table = kernel_table();
     let c = CUTOFF * (f64::from(to) / f64::from(from)).min(1.0);
     #[allow(clippy::cast_precision_loss)]
     let zeros = ZERO_CROSSINGS as f64;
     let half_width = zeros / c;
-    let mut out = Vec::with_capacity(out_len);
-    for n in 0..out_len as u64 {
+    let end = range.end.min(out_len);
+    let begin = range.start.min(end);
+    let mut out = Vec::with_capacity(end - begin);
+    for n in begin as u64..end as u64 {
         // Exact position: whole input frame plus a fraction.
         let whole = n * from64 / to64;
         #[allow(clippy::cast_precision_loss)]
@@ -227,6 +264,30 @@ mod tests {
         let out = resample(&input, 96_000, 48_000).unwrap();
         let level = rms(&out[500..out.len() - 500]);
         assert!(level < 0.01, "rms {level}");
+    }
+
+    #[test]
+    fn split_ranges_join_to_the_whole_bit_for_bit() {
+        let input = sine(440.0, 44_100, 5000);
+        for (from, to) in [(44_100, 48_000), (48_000, 44_100), (48_000, 48_000)] {
+            let whole = resample(&input, from, to).unwrap();
+            let len = resampled_len(input.len(), from, to).unwrap();
+            assert_eq!(len, whole.len());
+            let mut joined = Vec::new();
+            for cut in [0..7, 7..1234, 1234..len, len..len + 50] {
+                joined.extend(resample_range(&input, from, to, cut).unwrap());
+            }
+            assert_eq!(
+                whole.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                joined.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{from}->{to}"
+            );
+        }
+        assert_eq!(resampled_len(10, 0, 48_000), Err(ResampleError::ZeroRate));
+        assert_eq!(
+            resample_range(&input, 44_100, 0, 0..1),
+            Err(ResampleError::ZeroRate)
+        );
     }
 
     #[test]

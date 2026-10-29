@@ -325,3 +325,89 @@ fn a_buffer_larger_than_the_region_repeats_it_several_times() {
     let l = left(&play_frames(&mut engine, 1_000, 1_000));
     assert_eq!(l, expected_cycle(10, 10, 40, 1_000));
 }
+
+#[test]
+fn play_and_stop_are_visible_before_the_audio_thread_runs() {
+    let (mut control, mut engine) = pair(256, 0);
+    assert!(control.play());
+    assert!(control.is_playing(), "play is seen at once (SPEC-035)");
+    let mut out = vec![0.0f32; 512];
+    engine.fill(&mut out, 2);
+    assert!(control.is_playing());
+    assert!(control.stop());
+    assert!(!control.is_playing());
+    engine.fill(&mut out, 2);
+    assert!(!control.is_playing());
+}
+
+#[test]
+fn a_quantum_that_has_not_seen_play_does_not_report_stopped() {
+    let (mut control, mut engine) = pair(256, 0);
+    let mut out = vec![0.0f32; 512];
+    engine.fill(&mut out, 2);
+    assert!(control.play());
+    assert!(control.is_playing());
+    engine.fill(&mut out, 2);
+    assert!(control.is_playing(), "the engine applied play and keeps it");
+}
+
+/// A graph playing `samples` from frame 0, like [`pair`]'s.
+fn graph_of(samples: Vec<f32>, block_frames: usize) -> audio_core::Graph {
+    let mut track = SessionTrack::new("t");
+    track.clips.push(Clip::full(0, samples.len() as u64));
+    let mut session = Session::new("s", RATE, 120.0);
+    session.tracks.push(track.clone());
+    build_session_graph(SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: vec![Box::new(samples)],
+        }],
+        sample_rate: RATE,
+        block_frames,
+        frames: None,
+        output: std::path::PathBuf::new(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_replaced_graph_is_heard_from_the_next_buffer_without_moving() {
+    let (mut control, mut engine) = pair(256, 0);
+    control.play();
+    let mut out = vec![0.0f32; 256 * 2];
+    engine.fill(&mut out, 2);
+    assert_eq!(control.position(), 256);
+    let louder: Vec<f32> = ramp(LEN).iter().map(|s| s * 2.0).collect();
+    control
+        .replace_graph(graph_of(louder.clone(), 256))
+        .unwrap();
+    engine.fill(&mut out, 2);
+    assert!(control.is_playing());
+    assert_eq!(control.position(), 512);
+    assert_eq!(left(&out), louder[256..512].to_vec());
+}
+
+#[test]
+fn old_graphs_come_back_to_the_window_to_be_freed() {
+    let (mut control, mut engine) = pair(256, 0);
+    let mut out = vec![0.0f32; 256 * 2];
+    for _ in 0..5 {
+        control.replace_graph(graph_of(ramp(LEN), 256)).unwrap();
+        engine.fill(&mut out, 2);
+        control.collect();
+    }
+}
+
+#[test]
+fn a_second_graph_waits_while_one_is_pending() {
+    let (mut control, _engine) = pair(256, 0);
+    control.replace_graph(graph_of(ramp(LEN), 256)).unwrap();
+    assert!(control.replace_graph(graph_of(ramp(LEN), 256)).is_err());
+}
+
+#[test]
+fn a_graph_with_a_smaller_quantum_is_refused() {
+    let (mut control, _engine) = pair(1024, 0);
+    assert!(control.replace_graph(graph_of(ramp(LEN), 64)).is_err());
+}

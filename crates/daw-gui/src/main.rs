@@ -100,6 +100,35 @@ struct Player {
     control: PlaybackControl,
     #[cfg(feature = "audio")]
     _stream: daw_app::realtime::RealtimeHandle,
+    /// The project as it sounds now; an edit is swapped in while playing
+    /// (SPEC-035).
+    played: audio_core::session::Session,
+    /// When the project last differed from `played`.
+    changed: Option<std::time::Instant>,
+}
+
+/// Pause after the last edit before the new sound is built, so a drag does
+/// not rebuild it every frame.
+const REFRESH_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// A file decoded on a background thread (SPEC-035): path, target track,
+/// start, and the samples at the project rate.
+type Decoded = (
+    PathBuf,
+    Option<usize>,
+    Option<u64>,
+    Result<Vec<f32>, EditorError>,
+);
+
+/// Files being decoded in the background, in the order they were asked for.
+struct Imports {
+    tx: std::sync::mpsc::Sender<Decoded>,
+    rx: std::sync::mpsc::Receiver<Decoded>,
+    /// Files still decoding.
+    pending: usize,
+    /// Track the next file of the same drop goes to.
+    chain: Option<usize>,
+    added: usize,
 }
 
 /// A microphone take in progress (SPEC-020).
@@ -144,6 +173,7 @@ struct App {
     /// Playhead in samples while stopped; the player's position while playing.
     playhead: u64,
     player: Option<Player>,
+    imports: Imports,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -228,6 +258,16 @@ impl App {
             #[cfg(feature = "audio")]
             recorder: None,
             playhead: 0,
+            imports: {
+                let (tx, rx) = std::sync::mpsc::channel();
+                Imports {
+                    tx,
+                    rx,
+                    pending: 0,
+                    chain: None,
+                    added: 0,
+                }
+            },
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
@@ -302,6 +342,8 @@ impl App {
                     self.player = Some(Player {
                         control,
                         _stream: stream,
+                        played: self.editor.session().clone(),
+                        changed: None,
                     });
                 }
                 Err(e) => self.status = format!("Ошибка звука: {e}"),
@@ -471,6 +513,111 @@ impl App {
         }
     }
 
+    /// Swaps an edited project into the running player (SPEC-035): volume,
+    /// pan, notes and clips change while it keeps playing. A new length
+    /// restarts the player at the same spot.
+    fn refresh_player(&mut self, ctx: &egui::Context) {
+        let Some(player) = self.player.as_mut() else {
+            return;
+        };
+        if !player.control.is_playing() || *self.editor.session() == player.played {
+            player.changed = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let since = *player.changed.get_or_insert(now);
+        if now.duration_since(since) < REFRESH_DELAY {
+            ctx.request_repaint_after(REFRESH_DELAY);
+            return;
+        }
+        let session = self.editor.session().clone();
+        if session.length_samples() != player.control.end()
+            || session.sample_rate != player.played.sample_rate
+        {
+            self.playhead = player.control.position();
+            self.play();
+            return;
+        }
+        match self.editor.playback_graph() {
+            Ok((graph, _)) => {
+                if player.control.replace_graph(graph).is_ok() {
+                    player.played = session;
+                    player.changed = None;
+                } else {
+                    ctx.request_repaint_after(REFRESH_DELAY);
+                }
+            }
+            Err(e) => {
+                player.played = session;
+                player.changed = None;
+                self.status = format!("Ошибка: {e}");
+            }
+        }
+    }
+
+    /// Decodes audio files on a background thread so the window does not
+    /// freeze on a long MP3 (SPEC-035). The first file goes to `track` at
+    /// `start`; the others follow it on the same track.
+    fn import_in_background(
+        &mut self,
+        paths: Vec<PathBuf>,
+        track: Option<usize>,
+        start: Option<u64>,
+    ) {
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| daw_app::audio_file::is_audio_file(p))
+            .collect();
+        if paths.is_empty() {
+            self.status = "Можно добавлять только WAV и MP3".into();
+            return;
+        }
+        if self.imports.pending == 0 {
+            self.imports.chain = track;
+            self.imports.added = 0;
+        }
+        self.imports.pending += paths.len();
+        self.status = format!("Загрузка: {}…", paths.len());
+        let rate = self.editor.session().sample_rate;
+        let tx = self.imports.tx.clone();
+        std::thread::spawn(move || {
+            for (i, path) in paths.into_iter().enumerate() {
+                let samples = daw_gui::read_samples(&path, rate);
+                let at = if i == 0 { start } else { None };
+                let first = i == 0;
+                if tx
+                    .send((path, first.then_some(track).flatten(), at, samples))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Puts decoded files on the timeline as they arrive.
+    fn poll_imports(&mut self, ctx: &egui::Context) {
+        if self.imports.pending == 0 {
+            return;
+        }
+        while let Ok((path, track, start, samples)) = self.imports.rx.try_recv() {
+            self.imports.pending -= 1;
+            let target = track.or(self.imports.chain);
+            let result = samples.and_then(|s| self.editor.import_decoded(&path, s, target, start));
+            match result {
+                Ok((t, _)) => {
+                    self.imports.chain = Some(t);
+                    self.imports.added += 1;
+                    self.status = format!("Добавлено файлов: {}", self.imports.added);
+                }
+                Err(e) => self.status = format!("Ошибка ({}): {e}", path.display()),
+            }
+        }
+        if self.imports.pending > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// Passes the current cycle to a running player.
     fn sync_cycle(&mut self) {
         let cycle = self.editor.active_cycle();
@@ -614,15 +761,8 @@ impl App {
         else {
             return;
         };
-        for path in paths {
-            let result = self.editor.import_wav(&path);
-            if self
-                .report(result, &format!("Импортирован {}", path.display()))
-                .is_none()
-            {
-                break;
-            }
-        }
+        let track = self.editor.selected_track;
+        self.import_in_background(paths, track, None);
     }
 
     fn export_dialog(&mut self) {
@@ -989,12 +1129,7 @@ impl App {
             ),
             None => (None, 0),
         };
-        let (added, error) = self.editor.drop_audio_files(&dropped, track, start);
-        self.status = match (added, error) {
-            (_, Some(e)) => format!("Ошибка: {e}"),
-            (0, None) => "Можно перетаскивать только WAV и MP3".into(),
-            (n, None) => format!("Добавлено файлов: {n}"),
-        };
+        self.import_in_background(dropped, track, Some(start));
     }
 
     fn timeline(&mut self, ui: &mut egui::Ui) {
@@ -1207,6 +1342,8 @@ impl App {
                             .is_some_and(|p| row.contains(p))
                     })));
 
+        self.draw_take(&painter, area);
+
         let cursor = area.min.x + samples_to_x(self.playhead, rate_u32, self.zoom);
         painter.line_segment(
             [Pos2::new(cursor, area.min.y), Pos2::new(cursor, area.max.y)],
@@ -1249,6 +1386,61 @@ impl App {
             }
         }
     }
+
+    /// The take being recorded, growing as it records, with its waveform
+    /// (SPEC-035). It lands on the selected track, or below the last one.
+    #[cfg(feature = "audio")]
+    #[allow(clippy::cast_precision_loss)]
+    fn draw_take(&self, painter: &egui::Painter, area: Rect) {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return;
+        };
+        let samples = recorder.control.samples();
+        let rate = recorder.control.sample_rate().max(1);
+        let project = self.editor.session().sample_rate;
+        let tracks = self.editor.session().tracks.len();
+        let row = self
+            .editor
+            .selected_track
+            .filter(|&t| t < tracks)
+            .unwrap_or(tracks);
+        let top = area.min.y + RULER_HEIGHT + row as f32 * TRACK_HEIGHT;
+        let left = area.min.x + samples_to_x(recorder.start, project, self.zoom);
+        let seconds = samples.len() as f32 / rate as f32;
+        let rect = Rect::from_min_size(
+            Pos2::new(left, top + 3.0),
+            Vec2::new((seconds * self.zoom).max(2.0), TRACK_HEIGHT - 6.0),
+        );
+        painter.rect_filled(rect, 4.0, Color32::from_rgb(170, 40, 40));
+        let columns = rect.width().ceil() as usize;
+        if columns == 0 || samples.is_empty() {
+            return;
+        }
+        let per_px = samples.len() as f32 / rect.width();
+        let (mid, half) = (rect.center().y, rect.height() * 0.4);
+        for px in 0..columns.min(20_000) {
+            let from = (px as f32 * per_px) as usize;
+            let to = (((px + 1) as f32 * per_px).ceil() as usize).min(samples.len());
+            let peak = samples
+                .get(from..to.max(from + 1).min(samples.len()))
+                .unwrap_or(&[])
+                .iter()
+                .fold(0.0f32, |m, s| m.max(s.abs()))
+                .min(1.0);
+            let x = rect.min.x + px as f32;
+            painter.line_segment(
+                [
+                    Pos2::new(x, mid - peak * half),
+                    Pos2::new(x, mid + peak * half),
+                ],
+                Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 200)),
+            );
+        }
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    const fn draw_take(&self, _painter: &egui::Painter, _area: Rect) {}
 
     /// Marker flags on the ruler and their clicks, drags and menus (SPEC-030).
     /// Returns whether the current press started on a flag.
@@ -2482,6 +2674,7 @@ impl eframe::App for App {
         }
         self.poll_player(ctx);
         self.poll_recorder(ctx);
+        self.poll_imports(ctx);
         // Everything done during one mouse press is one undo step.
         if ctx.input(|i| i.pointer.any_down()) {
             self.editor.begin_group();
@@ -2583,6 +2776,11 @@ impl eframe::App for App {
                         }
                     });
                 });
+        }
+
+        self.refresh_player(ctx);
+        if let Some(player) = self.player.as_mut() {
+            player.control.collect();
         }
 
         let title = self.editor.title();

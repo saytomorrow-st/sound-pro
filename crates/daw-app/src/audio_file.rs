@@ -80,13 +80,50 @@ pub fn read_mono_at(path: &Path, rate: u32) -> Result<Vec<f32>, AudioFileError> 
         }
     }
     if spec.sample_rate != rate {
-        mono = audio_core::resample(&mono, spec.sample_rate, rate)
-            .map_err(|_| AudioFileError::Empty)?;
+        mono =
+            resample_parallel(&mono, spec.sample_rate, rate).map_err(|_| AudioFileError::Empty)?;
     }
     if mono.is_empty() {
         return Err(AudioFileError::Empty);
     }
     Ok(mono)
+}
+
+/// [`audio_core::resample`] split over the machine's cores (SPEC-035).
+///
+/// The result is bit for bit the same as the single-threaded call.
+///
+/// # Errors
+///
+/// [`audio_core::ResampleError::ZeroRate`] when either rate is zero.
+pub fn resample_parallel(
+    input: &[f32],
+    from: u32,
+    to: u32,
+) -> Result<Vec<f32>, audio_core::ResampleError> {
+    const MIN_PIECE: usize = 1 << 16;
+    let len = audio_core::resampled_len(input.len(), from, to)?;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(len.div_ceil(MIN_PIECE))
+        .max(1);
+    if threads == 1 || from == to {
+        return audio_core::resample(input, from, to);
+    }
+    let piece = len.div_ceil(threads);
+    let parts = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let range = i * piece..((i + 1) * piece).min(len);
+                scope.spawn(move || audio_core::resample_range(input, from, to, range))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(Err(audio_core::ResampleError::ZeroRate)))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(parts.concat())
 }
 
 fn read_mp3(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
