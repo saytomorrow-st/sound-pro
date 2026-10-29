@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use audio_core::session::{Clip, Note, Session, Track};
-use audio_core::{MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Project, ProjectError, SessionError};
+use audio_core::{
+    Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Project, ProjectError, SessionError,
+};
 
 /// Sample rate of a new project.
 pub const DEFAULT_RATE: u32 = 48_000;
@@ -87,6 +89,9 @@ pub enum EditorError {
     /// breaks a session rule (SPEC-021).
     #[error("invalid note")]
     InvalidNote,
+    /// The track or effect index does not exist (SPEC-022).
+    #[error("no such track or effect")]
+    NoEffect,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -697,6 +702,89 @@ impl Editor {
         Ok(())
     }
 
+    /// Appends an effect with default settings to a track's chain and
+    /// returns its index (SPEC-022).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoEffect`] for a bad track index,
+    /// [`EditorError::Session`] when the chain is full; `self` is unchanged.
+    pub fn add_effect(&mut self, track: usize, kind: EffectKind) -> Result<usize, EditorError> {
+        let mut session = self.project.session.clone();
+        let effects = &mut session
+            .tracks
+            .get_mut(track)
+            .ok_or(EditorError::NoEffect)?
+            .effects;
+        effects.push(Effect::new(kind));
+        let index = effects.len() - 1;
+        self.commit_track(session, track)?;
+        Ok(index)
+    }
+
+    /// Removes one effect from a track's chain.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoEffect`] for bad indices; `self` is unchanged.
+    pub fn remove_effect(&mut self, track: usize, index: usize) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let effects = effects_mut(&mut session, track, index)?;
+        effects.remove(index);
+        self.commit_track(session, track)
+    }
+
+    /// Replaces one effect's settings (bypass and parameters). Setting the
+    /// value it already has records no undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoEffect`] for bad indices, [`EditorError::Session`]
+    /// for an out-of-range value; `self` is unchanged.
+    pub fn set_effect(
+        &mut self,
+        track: usize,
+        index: usize,
+        effect: Effect,
+    ) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let slot = &mut effects_mut(&mut session, track, index)?[index];
+        if *slot == effect {
+            return Ok(());
+        }
+        *slot = effect;
+        self.commit_track(session, track)
+    }
+
+    /// Moves the effect at `from` to position `to` in the chain.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoEffect`] when either index is outside the chain;
+    /// `self` is unchanged.
+    pub fn move_effect(&mut self, track: usize, from: usize, to: usize) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let effects = effects_mut(&mut session, track, from)?;
+        if to >= effects.len() {
+            return Err(EditorError::NoEffect);
+        }
+        if from == to {
+            return Ok(());
+        }
+        let effect = effects.remove(from);
+        effects.insert(to, effect);
+        self.commit_track(session, track)
+    }
+
+    fn commit_track(&mut self, session: Session, track: usize) -> Result<(), EditorError> {
+        session.validate()?;
+        self.record();
+        self.project.session = session;
+        self.selected_track = Some(track);
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Removes one track and its clips; out-of-range indices do nothing.
     pub fn delete_track(&mut self, track: usize) {
         if track < self.project.session.tracks.len() {
@@ -864,6 +952,20 @@ fn insert_note(notes: &mut Vec<Note>, note: Note) -> usize {
     let index = notes.partition_point(|n| (n.start, n.pitch) <= (note.start, note.pitch));
     notes.insert(index, note);
     index
+}
+
+/// A track's effect chain, provided `index` is inside it.
+fn effects_mut(
+    session: &mut Session,
+    track: usize,
+    index: usize,
+) -> Result<&mut Vec<Effect>, EditorError> {
+    session
+        .tracks
+        .get_mut(track)
+        .map(|t| &mut t.effects)
+        .filter(|effects| index < effects.len())
+        .ok_or(EditorError::NoEffect)
 }
 
 /// Horizontal offset of `samples` at `zoom` pixels per second.
