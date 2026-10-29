@@ -1,0 +1,20 @@
+[package]
+name = "daw-gui"
+description = "Sound Pro desktop window: timeline, mixer, project files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sound-pro"
+path = "src/main.rs"
+
+[dependencies]
+audio-core = { workspace = true }
+daw-app = { path = "../daw-app" }
+thiserror = { workspace = true }
+eframe = { version = "0.33", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+rfd = "0.17"

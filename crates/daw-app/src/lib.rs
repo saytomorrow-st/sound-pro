@@ -495,8 +495,24 @@ pub fn load_session_project(
         path: path.to_path_buf(),
         source,
     })?;
-    let session = project.session().clone();
     let base = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+    load_session(project.session().clone(), base, output)
+}
+
+/// Loads every clip's WAV file of an in-memory `session` into a [`SessionJob`].
+///
+/// Relative `source` paths are resolved against `base`; this is what
+/// [`load_session_project`] does after parsing the document, and what the
+/// editor calls for a project that has not been saved yet.
+///
+/// # Errors
+///
+/// See [`LoadError`]; the first failing clip, in session order, is reported.
+pub fn load_session(
+    session: audio_core::Session,
+    base: &std::path::Path,
+    output: PathBuf,
+) -> Result<SessionJob, LoadError> {
     let mut tracks = Vec::with_capacity(session.tracks.len());
     for (track_index, track) in session.tracks.iter().enumerate() {
         let mut clips: Vec<Box<dyn nodes::ClipSource + Send>> =

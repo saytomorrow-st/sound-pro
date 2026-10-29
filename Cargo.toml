@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/audio-core", "crates/daw-app"]
+members = ["crates/audio-core", "crates/daw-app", "crates/daw-gui"]
 resolver = "3"
 
 [workspace.package]
