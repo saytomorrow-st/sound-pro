@@ -133,3 +133,39 @@ fn a_freshly_built_renderer_has_silent_scratch() {
         }
     }
 }
+
+/// Writes a distinct constant per channel: channel `n` gets `n + 1`.
+struct PerChannel;
+
+impl NodeProcessor for PerChannel {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
+        for ch in 0..output.channels() {
+            #[allow(clippy::cast_precision_loss)]
+            fill(&mut output.channel_mut(ch)[..ctx.frames], (ch + 1) as f32);
+        }
+    }
+}
+
+#[test]
+fn a_short_quantum_keeps_every_channel_in_its_own_lane() {
+    // A short quantum must not shift what a node wrote to channel 1 or later:
+    // the graph must read each channel back from where the node wrote it.
+    let mut graph = Graph::with_capacity(DEFAULT_SAMPLE_RATE, 2, QUANTUM, 2, 0);
+    graph.add_node("per-channel", PerChannel).unwrap();
+    let mut renderer = Renderer::new(graph, Transport::new(DEFAULT_SAMPLE_RATE), QUANTUM);
+    renderer.transport_mut().apply(TransportCommand::Play);
+    let mut device = AudioBuffer::new(2, QUANTUM);
+    for frames in [QUANTUM, SHORT, 1, QUANTUM - 1] {
+        renderer.render(frames, &mut device).unwrap();
+        assert!(
+            device.channel(0)[..frames].iter().all(|&s| s == 1.0),
+            "{frames}-frame quantum, channel 0: {:?}",
+            &device.channel(0)[..frames.min(16)]
+        );
+        assert!(
+            device.channel(1)[..frames].iter().all(|&s| s == 2.0),
+            "{frames}-frame quantum, channel 1: {:?}",
+            &device.channel(1)[..frames.min(16)]
+        );
+    }
+}

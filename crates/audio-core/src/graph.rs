@@ -433,11 +433,13 @@ impl Graph {
             // back to mix it: only one live handle to a slot at a time.
             let mut view = NodeView::new(&mut slot.scratch, frames);
             slot.processor.process(&node_ctx, &mut view);
-            slot.scratch = view.into_buffer();
+            // Read through the view: it lays channels out with a stride of
+            // `frames`, which differs from the restored buffer's stride on a
+            // short quantum.
             for ch in 0..channels {
-                let src = &slot.scratch.channel(ch)[..frames];
-                mix.add_from(ch, 0, src);
+                mix.add_from(ch, 0, &view.channel(ch)[..frames]);
             }
+            slot.scratch = view.into_buffer();
         }
         Ok(())
     }

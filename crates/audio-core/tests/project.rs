@@ -748,3 +748,83 @@ fn multi_byte_names_round_trip_unchanged() {
     let back = Project::from_json(&project.to_json()).unwrap();
     assert_eq!(back, project);
 }
+
+#[test]
+fn mixer_fields_survive_the_round_trip_in_order() {
+    let (graph, _) = demo_graph();
+    let mut session = demo_session();
+    session.master_gain = 0.5;
+    session.tracks[0].pan = -0.25;
+    session.tracks[0].solo = true;
+    let project = Project::with_session(Project::capture("demo", SR, 120.0, &graph), session);
+    let text = project.to_json();
+    assert_eq!(Project::from_json(&text).unwrap(), project);
+    let after = &text[text.find("\"session\"").unwrap()..];
+    let positions: Vec<usize> = [
+        "\"tempo_bpm\"",
+        "\"master_gain\": 0.5",
+        "\"tracks\"",
+        "\"gain\": 0.5",
+        "\"pan\": -0.25",
+        "\"mute\": false",
+        "\"solo\": true",
+        "\"clips\"",
+    ]
+    .iter()
+    .map(|needle| after.find(needle).unwrap())
+    .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{positions:?}"
+    );
+}
+
+#[test]
+fn documents_without_mixer_fields_load_with_neutral_defaults() {
+    let (graph, _) = demo_graph();
+    let project =
+        Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session());
+    let text = project
+        .to_json()
+        .replace("    \"master_gain\": 1,\n", "")
+        .replace("        \"pan\": 0,\n", "")
+        .replace("        \"solo\": false,\n", "");
+    assert!(!text.contains("master_gain") && !text.contains("\"pan\"") && !text.contains("solo"));
+    assert_eq!(Project::from_json(&text).unwrap(), project);
+}
+
+#[test]
+fn mixer_fields_of_the_wrong_type_are_malformed() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    for (from, to) in [
+        ("\"solo\": false", "\"solo\": 1"),
+        ("\"pan\": 0", "\"pan\": \"x\""),
+        ("\"master_gain\": 1", "\"master_gain\": true"),
+    ] {
+        assert!(
+            matches!(
+                Project::from_json(&text.replace(from, to)).unwrap_err(),
+                ProjectError::Malformed { .. }
+            ),
+            "{to}"
+        );
+    }
+}
+
+#[test]
+fn mixer_values_out_of_range_are_session_errors() {
+    use audio_core::SessionError;
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert_eq!(
+        Project::from_json(&text.replace("\"pan\": 0", "\"pan\": 1.5")).unwrap_err(),
+        ProjectError::Session(SessionError::InvalidPan { track: 0 })
+    );
+    assert_eq!(
+        Project::from_json(&text.replace("\"master_gain\": 1", "\"master_gain\": 2")).unwrap_err(),
+        ProjectError::Session(SessionError::InvalidMasterGain)
+    );
+}

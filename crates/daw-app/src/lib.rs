@@ -400,7 +400,7 @@ pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error:
 
     let mut graph = Graph::with_capacity(
         job.sample_rate,
-        1,
+        2,
         job.block_frames.next_power_of_two(),
         4,
         job.session.tracks.len().max(1),
@@ -408,8 +408,9 @@ pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error:
     // Sources are moved into the graph one by one, so the job is consumed:
     // rendering the same session twice means building the job twice, which is
     // what the determinism test does.
-    for source in job.tracks {
-        let node = nodes::Track::new(&source.track, source.clips)?;
+    for (index, source) in job.tracks.into_iter().enumerate() {
+        let node = nodes::Track::new(&source.track, source.clips)?
+            .with_mix(job.session.is_audible(index), job.session.master_gain);
         let name = track_label(&source.track.name);
         graph.add_node(name, node)?;
     }
@@ -425,7 +426,7 @@ fn track_label(name: &str) -> &'static str {
     Box::leak(label.into_boxed_str())
 }
 
-/// Renders `job` to mono WAV and reports what was written.
+/// Renders `job` to a stereo float32 WAV and reports what was written.
 ///
 /// The session is rendered from frame 0 with the transport playing; the
 /// default length is the session's own length, so a shorter `frames` trims
@@ -452,8 +453,15 @@ pub fn render_session(job: SessionJob) -> Result<SessionReport, Box<dyn std::err
     transport.apply(TransportCommand::Play);
     let renderer = Renderer::new(graph, transport, 1024);
     let mut offline = OfflineRenderer::new(renderer, block_frames);
-    let mono = offline.bounce_mono(frames)?;
-    write_mono_slice(&output, sample_rate, &mono)?;
+    let mix = offline.bounce(frames)?;
+    audio_core::wav::write_wav_mono(
+        &output,
+        audio_core::wav::WavSpec {
+            sample_rate,
+            channels: 2,
+        },
+        &mix,
+    )?;
     Ok(SessionReport {
         frames,
         session_frames,
@@ -481,9 +489,11 @@ pub fn build_demo_session(sample_rate: u32) -> Result<SessionJob, Box<dyn std::e
     let high = nodes::MonoClip::sine(660.0, sample_rate, quarter);
 
     let mut low_track = audio_core::SessionTrack::new("low");
+    low_track.pan = -0.5;
     low_track.clips.push(audio_core::Clip::full(0, half));
 
     let mut high_track = audio_core::SessionTrack::new("high");
+    high_track.pan = 0.5;
     high_track
         .clips
         .push(audio_core::Clip::full(quarter, quarter));

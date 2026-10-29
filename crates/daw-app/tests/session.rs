@@ -58,6 +58,9 @@ fn render_one(
     .unwrap();
     let (spec, buf) = audio_core::wav::read_wav_mono(&output).unwrap();
     assert_eq!(spec.sample_rate, RATE);
+    // SPEC-013: a centred track is identical in both channels.
+    assert_eq!(spec.channels, 2);
+    assert_eq!(buf.channel(0), buf.channel(1));
     (report, buf)
 }
 
@@ -335,4 +338,116 @@ fn a_clip_claiming_more_source_than_exists_renders_silence_past_the_real_end() {
 
     assert_eq!(&rendered[..100], &source[..]);
     assert!(rendered[100..].iter().all(|&s| s == 0.0));
+}
+
+/// Renders `tracks` (each one full clip over its source) with `master_gain`.
+fn render_mix(
+    scratch: &mut Scratch,
+    tracks: Vec<(SessionTrack, Vec<f32>)>,
+    master_gain: f32,
+) -> AudioBuffer {
+    let mut session = Session::new("mix", RATE, 120.0);
+    session.master_gain = master_gain;
+    let mut sources = Vec::new();
+    for (mut track, source) in tracks {
+        track.clips.push(Clip::full(0, source.len() as u64));
+        session.tracks.push(track.clone());
+        sources.push(TrackSource {
+            track,
+            clips: vec![Box::new(source)],
+        });
+    }
+    let output = scratch.path();
+    render_session(SessionJob {
+        session,
+        tracks: sources,
+        sample_rate: RATE,
+        block_frames: 64,
+        frames: None,
+        output: output.clone(),
+    })
+    .unwrap();
+    let (spec, buf) = audio_core::wav::read_wav_mono(&output).unwrap();
+    assert_eq!(spec.channels, 2);
+    buf
+}
+
+fn panned(pan: f32) -> SessionTrack {
+    let mut track = SessionTrack::new("p");
+    track.pan = pan;
+    track
+}
+
+fn scaled(source: &[f32], gain: f32) -> Vec<f32> {
+    source.iter().map(|s| s * gain).collect()
+}
+
+#[test]
+fn hard_pans_leave_exact_silence_on_the_far_side() {
+    let mut scratch = Scratch::new("hardpan");
+    let source = ramp(300);
+    let left = render_mix(&mut scratch, vec![(panned(-1.0), source.clone())], 1.0);
+    assert_eq!(left.channel(0), source.as_slice());
+    assert!(left.channel(1).iter().all(|&s| s == 0.0));
+    let right = render_mix(&mut scratch, vec![(panned(1.0), source.clone())], 1.0);
+    assert!(right.channel(0).iter().all(|&s| s == 0.0));
+    assert_eq!(right.channel(1), source.as_slice());
+}
+
+#[test]
+fn a_half_pan_follows_the_balance_law() {
+    let mut scratch = Scratch::new("halfpan");
+    let source = ramp(300);
+    let buf = render_mix(&mut scratch, vec![(panned(0.5), source.clone())], 1.0);
+    assert_eq!(buf.channel(0), scaled(&source, 0.5).as_slice());
+    assert_eq!(buf.channel(1), source.as_slice());
+}
+
+#[test]
+fn solo_silences_the_other_tracks_and_mute_beats_solo() {
+    let mut scratch = Scratch::new("solo");
+    let a = ramp(200);
+    let b: Vec<f32> = ramp(200).iter().map(|s| -s).collect();
+    let mut solo_b = SessionTrack::new("b");
+    solo_b.solo = true;
+    let buf = render_mix(
+        &mut scratch,
+        vec![
+            (SessionTrack::new("a"), a.clone()),
+            (solo_b.clone(), b.clone()),
+        ],
+        1.0,
+    );
+    assert_eq!(buf.channel(0), b.as_slice());
+    assert_eq!(buf.channel(1), b.as_slice());
+
+    solo_b.mute = true;
+    let buf = render_mix(
+        &mut scratch,
+        vec![(SessionTrack::new("a"), a), (solo_b, b)],
+        1.0,
+    );
+    assert!(
+        buf.channel(0)
+            .iter()
+            .chain(buf.channel(1))
+            .all(|&s| s == 0.0)
+    );
+}
+
+#[test]
+fn master_gain_scales_both_channels() {
+    let mut scratch = Scratch::new("master");
+    let source = ramp(200);
+    let buf = render_mix(&mut scratch, vec![(panned(0.0), source.clone())], 0.5);
+    let half = scaled(&source, 0.5);
+    assert_eq!(buf.channel(0), half.as_slice());
+    assert_eq!(buf.channel(1), half.as_slice());
+    let buf = render_mix(&mut scratch, vec![(panned(-0.5), source)], 0.0);
+    assert!(
+        buf.channel(0)
+            .iter()
+            .chain(buf.channel(1))
+            .all(|&s| s == 0.0)
+    );
 }

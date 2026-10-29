@@ -68,6 +68,13 @@ pub enum SessionError {
         /// Index of the offending track.
         track: usize,
     },
+    /// A track pan is not finite or outside `[-1, 1]`.
+    InvalidPan {
+        /// Index of the offending track.
+        track: usize,
+    },
+    /// The master gain is not finite or outside `[0, 1]`.
+    InvalidMasterGain,
     /// A clip gain is not finite or outside `[0, 1]`.
     InvalidClipGain {
         /// Index of the track holding the clip.
@@ -103,6 +110,10 @@ impl fmt::Display for SessionError {
             Self::InvalidGain { track } => {
                 write!(f, "track {track} gain is not in [0, 1]")
             }
+            Self::InvalidPan { track } => {
+                write!(f, "track {track} pan is not in [-1, 1]")
+            }
+            Self::InvalidMasterGain => write!(f, "master gain is not in [0, 1]"),
             Self::InvalidClipGain { track, clip } => {
                 write!(f, "clip {clip} of track {track} gain is not in [0, 1]")
             }
@@ -176,22 +187,37 @@ pub struct Track {
     pub name: String,
     /// Linear track gain, `0.0..=1.0`.
     pub gain: f32,
+    /// Balance pan, `-1.0` (left) ..= `1.0` (right); `0.0` is centre.
+    pub pan: f32,
     /// Silent track when `true`.
     pub mute: bool,
+    /// When any track is soloed, only soloed, unmuted tracks sound.
+    pub solo: bool,
     /// Clips in any order; nothing depends on `Vec` order for rendering.
     pub clips: Vec<Clip>,
 }
 
 impl Track {
-    /// Empty, unmuted track at unity gain.
+    /// Empty, unmuted, centred track at unity gain.
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_owned(),
             gain: 1.0,
+            pan: 0.0,
             mute: false,
+            solo: false,
             clips: Vec::new(),
         }
+    }
+
+    /// Balance-law multipliers `(left, right)`; both are exactly `1.0` at
+    /// centre.
+    #[must_use]
+    pub fn pan_gains(&self) -> (f32, f32) {
+        let left = if self.pan <= 0.0 { 1.0 } else { 1.0 - self.pan };
+        let right = if self.pan >= 0.0 { 1.0 } else { 1.0 + self.pan };
+        (left, right)
     }
 
     /// Timeline position where the last clip of this track stops sounding.
@@ -210,6 +236,8 @@ pub struct Session {
     pub sample_rate: u32,
     /// Tempo in beats per minute.
     pub tempo_bpm: f64,
+    /// Linear master gain, `0.0..=1.0`, applied to the whole mix.
+    pub master_gain: f32,
     /// Tracks in session order.
     pub tracks: Vec<Track>,
 }
@@ -222,6 +250,7 @@ impl Session {
             name: name.to_owned(),
             sample_rate,
             tempo_bpm,
+            master_gain: 1.0,
             tracks: Vec::new(),
         }
     }
@@ -249,6 +278,16 @@ impl Session {
         self.tracks.get(track).map_or(0, Track::length_samples)
     }
 
+    /// Whether `track` sounds: not muted, and either nothing is soloed or it
+    /// is. Mute beats solo; an out-of-range index is `false`.
+    #[must_use]
+    pub fn is_audible(&self, track: usize) -> bool {
+        let Some(t) = self.tracks.get(track) else {
+            return false;
+        };
+        !t.mute && (t.solo || !self.tracks.iter().any(|other| other.solo))
+    }
+
     /// Checks every invariant the renderer relies on.
     ///
     /// The constructor for the model is the caller's literal, so this is the
@@ -269,6 +308,9 @@ impl Session {
         if !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
             return Err(SessionError::InvalidTempo);
         }
+        if !valid_gain(self.master_gain) {
+            return Err(SessionError::InvalidMasterGain);
+        }
         if self.tracks.len() > MAX_TRACKS {
             return Err(SessionError::TooManyTracks { max: MAX_TRACKS });
         }
@@ -278,6 +320,9 @@ impl Session {
             }
             if !valid_gain(track.gain) {
                 return Err(SessionError::InvalidGain { track: track_index });
+            }
+            if !(track.pan.is_finite() && (-1.0..=1.0).contains(&track.pan)) {
+                return Err(SessionError::InvalidPan { track: track_index });
             }
             if track.clips.len() > MAX_CLIPS_PER_TRACK {
                 return Err(SessionError::TooManyClips {
@@ -424,6 +469,67 @@ mod tests {
             s.validate(),
             Err(SessionError::InvalidClipGain { track: 0, clip: 0 })
         );
+    }
+
+    #[test]
+    fn mixer_fields_default_to_neutral() {
+        let s = session();
+        assert_eq!(s.master_gain, 1.0);
+        assert_eq!(s.tracks[0].pan, 0.0);
+        assert!(!s.tracks[0].solo);
+        assert_eq!(s.tracks[0].pan_gains(), (1.0, 1.0));
+    }
+
+    #[test]
+    fn pan_and_master_are_checked() {
+        for bad in [1.5, -1.01, f32::NAN, f32::INFINITY] {
+            let mut s = session();
+            s.tracks[0].pan = bad;
+            assert_eq!(s.validate(), Err(SessionError::InvalidPan { track: 0 }));
+        }
+        for bad in [2.0, -0.1, f32::NAN] {
+            let mut s = session();
+            s.master_gain = bad;
+            assert_eq!(s.validate(), Err(SessionError::InvalidMasterGain));
+        }
+        let mut s = session();
+        s.tracks[0].pan = -1.0;
+        s.master_gain = 0.0;
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn balance_law_keeps_the_near_side_at_unity() {
+        let mut t = Track::new("t");
+        t.pan = -1.0;
+        assert_eq!(t.pan_gains(), (1.0, 0.0));
+        t.pan = 1.0;
+        assert_eq!(t.pan_gains(), (0.0, 1.0));
+        t.pan = 0.5;
+        assert_eq!(t.pan_gains(), (0.5, 1.0));
+        t.pan = -0.25;
+        assert_eq!(t.pan_gains(), (1.0, 0.75));
+    }
+
+    #[test]
+    fn solo_and_mute_decide_audibility() {
+        let mut s = Session::new("s", 48_000, 120.0);
+        s.tracks = (0..3).map(|_| Track::new("t")).collect();
+        assert!((0..3).all(|i| s.is_audible(i)));
+        assert!(!s.is_audible(3));
+        s.tracks[1].solo = true;
+        assert_eq!(
+            (0..3).map(|i| s.is_audible(i)).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        s.tracks[2].solo = true;
+        assert_eq!(
+            (0..3).map(|i| s.is_audible(i)).collect::<Vec<_>>(),
+            [false, true, true]
+        );
+        s.tracks[2].solo = false;
+        s.tracks[1].mute = true;
+        assert!((0..3).all(|i| !s.is_audible(i)), "mute beats solo");
     }
 
     #[test]

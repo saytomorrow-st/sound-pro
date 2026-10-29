@@ -368,6 +368,8 @@ fn write_session(out: &mut String, session: &Session) {
     out.push_str(&session.sample_rate.to_string());
     out.push_str(",\n    \"tempo_bpm\": ");
     out.push_str(&format_number(session.tempo_bpm));
+    out.push_str(",\n    \"master_gain\": ");
+    out.push_str(&format_number(f64::from(session.master_gain)));
     out.push_str(",\n    \"tracks\": [");
     for (track_index, track) in session.tracks.iter().enumerate() {
         if track_index > 0 {
@@ -377,8 +379,12 @@ fn write_session(out: &mut String, session: &Session) {
         write_string(out, &track.name);
         out.push_str(",\n        \"gain\": ");
         out.push_str(&format_number(f64::from(track.gain)));
+        out.push_str(",\n        \"pan\": ");
+        out.push_str(&format_number(f64::from(track.pan)));
         out.push_str(",\n        \"mute\": ");
         out.push_str(if track.mute { "true" } else { "false" });
+        out.push_str(",\n        \"solo\": ");
+        out.push_str(if track.solo { "true" } else { "false" });
         out.push_str(",\n        \"clips\": [");
         for (clip_index, clip) in track.clips.iter().enumerate() {
             if clip_index > 0 {
@@ -421,12 +427,14 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut name = None;
     let mut sample_rate = None;
     let mut tempo_bpm = None;
+    let mut master_gain = None;
     let mut tracks = None;
     for (key, value) in entries {
         match key.as_str() {
             "name" => name = Some(require_string(value)?),
             "sample_rate" => sample_rate = Some(require_u32(value)?),
             "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
+            "master_gain" => master_gain = Some(require_f32(value)?),
             "tracks" => {
                 let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
                 // Reject an over-long session while parsing rather than after
@@ -462,6 +470,8 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         tempo_bpm: tempo_bpm.ok_or(ProjectError::MissingField {
             field: "session.tempo_bpm",
         })?,
+        // Optional since SPEC-013 so older documents keep loading.
+        master_gain: master_gain.unwrap_or(1.0),
         tracks: tracks.ok_or(ProjectError::MissingField {
             field: "session.tracks",
         })?,
@@ -474,18 +484,17 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     };
     let mut name = None;
     let mut gain = None;
+    let mut pan = None;
     let mut mute = None;
+    let mut solo = None;
     let mut clips = None;
     for (key, value) in entries {
         match key.as_str() {
             "name" => name = Some(require_string(value)?),
             "gain" => gain = Some(require_f32(value)?),
-            "mute" => {
-                let Value::Bool(flag) = value else {
-                    return Err(ProjectError::Malformed { at: 0 });
-                };
-                mute = Some(*flag);
-            }
+            "pan" => pan = Some(require_f32(value)?),
+            "mute" => mute = Some(require_bool(value)?),
+            "solo" => solo = Some(require_bool(value)?),
             "clips" => {
                 let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
                 // Same reasoning as for tracks: cap before decoding.
@@ -516,13 +525,22 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
         gain: gain.ok_or(ProjectError::MissingField {
             field: "session.tracks[].gain",
         })?,
+        pan: pan.unwrap_or(0.0),
         mute: mute.ok_or(ProjectError::MissingField {
             field: "session.tracks[].mute",
         })?,
+        solo: solo.unwrap_or(false),
         clips: clips.ok_or(ProjectError::MissingField {
             field: "session.tracks[].clips",
         })?,
     })
+}
+
+fn require_bool(value: &Value) -> Result<bool, ProjectError> {
+    match value {
+        Value::Bool(flag) => Ok(*flag),
+        _ => Err(ProjectError::Malformed { at: 0 }),
+    }
 }
 
 fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {

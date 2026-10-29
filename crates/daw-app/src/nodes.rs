@@ -278,7 +278,8 @@ impl ClipSource for Vec<f32> {
 }
 
 /// A session track: its clips placed on the timeline, summed, gain and mute
-/// applied (SPEC-010 §3).
+/// applied (SPEC-010 §3), then panned and scaled by the master into two
+/// channels (SPEC-013).
 ///
 /// All the arithmetic is done on prepared slices: no allocation, no locking,
 /// no panics. A clip whose `source_length` does not match its source simply
@@ -290,6 +291,8 @@ pub struct Track {
     sources: Vec<Box<dyn ClipSource + Send>>,
     gain: f32,
     mute: bool,
+    left: f32,
+    right: f32,
 }
 
 impl Track {
@@ -310,12 +313,25 @@ impl Track {
                 sources: sources.len(),
             });
         }
+        let (left, right) = track.pan_gains();
         Ok(Self {
             clips: track.clips.clone(),
             sources,
             gain: track.gain,
             mute: track.mute,
+            left,
+            right,
         })
+    }
+
+    /// Applies session-level mixing decided at build time: solo/mute
+    /// audibility from [`audio_core::Session::is_audible`] and the master gain.
+    #[must_use]
+    pub fn with_mix(mut self, audible: bool, master_gain: f32) -> Self {
+        self.mute = self.mute || !audible;
+        self.left *= master_gain;
+        self.right *= master_gain;
+        self
     }
 
     /// Timeline length of the track in frames: the end of its last clip.
@@ -335,6 +351,8 @@ impl std::fmt::Debug for Track {
             .field("clips", &self.clips.len())
             .field("gain", &self.gain)
             .field("mute", &self.mute)
+            .field("left", &self.left)
+            .field("right", &self.right)
             .field("length_samples", &self.length_samples())
             .finish()
     }
@@ -342,12 +360,16 @@ impl std::fmt::Debug for Track {
 
 impl NodeProcessor for Track {
     fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
+        let frames = ctx.frames;
+        let stereo = output.channels() > 1;
+        if stereo {
+            output.channel_mut(1)[..frames].fill(0.0);
+        }
         let dst = output.channel_mut(0);
-        dst[..ctx.frames].fill(0.0);
+        dst[..frames].fill(0.0);
         if self.mute || self.gain == 0.0 {
             return;
         }
-        let track_gain = self.gain;
         for (clip, source) in self.clips.iter().zip(&self.sources) {
             if clip.gain == 0.0 || clip.length_samples == 0 {
                 continue;
@@ -368,8 +390,16 @@ impl NodeProcessor for Track {
                 }
             }
         }
-        for slot in &mut dst[..ctx.frames] {
-            *slot *= track_gain;
+        if stereo {
+            let right = self.gain * self.right;
+            for index in 0..frames {
+                let mono = output.channel(0)[index];
+                output.channel_mut(1)[index] = mono * right;
+            }
+        }
+        let left = self.gain * self.left;
+        for slot in &mut output.channel_mut(0)[..frames] {
+            *slot *= left;
         }
     }
 }
