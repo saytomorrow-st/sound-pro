@@ -3,6 +3,7 @@
 use audio_core::graph::{NodeProcessor, NodeView, ProcessContext};
 use audio_core::params::ParamHandle;
 use audio_core::schedule::{Schedule, ScheduleCursor};
+use audio_core::synth::{Envelope, Synth, SynthError};
 use audio_core::wav::sine;
 
 /// Steady sine whose amplitude is driven by a live parameter.
@@ -109,5 +110,102 @@ impl NodeProcessor for MidiPlayer {
             seen += 1.0;
         }
         self.events_seen.set(seen);
+    }
+}
+
+/// Polyphonic instrument: turns a [`Schedule`] into summed voices (SPEC-009).
+///
+/// `Synth` renders dry; the node owns the live `synth.gain` parameter and
+/// applies it to the block, so the UI can mute or ride the instrument without
+/// touching the audio thread.
+pub struct PolySynth {
+    synth: Synth,
+    schedule: Schedule,
+    cursor: ScheduleCursor,
+    last_position: u64,
+    gain: ParamHandle,
+    scratch: Vec<f32>,
+}
+
+impl PolySynth {
+    /// Builds an instrument for `sample_rate` playing `schedule`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SynthError`] for a zero sample rate or a bad envelope.
+    pub fn new(
+        schedule: Schedule,
+        sample_rate: u32,
+        envelope: Envelope,
+        gain: ParamHandle,
+    ) -> Result<Self, SynthError> {
+        Ok(Self {
+            synth: Synth::new(sample_rate, envelope)?,
+            cursor: schedule.cursor(),
+            schedule,
+            last_position: 0,
+            gain,
+            // Allocated once: the render path only slices it.
+            scratch: Vec::new(),
+        })
+    }
+
+    /// The schedule being played.
+    #[must_use]
+    pub const fn schedule(&self) -> &Schedule {
+        &self.schedule
+    }
+
+    /// The instrument, for diagnostics.
+    #[must_use]
+    pub const fn synth(&self) -> &Synth {
+        &self.synth
+    }
+
+    /// Voices started since the last backward seek.
+    #[must_use]
+    pub const fn voices_started(&self) -> u32 {
+        self.synth.voices_started()
+    }
+}
+
+impl std::fmt::Debug for PolySynth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolySynth")
+            .field("events", &self.schedule.len())
+            .field("length_samples", &self.schedule.length_samples())
+            .field("voices_started", &self.synth.voices_started())
+            .finish()
+    }
+}
+
+impl NodeProcessor for PolySynth {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
+        if ctx.position < self.last_position {
+            // Backward seek: the notes that started before the new position
+            // would hang forever, and the cursor cannot rewind (SPEC-009 §10).
+            self.cursor = self.schedule.cursor();
+            self.synth.reset();
+        }
+        self.last_position = ctx.position;
+
+        if self.scratch.len() < ctx.frames {
+            // Off the hot path in practice: the graph is built for the
+            // largest quantum it will see, so this grows once at most.
+            self.scratch.resize(ctx.frames, 0.0);
+        }
+        self.synth.render(
+            &self.schedule,
+            &mut self.cursor,
+            ctx.position,
+            ctx.frames,
+            &mut self.scratch[..ctx.frames],
+        );
+
+        let gain = self.gain.next(ctx.frames, ctx.sample_rate);
+        let dst = output.channel_mut(0);
+        for (i, sample) in self.scratch[..ctx.frames].iter().enumerate() {
+            dst[i] = sample * gain;
+        }
     }
 }

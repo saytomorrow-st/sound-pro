@@ -22,10 +22,15 @@ use audio_core::graph::Graph;
 use audio_core::offline::OfflineRenderer;
 use audio_core::params::{ParamHandle, ParamId, ParamSpec};
 use audio_core::render::Renderer;
+use audio_core::schedule::Schedule;
+use audio_core::synth::{Envelope, Synth};
 use audio_core::transport::{DEFAULT_SAMPLE_RATE, Transport, TransportCommand};
 use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
 
 pub mod nodes;
+
+/// Render quantum used by the MIDI pass in [`render_midi`].
+const BLOCK_FRAMES: usize = 256;
 
 /// Options for an offline smoke bounce.
 #[derive(Debug, Clone)]
@@ -174,4 +179,121 @@ pub fn build_demo_graph(sample_rate: u32) -> Result<Graph, Box<dyn std::error::E
 /// wrongly.
 pub fn demo_level_spec() -> Result<ParamSpec, Box<dyn std::error::Error>> {
     Ok(ParamSpec::new(ParamId(0), "tone.level", 0.0, 1.0, 0.5, 10)?)
+}
+
+/// Options for `daw render-midi`: a parsed schedule rendered to a WAV file.
+#[derive(Debug, Clone)]
+pub struct MidiRenderJob {
+    /// Destination WAV path.
+    pub output: PathBuf,
+    /// Schedule built on the control thread from an SMF file.
+    pub schedule: Schedule,
+    /// MIDI notes in the source file, for the report.
+    pub notes: u64,
+    /// Sample rate.
+    pub sample_rate: u32,
+    /// Render quantum, in frames.
+    pub block_frames: usize,
+    /// Override the length: render this many frames instead of
+    /// [`Schedule::length_samples`].
+    pub frames: Option<u64>,
+}
+
+/// Result of `daw render-midi`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiRenderReport {
+    /// Frames rendered and written.
+    pub frames: u64,
+    /// How many of them the schedule covers (the rest is the trailing tail).
+    pub scheduled_frames: u64,
+    /// Voice starts counted by the instrument during this render (voice
+    /// stealing included, so it can exceed the note count when the pool
+    /// overflows).
+    pub voices_started: u32,
+}
+
+/// Renders `job.schedule` through a [`nodes::PolySynth`] and writes mono WAV.
+///
+/// The graph holds exactly one node, so the tail beyond the last event is
+/// rendered as silence only because the schedule itself carries the release
+/// tail ([`audio_core::ScheduleSpec::from_midi`]).
+///
+/// # Errors
+///
+/// Returns a boxed error if the graph cannot be built, rendering fails, or the
+/// file cannot be written.
+pub fn render_midi(job: &MidiRenderJob) -> Result<MidiRenderReport, Box<dyn std::error::Error>> {
+    if let Some(parent) = job.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut graph = Graph::with_capacity(
+        job.sample_rate,
+        1,
+        job.block_frames.next_power_of_two(),
+        4,
+        1,
+    );
+    let gain = ParamHandle::new(synth_gain_spec()?);
+    graph.register_param(gain.clone())?;
+    graph.add_node(
+        "synth",
+        nodes::PolySynth::new(
+            job.schedule.clone(),
+            job.sample_rate,
+            Envelope::default(),
+            gain,
+        )?,
+    )?;
+
+    let mut transport = Transport::new(job.sample_rate);
+    transport.apply(TransportCommand::Play);
+
+    let scheduled = job.schedule.length_samples();
+    let frames = job.frames.unwrap_or(scheduled);
+    let renderer = Renderer::new(graph, transport, 1024);
+    let mut offline = OfflineRenderer::new(renderer, job.block_frames);
+    let mono = offline.bounce_mono(frames)?;
+    write_mono_slice(&job.output, job.sample_rate, &mono)?;
+
+    Ok(MidiRenderReport {
+        frames,
+        scheduled_frames: scheduled,
+        voices_started: voices_started(&job.schedule, frames, job.sample_rate),
+    })
+}
+
+/// Replays the schedule through a bare [`Synth`] to count voice starts.
+///
+/// The instrument inside the graph is not reachable from here, and adding a
+/// counter to the audio path for a diagnostic would be worse: the replay is a
+/// control-thread pass over the same events, in the same quanta, and the
+/// `Synth` is deterministic, so the number is the one the render saw.
+fn voices_started(schedule: &Schedule, frames: u64, sample_rate: u32) -> u32 {
+    let Ok(mut synth) = Synth::new(sample_rate, Envelope::default()) else {
+        return 0;
+    };
+    let mut cursor = schedule.cursor();
+    let mut block = vec![0.0_f32; BLOCK_FRAMES];
+    let mut position = 0_u64;
+    while position < frames {
+        let remaining = usize::try_from(frames - position).unwrap_or(usize::MAX);
+        let n = remaining.min(BLOCK_FRAMES);
+        synth.render(schedule, &mut cursor, position, n, &mut block[..n]);
+        position += n as u64;
+    }
+    synth.voices_started()
+}
+
+/// Description of the instrument's output gain: 0..1, half by default, 10 ms
+/// ramp (SPEC-009 §10).
+///
+/// # Errors
+///
+/// Returns a boxed [`audio_core::params::ParamError`] if the description is
+/// invalid; it is a constant, so this only trips if the constant is edited
+/// wrongly.
+pub fn synth_gain_spec() -> Result<ParamSpec, Box<dyn std::error::Error>> {
+    Ok(ParamSpec::new(ParamId(1), "synth.gain", 0.0, 1.0, 0.5, 10)?)
 }

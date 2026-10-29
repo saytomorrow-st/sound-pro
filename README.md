@@ -11,7 +11,7 @@
 crates/audio-core   движок: часы, буферы, граф, renderer, offline, WAV, MIDI
 crates/daw-app      оболочка: CLI smoke-инструменты, фича realtime (CPAL)
 specs/              спецификации; агенты реализуют только то, что здесь описано
-docs/               REALTIME.md, MIDI.md (поддержка SMF), AI-WORKFLOW.md
+docs/               REALTIME.md, MIDI.md (поддержка SMF), SYNTH.md (голоса), AI-WORKFLOW.md
 clean-room/         журнал метода чистой комнаты
 AGENTS.md           правила для ИИ-агентов (читать первым)
 .github/            CI, инструкции и промпты Copilot, шаблон задачи
@@ -50,14 +50,16 @@ cargo build -p daw-app --features realtime
 - Realtime-бэкенд на CPAL (`daw play`, фича `realtime`) — SPEC-005.
 - [Документ проекта](docs/PROJECT.md): сессия как JSON без `serde`
   (`daw project save|show`) — SPEC-008.
+- [Полифонический синтезатор](docs/SYNTH.md): 16 голосов, ADSR, MIDI-файл →
+  WAV (`daw render-midi`) — SPEC-009.
 
 ## Что дальше
 
 См. `docs/AI-WORKFLOW.md` → «Первые 5 задач для агента» и `specs/000-template.md`.
-Ближайшее — [SPEC-009](specs/009-polyphonic-synth.md): полифонический
-синтезатор, который играет `Schedule` вместо голой синусоиды. Сейчас
-[SPEC-007](specs/007-midi-event-scheduler.md) отдаёт события в узел, а
-[SPEC-008](specs/008-project-document.md) умеет сохранять сессию.
+[SPEC-007](specs/007-midi-event-scheduler.md) отдаёт события в узел,
+[SPEC-008](specs/008-project-document.md) сохраняет сессию, а
+[SPEC-009](specs/009-polyphonic-synth.md) играет их настоящими голосами.
+Ближайшее — следующий номер в `specs/`.
 
 ## Лицензия
 

@@ -172,13 +172,19 @@ fn seconds_to_sample(seconds: f64, sample_rate: f64) -> u64 {
     out
 }
 
-/// Forward-only read position inside a [`Schedule`].
+/// Read position inside a [`Schedule`].
+///
+/// The cursor moves forward as events are consumed and rewinds itself when
+/// the caller passes a smaller `position` (a backward seek).
 ///
 /// `Default` is the beginning, and [`Schedule::cursor`] is the canonical way
 /// to get one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScheduleCursor {
     next: usize,
+    /// Sample position the cursor was last used at, so a backward seek can
+    /// rewind it. `u64::MAX` means "never used".
+    position: u64,
 }
 
 /// An immutable, ready-to-play schedule.
@@ -228,7 +234,10 @@ impl Schedule {
     /// A cursor at the beginning of the schedule.
     #[must_use]
     pub const fn cursor(&self) -> ScheduleCursor {
-        ScheduleCursor { next: 0 }
+        ScheduleCursor {
+            next: 0,
+            position: u64::MAX,
+        }
     }
 
     /// Returns the next event inside `[position, position + frames)`.
@@ -237,13 +246,21 @@ impl Schedule {
     /// jumped over by a seek) and advance the cursor. The range is
     /// half-open, so an event exactly at `position + frames` belongs to the
     /// next quantum. Realtime-safe: index reads only, no allocation, no
-    /// locking, no panic.
+    /// locking, no panic. A caller that seeks backwards only has to pass the
+    /// new, smaller `position`: the cursor rewinds itself to the first event
+    /// at or after it.
     pub fn next_event(
         &self,
         cursor: &mut ScheduleCursor,
         position: u64,
         frames: usize,
     ) -> Option<ScheduledEvent> {
+        if frames > 0 {
+            if position < cursor.position {
+                cursor.next = self.events.partition_point(|event| event.sample < position);
+            }
+            cursor.position = position;
+        }
         let end = position.saturating_add(frames as u64);
         while let Some(event) = self.events.get(cursor.next) {
             if event.sample >= end {

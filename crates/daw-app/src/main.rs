@@ -5,6 +5,7 @@
 //! daw selftest                     # render + verify + exit non-zero on failure
 //! daw project save <path>          # write the demo session as JSON
 //! daw project show <path>          # print a session document
+//! daw render-midi <in.mid> <out.wav> [--tempo BPM] [--seconds S]
 //! ```
 
 #![forbid(unsafe_code)]
@@ -118,6 +119,7 @@ fn main() -> ExitCode {
             }
         }
         "project" => project(args),
+        "render-midi" => render_midi(args),
         "play" => {
             let seconds = args
                 .next()
@@ -141,7 +143,7 @@ fn usage() {
     eprintln!(
         "usage:\n  daw bounce <out.wav> [seconds] [--split <samples>]\n  \
          daw play [seconds]\n  daw selftest\n  daw project save <path>\n  \
-         daw project show <path>\n\n\
+         daw project show <path>\n  daw render-midi <in.mid> <out.wav> [--tempo BPM] [--seconds S]\n\n\
          --split <samples> writes part-01.wav, part-02.wav, ... each at most\n\
          <samples> long (samples, not frames; mono).\n\n\
          `daw play` needs `--features realtime`; without it the command exits 2.\n\
@@ -237,7 +239,9 @@ fn show_project(path: &std::path::Path) -> ExitCode {
 fn play(seconds: f64) -> ExitCode {
     use std::time::Duration;
 
-    // The graph is built by the backend at the rate the device actually runs.
+    // The graph is built by the backend at the rate the device actually
+    // runs. The demo instrument is silent without a schedule, so this proves
+    // the stream, not the sound; `daw render-midi` is the audible path.
     let mut handle = match daw_app::realtime::play_default(daw_app::build_demo_graph) {
         Ok(h) => h,
         Err(e) => {
@@ -264,4 +268,88 @@ fn play(seconds: f64) -> ExitCode {
 fn play(_seconds: f64) -> ExitCode {
     eprintln!("play is unavailable: rebuild with `--features realtime`");
     ExitCode::from(2)
+}
+
+/// `daw render-midi`: the only place that touches the filesystem for MIDI.
+fn render_midi(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let (Some(input), Some(output)) = (args.next(), args.next()) else {
+        eprintln!("usage: daw render-midi <in.mid> <out.wav> [--tempo BPM] [--seconds S]");
+        return ExitCode::from(2);
+    };
+    let mut tempo = audio_core::transport::Tempo::default();
+    let mut seconds = None;
+    while let Some(arg) = args.next() {
+        let value = match arg.as_str() {
+            "--tempo" | "--seconds" => args.next(),
+            other => {
+                eprintln!("unexpected argument: {other}");
+                return ExitCode::from(2);
+            }
+        };
+        let Some(value) = value else {
+            eprintln!("{arg} requires a value");
+            return ExitCode::from(2);
+        };
+        match (arg.as_str(), value.parse::<f64>()) {
+            ("--tempo", Ok(bpm)) if bpm.is_finite() && bpm > 0.0 => {
+                tempo = audio_core::transport::Tempo(bpm);
+            }
+            ("--seconds", Ok(s)) if s.is_finite() && s > 0.0 => seconds = Some(s),
+            (flag, _) => {
+                eprintln!("{flag} expects a positive number, got {value}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let bytes = match std::fs::read(&input) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("render-midi failed: {input}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let file = match audio_core::midi::parse_smf(&bytes) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("render-midi failed: {input}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sample_rate = audio_core::transport::DEFAULT_SAMPLE_RATE;
+    let spec = match audio_core::schedule::ScheduleSpec::from_midi(
+        &file,
+        sample_rate,
+        tempo,
+        u64::from(sample_rate),
+    ) {
+        Ok(spec) => spec,
+        Err(e) => {
+            eprintln!("render-midi failed: {input}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let frames = seconds.map(|s| (s * f64::from(sample_rate)).round() as u64);
+    let job = daw_app::MidiRenderJob {
+        output: PathBuf::from(&output),
+        schedule: audio_core::schedule::Schedule::new(spec),
+        notes: file.notes().len() as u64,
+        sample_rate,
+        block_frames: 256,
+        frames,
+    };
+    match daw_app::render_midi(&job) {
+        Ok(report) => {
+            println!(
+                "rendered {} frames (schedule {}), {} notes, {} voice starts to {}",
+                report.frames, report.scheduled_frames, job.notes, report.voices_started, output
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("render-midi failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
