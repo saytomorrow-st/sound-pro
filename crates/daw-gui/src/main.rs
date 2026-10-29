@@ -11,7 +11,8 @@ mod shell;
 use std::path::PathBuf;
 
 use audio_core::{
-    AutoPoint, Effect, EffectKind, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note, TRACK_COLORS,
+    AutoPoint, Effect, EffectKind, EffectParam, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note,
+    TRACK_COLORS,
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
@@ -1170,18 +1171,7 @@ impl App {
                                 self.auto_drag = None;
                             }
                             if self.auto == Some(index) {
-                                let other = match self.auto_lane {
-                                    Lane::Gain => Lane::Pan,
-                                    Lane::Pan => Lane::Gain,
-                                };
-                                if ui
-                                    .button(lane_label(self.auto_lane))
-                                    .on_hover_text("Какую линию показывать")
-                                    .clicked()
-                                {
-                                    self.auto_lane = other;
-                                    self.auto_drag = None;
-                                }
+                                self.lane_picker(ui, index);
                             }
                         });
                     });
@@ -2030,6 +2020,43 @@ impl App {
         self.seek(timeline::step_bar(at, bar, forward));
     }
 
+    /// Chooser of the shown automation lane: gain, pan or any parameter of
+    /// the track's effects (SPEC-041).
+    fn lane_picker(&mut self, ui: &mut egui::Ui, track: usize) {
+        let kinds: Vec<EffectKind> = self.editor.session().tracks[track]
+            .effects
+            .iter()
+            .map(|effect| effect.kind)
+            .collect();
+        if !lane_fits(self.auto_lane, &kinds) {
+            self.auto_lane = Lane::Gain;
+        }
+        let mut lanes = vec![Lane::Gain, Lane::Pan];
+        for (slot, kind) in kinds.iter().enumerate() {
+            let Ok(slot) = u8::try_from(slot) else { break };
+            lanes.extend(
+                EffectParam::of(kind)
+                    .iter()
+                    .map(|&param| Lane::Effect { slot, param }),
+            );
+        }
+        let mut chosen = self.auto_lane;
+        egui::ComboBox::from_id_salt(("auto-lane", track))
+            .selected_text(lane_label(chosen, &kinds))
+            .width(70.0)
+            .show_ui(ui, |ui| {
+                for lane in lanes {
+                    ui.selectable_value(&mut chosen, lane, lane_label(lane, &kinds));
+                }
+            })
+            .response
+            .on_hover_text("Какую линию показывать");
+        if chosen != self.auto_lane {
+            self.auto_lane = chosen;
+            self.auto_drag = None;
+        }
+    }
+
     /// Draws one track's automation lane over its clips (SPEC-023).
     #[allow(clippy::cast_precision_loss)]
     fn draw_lane(&self, painter: &egui::Painter, area: Rect, row: Rect, track: usize) {
@@ -2042,6 +2069,16 @@ impl App {
             let fixed = match self.auto_lane {
                 Lane::Gain => t.gain,
                 Lane::Pan => t.pan,
+                Lane::Effect { slot, param } => {
+                    let Some(value) = t
+                        .effects
+                        .get(usize::from(slot))
+                        .and_then(|effect| param.get(&effect.kind))
+                    else {
+                        return;
+                    };
+                    value
+                }
             };
             let y = value_to_y(self.auto_lane, fixed, row);
             let mut x = row.min.x;
@@ -3532,10 +3569,43 @@ impl eframe::App for App {
 /// Radius of an automation point in pixels.
 const POINT_RADIUS: f32 = 4.0;
 
-fn lane_label(lane: Lane) -> &'static str {
+/// `true` when `lane` can be automated on a track with these effects.
+fn lane_fits(lane: Lane, kinds: &[EffectKind]) -> bool {
     match lane {
-        Lane::Gain => "Громк.",
-        Lane::Pan => "Пан.",
+        Lane::Gain | Lane::Pan => true,
+        Lane::Effect { slot, param } => kinds
+            .get(usize::from(slot))
+            .is_some_and(|kind| param.get(kind).is_some()),
+    }
+}
+
+/// Menu text of an automation lane.
+fn lane_label(lane: Lane, kinds: &[EffectKind]) -> String {
+    match lane {
+        Lane::Gain => "Громк.".to_owned(),
+        Lane::Pan => "Пан.".to_owned(),
+        Lane::Effect { slot, param } => {
+            let title = kinds.get(usize::from(slot)).map_or("?", effect_title);
+            format!("{} {title} · {}", slot + 1, param_label(param))
+        }
+    }
+}
+
+/// Russian name of an effect parameter.
+const fn param_label(param: EffectParam) -> &'static str {
+    match param {
+        EffectParam::LowDb => "Низ, дБ",
+        EffectParam::MidDb => "Середина, дБ",
+        EffectParam::MidHz => "Середина, Гц",
+        EffectParam::HighDb => "Верх, дБ",
+        EffectParam::ThresholdDb => "Порог",
+        EffectParam::Ratio => "Степень",
+        EffectParam::AttackMs => "Атака",
+        EffectParam::ReleaseMs => "Восстановление",
+        EffectParam::MakeupDb => "Усиление",
+        EffectParam::Room => "Комната",
+        EffectParam::Damp => "Глушение",
+        EffectParam::Mix => "Микс",
     }
 }
 

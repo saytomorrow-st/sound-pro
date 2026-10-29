@@ -328,3 +328,47 @@ fn a_track_with_automation_does_not_allocate() {
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "automation allocated {count} times");
 }
+
+#[test]
+fn a_track_with_effect_automation_does_not_allocate() {
+    use audio_core::{AutoPoint, Effect, EffectKind, EffectParam, Lane};
+    let mut track = overlapping_track();
+    track.effects = vec![
+        Effect::new(EffectKind::eq()),
+        Effect::new(EffectKind::compressor()),
+        Effect::new(EffectKind::reverb()),
+    ];
+    for (slot, param, low, high) in [
+        (0, EffectParam::MidDb, -12.0, 12.0),
+        (0, EffectParam::MidHz, 200.0, 4_000.0),
+        (1, EffectParam::ThresholdDb, -40.0, 0.0),
+        (2, EffectParam::Mix, 0.0, 1.0),
+        (2, EffectParam::Room, 0.1, 0.9),
+    ] {
+        *track.automation.lane_mut(Lane::Effect { slot, param }) = (0..32)
+            .map(|i| AutoPoint {
+                time: i * 211,
+                value: if i % 2 == 0 { low } else { high },
+            })
+            .collect();
+    }
+    let mut session = Session::new("s", RATE, 120.0);
+    session.tracks.push(track.clone());
+    assert_eq!(session.validate(), Ok(()));
+    let job = SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: sources(),
+        }],
+        sample_rate: RATE,
+        block_frames: BLOCK,
+        frames: None,
+        output: std::path::PathBuf::new(),
+    };
+    let mut renderer = renderer_for(build_session_graph(job).unwrap());
+    let mut mix = AudioBuffer::new(2, BLOCK);
+    renderer.render(BLOCK, &mut mix).unwrap();
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(count, 0, "effect automation allocated {count} times");
+}

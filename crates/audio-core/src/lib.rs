@@ -36,7 +36,7 @@ pub mod wav;
 
 pub use buffer::{AudioBuffer, Sample};
 pub use commands::{CommandConsumer, CommandQueue};
-pub use fx::{Effect, EffectKind, EffectProcessor, MAX_EFFECTS_PER_TRACK};
+pub use fx::{Effect, EffectKind, EffectParam, EffectProcessor, MAX_EFFECTS_PER_TRACK};
 pub use graph::{Graph, GraphError, Node, NodeId, NodeProcessor};
 pub use midi::{MidiError, MidiEvent, MidiFile, MidiMessage, parse_smf};
 pub use offline::{OfflineError, OfflineRenderer};
@@ -46,10 +46,10 @@ pub use render::{RenderStats, Renderer};
 pub use resample::{ResampleError, resample, resample_range, resampled_len};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
-    AutoPoint, Automation, Bus, BusSend, CROSSFADE_SAMPLES, Clip, Lane, MAX_AUTOMATION_POINTS,
-    MAX_BUSES, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES, MAX_TRACKS,
-    Marker, Note, Session, SessionError, TRACK_COLORS, Track as SessionTrack, pan_law,
-    valid_time_signature,
+    AutoPoint, Automation, Bus, BusSend, CROSSFADE_SAMPLES, Clip, EffectLane, Lane,
+    MAX_AUTOMATION_POINTS, MAX_BUSES, MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS,
+    MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES, MAX_TRACKS, Marker, Note, Session, SessionError,
+    TRACK_COLORS, Track as SessionTrack, pan_law, valid_time_signature,
 };
 pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz, render_notes};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};

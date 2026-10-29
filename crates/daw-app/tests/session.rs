@@ -876,3 +876,133 @@ fn an_unfaded_clip_on_top_still_wins_exactly() {
     let ramp = audio_core::CROSSFADE_SAMPLES as usize;
     assert!(out[ramp..4_000 - ramp].iter().all(|s| *s == 0.7));
 }
+
+// --- SPEC-041: effect automation -----------------------------------------
+
+fn reverb_track(mix: Vec<(u64, f32)>) -> SessionTrack {
+    use audio_core::{AutoPoint, Effect, EffectKind, EffectParam, Lane};
+    let mut track = with_effects(vec![Effect::new(EffectKind::Reverb {
+        room: 0.5,
+        damp: 0.5,
+        mix: 0.0,
+    })]);
+    *track.automation.lane_mut(Lane::Effect {
+        slot: 0,
+        param: EffectParam::Mix,
+    }) = mix
+        .into_iter()
+        .map(|(time, value)| AutoPoint { time, value })
+        .collect();
+    track
+}
+
+#[test]
+fn an_automated_reverb_mix_changes_the_sound() {
+    let mut scratch = Scratch::new("fxauto");
+    let source = sine(RATE as usize / 2, 0.5);
+    let dry = render_mix(
+        &mut scratch,
+        vec![(reverb_track(vec![]), source.clone())],
+        1.0,
+    );
+    let wet = render_mix(
+        &mut scratch,
+        vec![(reverb_track(vec![(0, 0.0), (RATE as u64 / 4, 1.0)]), source)],
+        1.0,
+    );
+    let half = RATE as usize / 4;
+    // Before the ramp has moved much both renders match closely; after it
+    // the automated reverb is fully wet.
+    let early = dry.channel(0)[..32]
+        .iter()
+        .zip(&wet.channel(0)[..32])
+        .all(|(a, b)| (a - b).abs() < 1e-6);
+    assert!(early);
+    let late = dry.channel(0)[half..]
+        .iter()
+        .zip(&wet.channel(0)[half..])
+        .any(|(a, b)| (a - b).abs() > 1e-2);
+    assert!(late, "the automated mix is audible");
+}
+
+#[test]
+fn an_empty_effect_lane_is_bit_identical_to_none() {
+    use audio_core::{Effect, EffectKind};
+    let mut scratch = Scratch::new("fxautoempty");
+    let source = sine(4_000, 0.5);
+    let kind = EffectKind::Reverb {
+        room: 0.5,
+        damp: 0.5,
+        mix: 0.0,
+    };
+    let plain = render_mix(
+        &mut scratch,
+        vec![(with_effects(vec![Effect::new(kind)]), source.clone())],
+        1.0,
+    );
+    let lane = render_mix(&mut scratch, vec![(reverb_track(vec![]), source)], 1.0);
+    assert_eq!(plain, lane);
+}
+
+#[test]
+fn a_constant_effect_lane_equals_the_static_setting() {
+    use audio_core::{Effect, EffectKind};
+    let mut scratch = Scratch::new("fxautoconst");
+    let source = sine(4_000, 0.5);
+    let fixed = render_mix(
+        &mut scratch,
+        vec![(
+            with_effects(vec![Effect::new(EffectKind::Reverb {
+                room: 0.5,
+                damp: 0.5,
+                mix: 0.6,
+            })]),
+            source.clone(),
+        )],
+        1.0,
+    );
+    let automated = render_mix(
+        &mut scratch,
+        vec![(reverb_track(vec![(0, 0.6)]), source)],
+        1.0,
+    );
+    for (a, b) in fixed.channel(0).iter().zip(automated.channel(0)) {
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+    }
+}
+
+#[test]
+fn effect_automation_does_not_depend_on_the_block_size() {
+    let mut scratch = Scratch::new("fxautoblock");
+    let source = sine(6_000, 0.5);
+    let render = |scratch: &mut Scratch, block_frames| {
+        let mut track = reverb_track(vec![(0, 0.0), (5_000, 1.0)]);
+        track.clips.push(Clip::full(0, source.len() as u64));
+        let mut session = Session::new("mix", RATE, 120.0);
+        session.tracks.push(track.clone());
+        let output = scratch.path();
+        render_session(SessionJob {
+            session,
+            tracks: vec![TrackSource {
+                track,
+                clips: vec![Box::new(source.clone())],
+            }],
+            sample_rate: RATE,
+            block_frames,
+            frames: None,
+            output: output.clone(),
+        })
+        .unwrap();
+        audio_core::wav::read_wav_mono(&output).unwrap().1
+    };
+    let reference = render(&mut scratch, 64);
+    for block in [16, 37, 1024] {
+        let other = render(&mut scratch, block);
+        let same = reference
+            .channel(0)
+            .iter()
+            .zip(other.channel(0))
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "block {block}");
+    }
+}
