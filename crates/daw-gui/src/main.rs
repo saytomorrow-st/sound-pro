@@ -2,6 +2,8 @@
 //! [`daw_gui::Editor`].
 
 #![forbid(unsafe_code)]
+// No console window behind the GUI in Windows release builds (SPEC-024).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 

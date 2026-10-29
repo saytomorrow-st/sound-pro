@@ -1,0 +1,73 @@
+name: Release
+
+# SPEC-024: ready-to-run builds. A `v*` tag publishes a GitHub Release;
+# manual runs and PRs touching packaging only upload workflow artifacts.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libfuse2
+      - name: Build
+        run: cargo build --release --locked -p daw-gui --features audio
+      - name: AppImage
+        if: runner.os == 'Linux'
+        run: packaging/linux/build-appimage.sh target/release/sound-pro "$VERSION" dist
+      - name: Zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "Sound-Pro-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "stage/$dir" | Out-Null
+          Copy-Item target/release/sound-pro.exe "stage/$dir/"
+          Copy-Item README.md "stage/$dir/"
+          Get-ChildItem -Path . -Filter 'LICENSE*' | Copy-Item -Destination "stage/$dir/"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "stage/$dir" -DestinationPath "dist/$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sound-pro-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "Sound Pro $VERSION" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
