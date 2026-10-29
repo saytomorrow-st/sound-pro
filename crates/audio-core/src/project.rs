@@ -16,8 +16,8 @@ use crate::fx::{Effect, EffectKind, MAX_EFFECTS_PER_TRACK};
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
-    AutoPoint, Automation, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_CLIPS_PER_TRACK,
-    MAX_NOTES_PER_CLIP, MAX_TRACKS, Note, Session, SessionError, Track,
+    AutoPoint, Automation, Bus, BusSend, Clip, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
+    MAX_CLIPS_PER_TRACK, MAX_NOTES_PER_CLIP, MAX_TRACKS, Note, Session, SessionError, Track,
 };
 use crate::transport::TimeSignature;
 
@@ -436,6 +436,9 @@ fn write_session(out: &mut String, session: &Session) {
         if !track.automation.is_empty() {
             write_automation(out, &track.automation);
         }
+        if !track.sends.is_empty() {
+            write_sends(out, &track.sends);
+        }
         out.push_str("\n      }");
     }
     if session.tracks.is_empty() {
@@ -443,7 +446,126 @@ fn write_session(out: &mut String, session: &Session) {
     } else {
         out.push_str("\n    ]");
     }
+    // Written only when present, so older documents keep their exact text
+    // (SPEC-028).
+    if !session.buses.is_empty() {
+        write_buses(out, &session.buses);
+    }
     out.push_str("\n  }");
+}
+
+/// Appends a track's `"sends"` array (SPEC-028).
+fn write_sends(out: &mut String, sends: &[BusSend]) {
+    out.push_str(",\n        \"sends\": [");
+    for (index, send) in sends.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str("{\"bus\": ");
+        out.push_str(&send.bus.to_string());
+        out.push_str(", \"level\": ");
+        out.push_str(&format_number(f64::from(send.level)));
+        out.push('}');
+    }
+    out.push(']');
+}
+
+/// Appends the session's `"buses"` array (SPEC-028). Bus effects reuse the
+/// track effect format at the same indent.
+fn write_buses(out: &mut String, buses: &[Bus]) {
+    out.push_str(",\n    \"buses\": [");
+    for (index, bus) in buses.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n      {\n        \"name\": ");
+        write_string(out, &bus.name);
+        out.push_str(",\n        \"gain\": ");
+        out.push_str(&format_number(f64::from(bus.gain)));
+        if !bus.effects.is_empty() {
+            write_effects(out, &bus.effects);
+        }
+        out.push_str("\n      }");
+    }
+    out.push_str("\n    ]");
+}
+
+fn sends_from_value(value: &Value) -> Result<Vec<BusSend>, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    if items.len() > MAX_BUSES {
+        return Err(ProjectError::Session(SessionError::InvalidSend {
+            track: 0,
+            send: MAX_BUSES,
+        }));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let Value::Object(entries) = item else {
+                return Err(ProjectError::Malformed { at: 0 });
+            };
+            let mut bus = None;
+            let mut level = None;
+            for (key, value) in entries {
+                match key.as_str() {
+                    "bus" => bus = Some(require_u32(value)?),
+                    "level" => level = Some(require_f32(value)?),
+                    other => {
+                        return Err(ProjectError::UnknownField {
+                            field: other.to_owned(),
+                        });
+                    }
+                }
+            }
+            Ok(BusSend {
+                bus: bus.ok_or(ProjectError::MissingField {
+                    field: "session.tracks[].sends[].bus",
+                })? as usize,
+                level: level.ok_or(ProjectError::MissingField {
+                    field: "session.tracks[].sends[].level",
+                })?,
+            })
+        })
+        .collect()
+}
+
+fn buses_from_value(value: &Value) -> Result<Vec<Bus>, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    if items.len() > MAX_BUSES {
+        return Err(ProjectError::Session(SessionError::InvalidBus {
+            bus: MAX_BUSES,
+        }));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let Value::Object(entries) = item else {
+                return Err(ProjectError::Malformed { at: 0 });
+            };
+            let mut name = None;
+            let mut gain = None;
+            let mut effects = None;
+            for (key, value) in entries {
+                match key.as_str() {
+                    "name" => name = Some(require_string(value)?),
+                    "gain" => gain = Some(require_f32(value)?),
+                    "effects" => effects = Some(effects_from_value(value)?),
+                    other => {
+                        return Err(ProjectError::UnknownField {
+                            field: other.to_owned(),
+                        });
+                    }
+                }
+            }
+            Ok(Bus {
+                name: name.ok_or(ProjectError::MissingField {
+                    field: "session.buses[].name",
+                })?,
+                gain: gain.unwrap_or(1.0),
+                effects: effects.unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// Rebuilds a [`Session`] from its object, rejecting stray keys.
@@ -457,8 +579,10 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut master_gain = None;
     let mut time_signature = None;
     let mut tracks = None;
+    let mut buses = None;
     for (key, value) in entries {
         match key.as_str() {
+            "buses" => buses = Some(buses_from_value(value)?),
             "name" => name = Some(require_string(value)?),
             "sample_rate" => sample_rate = Some(require_u32(value)?),
             "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
@@ -506,6 +630,8 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         tracks: tracks.ok_or(ProjectError::MissingField {
             field: "session.tracks",
         })?,
+        // Optional since SPEC-028.
+        buses: buses.unwrap_or_default(),
     })
 }
 
@@ -532,8 +658,10 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut clips = None;
     let mut effects = None;
     let mut automation = None;
+    let mut sends = None;
     for (key, value) in entries {
         match key.as_str() {
+            "sends" => sends = Some(sends_from_value(value)?),
             "effects" => effects = Some(effects_from_value(value)?),
             "automation" => automation = Some(automation_from_value(value)?),
             "name" => name = Some(require_string(value)?),
@@ -583,6 +711,8 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
         effects: effects.unwrap_or_default(),
         // Optional since SPEC-023.
         automation: automation.unwrap_or_default(),
+        // Optional since SPEC-028.
+        sends: sends.unwrap_or_default(),
     })
 }
 

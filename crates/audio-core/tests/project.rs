@@ -1211,3 +1211,112 @@ fn a_malformed_time_signature_is_rejected() {
         );
     }
 }
+
+// --- SPEC-028: buses and sends -------------------------------------------
+
+fn buses_session() -> audio_core::Session {
+    use audio_core::{Bus, BusSend, Effect, EffectKind};
+    let mut session = demo_session();
+    let mut verb = Bus::new("Verb");
+    verb.gain = 0.75;
+    verb.effects.push(Effect::new(EffectKind::reverb()));
+    session.buses = vec![verb, Bus::new("Delay")];
+    session.tracks[0].sends = vec![
+        BusSend {
+            bus: 1,
+            level: 0.25,
+        },
+        BusSend { bus: 0, level: 0.5 },
+    ];
+    session
+}
+
+fn buses_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(Project::capture("demo", SR, 120.0, &graph), buses_session()).to_json()
+}
+
+#[test]
+fn buses_and_sends_survive_the_round_trip() {
+    let text = buses_json();
+    assert!(text.contains("\"buses\""), "{text}");
+    assert!(text.contains("\"sends\""), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &buses_session());
+    assert_eq!(back.session().tracks[0].send_level(0), 0.5);
+    assert_eq!(back.session().tracks[0].send_level(2), 0.0);
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn a_session_without_buses_writes_no_bus_keys() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert!(!text.contains("buses"), "{text}");
+    assert!(!text.contains("sends"), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert!(back.session().buses.is_empty());
+    assert!(back.session().tracks[0].sends.is_empty());
+}
+
+#[test]
+fn a_bus_gain_and_effects_are_optional_when_reading() {
+    let text = buses_json().replace(
+        "\"name\": \"Delay\",\n        \"gain\": 1",
+        "\"name\": \"Delay\"",
+    );
+    assert_ne!(text, buses_json());
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session().buses[1], audio_core::Bus::new("Delay"));
+}
+
+#[test]
+fn a_send_to_a_missing_bus_fails_validation() {
+    let text = buses_json().replace("\"bus\": 1", "\"bus\": 2");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidSend { track: 0, send: 0 })
+    );
+}
+
+#[test]
+fn two_sends_to_one_bus_fail_validation() {
+    let text = buses_json().replace("\"bus\": 1", "\"bus\": 0");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidSend { track: 0, send: 1 })
+    );
+}
+
+#[test]
+fn an_out_of_range_bus_gain_fails_validation() {
+    let text = buses_json().replace("\"gain\": 0.75", "\"gain\": 1.5");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidBus { bus: 0 })
+    );
+}
+
+#[test]
+fn an_unknown_key_inside_a_send_is_rejected() {
+    let text = buses_json().replace("\"level\": 0.5", "\"lvl\": 0.5");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "lvl".to_owned()
+        }
+    );
+}
+
+#[test]
+fn too_many_buses_are_rejected() {
+    let mut session = demo_session();
+    session.buses = vec![audio_core::Bus::new("b"); audio_core::MAX_BUSES + 1];
+    assert_eq!(
+        session.validate().unwrap_err(),
+        audio_core::SessionError::InvalidBus {
+            bus: audio_core::MAX_BUSES
+        }
+    );
+}

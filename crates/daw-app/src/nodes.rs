@@ -393,12 +393,30 @@ impl std::fmt::Debug for Track {
 impl NodeProcessor for Track {
     fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
         let frames = ctx.frames;
-        let stereo = output.channels() > 1;
-        if stereo {
-            output.channel_mut(1)[..frames].fill(0.0);
+        if output.channels() > 1 {
+            // A view addresses its channels with a stride of `frames`.
+            let (left, right) = output.split_at_mut(frames);
+            self.render(
+                ctx.position,
+                &mut left[..frames],
+                Some(&mut right[..frames]),
+            );
+        } else {
+            self.render(ctx.position, &mut output.channel_mut(0)[..frames], None);
         }
-        let dst = output.channel_mut(0);
-        dst[..frames].fill(0.0);
+    }
+}
+
+impl Track {
+    /// Renders one quantum into `left` (and `right` when stereo); both slices
+    /// hold exactly the quantum. Allocation-free.
+    fn render(&mut self, position: u64, left: &mut [f32], mut right: Option<&mut [f32]>) {
+        let frames = left.len();
+        if let Some(right) = right.as_deref_mut() {
+            right.fill(0.0);
+        }
+        let dst = left;
+        dst.fill(0.0);
         if self.mute || (self.automation.gain.is_empty() && self.gain == 0.0) {
             return;
         }
@@ -407,8 +425,8 @@ impl NodeProcessor for Track {
                 continue;
             }
             let content = source.channel(0);
-            for (index, slot) in dst[..ctx.frames].iter_mut().enumerate() {
-                let position = ctx.position.saturating_add(index as u64);
+            for (index, slot) in dst.iter_mut().enumerate() {
+                let position = position.saturating_add(index as u64);
                 if !clip.covers(position) {
                     continue;
                 }
@@ -423,51 +441,195 @@ impl NodeProcessor for Track {
             }
         }
         for effect in &mut self.effects {
-            effect.process(&mut output.channel_mut(0)[..frames]);
+            effect.process(dst);
         }
         if !self.automation.is_empty() {
-            self.apply_automation(ctx.position, frames, output, stereo);
+            self.apply_automation(position, dst, right);
             return;
         }
-        if stereo {
-            let right = self.gain * self.right;
-            for index in 0..frames {
-                let mono = output.channel(0)[index];
-                output.channel_mut(1)[index] = mono * right;
+        if let Some(right) = right {
+            let gain = self.gain * self.right;
+            for (out, mono) in right.iter_mut().zip(dst.iter()) {
+                *out = mono * gain;
             }
         }
-        let left = self.gain * self.left;
-        for slot in &mut output.channel_mut(0)[..frames] {
-            *slot *= left;
+        let gain = self.gain * self.left;
+        for slot in &mut dst[..frames] {
+            *slot *= gain;
         }
     }
-}
 
-impl Track {
     /// Per-sample gain and pan from the lanes (SPEC-023); allocation-free.
-    fn apply_automation(
-        &self,
-        position: u64,
-        frames: usize,
-        output: &mut NodeView<'_>,
-        stereo: bool,
-    ) {
+    fn apply_automation(&self, position: u64, left: &mut [f32], mut right: Option<&mut [f32]>) {
         use audio_core::Automation;
-        for index in 0..frames {
+        for (index, slot) in left.iter_mut().enumerate() {
             let time = position.saturating_add(index as u64);
             let gain = Automation::value_at(&self.automation.gain, time).unwrap_or(self.gain);
-            let (left, right) = match Automation::value_at(&self.automation.pan, time) {
+            let (l, r) = match Automation::value_at(&self.automation.pan, time) {
                 Some(pan) => {
                     let (l, r) = audio_core::pan_law(pan);
                     (l * self.master, r * self.master)
                 }
                 None => (self.left, self.right),
             };
-            let mono = output.channel(0)[index];
-            if stereo {
-                output.channel_mut(1)[index] = mono * (gain * right);
+            let mono = *slot;
+            if let Some(right) = right.as_deref_mut() {
+                right[index] = mono * (gain * r);
             }
-            output.channel_mut(0)[index] = mono * (gain * left);
+            *slot = mono * (gain * l);
+        }
+    }
+}
+
+/// One bus at render time: summed sends, its effects per channel, its gain
+/// (SPEC-028).
+struct BusChannel {
+    gain: f32,
+    effects: Vec<(audio_core::EffectProcessor, audio_core::EffectProcessor)>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+/// The whole mix of a session that has buses (SPEC-028): every track, its
+/// post-fader sends, the buses' effects and the master gain, in one node.
+///
+/// Tracks are built without the master; it is applied once to the sum of
+/// the dry tracks and the bus returns. All buffers are reserved for
+/// `max_frames` at build time; `process` never allocates.
+pub struct Mixer {
+    tracks: Vec<(Track, Vec<audio_core::BusSend>)>,
+    buses: Vec<BusChannel>,
+    master: f32,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+impl Mixer {
+    /// Builds the mixer for `buses`; `tracks` pairs each track node (made
+    /// with a master gain of `1.0`) with that track's sends.
+    #[must_use]
+    pub fn new(
+        tracks: Vec<(Track, Vec<audio_core::BusSend>)>,
+        buses: &[audio_core::Bus],
+        master: f32,
+        sample_rate: u32,
+        max_frames: usize,
+    ) -> Self {
+        let buses = buses
+            .iter()
+            .map(|bus| BusChannel {
+                gain: bus.gain,
+                effects: bus
+                    .effects
+                    .iter()
+                    .map(|effect| {
+                        (
+                            audio_core::EffectProcessor::new(effect, sample_rate),
+                            audio_core::EffectProcessor::new(effect, sample_rate),
+                        )
+                    })
+                    .collect(),
+                left: vec![0.0; max_frames],
+                right: vec![0.0; max_frames],
+            })
+            .collect();
+        Self {
+            tracks,
+            buses,
+            master,
+            left: vec![0.0; max_frames],
+            right: vec![0.0; max_frames],
+        }
+    }
+
+    /// Timeline length: the end of the longest track.
+    #[must_use]
+    pub fn length_samples(&self) -> u64 {
+        self.tracks
+            .iter()
+            .map(|(track, _)| track.length_samples())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+impl std::fmt::Debug for Mixer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mixer")
+            .field("tracks", &self.tracks.len())
+            .field("buses", &self.buses.len())
+            .field("master", &self.master)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeProcessor for Mixer {
+    fn process(&mut self, ctx: &ProcessContext<'_>, output: &mut NodeView<'_>) {
+        // The graph never hands over more than its reserved quantum; if it
+        // somehow did, the excess stays silent instead of panicking.
+        let frames = ctx.frames.min(self.left.len());
+        let stereo = output.channels() > 1;
+        let (out_left, out_right) = output.split_at_mut(ctx.frames);
+        let out_left = &mut out_left[..frames];
+        let out_right = &mut out_right[..if stereo { frames } else { 0 }];
+        out_left.fill(0.0);
+        out_right.fill(0.0);
+        for bus in &mut self.buses {
+            bus.left[..frames].fill(0.0);
+            bus.right[..frames].fill(0.0);
+        }
+        let left = &mut self.left[..frames];
+        let right = &mut self.right[..frames];
+        for (track, sends) in &mut self.tracks {
+            track.render(ctx.position, left, Some(right));
+            for (dst, src) in out_left.iter_mut().zip(left.iter()) {
+                *dst += src;
+            }
+            if stereo {
+                for (dst, src) in out_right.iter_mut().zip(right.iter()) {
+                    *dst += src;
+                }
+            } else {
+                for (dst, src) in out_left.iter_mut().zip(right.iter()) {
+                    *dst += src;
+                }
+            }
+            for send in sends.iter() {
+                let Some(bus) = self.buses.get_mut(send.bus) else {
+                    continue;
+                };
+                if send.level == 0.0 {
+                    continue;
+                }
+                for (dst, src) in bus.left[..frames].iter_mut().zip(left.iter()) {
+                    *dst += src * send.level;
+                }
+                for (dst, src) in bus.right[..frames].iter_mut().zip(right.iter()) {
+                    *dst += src * send.level;
+                }
+            }
+        }
+        for bus in &mut self.buses {
+            let (bus_left, bus_right) = (&mut bus.left[..frames], &mut bus.right[..frames]);
+            for (left_fx, right_fx) in &mut bus.effects {
+                left_fx.process(bus_left);
+                right_fx.process(bus_right);
+            }
+            for (dst, src) in out_left.iter_mut().zip(bus_left.iter()) {
+                *dst += src * bus.gain;
+            }
+            if stereo {
+                for (dst, src) in out_right.iter_mut().zip(bus_right.iter()) {
+                    *dst += src * bus.gain;
+                }
+            } else {
+                for (dst, src) in out_left.iter_mut().zip(bus_right.iter()) {
+                    *dst += src * bus.gain;
+                }
+            }
+        }
+        for slot in out_left.iter_mut().chain(out_right.iter_mut()) {
+            *slot *= self.master;
         }
     }
 }
