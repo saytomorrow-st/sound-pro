@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use audio_core::session::{Clip, Session, Track};
+use audio_core::session::{Clip, Note, Session, Track};
 use audio_core::{MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Project, ProjectError, SessionError};
 
 /// Sample rate of a new project.
@@ -80,6 +80,13 @@ pub enum EditorError {
     /// The track or clip index does not exist.
     #[error("no such track or clip")]
     NoClip,
+    /// A clip must be at least one sample long (SPEC-021).
+    #[error("the clip is empty")]
+    EmptyClip,
+    /// The clip is not a MIDI clip, the note index is wrong, or the note
+    /// breaks a session rule (SPEC-021).
+    #[error("invalid note")]
+    InvalidNote,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -568,6 +575,109 @@ impl Editor {
         self.commit(session, (track, clip))
     }
 
+    /// Adds a track named "MIDI" holding one empty MIDI clip at `start`
+    /// (SPEC-021). Returns `(track, clip)`, which becomes selected.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::EmptyClip`] for `length == 0`, [`EditorError::Session`]
+    /// for the track limit or a timeline overflow; `self` is unchanged.
+    pub fn add_midi_track(
+        &mut self,
+        start: u64,
+        length: u64,
+    ) -> Result<(usize, usize), EditorError> {
+        if length == 0 {
+            return Err(EditorError::EmptyClip);
+        }
+        let mut session = self.project.session.clone();
+        let mut track = Track::new("MIDI");
+        let mut clip = Clip::midi(start, length);
+        clip.name = "MIDI".to_owned();
+        track.clips.push(clip);
+        session.tracks.push(track);
+        let at = (session.tracks.len() - 1, 0);
+        self.commit(session, at)?;
+        Ok(at)
+    }
+
+    /// Adds `note` to a MIDI clip; notes stay sorted by `(start, pitch)`.
+    /// Returns the new note's index.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip or a note the session rejects; `self` is unchanged.
+    pub fn add_note(
+        &mut self,
+        track: usize,
+        clip: usize,
+        note: Note,
+    ) -> Result<usize, EditorError> {
+        let mut session = self.project.session.clone();
+        let index = insert_note(midi_notes(&mut session, track, clip)?, note);
+        self.commit_notes(session, (track, clip))?;
+        Ok(index)
+    }
+
+    /// Removes one note from a MIDI clip.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad clip indices,
+    /// [`EditorError::InvalidNote`] for an audio clip or a bad note index;
+    /// `self` is unchanged.
+    pub fn delete_note(
+        &mut self,
+        track: usize,
+        clip: usize,
+        index: usize,
+    ) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let notes = midi_notes(&mut session, track, clip)?;
+        if index >= notes.len() {
+            return Err(EditorError::InvalidNote);
+        }
+        notes.remove(index);
+        self.commit_notes(session, (track, clip))
+    }
+
+    /// Moves one note to `start` and `pitch`, keeping its length and
+    /// strength. Returns its new index.
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::delete_note`], plus [`EditorError::InvalidNote`] when the
+    /// moved note leaves the clip or the key range; `self` is unchanged.
+    pub fn move_note(
+        &mut self,
+        track: usize,
+        clip: usize,
+        index: usize,
+        start: u64,
+        pitch: u8,
+    ) -> Result<usize, EditorError> {
+        let mut session = self.project.session.clone();
+        let notes = midi_notes(&mut session, track, clip)?;
+        if index >= notes.len() {
+            return Err(EditorError::InvalidNote);
+        }
+        let mut note = notes.remove(index);
+        note.start = start;
+        note.pitch = pitch;
+        let index = insert_note(notes, note);
+        self.commit_notes(session, (track, clip))?;
+        Ok(index)
+    }
+
+    fn commit_notes(&mut self, session: Session, at: (usize, usize)) -> Result<(), EditorError> {
+        match session.validate() {
+            Err(SessionError::InvalidNote { .. }) => Err(EditorError::InvalidNote),
+            Err(other) => Err(other.into()),
+            Ok(()) => self.commit(session, at),
+        }
+    }
+
     fn clip_ref(&self, track: usize, clip: usize) -> Result<&Clip, EditorError> {
         self.project
             .session
@@ -735,6 +845,27 @@ impl Editor {
     }
 }
 
+fn midi_notes(
+    session: &mut Session,
+    track: usize,
+    clip: usize,
+) -> Result<&mut Vec<Note>, EditorError> {
+    session
+        .tracks
+        .get_mut(track)
+        .and_then(|t| t.clips.get_mut(clip))
+        .ok_or(EditorError::NoClip)?
+        .notes
+        .as_mut()
+        .ok_or(EditorError::InvalidNote)
+}
+
+fn insert_note(notes: &mut Vec<Note>, note: Note) -> usize {
+    let index = notes.partition_point(|n| (n.start, n.pitch) <= (note.start, note.pitch));
+    notes.insert(index, note);
+    index
+}
+
 /// Horizontal offset of `samples` at `zoom` pixels per second.
 #[must_use]
 pub fn samples_to_x(samples: u64, rate: u32, zoom: f32) -> f32 {
@@ -772,6 +903,20 @@ pub fn snap_to_beat(samples: u64, rate: u32, tempo_bpm: f64) -> u64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let snapped = (beats * beat).round() as u64;
     snapped
+}
+
+/// Length of a 1/16 note (a quarter beat) in samples, at least 1; the
+/// piano roll grid (SPEC-021). A bad tempo falls back to [`DEFAULT_TEMPO`].
+#[must_use]
+pub fn sixteenth_samples(rate: u32, tempo_bpm: f64) -> u64 {
+    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
+        tempo_bpm
+    } else {
+        DEFAULT_TEMPO
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let step = (f64::from(rate) * 15.0 / tempo).round() as u64;
+    step.max(1)
 }
 
 /// Clock time `m:ss.mmm` of a sample position.

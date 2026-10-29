@@ -293,3 +293,45 @@ fn unreadable_and_invalid_projects_are_reported() {
         "{err:?}"
     );
 }
+
+// ---- SPEC-021: MIDI clips need no file ----
+
+fn midi_project(dir: &Scratch) -> PathBuf {
+    let mut clip = Clip::midi(4_800, 24_000);
+    clip.notes = Some(vec![audio_core::Note {
+        pitch: 69,
+        start: 0,
+        length: 9_600,
+        velocity: 100,
+    }]);
+    let mut track = SessionTrack::new("keys");
+    track.clips.push(clip);
+    let mut session = Session::new("midi", RATE, 120.0);
+    session.tracks.push(track);
+    let path = dir.join("midi.json");
+    save_project(&path, session);
+    path
+}
+
+#[test]
+fn a_midi_clip_renders_its_notes_at_its_timeline_position() {
+    let dir = Scratch::new("midi");
+    let job = load_session_project(&midi_project(&dir), dir.join("o.wav")).unwrap();
+    let out = render_to(job);
+    let left = out.channel(0);
+    assert_eq!(left.len(), 4_800 + 24_000);
+    assert!(left[..4_800].iter().all(|&s| s == 0.0));
+    let peak = left[4_800..14_400]
+        .iter()
+        .fold(0.0_f32, |m, s| m.max(s.abs()));
+    assert!(peak > 0.01, "peak {peak}");
+}
+
+#[test]
+fn a_midi_clip_renders_identically_twice() {
+    let dir = Scratch::new("midi2");
+    let project = midi_project(&dir);
+    let first = render_to(load_session_project(&project, dir.join("a.wav")).unwrap());
+    let second = render_to(load_session_project(&project, dir.join("b.wav")).unwrap());
+    assert_bits_eq(&first, &second);
+}

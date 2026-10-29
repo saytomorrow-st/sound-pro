@@ -9,8 +9,9 @@
 //! makes the output independent of the quantum size: rendering 4800 frames in
 //! chunks of 256 or of 512 gives bit-for-bit the same samples.
 
-use crate::midi::MidiMessage;
-use crate::schedule::{Schedule, ScheduleCursor};
+use crate::midi::{MidiEvent, MidiMessage};
+use crate::schedule::{Schedule, ScheduleCursor, ScheduleSpec, ScheduledEvent};
+use crate::session::Note;
 
 /// Voices the synth can play at once.
 pub const MAX_VOICES: usize = 16;
@@ -439,11 +440,74 @@ impl Synth {
     }
 }
 
+/// Renders a MIDI clip's `notes` into `frames` mono samples (SPEC-021).
+///
+/// Control thread only: it allocates the schedule and the output. Uses the
+/// default [`Envelope`]; a release that would ring past `frames` is cut off.
+/// At the same sample a note-off comes before a note-on, so a repeated pitch
+/// restarts cleanly.
+///
+/// # Errors
+///
+/// [`SynthError::InvalidSampleRate`] for a zero `sample_rate`.
+pub fn render_notes(notes: &[Note], sample_rate: u32, frames: u64) -> Result<Vec<f32>, SynthError> {
+    let mut synth = Synth::new(sample_rate, Envelope::default())?;
+    let mut events = Vec::with_capacity(notes.len() * 2);
+    for note in notes {
+        let event = |sample, order, message| ScheduledEvent {
+            sample,
+            source: MidiEvent {
+                track: 0,
+                tick: 0,
+                order_in_track: order,
+                message,
+            },
+        };
+        events.push(event(
+            note.start,
+            1,
+            MidiMessage::NoteOn {
+                channel: 0,
+                note: note.pitch,
+                velocity: note.velocity.max(1),
+            },
+        ));
+        events.push(event(
+            note.end().unwrap_or(u64::MAX),
+            0,
+            MidiMessage::NoteOff {
+                channel: 0,
+                note: note.pitch,
+                velocity: 0,
+            },
+        ));
+    }
+    events.sort_by_key(|event| {
+        let pitch = match event.source.message {
+            MidiMessage::NoteOn { note, .. } | MidiMessage::NoteOff { note, .. } => note,
+            MidiMessage::Tempo { .. } => 0,
+        };
+        (event.sample, event.source.order_in_track, pitch)
+    });
+    let schedule = Schedule::new(ScheduleSpec {
+        events,
+        length_samples: frames,
+    });
+    let mut cursor = schedule.cursor();
+    let total = usize::try_from(frames).unwrap_or(usize::MAX);
+    let mut out = vec![0.0_f32; total];
+    let mut position = 0_u64;
+    for chunk in out.chunks_mut(4096) {
+        let len = chunk.len();
+        synth.render(&schedule, &mut cursor, position, len, chunk);
+        position += len as u64;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::midi::MidiEvent;
-    use crate::schedule::{ScheduleSpec, ScheduledEvent};
 
     const RATE: u32 = 48_000;
 

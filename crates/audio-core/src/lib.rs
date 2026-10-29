@@ -44,10 +44,10 @@ pub use render::{RenderStats, Renderer};
 pub use resample::{ResampleError, resample};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
-    Clip, MAX_CLIPS_PER_TRACK, MAX_SOURCE_BYTES, MAX_TRACKS, Session, SessionError,
-    Track as SessionTrack,
+    Clip, MAX_CLIPS_PER_TRACK, MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES, MAX_TRACKS, Note, Session,
+    SessionError, Track as SessionTrack,
 };
-pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz};
+pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz, render_notes};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
 pub use wav::{Recorder, WavError, WavSpec, read_wav_mono, write_wav_mono};
 

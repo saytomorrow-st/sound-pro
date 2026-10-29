@@ -14,7 +14,9 @@ use std::fmt::Write as _;
 
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
-use crate::session::{Clip, MAX_CLIPS_PER_TRACK, MAX_TRACKS, Session, SessionError, Track};
+use crate::session::{
+    Clip, MAX_CLIPS_PER_TRACK, MAX_NOTES_PER_CLIP, MAX_TRACKS, Note, Session, SessionError, Track,
+};
 
 /// Longest accepted `name`, in bytes.
 pub const MAX_NAME_BYTES: usize = 128;
@@ -406,6 +408,9 @@ fn write_session(out: &mut String, session: &Session) {
                 out.push_str(",\n            \"source\": ");
                 write_string(out, source);
             }
+            if let Some(notes) = &clip.notes {
+                write_notes(out, notes);
+            }
             out.push_str("\n          }");
         }
         if track.clips.is_empty() {
@@ -558,8 +563,10 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
     let mut gain = None;
     let mut name = None;
     let mut source = None;
+    let mut notes = None;
     for (key, value) in entries {
         match key.as_str() {
+            "notes" => notes = Some(notes_from_value(value)?),
             "start" => start = Some(require_u64(value)?),
             "length" => length = Some(require_u64(value)?),
             "offset" => offset = Some(require_u64(value)?),
@@ -594,7 +601,79 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
             field: "session.tracks[].clips[].name",
         })?,
         source,
+        notes,
     })
+}
+
+/// Appends a MIDI clip's `"notes"` array, one note per line (SPEC-021).
+fn write_notes(out: &mut String, notes: &[Note]) {
+    out.push_str(",\n            \"notes\": [");
+    for (index, note) in notes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n              {\"pitch\": ");
+        out.push_str(&note.pitch.to_string());
+        out.push_str(", \"start\": ");
+        out.push_str(&note.start.to_string());
+        out.push_str(", \"length\": ");
+        out.push_str(&note.length.to_string());
+        out.push_str(", \"velocity\": ");
+        out.push_str(&note.velocity.to_string());
+        out.push('}');
+    }
+    if notes.is_empty() {
+        out.push(']');
+    } else {
+        out.push_str("\n            ]");
+    }
+}
+
+fn notes_from_value(value: &Value) -> Result<Vec<Note>, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    // Cap before decoding, like tracks and clips.
+    if items.len() > MAX_NOTES_PER_CLIP {
+        return Err(ProjectError::Session(SessionError::InvalidNote {
+            track: 0,
+            clip: 0,
+            note: MAX_NOTES_PER_CLIP,
+        }));
+    }
+    items.iter().map(note_from_value).collect()
+}
+
+fn note_from_value(value: &Value) -> Result<Note, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut pitch = None;
+    let mut start = None;
+    let mut length = None;
+    let mut velocity = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "pitch" => pitch = Some(require_u8(value)?),
+            "start" => start = Some(require_u64(value)?),
+            "length" => length = Some(require_u64(value)?),
+            "velocity" => velocity = Some(require_u8(value)?),
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        }
+    }
+    let field = |field| ProjectError::MissingField { field };
+    Ok(Note {
+        pitch: pitch.ok_or(field("session.tracks[].clips[].notes[].pitch"))?,
+        start: start.ok_or(field("session.tracks[].clips[].notes[].start"))?,
+        length: length.ok_or(field("session.tracks[].clips[].notes[].length"))?,
+        velocity: velocity.ok_or(field("session.tracks[].clips[].notes[].velocity"))?,
+    })
+}
+
+fn require_u8(value: &Value) -> Result<u8, ProjectError> {
+    u8::try_from(require_u32(value)?).map_err(|_| ProjectError::Malformed { at: 0 })
 }
 
 /// The subset of JSON values the codec can hold.

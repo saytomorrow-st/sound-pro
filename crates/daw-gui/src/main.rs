@@ -1,12 +1,13 @@
-//! Sound Pro window (SPEC-015 to SPEC-020). All editing goes through
+//! Sound Pro window (SPEC-015 to SPEC-021). All editing goes through
 //! [`daw_gui::Editor`].
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
+use audio_core::Note;
 use daw_app::playback::PlaybackControl;
-use daw_gui::{Editor, bars, clock, samples_to_x, snap_to_beat, x_to_samples};
+use daw_gui::{Editor, bars, clock, samples_to_x, sixteenth_samples, snap_to_beat, x_to_samples};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
     ViewportCommand,
@@ -18,6 +19,25 @@ const MIN_ZOOM: f32 = 5.0;
 const MAX_ZOOM: f32 = 2_000.0;
 /// Width of the grab zone on each clip edge used for trimming.
 const EDGE_PX: f32 = 6.0;
+/// Piano roll: height of one key row and width of one 1/16 step.
+const KEY_HEIGHT: f32 = 12.0;
+const STEP_PX: f32 = 22.0;
+const KEYS_PX: f32 = 44.0;
+const PIANO_HEIGHT: f32 = 280.0;
+/// Strength of notes drawn with the mouse.
+const NEW_VELOCITY: u8 = 100;
+
+/// A note being dragged in the piano roll.
+#[derive(Clone, Copy)]
+struct NoteDrag {
+    index: usize,
+    /// Pointer position minus note start, in samples, at the press.
+    grab: i64,
+}
+
+const fn is_black_key(pitch: u8) -> bool {
+    matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragMode {
@@ -94,6 +114,11 @@ struct App {
     /// Snap clip edits to beats (Shift turns it off while dragging).
     snap: bool,
     drag: Option<Drag>,
+    /// MIDI clip open in the piano roll.
+    piano: Option<(usize, usize)>,
+    note_drag: Option<NoteDrag>,
+    /// Scroll the piano roll to middle C on the next frame.
+    piano_scroll: bool,
 }
 
 impl App {
@@ -110,6 +135,9 @@ impl App {
             confirm_quit: false,
             snap: true,
             drag: None,
+            piano: None,
+            note_drag: None,
+            piano_scroll: false,
         };
         if let Some(path) = start {
             app.open(path);
@@ -470,6 +498,11 @@ impl App {
                     ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                 }
             });
+            ui.menu_button("Дорожка", |ui| {
+                if ui.button("Новая MIDI-дорожка").clicked() {
+                    self.add_midi_track();
+                }
+            });
             ui.menu_button("Правка", |ui| {
                 let undo = egui::Button::new("Отменить").shortcut_text("Ctrl+Z");
                 if ui.add_enabled(self.editor.can_undo(), undo).clicked() {
@@ -596,6 +629,7 @@ impl App {
 
         let px_per_sample = self.zoom / rate as f32;
         let mut clicked = None;
+        let mut open_piano = None;
         let mut rects = Vec::new();
         let pointer = response.interact_pointer_pos();
         for (t, track) in self.editor.session().tracks.iter().enumerate() {
@@ -617,10 +651,35 @@ impl App {
                 let selected = self.editor.selected_clip == Some((t, c));
                 let fill = if track.mute {
                     Color32::from_rgb(70, 70, 70)
+                } else if clip.is_midi() {
+                    Color32::from_rgb(60, 120, 70)
                 } else {
                     Color32::from_rgb(44, 96, 140)
                 };
                 painter.rect_filled(rect, 4.0, fill);
+                if let Some(notes) = &clip.notes {
+                    let end = clip.offset_samples + clip.length_samples;
+                    for n in notes {
+                        if n.start + n.length <= clip.offset_samples || n.start >= end {
+                            continue;
+                        }
+                        let from = n.start.max(clip.offset_samples) - clip.offset_samples;
+                        let to = (n.start + n.length).min(end) - clip.offset_samples;
+                        let y =
+                            rect.max.y - 4.0 - f32::from(n.pitch) / 127.0 * (rect.height() - 8.0);
+                        painter.line_segment(
+                            [
+                                Pos2::new(rect.min.x + from as f32 * px_per_sample, y),
+                                Pos2::new(
+                                    (rect.min.x + to as f32 * px_per_sample)
+                                        .max(rect.min.x + from as f32 * px_per_sample + 2.0),
+                                    y,
+                                ),
+                            ],
+                            Stroke::new(2.0_f32, Color32::from_rgb(200, 240, 200)),
+                        );
+                    }
+                }
                 if let Some(peaks) = self.editor.peaks(clip) {
                     let mid = rect.center().y;
                     let half = rect.height() * 0.4;
@@ -658,6 +717,12 @@ impl App {
                 if response.clicked() && pointer.is_some_and(|p| rect.contains(p)) {
                     clicked = Some((t, c));
                 }
+                if response.double_clicked()
+                    && clip.is_midi()
+                    && pointer.is_some_and(|p| rect.contains(p))
+                {
+                    open_piano = Some((t, c));
+                }
             }
         }
 
@@ -681,6 +746,10 @@ impl App {
                 self.editor.selected_track =
                     (row >= 0.0 && (row as usize) < tracks).then_some(row as usize);
             }
+        }
+
+        if let Some(at) = open_piano {
+            self.open_piano(at);
         }
 
         self.drag_clips(ui, &response, area, &rects);
@@ -781,8 +850,242 @@ impl App {
         self.drag = Some(drag);
     }
 
+    fn add_midi_track(&mut self) {
+        let session = self.editor.session();
+        let length = sixteenth_samples(session.sample_rate, session.tempo_bpm) * 64;
+        let result = self.editor.add_midi_track(self.playhead, length);
+        if let Some(at) = self.report(result, "MIDI-дорожка добавлена") {
+            self.open_piano(at);
+        }
+    }
+
+    fn open_piano(&mut self, at: (usize, usize)) {
+        self.piano = Some(at);
+        self.note_drag = None;
+        self.piano_scroll = true;
+        self.editor.selected_clip = Some(at);
+        self.editor.selected_track = Some(at.0);
+    }
+
+    /// The open piano roll clip, closed if it is gone or no longer MIDI.
+    fn piano_clip(&mut self) -> Option<(usize, usize)> {
+        let (t, c) = self.piano?;
+        let ok = self
+            .editor
+            .session()
+            .tracks
+            .get(t)
+            .and_then(|track| track.clips.get(c))
+            .is_some_and(audio_core::session::Clip::is_midi);
+        if !ok {
+            self.piano = None;
+            self.note_drag = None;
+        }
+        self.piano
+    }
+
+    fn piano_roll(&mut self, ui: &mut egui::Ui) {
+        let Some((t, c)) = self.piano_clip() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            let name = &self.editor.session().tracks[t].name;
+            ui.label(egui::RichText::new(format!("Piano roll — {name}")).strong());
+            ui.label("клик — нота, правый клик — удалить, тяните — сдвиг");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("Закрыть").clicked() {
+                    self.piano = None;
+                    self.note_drag = None;
+                }
+            });
+        });
+        if self.piano.is_none() {
+            return;
+        }
+        let mut scroll = egui::ScrollArea::both().id_salt("piano");
+        if std::mem::take(&mut self.piano_scroll) {
+            scroll = scroll.vertical_scroll_offset((127.0 - 72.0) * KEY_HEIGHT);
+        }
+        scroll.show(ui, |ui| self.piano_grid(ui, t, c));
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
+    fn piano_grid(&mut self, ui: &mut egui::Ui, t: usize, c: usize) {
+        let session = self.editor.session();
+        let step = sixteenth_samples(session.sample_rate, session.tempo_bpm);
+        let clip = &session.tracks[t].clips[c];
+        let content = clip.source_length;
+        let notes = clip.notes.clone().unwrap_or_default();
+        let steps = content.div_ceil(step);
+        let px_per_sample = STEP_PX / step as f32;
+        let width = KEYS_PX + content as f32 * px_per_sample + 2.0;
+        let (area, response) = ui.allocate_exact_size(
+            Vec2::new(width.max(ui.available_width()), KEY_HEIGHT * 128.0),
+            Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(area);
+        let grid_x = area.min.x + KEYS_PX;
+        let row_y = |pitch: u8| area.min.y + f32::from(127 - pitch) * KEY_HEIGHT;
+        painter.rect_filled(area, 0.0, Color32::from_gray(26));
+        for pitch in 0..=127_u8 {
+            if is_black_key(pitch) {
+                let y = row_y(pitch);
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(grid_x, y),
+                        Vec2::new(width - KEYS_PX, KEY_HEIGHT),
+                    ),
+                    0.0,
+                    Color32::from_gray(21),
+                );
+            }
+        }
+        for s in 0..=steps.min(100_000) {
+            let x = grid_x + s as f32 * STEP_PX;
+            let gray = if s % 16 == 0 {
+                80
+            } else if s % 4 == 0 {
+                52
+            } else {
+                36
+            };
+            painter.line_segment(
+                [Pos2::new(x, area.min.y), Pos2::new(x, area.max.y)],
+                Stroke::new(1.0_f32, Color32::from_gray(gray)),
+            );
+        }
+        let mut note_rects = Vec::with_capacity(notes.len());
+        for (i, n) in notes.iter().enumerate() {
+            let rect = Rect::from_min_size(
+                Pos2::new(
+                    grid_x + n.start as f32 * px_per_sample,
+                    row_y(n.pitch) + 1.0,
+                ),
+                Vec2::new((n.length as f32 * px_per_sample).max(3.0), KEY_HEIGHT - 2.0),
+            );
+            let dragged = self.note_drag.is_some_and(|d| d.index == i);
+            let fill = if dragged {
+                Color32::from_rgb(255, 200, 60)
+            } else {
+                Color32::from_rgb(110, 200, 120)
+            };
+            painter.rect_filled(rect, 2.0, fill);
+            painter.rect_stroke(
+                rect,
+                2.0,
+                Stroke::new(1.0_f32, Color32::from_gray(10)),
+                StrokeKind::Inside,
+            );
+            note_rects.push(rect);
+        }
+        // Keys stay visible while the grid scrolls sideways.
+        let keys_x = area.min.x.max(ui.clip_rect().min.x);
+        let keys = ui.painter();
+        for pitch in 0..=127_u8 {
+            let rect = Rect::from_min_size(
+                Pos2::new(keys_x, row_y(pitch)),
+                Vec2::new(KEYS_PX, KEY_HEIGHT),
+            );
+            let fill = if is_black_key(pitch) {
+                Color32::from_gray(30)
+            } else {
+                Color32::from_gray(210)
+            };
+            keys.rect_filled(rect, 0.0, fill);
+            keys.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(0.5_f32, Color32::from_gray(90)),
+                StrokeKind::Inside,
+            );
+            if pitch % 12 == 0 {
+                keys.text(
+                    rect.right_center() - Vec2::new(3.0, 0.0),
+                    Align2::RIGHT_CENTER,
+                    format!("C{}", i32::from(pitch / 12) - 1),
+                    FontId::monospace(9.0),
+                    Color32::BLACK,
+                );
+            }
+        }
+
+        let hit = |p: Pos2| note_rects.iter().rposition(|r| r.contains(p));
+        let at_pos = |p: Pos2| {
+            let samples = ((p.x - grid_x).max(0.0) / px_per_sample) as u64;
+            let row = ((p.y - area.min.y) / KEY_HEIGHT).floor().clamp(0.0, 127.0) as u8;
+            (samples, 127 - row)
+        };
+        let pointer = response.interact_pointer_pos();
+
+        if response.secondary_clicked() {
+            if let Some(index) = pointer.and_then(hit) {
+                let result = self.editor.delete_note(t, c, index);
+                self.report(result, "Нота удалена");
+            }
+            return;
+        }
+        if response.clicked() {
+            if let Some(p) = pointer.filter(|p| p.x >= grid_x && hit(*p).is_none()) {
+                let (samples, pitch) = at_pos(p);
+                let start = samples / step * step;
+                let length = step.min(content.saturating_sub(start));
+                if length > 0 {
+                    let note = Note {
+                        pitch,
+                        start,
+                        length,
+                        velocity: NEW_VELOCITY,
+                    };
+                    let result = self.editor.add_note(t, c, note);
+                    self.report(result, "Нота добавлена");
+                }
+            }
+            return;
+        }
+        if response.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            self.note_drag = origin.and_then(|p| {
+                let index = hit(p)?;
+                let (samples, _) = at_pos(p);
+                Some(NoteDrag {
+                    index,
+                    grab: samples as i64 - notes[index].start as i64,
+                })
+            });
+        }
+        let Some(mut drag) = self.note_drag else {
+            return;
+        };
+        if response.drag_stopped() {
+            self.note_drag = None;
+            self.status = "Нота сдвинута".into();
+            return;
+        }
+        let (Some(p), Some(note)) = (pointer, notes.get(drag.index)) else {
+            return;
+        };
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        let (samples, pitch) = at_pos(p);
+        let raw = (samples as i64 - drag.grab).max(0) as u64;
+        let latest = content.saturating_sub(note.length);
+        let start = ((raw + step / 2) / step * step).min(latest);
+        if start != note.start || pitch != note.pitch {
+            match self.editor.move_note(t, c, drag.index, start, pitch) {
+                Ok(index) => drag.index = index,
+                Err(e) => self.status = format!("Ошибка: {e}"),
+            }
+        }
+        self.note_drag = Some(drag);
+    }
+
     fn undo(&mut self) {
         self.drag = None;
+        self.note_drag = None;
         self.status = if self.editor.undo() {
             "Отменено".into()
         } else {
@@ -792,6 +1095,7 @@ impl App {
 
     fn redo(&mut self) {
         self.drag = None;
+        self.note_drag = None;
         self.status = if self.editor.redo() {
             "Повторено".into()
         } else {
@@ -893,6 +1197,13 @@ impl eframe::App for App {
                     ui.label(&self.status);
                 });
             });
+
+        if self.piano_clip().is_some() {
+            egui::TopBottomPanel::bottom("piano")
+                .resizable(true)
+                .default_height(PIANO_HEIGHT)
+                .show(ctx, |ui| self.piano_roll(ui));
+        }
 
         egui::SidePanel::left("tracks")
             .resizable(true)
