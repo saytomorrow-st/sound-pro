@@ -13,6 +13,9 @@ use crate::transport::TimeSignature;
 /// Most tracks a session may hold.
 pub const MAX_TRACKS: usize = 32;
 
+/// Size of the track colour palette; [`Track::color`] indexes it (SPEC-029).
+pub const TRACK_COLORS: u8 = 8;
+
 /// Whether `signature` is one the editor supports: `1..=16` beats of a
 /// half, quarter, eighth or sixteenth note (SPEC-026).
 #[must_use]
@@ -158,6 +161,11 @@ pub enum SessionError {
         /// Index of the offending send; [`MAX_BUSES`] when there are too many.
         send: usize,
     },
+    /// A track colour is outside the palette (SPEC-029).
+    InvalidColor {
+        /// Index of the offending track.
+        track: usize,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -214,6 +222,7 @@ impl fmt::Display for SessionError {
             Self::InvalidSend { track, send } => {
                 write!(f, "track {track}: send {send} is invalid")
             }
+            Self::InvalidColor { track } => write!(f, "track {track}: colour is invalid"),
         }
     }
 }
@@ -462,6 +471,9 @@ pub struct Track {
     pub automation: Automation,
     /// Post-fader sends to the session's buses (SPEC-028).
     pub sends: Vec<BusSend>,
+    /// Palette index below [`TRACK_COLORS`]; `None` is the default colour.
+    /// Display only (SPEC-029).
+    pub color: Option<u8>,
 }
 
 /// A post-fader copy of a track's sound sent to one bus (SPEC-028).
@@ -511,6 +523,7 @@ impl Track {
             effects: Vec::new(),
             automation: Automation::default(),
             sends: Vec::new(),
+            color: None,
         }
     }
 
@@ -640,6 +653,9 @@ impl Session {
             }
             if !valid_gain(track.gain) {
                 return Err(SessionError::InvalidGain { track: track_index });
+            }
+            if track.color.is_some_and(|color| color >= TRACK_COLORS) {
+                return Err(SessionError::InvalidColor { track: track_index });
             }
             if !(track.pan.is_finite() && (-1.0..=1.0).contains(&track.pan)) {
                 return Err(SessionError::InvalidPan { track: track_index });

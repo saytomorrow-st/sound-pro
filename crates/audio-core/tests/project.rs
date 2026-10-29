@@ -1320,3 +1320,70 @@ fn too_many_buses_are_rejected() {
         }
     );
 }
+
+// --- SPEC-029: track colour ------------------------------------------------
+
+fn coloured_session() -> audio_core::Session {
+    let mut session = demo_session();
+    session.tracks[0].color = Some(3);
+    session
+}
+
+fn coloured_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        coloured_session(),
+    )
+    .to_json()
+}
+
+#[test]
+fn a_track_colour_survives_the_round_trip() {
+    let text = coloured_json();
+    assert!(text.contains("\"color\": 3"), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &coloured_session());
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn a_track_without_colour_writes_no_colour_key() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert!(!text.contains("color"), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session().tracks[0].color, None);
+}
+
+#[test]
+fn a_colour_outside_the_palette_fails_validation() {
+    let text = coloured_json().replace("\"color\": 3", "\"color\": 8");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidColor { track: 0 })
+    );
+}
+
+#[test]
+fn a_fractional_or_huge_colour_is_malformed() {
+    for bad in ["\"color\": 1.5", "\"color\": 300", "\"color\": \"red\""] {
+        let text = coloured_json().replace("\"color\": 3", bad);
+        assert!(
+            matches!(
+                Project::from_json(&text).unwrap_err(),
+                ProjectError::Malformed { .. }
+            ),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn the_palette_has_eight_colours() {
+    assert_eq!(audio_core::TRACK_COLORS, 8);
+    let mut session = demo_session();
+    session.tracks[0].color = Some(audio_core::TRACK_COLORS - 1);
+    assert!(session.validate().is_ok());
+}

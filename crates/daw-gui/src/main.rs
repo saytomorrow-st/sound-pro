@@ -7,7 +7,9 @@
 
 use std::path::PathBuf;
 
-use audio_core::{AutoPoint, Effect, EffectKind, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note};
+use audio_core::{
+    AutoPoint, Effect, EffectKind, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note, TRACK_COLORS,
+};
 use daw_app::playback::PlaybackControl;
 use daw_gui::{
     Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
@@ -104,6 +106,32 @@ struct Recorder {
     start: u64,
 }
 
+/// Track header command chosen in this frame (SPEC-029).
+#[derive(Clone, Copy)]
+enum TrackAction {
+    Rename(usize),
+    Color(usize, Option<u8>),
+    Move(usize, usize),
+    Duplicate(usize),
+}
+
+/// Display colour of a track; `None` is the neutral default (SPEC-029).
+fn track_color(color: Option<u8>) -> Color32 {
+    const PALETTE: [Color32; TRACK_COLORS as usize] = [
+        Color32::from_rgb(200, 70, 70),
+        Color32::from_rgb(220, 130, 50),
+        Color32::from_rgb(200, 180, 50),
+        Color32::from_rgb(80, 160, 80),
+        Color32::from_rgb(50, 160, 160),
+        Color32::from_rgb(60, 110, 200),
+        Color32::from_rgb(140, 90, 200),
+        Color32::from_rgb(200, 90, 160),
+    ];
+    color
+        .and_then(|c| PALETTE.get(usize::from(c)).copied())
+        .unwrap_or(Color32::from_gray(90))
+}
+
 struct App {
     editor: Editor,
     #[cfg(feature = "audio")]
@@ -128,6 +156,8 @@ struct App {
     fx: Option<FxTarget>,
     /// The buses window is open (SPEC-028).
     buses_open: bool,
+    /// Track whose name is being edited and the text typed so far (SPEC-029).
+    rename: Option<(usize, String)>,
     /// Track whose automation lane is shown (SPEC-023).
     auto: Option<usize>,
     auto_lane: Lane,
@@ -156,6 +186,7 @@ impl App {
             piano_scroll: false,
             fx: None,
             buses_open: false,
+            rename: None,
             auto: None,
             auto_lane: Lane::Gain,
             auto_drag: None,
@@ -677,10 +708,12 @@ impl App {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn track_headers(&mut self, ui: &mut egui::Ui) {
         ui.add_space(RULER_HEIGHT);
         let count = self.editor.session().tracks.len();
         let mut delete = None;
+        let mut action = None;
         for index in 0..count {
             let selected = self.editor.selected_track == Some(index);
             let frame = egui::Frame::new()
@@ -699,7 +732,29 @@ impl App {
                     let (mut gain, mut pan) = (track.gain, track.pan);
                     let name = track.name.clone();
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(name).strong());
+                        ui.add_space(6.0);
+                        if let Some((_, text)) =
+                            self.rename.as_mut().filter(|(track, _)| *track == index)
+                        {
+                            let edit =
+                                ui.add(egui::TextEdit::singleline(text).desired_width(110.0));
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.rename = None;
+                            } else if edit.lost_focus() {
+                                action = Some(TrackAction::Rename(index));
+                            } else {
+                                edit.request_focus();
+                            }
+                        } else if ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(&name).strong())
+                                    .sense(Sense::click()),
+                            )
+                            .on_hover_text("Двойной щелчок — переименовать")
+                            .double_clicked()
+                        {
+                            self.rename = Some((index, name.clone()));
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .small_button("✕")
@@ -780,11 +835,62 @@ impl App {
                     }
                 })
                 .response;
-            if response.interact(Sense::click()).clicked() {
+            ui.painter().rect_filled(
+                Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height())),
+                0.0,
+                track_color(self.editor.session().tracks[index].color),
+            );
+            let click = response.interact(Sense::click());
+            if click.clicked() {
                 self.editor.selected_track = Some(index);
             }
+            click.context_menu(|ui| {
+                if ui.button("Переименовать").clicked() {
+                    self.rename = Some((index, self.editor.session().tracks[index].name.clone()));
+                    ui.close();
+                }
+                ui.menu_button("Цвет", |ui| {
+                    for color in 0..TRACK_COLORS {
+                        let swatch = egui::RichText::new("■■■■").color(track_color(Some(color)));
+                        if ui.button(swatch).clicked() {
+                            action = Some(TrackAction::Color(index, Some(color)));
+                            ui.close();
+                        }
+                    }
+                    if ui.button("Без цвета").clicked() {
+                        action = Some(TrackAction::Color(index, None));
+                        ui.close();
+                    }
+                });
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("Выше"))
+                    .clicked()
+                {
+                    action = Some(TrackAction::Move(index, index - 1));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(index + 1 < count, egui::Button::new("Ниже"))
+                    .clicked()
+                {
+                    action = Some(TrackAction::Move(index, index + 1));
+                    ui.close();
+                }
+                if ui.button("Дублировать").clicked() {
+                    action = Some(TrackAction::Duplicate(index));
+                    ui.close();
+                }
+                if ui.button("Удалить").clicked() {
+                    delete = Some(index);
+                    ui.close();
+                }
+            });
+        }
+        if let Some(action) = action {
+            self.track_action(action);
         }
         if let Some(index) = delete {
+            self.rename = None;
             self.fx = None;
             self.auto = None;
             self.auto_drag = None;
@@ -794,6 +900,44 @@ impl App {
         if count == 0 {
             ui.label("Нет дорожек");
         }
+    }
+
+    fn track_action(&mut self, action: TrackAction) {
+        let result = match action {
+            TrackAction::Rename(track) => {
+                let Some((_, text)) = self.rename.take() else {
+                    return;
+                };
+                self.editor
+                    .rename_track(track, &text)
+                    .map(|()| "Дорожка переименована")
+            }
+            TrackAction::Color(track, color) => self
+                .editor
+                .set_track_color(track, color)
+                .map(|()| "Цвет изменён"),
+            TrackAction::Move(from, to) => {
+                self.fx = None;
+                self.auto = None;
+                self.auto_drag = None;
+                self.editor
+                    .move_track(from, to)
+                    .map(|()| "Дорожка перемещена")
+            }
+            TrackAction::Duplicate(track) => {
+                self.fx = None;
+                self.auto = None;
+                self.auto_drag = None;
+                self.editor
+                    .duplicate_track(track)
+                    .map(|_| "Дорожка продублирована")
+            }
+        };
+        self.status = match result {
+            Ok(text) => text.into(),
+            Err(EditorError::EmptyName) => "Имя не может быть пустым".into(),
+            Err(err) => format!("Не получилось: {err}"),
+        };
     }
 
     #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
@@ -896,6 +1040,8 @@ impl App {
                 let selected = self.editor.selected_clip == Some((t, c));
                 let fill = if track.mute {
                     Color32::from_rgb(70, 70, 70)
+                } else if track.color.is_some() {
+                    track_color(track.color)
                 } else if clip.is_midi() {
                     Color32::from_rgb(60, 120, 70)
                 } else {

@@ -439,6 +439,10 @@ fn write_session(out: &mut String, session: &Session) {
         if !track.sends.is_empty() {
             write_sends(out, &track.sends);
         }
+        if let Some(color) = track.color {
+            out.push_str(",\n        \"color\": ");
+            out.push_str(&color.to_string());
+        }
         out.push_str("\n      }");
     }
     if session.tracks.is_empty() {
@@ -659,8 +663,10 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut effects = None;
     let mut automation = None;
     let mut sends = None;
+    let mut color = None;
     for (key, value) in entries {
         match key.as_str() {
+            "color" => color = Some(require_u8(value)?),
             "sends" => sends = Some(sends_from_value(value)?),
             "effects" => effects = Some(effects_from_value(value)?),
             "automation" => automation = Some(automation_from_value(value)?),
@@ -713,6 +719,8 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
         automation: automation.unwrap_or_default(),
         // Optional since SPEC-028.
         sends: sends.unwrap_or_default(),
+        // Optional since SPEC-029.
+        color,
     })
 }
 
