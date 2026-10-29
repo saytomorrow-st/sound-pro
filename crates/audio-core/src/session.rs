@@ -6,6 +6,7 @@
 
 use std::fmt;
 
+use crate::fx::{Effect, MAX_EFFECTS_PER_TRACK};
 use crate::project::MAX_NAME_BYTES;
 
 /// Most tracks a session may hold.
@@ -106,6 +107,15 @@ pub enum SessionError {
         /// too many, `0` when the clip also has a `source`.
         note: usize,
     },
+    /// An effect parameter is out of range, or the chain is longer than
+    /// [`MAX_EFFECTS_PER_TRACK`] (SPEC-022).
+    InvalidEffect {
+        /// Index of the offending track.
+        track: usize,
+        /// Index of the offending effect; [`MAX_EFFECTS_PER_TRACK`] when there
+        /// are too many.
+        effect: usize,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -147,6 +157,9 @@ impl fmt::Display for SessionError {
             }
             Self::InvalidNote { track, clip, note } => {
                 write!(f, "track {track} clip {clip}: note {note} is invalid")
+            }
+            Self::InvalidEffect { track, effect } => {
+                write!(f, "track {track}: effect {effect} is invalid")
             }
         }
     }
@@ -279,6 +292,9 @@ pub struct Track {
     pub solo: bool,
     /// Clips in any order; nothing depends on `Vec` order for rendering.
     pub clips: Vec<Clip>,
+    /// Insert effects, processed in order after the clips are summed and
+    /// before gain and pan (SPEC-022).
+    pub effects: Vec<Effect>,
 }
 
 impl Track {
@@ -292,6 +308,7 @@ impl Track {
             mute: false,
             solo: false,
             clips: Vec::new(),
+            effects: Vec::new(),
         }
     }
 
@@ -470,6 +487,7 @@ impl Session {
                     validate_notes(notes, clip, track_index, clip_index)?;
                 }
             }
+            validate_effects(&track.effects, track_index)?;
         }
         Ok(())
     }
@@ -498,6 +516,20 @@ fn validate_notes(
         .position(|note| !note.is_valid(clip.source_length))
     {
         Some(index) => Err(error(index)),
+        None => Ok(()),
+    }
+}
+
+/// SPEC-022 checks for one track's effect chain.
+fn validate_effects(effects: &[Effect], track: usize) -> Result<(), SessionError> {
+    if effects.len() > MAX_EFFECTS_PER_TRACK {
+        return Err(SessionError::InvalidEffect {
+            track,
+            effect: MAX_EFFECTS_PER_TRACK,
+        });
+    }
+    match effects.iter().position(|effect| !effect.kind.is_valid()) {
+        Some(effect) => Err(SessionError::InvalidEffect { track, effect }),
         None => Ok(()),
     }
 }
@@ -696,5 +728,59 @@ mod tests {
         assert_eq!(clip.source_index(100), 10);
         assert_eq!(clip.source_index(149), 59);
         assert_eq!(Clip::full(u64::MAX, 2).end_samples(), u64::MAX);
+    }
+
+    #[test]
+    fn new_tracks_have_no_effects() {
+        assert_eq!(Track::new("t").effects, Vec::new());
+    }
+
+    #[test]
+    fn a_full_valid_effect_chain_passes() {
+        let mut s = session();
+        s.tracks[0].effects = (0..MAX_EFFECTS_PER_TRACK)
+            .map(|_| Effect::new(crate::fx::EffectKind::reverb()))
+            .collect();
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn too_many_effects_are_rejected() {
+        let mut s = session();
+        s.tracks[0].effects = (0..=MAX_EFFECTS_PER_TRACK)
+            .map(|_| Effect::new(crate::fx::EffectKind::eq()))
+            .collect();
+        assert_eq!(
+            s.validate(),
+            Err(SessionError::InvalidEffect {
+                track: 0,
+                effect: MAX_EFFECTS_PER_TRACK
+            })
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_effect_is_rejected_by_index() {
+        let mut s = session();
+        s.tracks[0].effects = vec![
+            Effect::new(crate::fx::EffectKind::eq()),
+            Effect::new(crate::fx::EffectKind::Compressor {
+                threshold_db: -18.0,
+                ratio: 0.5,
+                attack_ms: 10.0,
+                release_ms: 100.0,
+                makeup_db: 0.0,
+            }),
+        ];
+        assert_eq!(
+            s.validate(),
+            Err(SessionError::InvalidEffect {
+                track: 0,
+                effect: 1
+            })
+        );
+        // Bypass does not excuse an invalid value.
+        s.tracks[0].effects[1].bypass = true;
+        assert!(s.validate().is_err());
     }
 }

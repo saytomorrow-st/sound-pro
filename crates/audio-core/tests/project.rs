@@ -892,3 +892,116 @@ fn a_bad_source_path_is_rejected() {
         ProjectError::Malformed { .. }
     ));
 }
+
+// --- SPEC-022: track effects ---------------------------------------------
+
+fn effects_session() -> audio_core::Session {
+    use audio_core::{Effect, EffectKind};
+    let mut session = demo_session();
+    session.tracks[0].effects = vec![
+        Effect::new(EffectKind::Eq {
+            low_db: 3.5,
+            mid_db: -6.0,
+            mid_hz: 1250.0,
+            high_db: 2.0,
+        }),
+        Effect {
+            bypass: true,
+            kind: EffectKind::compressor(),
+        },
+        Effect::new(EffectKind::reverb()),
+    ];
+    session
+}
+
+fn effects_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        effects_session(),
+    )
+    .to_json()
+}
+
+#[test]
+fn effects_survive_the_round_trip() {
+    let text = effects_json();
+    assert!(text.contains("\"effects\""), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &effects_session());
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn a_track_without_effects_writes_no_effects_key() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert!(!text.contains("effects"), "{text}");
+    assert!(
+        Project::from_json(&text).unwrap().session().tracks[0]
+            .effects
+            .is_empty()
+    );
+}
+
+#[test]
+fn bypass_is_optional_when_reading() {
+    let text = effects_json().replace("\"bypass\": false, ", "");
+    let back = Project::from_json(&text).unwrap();
+    assert!(!back.session().tracks[0].effects[0].bypass);
+    assert!(back.session().tracks[0].effects[1].bypass);
+}
+
+#[test]
+fn an_unknown_effect_type_is_rejected() {
+    let text = effects_json().replace("\"reverb\"", "\"flanger\"");
+    assert!(Project::from_json(&text).is_err());
+}
+
+#[test]
+fn a_parameter_of_another_effect_type_is_an_unknown_field() {
+    let text = effects_json().replace("\"room\"", "\"ratio\"");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "ratio".to_owned()
+        }
+    );
+}
+
+#[test]
+fn a_missing_effect_parameter_is_reported() {
+    let text = effects_json().replace(", \"mix\": 0.25", "");
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::MissingField { .. }
+    ));
+}
+
+#[test]
+fn an_out_of_range_effect_parameter_fails_validation() {
+    let text = effects_json().replace("\"ratio\": 4", "\"ratio\": 0.5");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidEffect {
+            track: 0,
+            effect: 1
+        })
+    );
+}
+
+#[test]
+fn too_many_effects_are_rejected_before_decoding() {
+    let one = r#"{"type": "nonsense"}"#;
+    let list = [one; audio_core::MAX_EFFECTS_PER_TRACK + 1].join(", ");
+    let text = effects_json();
+    let start = text.find("\"effects\": [").unwrap();
+    let end = start + text[start..].find(']').unwrap();
+    let text = format!("{}\"effects\": [{list}{}", &text[..start], &text[end..]);
+    assert!(matches!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidEffect { effect, .. })
+            if effect == audio_core::MAX_EFFECTS_PER_TRACK
+    ));
+}

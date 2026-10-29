@@ -12,6 +12,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 
+use crate::fx::{Effect, EffectKind, MAX_EFFECTS_PER_TRACK};
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
@@ -418,6 +419,9 @@ fn write_session(out: &mut String, session: &Session) {
         } else {
             out.push_str("\n        ]");
         }
+        if !track.effects.is_empty() {
+            write_effects(out, &track.effects);
+        }
         out.push_str("\n      }");
     }
     if session.tracks.is_empty() {
@@ -497,8 +501,10 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut mute = None;
     let mut solo = None;
     let mut clips = None;
+    let mut effects = None;
     for (key, value) in entries {
         match key.as_str() {
+            "effects" => effects = Some(effects_from_value(value)?),
             "name" => name = Some(require_string(value)?),
             "gain" => gain = Some(require_f32(value)?),
             "pan" => pan = Some(require_f32(value)?),
@@ -542,6 +548,140 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
         clips: clips.ok_or(ProjectError::MissingField {
             field: "session.tracks[].clips",
         })?,
+        // Optional since SPEC-022.
+        effects: effects.unwrap_or_default(),
+    })
+}
+
+/// Appends a track's `"effects"` array, one effect per line (SPEC-022).
+fn write_effects(out: &mut String, effects: &[Effect]) {
+    out.push_str(",\n        \"effects\": [");
+    for (index, effect) in effects.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n          {\"type\": ");
+        write_string(out, effect.kind.type_name());
+        out.push_str(", \"bypass\": ");
+        out.push_str(if effect.bypass { "true" } else { "false" });
+        let fields: &[(&str, f32)] = match effect.kind {
+            EffectKind::Eq {
+                low_db,
+                mid_db,
+                mid_hz,
+                high_db,
+            } => &[
+                ("low_db", low_db),
+                ("mid_db", mid_db),
+                ("mid_hz", mid_hz),
+                ("high_db", high_db),
+            ],
+            EffectKind::Compressor {
+                threshold_db,
+                ratio,
+                attack_ms,
+                release_ms,
+                makeup_db,
+            } => &[
+                ("threshold_db", threshold_db),
+                ("ratio", ratio),
+                ("attack_ms", attack_ms),
+                ("release_ms", release_ms),
+                ("makeup_db", makeup_db),
+            ],
+            EffectKind::Reverb { room, damp, mix } => {
+                &[("room", room), ("damp", damp), ("mix", mix)]
+            }
+        };
+        for (key, value) in fields {
+            out.push_str(", ");
+            write_string(out, key);
+            out.push_str(": ");
+            out.push_str(&format_number(f64::from(*value)));
+        }
+        out.push('}');
+    }
+    out.push_str("\n        ]");
+}
+
+fn effects_from_value(value: &Value) -> Result<Vec<Effect>, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    // Cap before decoding, like tracks, clips and notes.
+    if items.len() > MAX_EFFECTS_PER_TRACK {
+        return Err(ProjectError::Session(SessionError::InvalidEffect {
+            track: 0,
+            effect: MAX_EFFECTS_PER_TRACK,
+        }));
+    }
+    items.iter().map(effect_from_value).collect()
+}
+
+fn effect_from_value(value: &Value) -> Result<Effect, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut kind_name = None;
+    let mut bypass = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "type" => kind_name = Some(require_string(value)?),
+            "bypass" => bypass = Some(require_bool(value)?),
+            _ => {}
+        }
+    }
+    let kind_name = kind_name.ok_or(ProjectError::MissingField {
+        field: "session.tracks[].effects[].type",
+    })?;
+    let allowed: &[&str] = match kind_name.as_str() {
+        "eq" => &["low_db", "mid_db", "mid_hz", "high_db"],
+        "compressor" => &[
+            "threshold_db",
+            "ratio",
+            "attack_ms",
+            "release_ms",
+            "makeup_db",
+        ],
+        "reverb" => &["room", "damp", "mix"],
+        _ => return Err(ProjectError::Malformed { at: 0 }),
+    };
+    let mut values = [None; 5];
+    for (key, value) in entries {
+        if key == "type" || key == "bypass" {
+            continue;
+        }
+        let Some(slot) = allowed.iter().position(|name| name == key) else {
+            return Err(ProjectError::UnknownField { field: key.clone() });
+        };
+        values[slot] = Some(require_f32(value)?);
+    }
+    let get = |slot: usize| {
+        values[slot].ok_or(ProjectError::MissingField {
+            field: "session.tracks[].effects[] parameter",
+        })
+    };
+    let kind = match kind_name.as_str() {
+        "eq" => EffectKind::Eq {
+            low_db: get(0)?,
+            mid_db: get(1)?,
+            mid_hz: get(2)?,
+            high_db: get(3)?,
+        },
+        "compressor" => EffectKind::Compressor {
+            threshold_db: get(0)?,
+            ratio: get(1)?,
+            attack_ms: get(2)?,
+            release_ms: get(3)?,
+            makeup_db: get(4)?,
+        },
+        _ => EffectKind::Reverb {
+            room: get(0)?,
+            damp: get(1)?,
+            mix: get(2)?,
+        },
+    };
+    Ok(Effect {
+        bypass: bypass.unwrap_or(false),
+        kind,
     })
 }
 

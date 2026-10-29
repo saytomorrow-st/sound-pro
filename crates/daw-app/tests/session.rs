@@ -451,3 +451,94 @@ fn master_gain_scales_both_channels() {
             .all(|&s| s == 0.0)
     );
 }
+
+// --- SPEC-022: track effects ---------------------------------------------
+
+fn with_effects(effects: Vec<audio_core::Effect>) -> SessionTrack {
+    let mut track = SessionTrack::new("fx");
+    track.effects = effects;
+    track
+}
+
+fn sine(len: usize, amplitude: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| amplitude * (i as f32 * 2.0 * std::f32::consts::PI * 440.0 / RATE as f32).sin())
+        .collect()
+}
+
+fn peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0, |m, s| m.max(s.abs()))
+}
+
+#[test]
+fn bypassed_effects_leave_the_sound_bit_identical() {
+    use audio_core::{Effect, EffectKind};
+    let mut scratch = Scratch::new("fxbypass");
+    let source = ramp(500);
+    let dry = render_mix(&mut scratch, vec![(panned(0.0), source.clone())], 1.0);
+    let chain = [
+        EffectKind::eq(),
+        EffectKind::compressor(),
+        EffectKind::reverb(),
+    ]
+    .into_iter()
+    .map(|kind| Effect { bypass: true, kind })
+    .collect();
+    let wet = render_mix(&mut scratch, vec![(with_effects(chain), source)], 1.0);
+    assert_eq!(dry, wet);
+}
+
+#[test]
+fn a_flat_eq_leaves_the_sound_bit_identical() {
+    use audio_core::{Effect, EffectKind};
+    let mut scratch = Scratch::new("fxflat");
+    let source = sine(2_000, 0.5);
+    let dry = render_mix(&mut scratch, vec![(panned(0.0), source.clone())], 1.0);
+    let wet = render_mix(
+        &mut scratch,
+        vec![(with_effects(vec![Effect::new(EffectKind::eq())]), source)],
+        1.0,
+    );
+    assert_eq!(dry, wet);
+}
+
+#[test]
+fn a_compressor_lowers_a_loud_signal() {
+    use audio_core::{Effect, EffectKind};
+    let mut scratch = Scratch::new("fxcomp");
+    let source = sine(RATE as usize / 2, 0.9);
+    let compressor = Effect::new(EffectKind::Compressor {
+        threshold_db: -20.0,
+        ratio: 8.0,
+        attack_ms: 1.0,
+        release_ms: 100.0,
+        makeup_db: 0.0,
+    });
+    let buf = render_mix(
+        &mut scratch,
+        vec![(with_effects(vec![compressor]), source)],
+        1.0,
+    );
+    let settled = &buf.channel(0)[RATE as usize / 4..];
+    assert!(peak(settled) < 0.5, "peak {}", peak(settled));
+    assert!(peak(settled) > 0.01);
+    assert_eq!(buf.channel(0), buf.channel(1));
+}
+
+#[test]
+fn a_reverb_rings_after_the_dry_sound_stops() {
+    use audio_core::{Effect, EffectKind};
+    let mut scratch = Scratch::new("fxverb");
+    let mut source = vec![0.0; RATE as usize / 2];
+    source[..200].copy_from_slice(&sine(200, 0.8));
+    let buf = render_mix(
+        &mut scratch,
+        vec![(
+            with_effects(vec![Effect::new(EffectKind::reverb())]),
+            source,
+        )],
+        1.0,
+    );
+    let tail = &buf.channel(0)[RATE as usize / 10..];
+    assert!(peak(tail) > 1e-4, "tail peak {}", peak(tail));
+}

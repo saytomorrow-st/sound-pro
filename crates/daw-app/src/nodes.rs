@@ -293,6 +293,8 @@ pub struct Track {
     mute: bool,
     left: f32,
     right: f32,
+    // SPEC-022: the insert chain, built once; processing never allocates.
+    effects: Vec<audio_core::EffectProcessor>,
 }
 
 impl Track {
@@ -321,7 +323,19 @@ impl Track {
             mute: track.mute,
             left,
             right,
+            effects: Vec::new(),
         })
+    }
+
+    /// Builds the track's insert chain (SPEC-022) for `sample_rate`. Bypassed
+    /// effects become pass-throughs, an empty list leaves the sound untouched.
+    #[must_use]
+    pub fn with_effects(mut self, effects: &[audio_core::Effect], sample_rate: u32) -> Self {
+        self.effects = effects
+            .iter()
+            .map(|effect| audio_core::EffectProcessor::new(effect, sample_rate))
+            .collect();
+        self
     }
 
     /// Applies session-level mixing decided at build time: solo/mute
@@ -353,6 +367,7 @@ impl std::fmt::Debug for Track {
             .field("mute", &self.mute)
             .field("left", &self.left)
             .field("right", &self.right)
+            .field("effects", &self.effects.len())
             .field("length_samples", &self.length_samples())
             .finish()
     }
@@ -389,6 +404,9 @@ impl NodeProcessor for Track {
                     *slot += sample * clip.gain;
                 }
             }
+        }
+        for effect in &mut self.effects {
+            effect.process(&mut output.channel_mut(0)[..frames]);
         }
         if stereo {
             let right = self.gain * self.right;
