@@ -1,4 +1,4 @@
-//! Acceptance tests for clip fades and overlap weights (SPEC-038 §1–§4).
+//! Acceptance tests for clip fades and overlap weights (SPEC-038 §1–§3, SPEC-044 §2).
 
 use audio_core::{CROSSFADE_SAMPLES, Clip, Project, Session, SessionError, SessionTrack};
 
@@ -65,35 +65,68 @@ fn fades_longer_than_the_clip_are_rejected() {
     assert_eq!(session_with(faded(0, 10, 5, 5)).validate(), Ok(()));
 }
 
+// SPEC-044 §2 supersedes the SPEC-038 §4 layer tests: the later start is
+// above regardless of list order, and a running-out overlap is one
+// crossfade across all of it.
+
 #[test]
-fn the_upper_clip_wins_away_from_its_edges() {
-    let lower = Clip::full(0, 10_000);
-    let upper = Clip::full(2_000, 2_000);
-    assert_eq!(upper.layer_weight(&lower, 3_000), 1.0);
+fn the_later_start_is_above_regardless_of_list_order() {
+    let early = Clip::full(0, 1_000);
+    let late = Clip::full(500, 1_000);
+    assert!(late.is_above(0, &early, 1));
+    assert!(late.is_above(1, &early, 0));
+    assert!(!early.is_above(1, &late, 0));
 }
 
 #[test]
-fn the_upper_clip_crossfades_in_and_out_over_the_lower_one() {
+fn a_clip_inside_another_is_above_it() {
+    let outer = Clip::full(0, 10_000);
+    let inner = Clip::full(0, 2_000);
+    assert!(inner.is_above(0, &outer, 1));
+    assert!(!outer.is_above(1, &inner, 0));
+}
+
+#[test]
+fn identical_spans_fall_back_to_the_list_order() {
+    let a = Clip::full(0, 1_000);
+    assert!(a.is_above(1, &a, 0));
+    assert!(!a.is_above(0, &a, 1));
+}
+
+#[test]
+fn an_overlap_running_past_the_lower_end_crossfades_over_all_of_it() {
+    let lower = Clip::full(0, 10_000);
+    let upper = Clip::full(6_000, 10_000);
+    assert_eq!(upper.overlap_weight(&lower, 6_000), 0.0);
+    assert!((upper.overlap_weight(&lower, 8_000) - 0.5).abs() < 1e-6);
+    assert!((upper.overlap_weight(&lower, 9_999) - 0.999_75).abs() < 1e-6);
+}
+
+#[test]
+fn a_clip_inside_another_ramps_in_and_out_at_its_edges() {
     let lower = Clip::full(0, 10_000);
     let upper = Clip::full(2_000, 2_000);
     let n = CROSSFADE_SAMPLES;
-    assert_eq!(upper.layer_weight(&lower, 2_000), 0.0);
-    assert!((upper.layer_weight(&lower, 2_000 + n / 2) - 0.5).abs() < 1e-6);
-    assert_eq!(upper.layer_weight(&lower, 2_000 + n), 1.0);
-    assert_eq!(upper.layer_weight(&lower, 3_999), 0.0);
-    assert!((upper.layer_weight(&lower, 3_999 - n / 2) - 0.5).abs() < 1e-6);
+    assert_eq!(upper.overlap_weight(&lower, 2_000), 0.0);
+    assert!((upper.overlap_weight(&lower, 2_000 + n / 2) - 0.5).abs() < 1e-6);
+    assert_eq!(upper.overlap_weight(&lower, 3_000), 1.0);
+    assert_eq!(upper.overlap_weight(&lower, 3_999), 0.0);
 }
 
 #[test]
-fn a_short_overlap_crossfades_over_all_of_it() {
-    let lower = Clip::full(0, 1_000);
-    let upper = Clip::full(900, 1_000);
-    // Overlap is 100 samples: the ramp spans exactly those.
-    assert_eq!(upper.layer_weight(&lower, 900), 0.0);
-    assert!((upper.layer_weight(&lower, 950) - 0.5).abs() < 1e-6);
-    assert!((upper.layer_weight(&lower, 999) - 0.99).abs() < 1e-6);
-    // The upper end lies outside the lower clip: no fade-out ramp there.
-    assert_eq!(upper.layer_weight(&lower, 1_899), 1.0);
+fn a_short_clip_inside_another_ramps_over_its_halves() {
+    let lower = Clip::full(0, 10_000);
+    let upper = Clip::full(1_000, 100);
+    assert_eq!(upper.overlap_weight(&lower, 1_000), 0.0);
+    assert!((upper.overlap_weight(&lower, 1_025) - 0.5).abs() < 1e-6);
+    assert!((upper.overlap_weight(&lower, 1_049) - 0.98).abs() < 1e-6);
+}
+
+#[test]
+fn a_shared_start_has_no_ramp_in() {
+    let lower = Clip::full(0, 10_000);
+    let upper = Clip::full(0, 2_000);
+    assert_eq!(upper.overlap_weight(&lower, 0), 1.0);
 }
 
 #[test]

@@ -286,8 +286,8 @@ pub struct Clip {
     pub fade_out_samples: u64,
 }
 
-/// Length of the automatic crossfade where clips overlap: 10 ms at 48 kHz
-/// (SPEC-038 §4).
+/// Longest edge ramp of a clip lying inside another: 10 ms at 48 kHz
+/// (SPEC-044 §2).
 pub const CROSSFADE_SAMPLES: u64 = 480;
 
 /// One note of a MIDI clip, positioned inside the clip's content.
@@ -403,40 +403,63 @@ impl Clip {
         gain
     }
 
-    /// Weight of this clip over `lower`, a clip it overlaps, at `position`
-    /// (SPEC-038 §4); `lower` gets `1 - weight`.
+    /// Whether this clip sounds over `other` where both cover a position
+    /// (SPEC-044 §2): the later start wins, then the earlier end (a clip
+    /// lying inside another), then the later list index. Depends on the
+    /// list order only for clips with identical spans.
+    #[must_use]
+    pub fn is_above(&self, index: usize, other: &Self, other_index: usize) -> bool {
+        overlap_key(self, index) > overlap_key(other, other_index)
+    }
+
+    /// Weight of this clip over `lower`, a clip it overlaps and is above
+    /// (see [`Clip::is_above`]), at `position` (SPEC-044 §2); `lower` gets
+    /// `1 - weight`.
     ///
     /// An equal-gain linear crossfade, as in Roads, *The Computer Music
-    /// Tutorial* (1996), ch. 2: at each edge of this clip that lies inside
-    /// `lower`, the weight ramps over `n = min(CROSSFADE_SAMPLES, overlap)`
-    /// samples as `t / n` (from the start) or `r / n` (to the end). Away from
-    /// such edges the upper clip wins with exactly `1.0`. Only meaningful
-    /// when both clips cover `position`.
+    /// Tutorial* (1996), ch. 2:
+    /// - this clip runs past the end of `lower`: the weight ramps `t / n`
+    ///   over the whole overlap, `t = position - start`,
+    ///   `n = lower.end - start`;
+    /// - this clip lies inside `lower`: ramps of
+    ///   `n = min(CROSSFADE_SAMPLES, length / 2)` samples at each edge that
+    ///   is inside `lower`, exactly `1.0` between them.
+    ///
+    /// Only meaningful when both clips cover `position`.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
-        reason = "the ramp is at most CROSSFADE_SAMPLES long"
+        reason = "an overlap longer than 2^24 samples only loses ramp precision"
     )]
-    pub fn layer_weight(&self, lower: &Self, position: u64) -> f32 {
+    pub fn overlap_weight(&self, lower: &Self, position: u64) -> f32 {
         let start = self.start_samples;
         let end = self.end_samples();
+        let lower_end = lower.end_samples();
         let t = position.wrapping_sub(start);
+        if start > lower.start_samples && end >= lower_end {
+            let n = lower_end.saturating_sub(start).max(1);
+            return (t as f32 / n as f32).min(1.0);
+        }
+        let n = CROSSFADE_SAMPLES.min(self.length_samples / 2).max(1);
         let r = end.saturating_sub(position).saturating_sub(1);
         let mut weight = 1.0_f32;
-        if lower.covers(start) {
-            let n = CROSSFADE_SAMPLES.min(lower.end_samples().min(end) - start);
-            if t < n {
-                weight = weight.min(t as f32 / n as f32);
-            }
+        if start > lower.start_samples && t < n {
+            weight = weight.min(t as f32 / n as f32);
         }
-        if end > 0 && lower.covers(end - 1) {
-            let n = CROSSFADE_SAMPLES.min(end - lower.start_samples.max(start));
-            if r < n {
-                weight = weight.min(r as f32 / n as f32);
-            }
+        if end < lower_end && r < n {
+            weight = weight.min(r as f32 / n as f32);
         }
         weight
     }
+}
+
+/// Sort key of [`Clip::is_above`]: larger is above.
+const fn overlap_key(clip: &Clip, index: usize) -> (u64, u64, usize) {
+    (
+        clip.start_samples,
+        u64::MAX - clip.start_samples.saturating_add(clip.length_samples),
+        index,
+    )
 }
 
 /// Balance-law multipliers `(left, right)` for `pan` in `-1.0..=1.0`; both
@@ -635,6 +658,9 @@ pub struct Track {
     pub mute: bool,
     /// When any track is soloed, only soloed, unmuted tracks sound.
     pub solo: bool,
+    /// Input monitoring (the I button, SPEC-044 §1): stored with the
+    /// project; the live input path honours it once it exists.
+    pub input_monitor: bool,
     /// Clips in any order; nothing depends on `Vec` order for rendering.
     pub clips: Vec<Clip>,
     /// Insert effects, processed in order after the clips are summed and
@@ -694,6 +720,7 @@ impl Track {
             pan: 0.0,
             mute: false,
             solo: false,
+            input_monitor: false,
             clips: Vec::new(),
             effects: Vec::new(),
             automation: Automation::default(),
@@ -737,6 +764,10 @@ pub struct Session {
     pub tempo_bpm: f64,
     /// Linear master gain, `0.0..=1.0`, applied to the whole mix.
     pub master_gain: f32,
+    /// Master mute, the M button of Stereo Out (SPEC-044 §1).
+    pub master_mute: bool,
+    /// Master dim, the D button of Stereo Out: [`DIM_GAIN`] (SPEC-044 §1).
+    pub master_dim: bool,
     /// Bar layout; `tempo_bpm` counts its beats (SPEC-026).
     pub time_signature: TimeSignature,
     /// Tracks in session order.
@@ -758,7 +789,23 @@ pub struct Marker {
     pub position: u64,
 }
 
+/// Gain of the master dim: −20 dB (SPEC-044 §1).
+pub const DIM_GAIN: f32 = 0.1;
+
 impl Session {
+    /// Master gain as heard: `0.0` when muted, times [`DIM_GAIN`] when
+    /// dimmed (SPEC-044 §1).
+    #[must_use]
+    pub fn master_level(&self) -> f32 {
+        if self.master_mute {
+            0.0
+        } else if self.master_dim {
+            self.master_gain * DIM_GAIN
+        } else {
+            self.master_gain
+        }
+    }
+
     /// Empty session with no tracks.
     #[must_use]
     pub fn new(name: &str, sample_rate: u32, tempo_bpm: f64) -> Self {
@@ -767,6 +814,8 @@ impl Session {
             sample_rate,
             tempo_bpm,
             master_gain: 1.0,
+            master_mute: false,
+            master_dim: false,
             time_signature: TimeSignature::default(),
             tracks: Vec::new(),
             buses: Vec::new(),

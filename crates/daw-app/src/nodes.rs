@@ -353,6 +353,26 @@ pub struct Track {
 }
 
 impl Track {
+    /// The highest clip covering `position` that lies below the clip at
+    /// `above` (or below none), by [`Clip::is_above`]. Allocation-free.
+    fn next_below(&self, position: u64, above: Option<usize>) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (index, clip) in self.clips.iter().enumerate() {
+            if !clip.covers(position) {
+                continue;
+            }
+            if let Some(top) = above {
+                if !self.clips[top].is_above(top, clip, index) {
+                    continue;
+                }
+            }
+            if best.is_none_or(|b| clip.is_above(index, &self.clips[b], b)) {
+                best = Some(index);
+            }
+        }
+        best
+    }
+
     /// Pairs each clip with the source holding its content, in the same order.
     ///
     /// # Errors
@@ -475,7 +495,7 @@ impl NodeProcessor for Track {
 }
 
 /// One clip's sample at timeline `position`, with its gain but without its
-/// fades (they are applied as layer weights); the caller has checked that
+/// fades (they are applied as overlap weights); the caller has checked that
 /// the clip covers `position`.
 fn clip_sample(
     clip: &audio_core::session::Clip,
@@ -523,34 +543,32 @@ impl Track {
         right: Option<&mut [f32]>,
     ) -> (f32, f32) {
         let frames = dst.len();
-        // SPEC-038/040: clips are layers, the later one in the list on top.
-        // Each layer covers what lies below it by its weight: its own fade
-        // times the automatic crossfade over the next covering layer. What a
-        // layer leaves uncovered shows the layers below, so a fade over
-        // another clip reveals it, through any number of layers.
+        // SPEC-044 §2: where clips overlap the later-starting one crossfades
+        // over the earlier one (`Clip::overlap_weight`); the result does not
+        // depend on the list order. Covering clips are walked from the one
+        // above all others down; what a clip leaves uncovered shows the
+        // clips below, so a fade over another clip still reveals it.
         for (index, slot) in dst.iter_mut().enumerate() {
             let position = position.saturating_add(index as u64);
-            let mut layers = self
-                .clips
-                .iter()
-                .zip(&self.sources)
-                .rev()
-                .filter(|(clip, _)| clip.covers(position))
-                .peekable();
+            let mut current = self.next_below(position, None);
             let mut sum = 0.0_f32;
             let mut remaining = 1.0_f32;
-            while let Some((clip, source)) = layers.next() {
+            while let Some(at) = current {
+                let clip = &self.clips[at];
+                let below = self.next_below(position, Some(at));
                 let mut weight = clip.fade_gain(position);
-                if let Some((below, _)) = layers.peek() {
-                    weight *= clip.layer_weight(below, position);
+                if let Some(lower) = below {
+                    weight *= clip.overlap_weight(&self.clips[lower], position);
                 }
                 if weight > 0.0 {
-                    sum += remaining * weight * clip_sample(clip, source.as_ref(), position);
+                    sum +=
+                        remaining * weight * clip_sample(clip, self.sources[at].as_ref(), position);
                 }
                 remaining *= 1.0 - weight;
                 if remaining <= 0.0 {
                     break;
                 }
+                current = below;
             }
             *slot = sum;
         }

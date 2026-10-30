@@ -181,3 +181,38 @@ fn slider_zoom_anchors_to_a_visible_playhead() {
     assert!((slider_anchor(50.0, 200.0, 800.0) - 400.0).abs() < 1e-3);
     assert!((slider_anchor(5_000.0, 200.0, 800.0) - 400.0).abs() < 1e-3);
 }
+
+// --- SPEC-044 §3: merged overlaps ------------------------------------------
+
+fn span(start: u64, length: u64) -> audio_core::session::Clip {
+    audio_core::session::Clip::full(start, length)
+}
+
+#[test]
+fn the_later_start_draws_on_top_whatever_the_list_order() {
+    use daw_gui::layout::draw_order;
+    assert_eq!(draw_order(&[span(100, 100), span(0, 150)]), [1, 0]);
+    assert_eq!(draw_order(&[span(0, 150), span(100, 100)]), [0, 1]);
+}
+
+#[test]
+fn a_clip_inside_another_draws_on_top() {
+    use daw_gui::layout::draw_order;
+    assert_eq!(draw_order(&[span(50, 20), span(50, 200)]), [1, 0]);
+    assert_eq!(draw_order(&[span(0, 100), span(0, 100)]), [0, 1]);
+}
+
+#[test]
+fn overlap_zones_cover_only_where_clips_sound_together() {
+    use daw_gui::layout::overlap_zones;
+    assert!(overlap_zones(&[span(0, 100), span(100, 50)]).is_empty());
+    assert_eq!(overlap_zones(&[span(80, 100), span(0, 100)]), [(80, 100)]);
+    assert_eq!(
+        overlap_zones(&[span(0, 100), span(50, 100), span(120, 100)]),
+        [(50, 100), (120, 150)]
+    );
+    assert_eq!(
+        overlap_zones(&[span(0, 300), span(50, 20), span(60, 100)]),
+        [(50, 160)]
+    );
+}

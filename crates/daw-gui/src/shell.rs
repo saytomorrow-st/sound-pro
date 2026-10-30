@@ -130,21 +130,6 @@ pub(crate) fn pill(ui: &mut egui::Ui, on: &mut bool, text: &str, color: Color32)
     response
 }
 
-/// Disabled rounded button with the same look as [`pill`].
-pub(crate) fn pill_stub(ui: &mut egui::Ui, text: &str) {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(20.0, 15.0), Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(4), Color32::from_gray(48));
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::FontId::proportional(10.0),
-        Color32::from_gray(100),
-    );
-    response.on_hover_text("Скоро");
-}
-
 /// Drawn pan knob; dragging up/right turns it clockwise.
 fn pan_knob(ui: &mut egui::Ui, pan: &mut f32, enabled: bool) -> egui::Response {
     let size = Vec2::splat(30.0);
@@ -397,6 +382,93 @@ fn eq_thumb(ui: &mut egui::Ui) {
         Color32::from_gray(90),
     );
     response.on_hover_text("Эквалайзер: скоро");
+}
+
+/// Size of one button of the tool group.
+const TOOL_SIZE: Vec2 = Vec2::new(30.0, 22.0);
+
+/// Segmented group of the editing tools with drawn icons (SPEC-044 §5).
+/// Returns the tool the user clicked.
+fn tool_group(ui: &mut egui::Ui, current: super::Tool) -> Option<super::Tool> {
+    let mut picked = None;
+    egui::Frame::new()
+        .fill(Color32::from_gray(30))
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(2.0)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for tool in super::Tool::ALL {
+                let (rect, response) = ui.allocate_exact_size(TOOL_SIZE, Sense::click());
+                let on = tool == current;
+                let fill = if on {
+                    Color32::from_rgb(70, 110, 170)
+                } else if response.hovered() {
+                    Color32::from_gray(60)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let ink = if on {
+                    Color32::WHITE
+                } else {
+                    Color32::from_gray(200)
+                };
+                ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+                paint_tool_icon(ui.painter(), rect.shrink2(Vec2::new(8.0, 5.0)), tool, ink);
+                if response
+                    .on_hover_text(format!(
+                        "{}\nT — следующий инструмент, Esc — стрелка",
+                        tool.label()
+                    ))
+                    .clicked()
+                {
+                    picked = Some(tool);
+                }
+            }
+        });
+    picked
+}
+
+/// Draws the icon of `tool` inside `r` with strokes only, so it does not
+/// depend on the glyphs a font happens to have.
+fn paint_tool_icon(painter: &egui::Painter, r: egui::Rect, tool: super::Tool, ink: Color32) {
+    let line = Stroke::new(1.5_f32, ink);
+    let at = |x: f32, y: f32| egui::pos2(r.left() + x * r.width(), r.top() + y * r.height());
+    match tool {
+        super::Tool::Pointer => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![at(0.2, 0.0), at(0.2, 0.85), at(0.42, 0.65), at(0.75, 0.62)],
+                ink,
+                Stroke::NONE,
+            ));
+            painter.line_segment([at(0.42, 0.65), at(0.6, 1.0)], line);
+        }
+        super::Tool::Scissors => {
+            painter.line_segment([at(0.15, 0.0), at(0.7, 0.7)], line);
+            painter.line_segment([at(0.85, 0.0), at(0.3, 0.7)], line);
+            painter.circle_stroke(at(0.22, 0.85), r.height() * 0.15, line);
+            painter.circle_stroke(at(0.78, 0.85), r.height() * 0.15, line);
+        }
+        super::Tool::Glue => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(at(0.0, 0.2), at(0.45, 0.8)),
+                CornerRadius::same(1),
+                line,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_max(at(0.55, 0.2), at(1.0, 0.8)),
+                CornerRadius::same(1),
+                line,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment([at(0.3, 0.5), at(0.7, 0.5)], line);
+        }
+        super::Tool::Fade => {
+            painter.line_segment([at(0.0, 1.0), at(0.5, 0.0)], line);
+            painter.line_segment([at(0.5, 0.0), at(1.0, 1.0)], line);
+            painter.line_segment([at(0.0, 1.0), at(1.0, 1.0)], line);
+        }
+    }
 }
 
 /// Coloured name plate at the bottom of a strip.
@@ -744,37 +816,27 @@ impl App {
             });
             ui.separator();
             if ui
-                .button("＋")
+                .add(egui::Button::new("＋ Дорожка").min_size(Vec2::new(0.0, TOOL_SIZE.y)))
                 .on_hover_text("Новая MIDI-дорожка")
                 .clicked()
             {
                 self.add_midi_track();
             }
-            ui.separator();
-            for tool in super::Tool::ALL {
-                if ui
-                    .selectable_label(self.tool == tool, tool.label())
-                    .on_hover_text("Инструмент: T — следующий, Esc — стрелка")
-                    .clicked()
-                {
-                    self.tool = tool;
-                }
+            ui.add_space(6.0);
+            if let Some(tool) = tool_group(ui, self.tool) {
+                self.tool = tool;
             }
-            ui.separator();
-            egui::ComboBox::from_id_salt("drag_mode")
-                .selected_text(if self.drag_xfade {
-                    "Перетаскивание: X-Fade"
-                } else {
-                    "Перетаскивание: Наложение"
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.drag_xfade, false, "Наложение");
-                    ui.selectable_value(&mut self.drag_xfade, true, "X-Fade");
-                })
-                .response
-                .on_hover_text("X-Fade: перемещённый клип делает кроссфейд с соседним");
-            ui.checkbox(&mut self.snap, "Сетка: доля")
-                .on_hover_text("Привязка клипов к долям. Shift при перетаскивании отключает.");
+            ui.add_space(6.0);
+            let snap = egui::Button::new("▦ Сетка")
+                .selected(self.snap)
+                .min_size(Vec2::new(0.0, TOOL_SIZE.y));
+            if ui
+                .add(snap)
+                .on_hover_text("Привязка клипов к долям. Shift при перетаскивании отключает.")
+                .clicked()
+            {
+                self.snap = !self.snap;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.zoom, super::MIN_ZOOM..=super::MAX_ZOOM)
@@ -1124,7 +1186,29 @@ impl App {
         } else {
             Color32::from_gray(44)
         };
-        let response = egui::Frame::new()
+        // The strip senses clicks *behind* its contents, so the buttons on it
+        // keep their own clicks (SPEC-044 §1).
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
+                self.channel_strip_body(ui, index, full, &track, fill);
+            })
+            .response;
+        if response.clicked() {
+            self.editor.selected_track = Some(index);
+        }
+        response.rect.height()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn channel_strip_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        full: bool,
+        track: &audio_core::SessionTrack,
+        fill: Color32,
+    ) {
+        egui::Frame::new()
             .fill(fill)
             .stroke(Stroke::new(1.0_f32, Color32::from_gray(28)))
             .corner_radius(CornerRadius::same(4))
@@ -1240,18 +1324,27 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            pill_stub(ui, "R");
-                            pill_stub(ui, "I");
+                            let mut armed = self.editor.armed_track() == Some(index);
+                            if pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
+                                .on_hover_text("Запись на эту дорожку")
+                                .changed()
+                            {
+                                self.editor.arm_track(armed.then_some(index));
+                            }
+                            let mut monitor = track.input_monitor;
+                            if pill(ui, &mut monitor, "I", Color32::from_rgb(240, 160, 60))
+                                .on_hover_text("Мониторинг входа")
+                                .changed()
+                            {
+                                if let Some(t) = self.editor.track_mut(index) {
+                                    t.input_monitor = monitor;
+                                }
+                            }
                         });
                     }
                     name_plate(ui, &track.name, track_color(track.color, index));
                 });
-            })
-            .response;
-        if response.interact(Sense::click()).clicked() {
-            self.editor.selected_track = Some(index);
-        }
-        response.rect.height()
+            });
     }
 
     /// Master channel strip (Stereo Out). With `match_height` the strip is
@@ -1285,8 +1378,20 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            pill_stub(ui, "M");
-                            pill_stub(ui, "D");
+                            let session = self.editor.session();
+                            let (mut mute, mut dim) = (session.master_mute, session.master_dim);
+                            if pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
+                                .on_hover_text("Выключить звук мастера")
+                                .changed()
+                            {
+                                self.editor.set_master_mute(mute);
+                            }
+                            if pill(ui, &mut dim, "D", Color32::from_rgb(240, 160, 60))
+                                .on_hover_text("Приглушить мастер на 20 дБ")
+                                .changed()
+                            {
+                                self.editor.set_master_dim(dim);
+                            }
                         });
                         let mut master = self.editor.session().master_gain;
                         let meter = self.master_meter;

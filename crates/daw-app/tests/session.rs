@@ -452,6 +452,48 @@ fn master_gain_scales_both_channels() {
     );
 }
 
+#[test]
+fn master_mute_silences_and_dim_lowers_the_mix_by_twenty_db() {
+    let mut scratch = Scratch::new("master-mute");
+    let source = ramp(200);
+    let mut session = Session::new("mix", RATE, 120.0);
+    session.master_dim = true;
+    let buf = render_with_master(&mut scratch, session.clone(), &source);
+    assert_eq!(
+        buf.channel(0),
+        scaled(&source, audio_core::DIM_GAIN).as_slice()
+    );
+    session.master_mute = true;
+    let buf = render_with_master(&mut scratch, session, &source);
+    assert!(
+        buf.channel(0)
+            .iter()
+            .chain(buf.channel(1))
+            .all(|&s| s == 0.0)
+    );
+}
+
+/// Renders one centred track over `source` in `session` (SPEC-044 §1).
+fn render_with_master(scratch: &mut Scratch, mut session: Session, source: &[f32]) -> AudioBuffer {
+    let mut track = panned(0.0);
+    track.clips.push(Clip::full(0, source.len() as u64));
+    session.tracks.push(track.clone());
+    let output = scratch.path();
+    render_session(SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: vec![Box::new(source.to_vec())],
+        }],
+        sample_rate: RATE,
+        block_frames: 64,
+        frames: None,
+        output: output.clone(),
+    })
+    .unwrap();
+    audio_core::wav::read_wav_mono(&output).unwrap().1
+}
+
 // --- SPEC-022: track effects ---------------------------------------------
 
 fn with_effects(effects: Vec<audio_core::Effect>) -> SessionTrack {
@@ -775,42 +817,59 @@ fn render_track(scratch: &mut Scratch, clips: Vec<(Clip, f32)>) -> Vec<f32> {
         .to_vec()
 }
 
+// SPEC-044 §2 supersedes the SPEC-038 §4 / SPEC-040 §1 layer tests: the
+// later start sounds over the earlier one whatever the list order, and the
+// overlap is one crossfade.
+
+fn crossing() -> Vec<(Clip, f32)> {
+    vec![
+        (Clip::full(0, 10_000), 1.0),
+        (Clip::full(6_000, 10_000), 0.5),
+    ]
+}
+
 #[test]
-fn overlapping_clips_are_not_summed_the_later_one_wins() {
-    // SPEC-038 §4, superseding the SPEC-010 sum.
-    let mut scratch = Scratch::new("overlap");
-    let out = render_track(
-        &mut scratch,
-        vec![
-            (Clip::full(0, 10_000), 1.0),
-            (Clip::full(2_000, 4_000), 0.5),
-        ],
-    );
-    assert_eq!(out[1_000], 1.0);
-    assert!(
-        (out[4_000] - 0.5).abs() < 1e-6,
-        "top clip only: {}",
-        out[4_000]
-    );
-    assert_eq!(out[8_000], 1.0);
-    // Crossfade halfway in: 0.5 * 0.5 + 1.0 * 0.5.
-    let mid = 2_000 + audio_core::CROSSFADE_SAMPLES as usize / 2;
-    assert!((out[mid] - 0.75).abs() < 1e-6, "{}", out[mid]);
-    // No sample jumps by more than one ramp step.
-    let step = 0.5 / audio_core::CROSSFADE_SAMPLES as f32 + 1e-6;
-    for pair in out[..10_000].windows(2) {
+fn the_list_order_of_overlapping_clips_does_not_matter() {
+    let mut scratch = Scratch::new("order");
+    let forward = render_track(&mut scratch, crossing());
+    let mut reversed = crossing();
+    reversed.reverse();
+    let mut scratch = Scratch::new("order-rev");
+    assert_eq!(forward, render_track(&mut scratch, reversed));
+}
+
+#[test]
+fn an_overlap_crossfades_from_the_earlier_clip_to_the_later() {
+    let mut scratch = Scratch::new("xfade");
+    let out = render_track(&mut scratch, crossing());
+    assert_eq!(out[5_999], 1.0);
+    assert_eq!(out[6_000], 1.0);
+    assert!((out[8_000] - 0.75).abs() < 1e-6, "{}", out[8_000]);
+    assert_eq!(out[10_000], 0.5);
+    assert_eq!(out[15_000], 0.5);
+    let step = 0.5 / 4_000.0 + 1e-6;
+    for pair in out[..16_000].windows(2) {
         assert!((pair[1] - pair[0]).abs() <= step, "click: {pair:?}");
     }
 }
 
 #[test]
-fn a_clip_fully_under_another_is_silent() {
-    let mut scratch = Scratch::new("hidden");
+fn a_clip_inside_another_plays_over_it_with_short_ramps() {
+    let mut scratch = Scratch::new("inside");
     let out = render_track(
         &mut scratch,
-        vec![(Clip::full(1_000, 500), 1.0), (Clip::full(0, 4_000), 0.25)],
+        vec![
+            (Clip::full(1_000, 2_000), 0.25),
+            (Clip::full(0, 4_000), 1.0),
+        ],
     );
-    assert!(out[1_000..1_500].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+    assert_eq!(out[500], 1.0);
+    assert!(out[1_500..2_500].iter().all(|s| *s == 0.25));
+    assert_eq!(out[3_500], 1.0);
+    let step = 0.75 / audio_core::CROSSFADE_SAMPLES as f32 + 1e-6;
+    for pair in out[..4_000].windows(2) {
+        assert!((pair[1] - pair[0]).abs() <= step, "click: {pair:?}");
+    }
 }
 
 #[test]
@@ -828,53 +887,29 @@ fn clip_fades_shape_the_rendered_sound() {
 }
 
 #[test]
-fn a_fade_over_another_clip_reveals_it() {
-    // SPEC-040 §1: the upper clip's fade-in uncovers the clip below.
+fn a_fade_in_over_another_clip_still_reveals_it() {
     let mut scratch = Scratch::new("fadeover");
     let mut upper = Clip::full(2_000, 4_000);
     upper.fade_in_samples = 1_000;
     let out = render_track(
         &mut scratch,
-        vec![(Clip::full(0, 10_000), 1.0), (upper, 0.5)],
+        vec![(upper, 0.5), (Clip::full(0, 10_000), 1.0)],
     );
-    // At the very start of the fade only the lower clip sounds.
-    assert!((out[2_000] - 1.0).abs() < 1e-6, "{}", out[2_000]);
-    // Halfway through the fade: 0.5 * 0.5 + 0.5 * 1.0.
-    assert!((out[2_500] - 0.75).abs() < 1e-3, "{}", out[2_500]);
+    assert_eq!(out[2_000], 1.0);
     assert!((out[4_000] - 0.5).abs() < 1e-6);
-}
-
-#[test]
-fn fades_cross_through_three_layers() {
-    let mut scratch = Scratch::new("three");
-    let mut middle = Clip::full(1_000, 3_000);
-    middle.fade_out_samples = 1_000;
-    let mut top = Clip::full(3_000, 2_000);
-    top.fade_in_samples = 1_000;
-    let out = render_track(
-        &mut scratch,
-        vec![(Clip::full(0, 6_000), 1.0), (middle, 0.5), (top, 0.25)],
-    );
-    assert!((out[2_000] - 0.5).abs() < 1e-6);
-    // Top at 0, so its fade shows the fading middle over the bottom.
-    let m = 0.5 * (999.0 / 1_000.0) + 1.0 * (1.0 / 1_000.0);
-    assert!((out[3_000] - m).abs() < 1e-3, "{}", out[3_000]);
-    assert!((out[4_500] - 0.25).abs() < 1e-6);
-    // No click anywhere across the stack.
-    for pair in out[..6_000].windows(2) {
+    for pair in out[..10_000].windows(2) {
         assert!((pair[1] - pair[0]).abs() < 0.01, "click: {pair:?}");
     }
 }
 
 #[test]
-fn an_unfaded_clip_on_top_still_wins_exactly() {
+fn identical_clips_play_the_later_one_in_the_list() {
     let mut scratch = Scratch::new("exact");
     let out = render_track(
         &mut scratch,
         vec![(Clip::full(0, 4_000), 0.3), (Clip::full(0, 4_000), 0.7)],
     );
-    let ramp = audio_core::CROSSFADE_SAMPLES as usize;
-    assert!(out[ramp..4_000 - ramp].iter().all(|s| *s == 0.7));
+    assert!(out[..4_000].iter().all(|s| *s == 0.7));
 }
 
 // --- SPEC-041: effect automation -----------------------------------------

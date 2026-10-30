@@ -205,6 +205,46 @@ fn draw_fades(
     }
 }
 
+/// Width left for a track name once the header's right-hand buttons
+/// (✕, FX, A and, when automation is open, the lane picker) are reserved,
+/// so a long name is cut with "…" instead of running under them (SPEC-044 §4).
+fn name_width(available: f32, lanes_open: bool) -> f32 {
+    let reserved = if lanes_open { 210.0 } else { 90.0 };
+    (available - reserved).max(24.0)
+}
+
+/// Paints an overlap of clips as one merged region with an X crossfade
+/// (SPEC-044 §3): the clip borders disappear under its body, so neither
+/// clip looks like it lies in front of the other.
+fn draw_overlap_zone(
+    painter: &egui::Painter,
+    (start, end): (u64, u64),
+    left: f32,
+    top: f32,
+    px_per_sample: f32,
+    colors: &daw_gui::layout::RegionColors,
+) {
+    let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+    let x0 = left + start as f32 * px_per_sample;
+    let x1 = (left + end as f32 * px_per_sample).max(x0 + 2.0);
+    let rect = Rect::from_min_max(
+        Pos2::new(x0, top + 3.0),
+        Pos2::new(x1, top + TRACK_HEIGHT - 3.0),
+    );
+    let header_h = 14.0_f32.min(rect.height() * 0.4);
+    let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_h));
+    let body = Rect::from_min_max(Pos2::new(rect.min.x, header.max.y), rect.max);
+    // The header keeps the top clip's name; only the body merges.
+    painter.rect_filled(body, 0.0, rgb(colors.body).gamma_multiply(0.92));
+    painter.rect_filled(body, 0.0, Color32::from_black_alpha(50));
+    let line = Stroke::new(1.5_f32, Color32::from_gray(235));
+    painter.line_segment([body.left_bottom(), body.right_top()], line);
+    painter.line_segment([body.left_top(), body.right_bottom()], line);
+    let edge = Stroke::new(1.0_f32, Color32::from_black_alpha(140));
+    painter.hline(rect.x_range(), rect.min.y + 0.5, edge);
+    painter.hline(rect.x_range(), rect.max.y - 0.5, edge);
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -278,8 +318,6 @@ struct Recorder {
 /// Region menu command chosen in this frame (SPEC-037).
 #[derive(Clone, Copy)]
 enum RegionAction {
-    Front,
-    Back,
     Piano,
     Copy,
     Paste,
@@ -366,9 +404,6 @@ struct App {
     fx: Option<FxTarget>,
     /// The buses window is open (SPEC-028).
     buses_open: bool,
-    /// Drag mode X-Fade: a moved clip crossfades with its neighbour
-    /// (SPEC-043 §2).
-    drag_xfade: bool,
     /// Bus whose strip the inspector shows on the right (SPEC-043 §5).
     selected_send: Option<usize>,
     /// Track whose name is being edited and the text typed so far (SPEC-029).
@@ -471,7 +506,6 @@ impl App {
             piano_offset: None,
             fx: None,
             buses_open: false,
-            drag_xfade: false,
             selected_send: None,
             rename: None,
             auto: None,
@@ -1116,156 +1150,181 @@ impl App {
                     Color32::from_gray(36)
                 })
                 .inner_margin(4.0);
-            let response = frame
-                .show(ui, |ui| {
-                    ui.set_height(TRACK_HEIGHT - 8.0);
-                    ui.set_width(ui.available_width());
-                    let track = &self.editor.session().tracks[index];
-                    let (mut mute, mut solo) = (track.mute, track.solo);
-                    let (mut gain, mut pan) = (track.gain, track.pan);
-                    let name = track.name.clone();
-                    let audio = track.clips.iter().any(|c| c.source.is_some());
-                    let color = track_color(track.color, index);
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        let (icon, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                        ui.painter()
-                            .rect_filled(icon, 4.0, color.gamma_multiply(0.35));
-                        ui.painter().rect_stroke(
-                            icon,
-                            4.0,
-                            egui::Stroke::new(1.0_f32, color),
-                            egui::StrokeKind::Inside,
-                        );
-                        ui.painter().text(
-                            icon.center(),
-                            egui::Align2::CENTER_CENTER,
-                            if audio { "〰" } else { "♪" },
-                            egui::FontId::proportional(13.0),
-                            color,
-                        );
-                        if let Some((_, text)) =
-                            self.rename.as_mut().filter(|(track, _)| *track == index)
-                        {
-                            let edit =
-                                ui.add(egui::TextEdit::singleline(text).desired_width(110.0));
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                self.rename = None;
-                            } else if edit.lost_focus() {
-                                action = Some(TrackAction::Rename(index));
-                            } else {
-                                edit.request_focus();
-                            }
-                        } else if ui
-                            .add(
-                                egui::Label::new(egui::RichText::new(&name).strong())
-                                    .sense(Sense::click()),
-                            )
-                            .on_hover_text("Двойной щелчок — переименовать")
-                            .double_clicked()
-                        {
-                            self.rename = Some((index, name.clone()));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Удалить дорожку")
-                                .clicked()
+            // SPEC-044 §1: the click-sensing scope is registered before
+            // its children, so the M/S/R/I buttons inside get their clicks.
+            let response = ui
+                .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
+                    frame.show(ui, |ui| {
+                        ui.set_height(TRACK_HEIGHT - 8.0);
+                        ui.set_width(ui.available_width());
+                        let track = &self.editor.session().tracks[index];
+                        let (mut mute, mut solo) = (track.mute, track.solo);
+                        let track_monitor = track.input_monitor;
+                        let (mut gain, mut pan) = (track.gain, track.pan);
+                        let name = track.name.clone();
+                        let audio = track.clips.iter().any(|c| c.source.is_some());
+                        let color = track_color(track.color, index);
+                        ui.horizontal(|ui| {
+                            ui.add_space(6.0);
+                            let (icon, _) =
+                                ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                            ui.painter()
+                                .rect_filled(icon, 4.0, color.gamma_multiply(0.35));
+                            ui.painter().rect_stroke(
+                                icon,
+                                4.0,
+                                egui::Stroke::new(1.0_f32, color),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                icon.center(),
+                                egui::Align2::CENTER_CENTER,
+                                if audio { "〰" } else { "♪" },
+                                egui::FontId::proportional(13.0),
+                                color,
+                            );
+                            if let Some((_, text)) =
+                                self.rename.as_mut().filter(|(track, _)| *track == index)
                             {
-                                delete = Some(index);
-                            }
-                            let effects = self.editor.session().tracks[index].effects.len();
-                            let label = if effects == 0 {
-                                "FX".to_owned()
-                            } else {
-                                format!("FX {effects}")
-                            };
-                            if ui
-                                .selectable_label(self.fx == Some(FxTarget::Track(index)), label)
-                                .on_hover_text("Эффекты дорожки")
-                                .clicked()
-                            {
-                                self.fx = if self.fx == Some(FxTarget::Track(index)) {
-                                    None
+                                let edit =
+                                    ui.add(egui::TextEdit::singleline(text).desired_width(110.0));
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    self.rename = None;
+                                } else if edit.lost_focus() {
+                                    action = Some(TrackAction::Rename(index));
                                 } else {
-                                    Some(FxTarget::Track(index))
-                                };
-                            }
-                            if ui
-                                .selectable_label(self.auto == Some(index), "A")
-                                .on_hover_text("Автоматизация")
-                                .clicked()
+                                    edit.request_focus();
+                                }
+                            } else if ui
+                                .add_sized(
+                                    Vec2::new(
+                                        name_width(ui.available_width(), self.auto == Some(index)),
+                                        ui.spacing().interact_size.y,
+                                    ),
+                                    egui::Label::new(egui::RichText::new(&name).strong())
+                                        .truncate()
+                                        .halign(egui::Align::LEFT)
+                                        .sense(Sense::click()),
+                                )
+                                .on_hover_text(format!("{name}\nДвойной щелчок — переименовать"))
+                                .double_clicked()
                             {
-                                self.auto = if self.auto == Some(index) {
-                                    None
-                                } else {
-                                    Some(index)
-                                };
-                                self.auto_drag = None;
+                                self.rename = Some((index, name.clone()));
                             }
-                            if self.auto == Some(index) {
-                                self.lane_picker(ui, index);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("✕")
+                                        .on_hover_text("Удалить дорожку")
+                                        .clicked()
+                                    {
+                                        delete = Some(index);
+                                    }
+                                    let effects = self.editor.session().tracks[index].effects.len();
+                                    let label = if effects == 0 {
+                                        "FX".to_owned()
+                                    } else {
+                                        format!("FX {effects}")
+                                    };
+                                    if ui
+                                        .selectable_label(
+                                            self.fx == Some(FxTarget::Track(index)),
+                                            label,
+                                        )
+                                        .on_hover_text("Эффекты дорожки")
+                                        .clicked()
+                                    {
+                                        self.fx = if self.fx == Some(FxTarget::Track(index)) {
+                                            None
+                                        } else {
+                                            Some(FxTarget::Track(index))
+                                        };
+                                    }
+                                    if ui
+                                        .selectable_label(self.auto == Some(index), "A")
+                                        .on_hover_text("Автоматизация")
+                                        .clicked()
+                                    {
+                                        self.auto = if self.auto == Some(index) {
+                                            None
+                                        } else {
+                                            Some(index)
+                                        };
+                                        self.auto_drag = None;
+                                    }
+                                    if self.auto == Some(index) {
+                                        self.lane_picker(ui, index);
+                                    }
+                                },
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(34.0);
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            let m =
+                                shell::pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
+                                    .on_hover_text("Без звука");
+                            let s =
+                                shell::pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
+                                    .on_hover_text("Соло");
+                            let mut armed = self.editor.armed_track() == Some(index);
+                            if shell::pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
+                                .on_hover_text("Запись на эту дорожку")
+                                .changed()
+                            {
+                                self.editor.arm_track(armed.then_some(index));
+                            }
+                            let mut monitor = track_monitor;
+                            let i =
+                                shell::pill(ui, &mut monitor, "I", Color32::from_rgb(240, 160, 60))
+                                    .on_hover_text("Мониторинг входа");
+                            if s.changed() || m.changed() || i.changed() {
+                                if let Some(t) = self.editor.track_mut(index) {
+                                    t.mute = mute;
+                                    t.solo = solo;
+                                    t.input_monitor = monitor;
+                                }
                             }
                         });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(34.0);
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        let m = shell::pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
-                            .on_hover_text("Без звука");
-                        let s = shell::pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
-                            .on_hover_text("Соло");
-                        let mut armed = self.editor.armed_track() == Some(index);
-                        if shell::pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
-                            .on_hover_text("Запись на эту дорожку")
-                            .changed()
-                        {
-                            self.editor.arm_track(armed.then_some(index));
-                        }
-                        shell::pill_stub(ui, "I");
-                        if s.changed() || m.changed() {
+                        let automation = &self.editor.session().tracks[index].automation;
+                        let (gain_free, pan_free) =
+                            (automation.gain.is_empty(), automation.pan.is_empty());
+                        let (g, p) = ui
+                            .horizontal(|ui| {
+                                ui.add_space(30.0);
+                                ui.spacing_mut().slider_width =
+                                    ((ui.available_width() - 60.0) * 0.6).max(40.0);
+                                let g = ui
+                                    .add_enabled(
+                                        gain_free,
+                                        egui::Slider::new(&mut gain, 0.0..=1.0).show_value(false),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Громкость {}",
+                                        daw_gui::layout::db_label(gain)
+                                    ));
+                                ui.spacing_mut().slider_width =
+                                    (ui.available_width() - 8.0).max(30.0);
+                                let p = ui
+                                    .add_enabled(
+                                        pan_free,
+                                        egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Панорама {}",
+                                        daw_gui::layout::pan_label(pan)
+                                    ));
+                                (g, p)
+                            })
+                            .inner;
+                        if g.changed() || p.changed() {
                             if let Some(t) = self.editor.track_mut(index) {
-                                t.mute = mute;
-                                t.solo = solo;
+                                t.gain = gain;
+                                t.pan = pan;
                             }
                         }
                     });
-                    let automation = &self.editor.session().tracks[index].automation;
-                    let (gain_free, pan_free) =
-                        (automation.gain.is_empty(), automation.pan.is_empty());
-                    let (g, p) = ui
-                        .horizontal(|ui| {
-                            ui.add_space(30.0);
-                            ui.spacing_mut().slider_width =
-                                ((ui.available_width() - 60.0) * 0.6).max(40.0);
-                            let g = ui
-                                .add_enabled(
-                                    gain_free,
-                                    egui::Slider::new(&mut gain, 0.0..=1.0).show_value(false),
-                                )
-                                .on_hover_text(format!(
-                                    "Громкость {}",
-                                    daw_gui::layout::db_label(gain)
-                                ));
-                            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(30.0);
-                            let p = ui
-                                .add_enabled(
-                                    pan_free,
-                                    egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false),
-                                )
-                                .on_hover_text(format!(
-                                    "Панорама {}",
-                                    daw_gui::layout::pan_label(pan)
-                                ));
-                            (g, p)
-                        })
-                        .inner;
-                    if g.changed() || p.changed() {
-                        if let Some(t) = self.editor.track_mut(index) {
-                            t.gain = gain;
-                            t.pan = pan;
-                        }
-                    }
                 })
                 .response;
             ui.painter().rect_filled(
@@ -1281,11 +1340,10 @@ impl App {
                 );
                 shell::paint_meter_bars(ui.painter(), bar, meter, false);
             }
-            let click = response.interact(Sense::click());
-            if click.clicked() {
+            if response.clicked() {
                 self.editor.selected_track = Some(index);
             }
-            click.context_menu(|ui| {
+            response.context_menu(|ui| {
                 if ui.button("Переименовать").clicked() {
                     self.rename = Some((index, self.editor.session().tracks[index].name.clone()));
                     ui.close();
@@ -1556,7 +1614,9 @@ impl App {
                 ],
                 Stroke::new(1.0_f32, Color32::from_gray(45)),
             );
-            for (c, clip) in track.clips.iter().enumerate() {
+            let mut selected_rect = None;
+            for c in daw_gui::layout::draw_order(&track.clips) {
+                let clip = &track.clips[c];
                 let left = area.min.x + clip.start_samples as f32 * px_per_sample;
                 let w = (clip.length_samples as f32 * px_per_sample).max(2.0);
                 let rect = Rect::from_min_size(
@@ -1646,6 +1706,9 @@ impl App {
                     Stroke::new(1.0_f32, Color32::from_black_alpha(140))
                 };
                 painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
+                if selected {
+                    selected_rect = Some((rect, border));
+                }
                 rects.push(((t, c), rect));
                 if (response.clicked() || response.secondary_clicked())
                     && pointer.is_some_and(|p| rect.contains(p))
@@ -1655,6 +1718,17 @@ impl App {
                 if response.double_clicked() && pointer.is_some_and(|p| rect.contains(p)) {
                     open_piano = Some((t, c));
                 }
+            }
+            let base = track_color(track.color, t);
+            let colors = daw_gui::layout::region_colors(
+                [base.r(), base.g(), base.b()],
+                !self.editor.session().is_audible(t),
+            );
+            for zone in daw_gui::layout::overlap_zones(&track.clips) {
+                draw_overlap_zone(&painter, zone, area.min.x, top, px_per_sample, &colors);
+            }
+            if let Some((rect, border)) = selected_rect {
+                painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
             }
         }
 
@@ -2319,13 +2393,6 @@ impl App {
         if response.drag_stopped() {
             self.drag = None;
             self.status = "Клип изменён".into();
-            if drag.mode == DragMode::Move && self.drag_xfade {
-                match self.editor.crossfade(drag.track, drag.clip) {
-                    Ok(()) => self.status = "Клип перемещён, кроссфейд создан".into(),
-                    Err(EditorError::CannotCrossfade) => {}
-                    Err(e) => self.status = format!("Ошибка: {e}"),
-                }
-            }
             return;
         }
         let Some(p) = response.interact_pointer_pos() else {
@@ -2718,8 +2785,6 @@ impl App {
                 item(ui, "Фейд-аут 10 мс", "", RegionAction::FadeOut);
                 item(ui, "Убрать фейды", "", RegionAction::NoFades);
                 ui.separator();
-                item(ui, "На передний план", "Ctrl+]", RegionAction::Front);
-                item(ui, "На задний план", "Ctrl+[", RegionAction::Back);
                 ui.separator();
                 for stub in ["Переименовать", "Цвет", "Квантизация", "Зациклить"]
                 {
@@ -2753,9 +2818,6 @@ impl App {
                     self.join_clip(t, c);
                 }
             }
-            Some(a @ (RegionAction::Front | RegionAction::Back)) => {
-                self.reorder_selected(matches!(a, RegionAction::Front));
-            }
             Some(a @ (RegionAction::FadeIn | RegionAction::FadeOut | RegionAction::NoFades)) => {
                 if let Some((t, c)) = selected {
                     self.quick_fade(t, c, a);
@@ -2763,25 +2825,6 @@ impl App {
             }
             None => {}
         }
-    }
-
-    /// Puts the selected region above or below the others where they
-    /// overlap (SPEC-040 §2).
-    fn reorder_selected(&mut self, front: bool) {
-        let Some((t, c)) = self.editor.selected_clip else {
-            return;
-        };
-        self.drag = None;
-        let result = if front {
-            self.editor.bring_to_front(t, c)
-        } else {
-            self.editor.send_to_back(t, c)
-        };
-        self.status = match result {
-            Ok(_) if front => "Регион на переднем плане".into(),
-            Ok(_) => "Регион на заднем плане".into(),
-            Err(e) => format!("Ошибка: {e}"),
-        };
     }
 
     /// Joins a clip with the next one on its track (SPEC-038 §5).
@@ -2951,15 +2994,6 @@ impl App {
                     i.consume_key(egui::Modifiers::NONE, Key::Enter),
                 )
             });
-            let (front, back_layer) = ctx.input_mut(|i| {
-                (
-                    i.consume_key(egui::Modifiers::COMMAND, Key::CloseBracket),
-                    i.consume_key(egui::Modifiers::COMMAND, Key::OpenBracket),
-                )
-            });
-            if front || back_layer {
-                self.reorder_selected(front);
-            }
             let xfade = ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::ALT, Key::X)
             });

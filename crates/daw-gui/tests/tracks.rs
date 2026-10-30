@@ -153,3 +153,28 @@ fn duplicating_respects_the_track_limit() {
     ));
     assert_eq!(editor.session().tracks.len(), MAX_TRACKS);
 }
+
+// --- SPEC-044 §1: master mute and dim ------------------------------------
+
+#[test]
+fn master_mute_and_dim_toggle_and_undo() {
+    let mut editor = editor_with(1);
+    editor.set_master_mute(true);
+    editor.set_master_dim(true);
+    assert!(editor.session().master_mute && editor.session().master_dim);
+    assert!(editor.undo());
+    assert!(editor.session().master_mute && !editor.session().master_dim);
+    assert!(editor.undo());
+    assert!(!editor.session().master_mute);
+}
+
+#[test]
+fn setting_the_same_master_state_adds_no_undo_step() {
+    let mut editor = editor_with(1);
+    editor.set_master_dim(true);
+    editor.set_master_dim(true);
+    editor.set_master_mute(false);
+    assert!(editor.undo());
+    assert!(!editor.session().master_dim);
+    assert_eq!(names(&editor), ["T0"], "one undo step only removed the dim");
+}
