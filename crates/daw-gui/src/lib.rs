@@ -239,8 +239,9 @@ pub struct Editor {
     pub metronome: bool,
     /// Clip copied with [`Self::copy_clip`]; not saved (SPEC-027).
     clipboard: Option<Clip>,
-    /// Track armed for recording; not saved (SPEC-038).
-    armed: Option<usize>,
+    /// Tracks armed for recording, sorted and without repeats; not saved
+    /// (SPEC-038, SPEC-046 §1).
+    armed: Vec<usize>,
     /// Live levels of playback, shared by every graph it plays (SPEC-042).
     meters: daw_app::meters::Meters,
 }
@@ -278,7 +279,7 @@ impl Editor {
             cycle: None,
             cycle_enabled: false,
             metronome: false,
-            armed: None,
+            armed: Vec::new(),
             clipboard: None,
             meters: daw_app::meters::Meters::new(),
         }
@@ -344,7 +345,7 @@ impl Editor {
             cycle_enabled: false,
             metronome: self.metronome,
             clipboard: None,
-            armed: None,
+            armed: Vec::new(),
             meters: self.meters.clone(),
         };
         Ok(())
@@ -474,8 +475,9 @@ impl Editor {
     /// Adds a microphone take as a clip at `start` (SPEC-020).
     ///
     /// The take is converted to the project rate and written to the first
-    /// free `rec-NNN.wav` in `dir`; the clip goes on the selected track, or a
-    /// new "Запись" track. One undo step.
+    /// free `rec-NNN.wav` in `dir`. A clip of it goes on every armed track
+    /// (SPEC-046 §1); with none armed, on the selected track, or a new
+    /// "Запись" track. One undo step. Returns the first armed track's clip.
     ///
     /// # Errors
     ///
@@ -503,21 +505,27 @@ impl Editor {
             return Err(EditorError::EmptyRecording);
         }
         let mut session = self.project.session.clone();
-        let track_index = match self
-            .armed_track()
-            .or(self.selected_track)
-            .filter(|&t| t < session.tracks.len())
-        {
-            Some(t) => t,
-            None => {
-                session.tracks.push(Track::new("Запись"));
-                session.tracks.len() - 1
-            }
-        };
-        let track = &mut session.tracks[track_index];
+        let mut targets: Vec<usize> = self.armed_tracks().collect();
+        if targets.is_empty() {
+            targets.push(
+                match self.selected_track.filter(|&t| t < session.tracks.len()) {
+                    Some(t) => t,
+                    None => {
+                        session.tracks.push(Track::new("Запись"));
+                        session.tracks.len() - 1
+                    }
+                },
+            );
+        }
         let mut clip = Clip::full(start, audio.len() as u64);
-        track.clips.push(clip.clone());
-        let clip_index = track.clips.len() - 1;
+        let placed: Vec<(usize, usize)> = targets
+            .iter()
+            .map(|&t| {
+                session.tracks[t].clips.push(clip.clone());
+                (t, session.tracks[t].clips.len() - 1)
+            })
+            .collect();
+        let (track_index, clip_index) = placed[0];
         session.validate()?;
 
         let write_err = |path: &Path, source| EditorError::Write {
@@ -542,7 +550,9 @@ impl Editor {
         })?;
         clip.name = clip_name(&path);
         clip.source = Some(source.clone());
-        session.tracks[track_index].clips[clip_index] = clip;
+        for &(t, c) in &placed {
+            session.tracks[t].clips[c] = clip.clone();
+        }
 
         self.record();
         self.project.session = session;
@@ -1234,16 +1244,47 @@ impl Editor {
         Ok(at)
     }
 
-    /// Track armed for recording, if any (SPEC-038 §9).
+    /// The first track armed for recording, if any (SPEC-038 §9).
     #[must_use]
     pub fn armed_track(&self) -> Option<usize> {
-        self.armed
-            .filter(|&t| t < self.project.session.tracks.len())
+        self.armed_tracks().next()
     }
 
-    /// Arms one track for recording, or none; the project is untouched.
+    /// Every track armed for recording, top to bottom (SPEC-046 §1).
+    pub fn armed_tracks(&self) -> impl Iterator<Item = usize> + '_ {
+        let tracks = self.project.session.tracks.len();
+        self.armed.iter().copied().filter(move |&t| t < tracks)
+    }
+
+    /// Whether `track` is armed for recording.
+    #[must_use]
+    pub fn is_armed(&self, track: usize) -> bool {
+        self.armed_tracks().any(|t| t == track)
+    }
+
+    /// Arms exactly one track for recording, or none; the project is
+    /// untouched.
     pub fn arm_track(&mut self, track: Option<usize>) {
-        self.armed = track.filter(|&t| t < self.project.session.tracks.len());
+        self.armed.clear();
+        if let Some(t) = track.filter(|&t| t < self.project.session.tracks.len()) {
+            self.armed.push(t);
+        }
+    }
+
+    /// Arms or disarms one track and leaves the others as they are, so
+    /// several tracks can be armed at once, as in Logic (SPEC-046 §1).
+    /// Bad indices do nothing; the project is untouched.
+    pub fn set_armed(&mut self, track: usize, on: bool) {
+        if track >= self.project.session.tracks.len() {
+            return;
+        }
+        match (self.armed.binary_search(&track), on) {
+            (Err(at), true) => self.armed.insert(at, track),
+            (Ok(at), false) => {
+                self.armed.remove(at);
+            }
+            _ => {}
+        }
     }
 
     /// Copies a clip to the window's clipboard; the project is untouched.
@@ -1994,17 +2035,18 @@ impl Editor {
         let moved = session.tracks.remove(from);
         session.tracks.insert(to, moved);
         self.commit_track(session, to)?;
-        self.armed = self.armed.map(|a| {
-            if a == from {
+        for a in &mut self.armed {
+            *a = if *a == from {
                 to
-            } else if from < a && a <= to {
-                a - 1
-            } else if to <= a && a < from {
-                a + 1
+            } else if from < *a && *a <= to {
+                *a - 1
+            } else if to <= *a && *a < from {
+                *a + 1
             } else {
-                a
-            }
-        });
+                *a
+            };
+        }
+        self.armed.sort_unstable();
         self.selected_clip = None;
         Ok(())
     }
@@ -2029,7 +2071,11 @@ impl Editor {
         }
         session.tracks.insert(track + 1, copy);
         self.commit_track(session, track + 1)?;
-        self.armed = self.armed.map(|a| if a > track { a + 1 } else { a });
+        for a in &mut self.armed {
+            if *a > track {
+                *a += 1;
+            }
+        }
         self.selected_clip = None;
         Ok(track + 1)
     }
@@ -2039,11 +2085,12 @@ impl Editor {
         if track < self.project.session.tracks.len() {
             self.record();
             self.project.session.tracks.remove(track);
-            self.armed = match self.armed {
-                Some(a) if a == track => None,
-                Some(a) if a > track => Some(a - 1),
-                other => other,
-            };
+            self.armed.retain(|&a| a != track);
+            for a in &mut self.armed {
+                if *a > track {
+                    *a -= 1;
+                }
+            }
             self.selected_track = None;
             self.selected_clip = None;
             self.dirty = true;
