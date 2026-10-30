@@ -47,6 +47,15 @@ fn tracks(dir: &Scratch, count: usize) -> Editor {
     editor
 }
 
+/// An editor with `count` audio tracks; the first holds one clip.
+fn audio_tracks(dir: &Scratch, count: usize) -> Editor {
+    let mut editor = tracks(dir, 1);
+    editor
+        .add_tracks(audio_core::TrackKind::Audio, count - 1, "")
+        .unwrap();
+    editor
+}
+
 fn armed(editor: &Editor) -> Vec<usize> {
     editor.armed_tracks().collect()
 }
@@ -102,7 +111,7 @@ fn arms_follow_tracks_on_delete_move_and_duplicate() {
 #[test]
 fn a_take_lands_on_every_armed_track_as_one_undo_step() {
     let dir = Scratch::new("rec");
-    let mut editor = tracks(&dir, 3);
+    let mut editor = audio_tracks(&dir, 3);
     editor.set_armed(0, true);
     editor.set_armed(2, true);
     editor.selected_track = Some(1);

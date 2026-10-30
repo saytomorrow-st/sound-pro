@@ -753,11 +753,35 @@ impl Automation {
     }
 }
 
+/// What a track holds (SPEC-049): audio regions or MIDI regions played
+/// by its instrument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackKind {
+    /// Audio regions; microphone takes are recorded here.
+    #[default]
+    Audio,
+    /// Software instrument: MIDI regions.
+    Instrument,
+}
+
+impl TrackKind {
+    /// Whether a clip of this kind of content belongs on such a track.
+    #[must_use]
+    pub const fn accepts(self, clip: &Clip) -> bool {
+        matches!(
+            (self, clip.is_midi()),
+            (Self::Audio, false) | (Self::Instrument, true)
+        )
+    }
+}
+
 /// A horizontal lane holding clips.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
     /// Display name.
     pub name: String,
+    /// Audio or software instrument (SPEC-049).
+    pub kind: TrackKind,
     /// Linear track gain, `0.0..=1.0`.
     pub gain: f32,
     /// Balance pan, `-1.0` (left) ..= `1.0` (right); `0.0` is centre.
@@ -819,11 +843,21 @@ impl Bus {
 }
 
 impl Track {
-    /// Empty, unmuted, centred track at unity gain.
+    /// Empty software-instrument track (SPEC-049).
+    #[must_use]
+    pub fn instrument(name: &str) -> Self {
+        Self {
+            kind: TrackKind::Instrument,
+            ..Self::new(name)
+        }
+    }
+
+    /// Empty, unmuted, centred audio track at unity gain.
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_owned(),
+            kind: TrackKind::Audio,
             gain: 1.0,
             pan: 0.0,
             mute: false,

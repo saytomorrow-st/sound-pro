@@ -18,7 +18,7 @@ use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
     AutoPoint, Automation, Bus, BusSend, Clip, EffectLane, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
     MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker,
-    Note, Session, SessionError, Track,
+    Note, Session, SessionError, Track, TrackKind,
 };
 use crate::transport::TimeSignature;
 
@@ -439,6 +439,9 @@ fn write_session(out: &mut String, session: &Session) {
         }
         out.push_str("\n      {\n        \"name\": ");
         write_string(out, &track.name);
+        if track.kind == TrackKind::Instrument {
+            out.push_str(",\n        \"kind\": \"instrument\"");
+        }
         out.push_str(",\n        \"gain\": ");
         out.push_str(&format_number(f64::from(track.gain)));
         out.push_str(",\n        \"pan\": ");
@@ -774,8 +777,10 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut sends = None;
     let mut color = None;
     let mut notes = None;
+    let mut kind = None;
     for (key, value) in entries {
         match key.as_str() {
+            "kind" => kind = Some(kind_from_value(value)?),
             "notes" => notes = Some(require_string(value)?),
             "color" => color = Some(require_u8(value)?),
             "sends" => sends = Some(sends_from_value(value)?),
@@ -810,10 +815,20 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
             }
         }
     }
+    let clips: Vec<Clip> = clips.ok_or(ProjectError::MissingField {
+        field: "session.tracks[].clips",
+    })?;
+    // Optional since SPEC-049: older projects made MIDI tracks implicitly.
+    let kind = kind.unwrap_or(if clips.iter().any(Clip::is_midi) {
+        TrackKind::Instrument
+    } else {
+        TrackKind::Audio
+    });
     Ok(Track {
         name: name.ok_or(ProjectError::MissingField {
             field: "session.tracks[].name",
         })?,
+        kind,
         gain: gain.ok_or(ProjectError::MissingField {
             field: "session.tracks[].gain",
         })?,
@@ -824,9 +839,7 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
         solo: solo.unwrap_or(false),
         // Optional since SPEC-044.
         input_monitor: input_monitor.unwrap_or(false),
-        clips: clips.ok_or(ProjectError::MissingField {
-            field: "session.tracks[].clips",
-        })?,
+        clips,
         // Optional since SPEC-022.
         effects: effects.unwrap_or_default(),
         // Optional since SPEC-023.
@@ -1577,6 +1590,15 @@ fn project_from_object(entries: &[(String, Value)]) -> Result<Project, ProjectEr
     })
 }
 
+/// `"audio"` or `"instrument"` (SPEC-049).
+fn kind_from_value(value: &Value) -> Result<TrackKind, ProjectError> {
+    match require_string(value)?.as_str() {
+        "audio" => Ok(TrackKind::Audio),
+        "instrument" => Ok(TrackKind::Instrument),
+        _ => Err(ProjectError::Malformed { at: 0 }),
+    }
+}
+
 fn require_string(value: &Value) -> Result<String, ProjectError> {
     value
         .as_str()
@@ -1879,6 +1901,35 @@ mod tests {
         let back = Project::from_json(&text).unwrap();
         assert_eq!(back.tempo_bpm.to_bits(), 128.5_f64.to_bits());
         assert_eq!(back.params[0].value.to_bits(), 0.1_f32.to_bits());
+    }
+
+    #[test]
+    fn track_kind_round_trips_and_legacy_is_inferred() {
+        use crate::session::{Clip, Track, TrackKind};
+        let mut session = Session::new_untitled(48_000, 120.0);
+        session.tracks.push(Track::instrument("Синт"));
+        session.tracks.push(Track::new("Аудио"));
+        let mut legacy = Track::new("Старый MIDI");
+        legacy.clips.push(Clip::midi(0, 100));
+        session.tracks.push(legacy);
+        let text = Project::with_session(project(), session).to_json();
+        assert_eq!(text.matches("\"kind\": \"instrument\"").count(), 1);
+        let back = Project::from_json(&text).unwrap();
+        let kinds: Vec<_> = back.session.tracks.iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TrackKind::Instrument,
+                TrackKind::Audio,
+                TrackKind::Instrument
+            ],
+            "a track with MIDI regions and no kind loads as instrument"
+        );
+        let bad = text.replace("\"kind\": \"instrument\"", "\"kind\": \"drums\"");
+        assert!(matches!(
+            Project::from_json(&bad).unwrap_err(),
+            ProjectError::Malformed { .. }
+        ));
     }
 
     #[test]
