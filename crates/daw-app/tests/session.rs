@@ -1041,3 +1041,31 @@ fn effect_automation_does_not_depend_on_the_block_size() {
         assert!(same, "block {block}");
     }
 }
+
+// SPEC-045 §2: an explicit crossfade over an overlap does not dip.
+#[test]
+fn an_explicit_crossfade_keeps_constant_level_over_the_overlap() {
+    let mut scratch = Scratch::new("explicit-xfade");
+    let out = render_track(
+        &mut scratch,
+        vec![
+            (
+                Clip {
+                    fade_out_samples: 4_000,
+                    ..Clip::full(0, 10_000)
+                },
+                1.0,
+            ),
+            (
+                Clip {
+                    fade_in_samples: 4_000,
+                    ..Clip::full(6_000, 10_000)
+                },
+                1.0,
+            ),
+        ],
+    );
+    for (i, v) in out.iter().enumerate().take(16_000) {
+        assert!((v - 1.0).abs() < 1e-3, "dip at {i}: {v}");
+    }
+}

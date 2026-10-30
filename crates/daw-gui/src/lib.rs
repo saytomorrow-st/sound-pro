@@ -854,12 +854,14 @@ impl Editor {
         right.offset_samples += head;
         right.length_samples -= head;
         right.fade_in_samples = 0;
+        right.fade_in_curve = 0.0;
         right.fade_out_samples = c.fade_out_samples.min(right.length_samples);
         let mut session = self.project.session.clone();
         let left = &mut session.tracks[track].clips[clip];
         left.length_samples = head;
         left.fade_in_samples = left.fade_in_samples.min(head);
         left.fade_out_samples = 0;
+        left.fade_out_curve = 0.0;
         session.tracks[track].clips.insert(clip + 1, right);
         let at = (track, clip + 1);
         self.commit(session, at)?;
@@ -890,6 +892,34 @@ impl Editor {
         let c = &mut session.tracks[track].clips[clip];
         c.fade_in_samples = fade_in;
         c.fade_out_samples = fade_out;
+        self.commit(session, (track, clip))
+    }
+
+    /// Sets the shapes of a clip's fades, each limited to `-1.0..=1.0`; NaN
+    /// counts as linear (SPEC-045 §1). One undo step unless unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices; `self` is unchanged.
+    pub fn set_fade_curves(
+        &mut self,
+        track: usize,
+        clip: usize,
+        fade_in: f32,
+        fade_out: f32,
+    ) -> Result<(), EditorError> {
+        let c = self.clip_ref(track, clip)?;
+        let limit = |v: f32| if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) };
+        let (fade_in, fade_out) = (limit(fade_in), limit(fade_out));
+        if c.fade_in_curve.to_bits() == fade_in.to_bits()
+            && c.fade_out_curve.to_bits() == fade_out.to_bits()
+        {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        let c = &mut session.tracks[track].clips[clip];
+        c.fade_in_curve = fade_in;
+        c.fade_out_curve = fade_out;
         self.commit(session, (track, clip))
     }
 
@@ -1173,6 +1203,7 @@ impl Editor {
                     source_length: length,
                     notes: Some(notes),
                     fade_out_samples: b.fade_out_samples,
+                    fade_out_curve: b.fade_out_curve,
                     ..a.clone()
                 }
             }
@@ -1186,6 +1217,7 @@ impl Editor {
                 Clip {
                     length_samples: a.length_samples + b.length_samples,
                     fade_out_samples: b.fade_out_samples,
+                    fade_out_curve: b.fade_out_curve,
                     ..a.clone()
                 }
             }
