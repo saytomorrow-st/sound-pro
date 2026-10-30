@@ -229,8 +229,13 @@ pub struct Editor {
     group: Option<bool>,
     /// Selected track, if any.
     pub selected_track: Option<usize>,
-    /// Selected clip as `(track, clip)`, if any.
+    /// Selected clip as `(track, clip)`, if any; the primary one of a
+    /// multiple selection (SPEC-047).
     pub selected_clip: Option<(usize, usize)>,
+    /// Clips selected besides [`Self::selected_clip`] (SPEC-047), sorted.
+    more_clips: Vec<(usize, usize)>,
+    /// Tracks selected besides [`Self::selected_track`] (SPEC-047), sorted.
+    more_tracks: Vec<usize>,
     /// Cycle region `[start, end)` of the window; not saved (SPEC-025).
     cycle: Option<(u64, u64)>,
     /// Whether playback repeats [`Self::cycle`].
@@ -276,6 +281,8 @@ impl Editor {
             group: None,
             selected_track: None,
             selected_clip: None,
+            more_clips: Vec::new(),
+            more_tracks: Vec::new(),
             cycle: None,
             cycle_enabled: false,
             metronome: false,
@@ -341,6 +348,8 @@ impl Editor {
             group: None,
             selected_track: None,
             selected_clip: None,
+            more_clips: Vec::new(),
+            more_tracks: Vec::new(),
             cycle: None,
             cycle_enabled: false,
             metronome: self.metronome,
@@ -756,6 +765,7 @@ impl Editor {
             self.record();
             self.project.session.tracks[track].clips.remove(clip);
             self.selected_clip = None;
+            self.more_clips.clear();
             self.dirty = true;
         }
     }
@@ -1287,6 +1297,283 @@ impl Editor {
         }
     }
 
+    /// Every selected clip, primary included, sorted by `(track, clip)`
+    /// (SPEC-047 §1).
+    #[must_use]
+    pub fn selected_clips(&self) -> Vec<(usize, usize)> {
+        let mut all = self.more_clips.clone();
+        if let Some(at) = self.selected_clip {
+            if let Err(i) = all.binary_search(&at) {
+                all.insert(i, at);
+            }
+        }
+        let tracks = &self.project.session.tracks;
+        all.retain(|&(t, c)| tracks.get(t).is_some_and(|tr| c < tr.clips.len()));
+        all
+    }
+
+    /// Whether the clip at `(track, clip)` is part of the selection.
+    #[must_use]
+    pub fn is_clip_selected(&self, at: (usize, usize)) -> bool {
+        self.selected_clip == Some(at) || self.more_clips.binary_search(&at).is_ok()
+    }
+
+    /// Selects one clip. Without `toggle` it replaces the selection (`None`
+    /// clears it); with `toggle` (Shift- or Ctrl-click) it adds the clip or,
+    /// if it was selected, removes it (SPEC-047 §1). Bad indices do nothing.
+    pub fn select_clip(&mut self, at: Option<(usize, usize)>, toggle: bool) {
+        let valid = |at: (usize, usize)| {
+            self.project
+                .session
+                .tracks
+                .get(at.0)
+                .is_some_and(|t| at.1 < t.clips.len())
+        };
+        if at.is_some_and(|at| !valid(at)) {
+            return;
+        }
+        if !toggle {
+            self.more_clips.clear();
+            self.more_tracks.clear();
+            self.selected_clip = at;
+            if let Some((t, _)) = at {
+                self.selected_track = Some(t);
+            }
+            return;
+        }
+        let Some(at) = at else { return };
+        if self.is_clip_selected(at) {
+            if self.selected_clip == Some(at) {
+                self.selected_clip =
+                    (!self.more_clips.is_empty()).then(|| self.more_clips.remove(0));
+            } else if let Ok(i) = self.more_clips.binary_search(&at) {
+                self.more_clips.remove(i);
+            }
+            return;
+        }
+        if let Some(old) = self.selected_clip {
+            if let Err(i) = self.more_clips.binary_search(&old) {
+                self.more_clips.insert(i, old);
+            }
+        }
+        self.selected_clip = Some(at);
+        self.selected_track = Some(at.0);
+    }
+
+    /// Makes a selected clip the primary one, keeping the rest of the
+    /// selection, so a drag on any clip of a group moves the group. Clips
+    /// outside the selection do nothing.
+    pub fn focus_clip(&mut self, at: (usize, usize)) {
+        let Ok(i) = self.more_clips.binary_search(&at) else {
+            return;
+        };
+        self.more_clips.remove(i);
+        if let Some(old) = self.selected_clip.replace(at) {
+            if let Err(i) = self.more_clips.binary_search(&old) {
+                self.more_clips.insert(i, old);
+            }
+        }
+        self.selected_track = Some(at.0);
+    }
+
+    /// Selects every clip on tracks `first..=last` that overlaps samples
+    /// `from..to`: the rubber band of the arrange window (SPEC-047 §2). With
+    /// `additive` the clips join the current selection. Returns how many
+    /// clips the band touched.
+    pub fn select_clips_in(
+        &mut self,
+        tracks: std::ops::RangeInclusive<usize>,
+        from: u64,
+        to: u64,
+        additive: bool,
+    ) -> usize {
+        let (from, to) = (from.min(to), from.max(to));
+        let mut hits = Vec::new();
+        for (t, track) in self.project.session.tracks.iter().enumerate() {
+            if !tracks.contains(&t) {
+                continue;
+            }
+            for (c, clip) in track.clips.iter().enumerate() {
+                let end = clip.start_samples.saturating_add(clip.length_samples);
+                if clip.start_samples < to.max(from + 1) && end > from {
+                    hits.push((t, c));
+                }
+            }
+        }
+        if !additive {
+            self.more_clips.clear();
+            self.selected_clip = None;
+        }
+        let count = hits.len();
+        for at in hits {
+            if !self.is_clip_selected(at) {
+                self.select_clip(Some(at), true);
+            }
+        }
+        count
+    }
+
+    /// Selects every clip of the session (Ctrl+A, SPEC-047 §6).
+    pub fn select_all_clips(&mut self) {
+        let last = self.project.session.tracks.len().saturating_sub(1);
+        self.select_clips_in(0..=last, 0, u64::MAX, false);
+    }
+
+    /// Removes every selected clip as one undo step and clears the
+    /// selection (SPEC-047 §3). Returns how many clips were removed.
+    pub fn delete_selected_clips(&mut self) -> usize {
+        let all = self.selected_clips();
+        if all.is_empty() {
+            return 0;
+        }
+        self.record();
+        // Back to front, so the remaining indices stay valid.
+        for &(t, c) in all.iter().rev() {
+            self.project.session.tracks[t].clips.remove(c);
+        }
+        self.selected_clip = None;
+        self.more_clips.clear();
+        self.dirty = true;
+        all.len()
+    }
+
+    /// Moves every selected clip by `delta` samples and `delta_tracks` rows
+    /// as one edit, keeping their relative places (SPEC-047 §4). The shift
+    /// stops when the earliest clip reaches zero or a clip reaches the first
+    /// or last track. Clips that change track go to the end of the new
+    /// track's list; the selection follows them.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] when nothing is selected,
+    /// [`EditorError::Session`] for a full track or a timeline overflow;
+    /// `self` is unchanged.
+    pub fn move_selected_clips(
+        &mut self,
+        delta: i64,
+        delta_tracks: isize,
+    ) -> Result<(), EditorError> {
+        let all = self.selected_clips();
+        if all.is_empty() {
+            return Err(EditorError::NoClip);
+        }
+        let mut session = self.project.session.clone();
+        let earliest = all
+            .iter()
+            .map(|&(t, c)| session.tracks[t].clips[c].start_samples)
+            .min()
+            .unwrap_or(0);
+        let delta = delta.max(-i64::try_from(earliest).unwrap_or(i64::MAX));
+        let count = session.tracks.len();
+        let top = all.first().map_or(0, |a| a.0);
+        let bottom = all.iter().map(|a| a.0).max().unwrap_or(0);
+        let delta_tracks = delta_tracks
+            .max(-isize::try_from(top).unwrap_or(isize::MAX))
+            .min(isize::try_from(count - 1 - bottom).unwrap_or(0));
+        if delta == 0 && delta_tracks == 0 {
+            return Ok(());
+        }
+        let shift = |start: u64| start.checked_add_signed(delta).ok_or(EditorError::NoClip);
+        let primary = self.selected_clip;
+        let mut placed = Vec::with_capacity(all.len());
+        let mut new_primary = None;
+        if delta_tracks == 0 {
+            for &(t, c) in &all {
+                let clip = &mut session.tracks[t].clips[c];
+                clip.start_samples = shift(clip.start_samples)?;
+                placed.push((t, c));
+            }
+            new_primary = primary;
+        } else {
+            let mut moved = Vec::with_capacity(all.len());
+            for &(t, c) in all.iter().rev() {
+                let mut clip = session.tracks[t].clips.remove(c);
+                clip.start_samples = shift(clip.start_samples)?;
+                moved.push(((t, c), clip));
+            }
+            for ((t, c), clip) in moved.into_iter().rev() {
+                let to = t.saturating_add_signed(delta_tracks);
+                session.tracks[to].clips.push(clip);
+                let at = (to, session.tracks[to].clips.len() - 1);
+                if primary == Some((t, c)) {
+                    new_primary = Some(at);
+                }
+                placed.push(at);
+            }
+        }
+        session.validate()?;
+        self.record();
+        self.project.session = session;
+        placed.sort_unstable();
+        self.selected_clip = new_primary.or_else(|| placed.first().copied());
+        if let Some((t, _)) = self.selected_clip {
+            self.selected_track = Some(t);
+        }
+        placed.retain(|&at| Some(at) != self.selected_clip);
+        self.more_clips = placed;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Every selected track, primary included, top to bottom (SPEC-047 §5).
+    #[must_use]
+    pub fn selected_tracks(&self) -> Vec<usize> {
+        let mut all = self.more_tracks.clone();
+        if let Some(t) = self.selected_track {
+            if let Err(i) = all.binary_search(&t) {
+                all.insert(i, t);
+            }
+        }
+        let count = self.project.session.tracks.len();
+        all.retain(|&t| t < count);
+        all
+    }
+
+    /// Whether `track` is part of the track selection.
+    #[must_use]
+    pub fn is_track_selected(&self, track: usize) -> bool {
+        self.selected_track == Some(track) || self.more_tracks.binary_search(&track).is_ok()
+    }
+
+    /// Selects a track: alone, with Ctrl (`toggle`) added or removed, or with
+    /// Shift (`range`) together with every track up to the primary one
+    /// (SPEC-047 §5). Bad indices do nothing.
+    pub fn select_track(&mut self, track: usize, toggle: bool, range: bool) {
+        if track >= self.project.session.tracks.len() {
+            return;
+        }
+        if range {
+            if let Some(anchor) = self.selected_track {
+                for t in anchor.min(track)..=anchor.max(track) {
+                    if let Err(i) = self.more_tracks.binary_search(&t) {
+                        if t != anchor {
+                            self.more_tracks.insert(i, t);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        if toggle {
+            if self.selected_track == Some(track) {
+                self.selected_track =
+                    (!self.more_tracks.is_empty()).then(|| self.more_tracks.remove(0));
+            } else if let Ok(i) = self.more_tracks.binary_search(&track) {
+                self.more_tracks.remove(i);
+            } else {
+                if let Some(old) = self.selected_track {
+                    if let Err(i) = self.more_tracks.binary_search(&old) {
+                        self.more_tracks.insert(i, old);
+                    }
+                }
+                self.selected_track = Some(track);
+            }
+            return;
+        }
+        self.more_tracks.clear();
+        self.selected_track = Some(track);
+    }
+
     /// Copies a clip to the window's clipboard; the project is untouched.
     ///
     /// # Errors
@@ -1497,6 +1784,8 @@ impl Editor {
         self.project.session = session;
         self.selected_track = Some(selected.0);
         self.selected_clip = Some(selected);
+        self.more_clips.clear();
+        self.more_tracks.clear();
         self.dirty = true;
         Ok(())
     }
@@ -1850,6 +2139,8 @@ impl Editor {
         self.record();
         self.project.session = session;
         self.selected_track = Some(track);
+        self.more_tracks.clear();
+        self.more_clips.clear();
         self.dirty = true;
         Ok(())
     }
@@ -2093,6 +2384,8 @@ impl Editor {
             }
             self.selected_track = None;
             self.selected_clip = None;
+            self.more_tracks.clear();
+            self.more_clips.clear();
             self.dirty = true;
         }
     }
@@ -2251,6 +2544,9 @@ impl Editor {
         self.selected_clip = self
             .selected_clip
             .filter(|&(t, c)| tracks.get(t).is_some_and(|tr| c < tr.clips.len()));
+        self.more_clips
+            .retain(|&(t, c)| tracks.get(t).is_some_and(|tr| c < tr.clips.len()));
+        self.more_tracks.retain(|&t| t < tracks.len());
         let mut saved = self.saved.clone();
         saved.name.clone_from(&self.project.session.name);
         self.dirty = self.project.session != saved;

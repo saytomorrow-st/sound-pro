@@ -469,6 +469,9 @@ struct App {
     /// Snap clip edits to beats (Shift turns it off while dragging).
     snap: bool,
     drag: Option<Drag>,
+    /// Rubber band on empty timeline space: where the press began and
+    /// whether it adds to the selection (SPEC-047 §2).
+    band: Option<(Pos2, bool)>,
     /// Active region tool (SPEC-038).
     pub(crate) tool: Tool,
     /// MIDI clip open in the piano roll.
@@ -579,6 +582,7 @@ impl App {
             confirm_quit: false,
             snap: true,
             drag: None,
+            band: None,
             tool: Tool::Pointer,
             piano: None,
             audio_edit: audio_editor::AudioEdit::default(),
@@ -1229,7 +1233,7 @@ impl App {
         let mut delete = None;
         let mut action = None;
         for index in 0..count {
-            let selected = self.editor.selected_track == Some(index);
+            let selected = self.editor.is_track_selected(index);
             let frame = egui::Frame::new()
                 .fill(if selected {
                     Color32::from_rgb(48, 56, 72)
@@ -1428,7 +1432,9 @@ impl App {
                 shell::paint_meter_bars(ui.painter(), bar, meter, false);
             }
             if response.clicked() {
-                self.editor.selected_track = Some(index);
+                // SPEC-047 §5: Ctrl adds or removes a track, Shift a range.
+                let (toggle, range) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                self.editor.select_track(index, toggle, range);
             }
             response.context_menu(|ui| {
                 if ui.button("Переименовать").clicked() {
@@ -1701,7 +1707,7 @@ impl App {
                 ],
                 Stroke::new(1.0_f32, Color32::from_gray(45)),
             );
-            let mut selected_rect = None;
+            let mut selected_rects = Vec::new();
             for c in daw_gui::layout::draw_order(&track.clips) {
                 let clip = &track.clips[c];
                 let left = area.min.x + clip.start_samples as f32 * px_per_sample;
@@ -1710,7 +1716,7 @@ impl App {
                     Pos2::new(left, top + 3.0),
                     Vec2::new(w, TRACK_HEIGHT - 6.0),
                 );
-                let selected = self.editor.selected_clip == Some((t, c));
+                let selected = self.editor.is_clip_selected((t, c));
                 let base = track_color(track.color, t);
                 let colors = daw_gui::layout::region_colors(
                     [base.r(), base.g(), base.b()],
@@ -1784,7 +1790,7 @@ impl App {
                 };
                 painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
                 if selected {
-                    selected_rect = Some((rect, border));
+                    selected_rects.push((rect, border));
                 }
                 rects.push(((t, c), rect));
                 if (response.clicked() || response.secondary_clicked())
@@ -1822,7 +1828,7 @@ impl App {
                 }
                 draw_crossfade_x(&painter, body);
             }
-            if let Some((rect, border)) = selected_rect {
+            for (rect, border) in selected_rects {
                 painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
             }
         }
@@ -1869,13 +1875,27 @@ impl App {
                 self.edit_lane(ui, &response, area, row, t);
             }
         } else if response.clicked() || response.secondary_clicked() {
-            self.editor.selected_clip = clicked;
-            if let Some((t, _)) = clicked {
-                self.editor.selected_track = Some(t);
-            } else if let Some(p) = pointer {
-                let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
-                self.editor.selected_track =
-                    (row >= 0.0 && (row as usize) < tracks).then_some(row as usize);
+            // SPEC-047 §1: Shift or Ctrl adds or removes a region; a right
+            // click on a selected region keeps the group for its menu.
+            let toggle = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+            match clicked {
+                Some(at) if response.secondary_clicked() && self.editor.is_clip_selected(at) => {
+                    self.editor.focus_clip(at);
+                }
+                Some(at) => self
+                    .editor
+                    .select_clip(Some(at), toggle && response.clicked()),
+                None => {
+                    if !toggle {
+                        self.editor.select_clip(None, false);
+                    }
+                    if let Some(p) = pointer {
+                        let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
+                        if row >= 0.0 && (row as usize) < tracks {
+                            self.editor.select_track(row as usize, false, false);
+                        }
+                    }
+                }
             }
         }
 
@@ -2463,9 +2483,23 @@ impl App {
                 })
             });
             if let Some(d) = self.drag {
-                self.editor.selected_clip = Some((d.track, d.clip));
-                self.editor.selected_track = Some(d.track);
+                let at = (d.track, d.clip);
+                if self.editor.is_clip_selected(at) {
+                    self.editor.focus_clip(at);
+                } else {
+                    let toggle = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                    self.editor.select_clip(Some(at), toggle);
+                }
+            } else if tool == Tool::Pointer {
+                if let Some(p) = origin.filter(|&p| hit(p).is_none()) {
+                    let additive = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                    self.band = Some((p, additive));
+                }
             }
+        }
+        if self.band.is_some() {
+            self.rubber_band(ui, response, area);
+            return;
         }
 
         let Some(mut drag) = self.drag else { return };
@@ -2494,12 +2528,26 @@ impl App {
                 } else {
                     (row as usize).min(tracks.saturating_sub(1))
                 };
-                self.editor
-                    .move_clip(drag.track, drag.clip, start, to)
-                    .map(|(t, c)| {
-                        drag.track = t;
-                        drag.clip = c;
+                if self.editor.selected_clips().len() > 1 {
+                    // SPEC-047 §4: the grabbed clip leads the whole group.
+                    let now =
+                        self.editor.session().tracks[drag.track].clips[drag.clip].start_samples;
+                    let delta = start as i64 - now as i64;
+                    let rows = to as isize - drag.track as isize;
+                    self.editor.move_selected_clips(delta, rows).map(|()| {
+                        if let Some((t, c)) = self.editor.selected_clip {
+                            drag.track = t;
+                            drag.clip = c;
+                        }
                     })
+                } else {
+                    self.editor
+                        .move_clip(drag.track, drag.clip, start, to)
+                        .map(|(t, c)| {
+                            drag.track = t;
+                            drag.clip = c;
+                        })
+                }
             }
             DragMode::TrimStart => self.editor.trim_start(drag.track, drag.clip, fit(at)),
             DragMode::TrimEnd => self.editor.trim_end(drag.track, drag.clip, fit(at)),
@@ -2523,6 +2571,61 @@ impl App {
             self.status = format!("Ошибка: {e}");
         }
         self.drag = Some(drag);
+    }
+
+    /// The rubber band: a frame dragged over empty space selects every
+    /// region it touches (SPEC-047 §2).
+    fn rubber_band(&mut self, ui: &egui::Ui, response: &egui::Response, area: Rect) {
+        let Some((origin, additive)) = self.band else {
+            return;
+        };
+        let Some(p) = ui.input(|i| i.pointer.interact_pos()) else {
+            self.band = None;
+            return;
+        };
+        let rate = self.editor.session().sample_rate;
+        let tracks = self.editor.session().tracks.len();
+        let row = |y: f32| {
+            ((y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT)
+                .floor()
+                .max(0.0) as usize
+        };
+        let (top, bottom) = (row(origin.y.min(p.y)), row(origin.y.max(p.y)));
+        let rows = if top < tracks {
+            top..=bottom.min(tracks - 1)
+        } else {
+            // An empty range: the band is below the last track.
+            #[allow(clippy::reversed_empty_ranges, reason = "selects nothing on purpose")]
+            let none = 1..=0;
+            none
+        };
+        let from = x_to_samples((origin.x - area.min.x).max(0.0), rate, self.zoom);
+        let to = x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom);
+        let done = response.drag_stopped() || !ui.input(|i| i.pointer.primary_down());
+        if !additive || done {
+            let count = self.editor.select_clips_in(rows, from, to, additive);
+            if done {
+                self.band = None;
+                self.status = format!(
+                    "Выбрано регионов: {}",
+                    self.editor.selected_clips().len().max(count)
+                );
+                return;
+            }
+        }
+        let frame = Rect::from_two_pos(origin, p).intersect(area);
+        let painter = ui.painter_at(area);
+        painter.rect_filled(
+            frame,
+            0.0,
+            Color32::from_rgba_unmultiplied(255, 200, 60, 28),
+        );
+        painter.rect_stroke(
+            frame,
+            0.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 60)),
+            StrokeKind::Inside,
+        );
     }
 
     fn add_midi_track(&mut self) {
@@ -2986,9 +3089,11 @@ impl App {
     }
 
     fn delete_selected_clip(&mut self) {
-        if let Some((t, c)) = self.editor.selected_clip {
-            self.editor.delete_clip(t, c);
-            self.status = "Клип удалён".into();
+        self.drag = None;
+        match self.editor.delete_selected_clips() {
+            0 => {}
+            1 => self.status = "Клип удалён".into(),
+            n => self.status = format!("Удалено регионов: {n}"),
         }
     }
 
@@ -3185,6 +3290,11 @@ impl App {
                 i.consume_key(egui::Modifiers::COMMAND, Key::I),
             )
         });
+        // SPEC-047 §6: Ctrl+A selects every region.
+        if !in_text && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A)) {
+            self.editor.select_all_clips();
+            self.status = format!("Выбрано регионов: {}", self.editor.selected_clips().len());
+        }
         if delete {
             self.delete_selected_clip();
         }

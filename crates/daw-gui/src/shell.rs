@@ -1252,7 +1252,7 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn channel_strip(&mut self, ui: &mut egui::Ui, index: usize, full: bool) -> f32 {
         let track = self.editor.session().tracks[index].clone();
-        let selected = self.editor.selected_track == Some(index);
+        let selected = self.editor.is_track_selected(index);
         let fill = if selected {
             Color32::from_gray(56)
         } else {
@@ -1266,7 +1266,8 @@ impl App {
             })
             .response;
         if response.clicked() {
-            self.editor.selected_track = Some(index);
+            let (toggle, range) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+            self.editor.select_track(index, toggle, range);
         }
         response.rect.height()
     }
