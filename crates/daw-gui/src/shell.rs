@@ -3,7 +3,8 @@
 //! with mixer, editor and smart controls. Placeholders are marked as such.
 
 use daw_gui::layout::{
-    Bottom, db_label, fader_gain, fader_position, lcd_position, pan_angle, pan_label,
+    Bottom, FADER_FLOOR_DB, MeterState, MeterZone, db_label, fader_gain, fader_position,
+    lcd_position, meter_zone, pan_angle, pan_label,
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Stroke, Vec2};
 
@@ -188,13 +189,130 @@ fn pan_knob(ui: &mut egui::Ui, pan: &mut f32, enabled: bool) -> egui::Response {
     ))
 }
 
-/// Drawn volume fader with a decorative level meter on the left.
+/// Meter colour for a level zone.
+fn zone_color(zone: MeterZone) -> Color32 {
+    match zone {
+        MeterZone::Safe => Color32::from_rgb(80, 210, 90),
+        MeterZone::Hot => Color32::from_rgb(235, 205, 60),
+        MeterZone::Clip => Color32::from_rgb(235, 60, 50),
+    }
+}
+
+/// Paints a stereo meter into `rect`: two bars, green/yellow/red by level,
+/// with the held peak as a thin mark. Vertical bars fill upwards,
+/// horizontal ones to the right (SPEC-042).
+pub(crate) fn paint_meter_bars(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    meter: &MeterState,
+    vertical: bool,
+) {
+    painter.rect_filled(rect, CornerRadius::same(1), Color32::from_gray(20));
+    let hot = fader_position(10f32.powf(-6.0 / 20.0));
+    let gap = 1.0;
+    for ch in 0..2 {
+        // One bar: `along` is the 0..1 span along the level axis.
+        let bar = |from: f32, to: f32| -> egui::Rect {
+            if vertical {
+                let w = (rect.width() - gap) / 2.0;
+                let left = rect.left() + ch as f32 * (w + gap);
+                egui::Rect::from_min_max(
+                    egui::pos2(left, rect.bottom() - rect.height() * to),
+                    egui::pos2(left + w, rect.bottom() - rect.height() * from),
+                )
+            } else {
+                let h = (rect.height() - gap) / 2.0;
+                let top = rect.top() + ch as f32 * (h + gap);
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + rect.width() * from, top),
+                    egui::pos2(rect.left() + rect.width() * to, top + h),
+                )
+            }
+        };
+        let lit = fader_position(meter.level[ch]);
+        if lit > 0.0 {
+            let zones = [
+                (0.0, hot, MeterZone::Safe),
+                (hot, 0.999, MeterZone::Hot),
+                (0.999, 1.0, MeterZone::Clip),
+            ];
+            for (from, to, zone) in zones {
+                if lit > from {
+                    painter.rect_filled(bar(from, lit.min(to)), 0.0, zone_color(zone));
+                }
+            }
+            if meter.level[ch] >= 1.0 {
+                painter.rect_filled(bar(0.97, 1.0), 0.0, zone_color(MeterZone::Clip));
+            }
+        }
+        let hold = fader_position(meter.hold[ch]);
+        if hold > 0.0 {
+            let span = if vertical {
+                1.5 / rect.height()
+            } else {
+                1.5 / rect.width()
+            };
+            let mark = bar((hold - span).max(0.0), hold);
+            painter.rect_filled(mark, 0.0, zone_color(meter_zone(meter.hold[ch])));
+        }
+    }
+}
+
+/// Gain and peak readouts above a fader, side by side (SPEC-042).
+fn level_labels(ui: &mut egui::Ui, gain: f32, meter: &mut MeterState) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.add_space((ui.available_width() - 72.0).max(0.0) / 2.0);
+        ui.add_sized(
+            Vec2::new(35.0, 15.0),
+            egui::Label::new(
+                RichText::new(db_label(gain))
+                    .monospace()
+                    .size(10.0)
+                    .color(Color32::from_gray(210)),
+            ),
+        );
+        peak_label(ui, meter);
+    });
+}
+
+/// Highest level since the last reset, in dB, above a fader; red after a
+/// clip; a click resets it (SPEC-042).
+fn peak_label(ui: &mut egui::Ui, meter: &mut MeterState) {
+    let text = if meter.peak > 0.0 {
+        let db = 20.0 * meter.peak.log10();
+        if db < FADER_FLOOR_DB {
+            "-∞".to_owned()
+        } else {
+            format!("{db:.1}")
+        }
+    } else {
+        "-∞".to_owned()
+    };
+    let (fill, color) = if meter.clipped() {
+        (Color32::from_rgb(190, 40, 35), Color32::WHITE)
+    } else {
+        (Color32::from_gray(26), Color32::from_gray(200))
+    };
+    let button = egui::Button::new(RichText::new(text).monospace().size(10.0).color(color))
+        .fill(fill)
+        .min_size(Vec2::new(35.0, 15.0));
+    if ui
+        .add(button)
+        .on_hover_text("Пиковый уровень с последнего сброса (щелчок — сбросить)")
+        .clicked()
+    {
+        meter.reset_peak();
+    }
+}
+
+/// Drawn volume fader with a stereo level meter on the left (SPEC-042).
 fn fader(
     ui: &mut egui::Ui,
     gain: &mut f32,
     enabled: bool,
     height: f32,
-    level: f32,
+    meter: &MeterState,
 ) -> egui::Response {
     let size = Vec2::new(40.0, height);
     let sense = if enabled {
@@ -219,17 +337,12 @@ fn fader(
         response.mark_changed();
     }
     let painter = ui.painter();
-    let meter = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 4.0, track.top()),
-        egui::pos2(rect.left() + 10.0, track.bottom()),
+    let meter_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 3.0, track.top()),
+        egui::pos2(rect.left() + 11.0, track.bottom()),
     );
-    painter.rect_filled(meter, CornerRadius::same(1), Color32::from_gray(20));
-    let lit = meter.height() * level.clamp(0.0, 1.0);
-    if lit > 0.0 {
-        let fill =
-            egui::Rect::from_min_max(egui::pos2(meter.left(), meter.bottom() - lit), meter.max);
-        painter.rect_filled(fill, CornerRadius::same(1), Color32::from_rgb(80, 210, 90));
-    }
+    paint_meter_bars(painter, meter_rect, meter, true);
+    let meter = meter_rect;
     for db in [0.0_f32, -6.0, -12.0, -24.0, -40.0] {
         let y = track.bottom() - track.height() * fader_position(10f32.powf(db / 20.0));
         painter.line_segment(
@@ -682,7 +795,6 @@ impl App {
         } else {
             Color32::from_gray(44)
         };
-        let playing = self.is_playing();
         let response = egui::Frame::new()
             .fill(fill)
             .stroke(Stroke::new(1.0_f32, Color32::from_gray(28)))
@@ -756,26 +868,20 @@ impl App {
                     ui.add_space(2.0);
                     let mut pan = track.pan;
                     let p = pan_knob(ui, &mut pan, track.automation.pan.is_empty());
-                    ui.label(
-                        RichText::new(db_label(track.gain))
-                            .monospace()
-                            .size(10.0)
-                            .color(Color32::from_gray(210)),
-                    );
+                    let mut meter = self.track_meters.get(index).copied().unwrap_or_default();
+                    level_labels(ui, track.gain, &mut meter);
                     let mut gain = track.gain;
-                    let level = if playing && !track.mute {
-                        fader_position(gain) * 0.85
-                    } else {
-                        0.0
-                    };
                     let height = if full { 150.0 } else { 130.0 };
                     let g = fader(
                         ui,
                         &mut gain,
                         track.automation.gain.is_empty(),
                         height,
-                        level,
+                        &meter,
                     );
+                    if let Some(slot) = self.track_meters.get_mut(index) {
+                        slot.peak = meter.peak;
+                    }
                     if g.changed() || p.changed() {
                         if let Some(t) = self.editor.track_mut(index) {
                             t.gain = gain;
@@ -811,7 +917,6 @@ impl App {
     /// stretched to that outer height and its fader is pinned to the bottom,
     /// so it lines up with the neighbouring channel strip.
     fn master_strip(&mut self, ui: &mut egui::Ui, height: f32, match_height: Option<f32>) {
-        let playing = self.is_playing();
         egui::Frame::new()
             .fill(Color32::from_gray(48))
             .stroke(Stroke::new(1.0_f32, Color32::from_gray(28)))
@@ -843,20 +948,11 @@ impl App {
                             pill_stub(ui, "D");
                         });
                         let mut master = self.editor.session().master_gain;
-                        let level = if playing {
-                            fader_position(master) * 0.85
-                        } else {
-                            0.0
-                        };
-                        if fader(ui, &mut master, true, height, level).changed() {
+                        let meter = self.master_meter;
+                        if fader(ui, &mut master, true, height, &meter).changed() {
                             self.editor.set_master_gain(master);
                         }
-                        ui.label(
-                            RichText::new(db_label(master))
-                                .monospace()
-                                .size(10.0)
-                                .color(Color32::from_gray(210)),
-                        );
+                        level_labels(ui, master, &mut self.master_meter);
                     },
                 );
             });
@@ -864,7 +960,6 @@ impl App {
 
     fn bus_strip(&mut self, ui: &mut egui::Ui, index: usize) {
         let bus = self.editor.session().buses[index].clone();
-        let playing = self.is_playing();
         egui::Frame::new()
             .fill(Color32::from_gray(42))
             .stroke(Stroke::new(1.0_f32, Color32::from_gray(28)))
@@ -889,18 +984,10 @@ impl App {
                     }
                     ui.add_space(34.0);
                     let mut gain = bus.gain;
-                    ui.label(
-                        RichText::new(db_label(gain))
-                            .monospace()
-                            .size(10.0)
-                            .color(Color32::from_gray(210)),
-                    );
-                    let level = if playing {
-                        fader_position(gain) * 0.6
-                    } else {
-                        0.0
-                    };
-                    if fader(ui, &mut gain, true, 130.0, level).changed() {
+                    // Buses have no measurement of their own yet (SPEC-042).
+                    let mut meter = MeterState::default();
+                    level_labels(ui, gain, &mut meter);
+                    if fader(ui, &mut gain, true, 130.0, &meter).changed() {
                         let _ = self.editor.set_bus_gain(index, gain);
                     }
                     ui.add_space(18.0);

@@ -200,6 +200,101 @@ pub fn fader_gain(position: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Fastest fall of a level meter, in dB per second (SPEC-042).
+pub const METER_FALL_DB_PER_S: f32 = 26.0;
+
+/// How long the peak mark of a meter holds before it falls, in seconds.
+pub const METER_HOLD_SECONDS: f32 = 1.5;
+
+/// Displayed state of a stereo level meter: ballistics over the raw peaks
+/// the engine reports (SPEC-042).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeterState {
+    /// Shown level per channel, linear.
+    pub level: [f32; 2],
+    /// Peak mark per channel, linear.
+    pub hold: [f32; 2],
+    hold_age: [f32; 2],
+    /// Highest level since the last [`MeterState::reset_peak`].
+    pub peak: f32,
+}
+
+fn meter_fall(value: f32, dt: f32) -> f32 {
+    if value <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * value.log10() - METER_FALL_DB_PER_S * dt;
+    if db < FADER_FLOOR_DB {
+        0.0
+    } else {
+        10f32.powf(db / 20.0)
+    }
+}
+
+impl MeterState {
+    /// Feeds the peaks `(left, right)` measured over the last `dt` seconds.
+    pub fn update(&mut self, peaks: (f32, f32), dt: f32) {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        for (ch, raw) in [peaks.0, peaks.1].into_iter().enumerate() {
+            let raw = if raw.is_finite() { raw.abs() } else { 0.0 };
+            self.level[ch] = meter_fall(self.level[ch], dt).max(raw);
+            if raw >= self.hold[ch] {
+                self.hold[ch] = raw;
+                self.hold_age[ch] = 0.0;
+            } else {
+                let age = self.hold_age[ch] + dt;
+                if age > METER_HOLD_SECONDS {
+                    let fall = (age - METER_HOLD_SECONDS).min(dt);
+                    self.hold[ch] = meter_fall(self.hold[ch], fall).max(raw);
+                }
+                self.hold_age[ch] = age;
+            }
+            self.hold[ch] = self.hold[ch].max(self.level[ch]);
+            self.peak = self.peak.max(raw);
+        }
+    }
+
+    /// Whether the peak since the last reset reached 0 dBFS.
+    #[must_use]
+    pub fn clipped(&self) -> bool {
+        self.peak >= 1.0
+    }
+
+    /// Forgets the peak since the last reset.
+    pub fn reset_peak(&mut self) {
+        self.peak = 0.0;
+    }
+
+    /// Whether everything has died out and the meter need not repaint.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.level == [0.0; 2] && self.hold == [0.0; 2]
+    }
+}
+
+/// Colour zone of a meter level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeterZone {
+    /// Below -6 dB: green.
+    Safe,
+    /// From -6 dB to 0 dB: yellow.
+    Hot,
+    /// 0 dB and above: red.
+    Clip,
+}
+
+/// Colour zone for a linear level.
+#[must_use]
+pub fn meter_zone(level: f32) -> MeterZone {
+    if level >= 1.0 {
+        MeterZone::Clip
+    } else if level >= 10f32.powf(-6.0 / 20.0) {
+        MeterZone::Hot
+    } else {
+        MeterZone::Safe
+    }
+}
+
 /// Pan knob pointer angle in radians from straight up: `-135°` for hard
 /// left, `+135°` for hard right.
 #[must_use]

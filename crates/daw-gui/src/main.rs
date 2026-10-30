@@ -16,7 +16,7 @@ use audio_core::{
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
-use daw_gui::layout::{Bottom, Layout};
+use daw_gui::layout::{Bottom, Layout, MeterState};
 use daw_gui::timeline::{self, CycleHit};
 use daw_gui::{
     Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
@@ -335,6 +335,10 @@ struct App {
     zoom_anchor: Option<f32>,
     /// Track to scroll into view on the next frame (SPEC-037).
     reveal_track: Option<usize>,
+    /// Shown level of each track, by track index (SPEC-042).
+    track_meters: Vec<MeterState>,
+    /// Shown level of the master (SPEC-042).
+    master_meter: MeterState,
     /// Horizontal scroll offset and width of the visible timeline.
     timeline_view: (f32, f32),
     title: String,
@@ -443,6 +447,8 @@ impl App {
             drawn_zoom: 100.0,
             zoom_anchor: None,
             reveal_track: None,
+            track_meters: Vec::new(),
+            master_meter: MeterState::default(),
             timeline_view: (0.0, 0.0),
             title: String::new(),
             confirm_quit: false,
@@ -689,6 +695,23 @@ impl App {
                 self.playhead = self.editor.active_cycle().map_or(0, |(from, _)| from);
                 self.status = "Конец".into();
             }
+        }
+    }
+
+    /// Reads the levels the audio thread measured since the last frame and
+    /// lets the meters fall after a stop (SPEC-042).
+    fn poll_meters(&mut self, ctx: &egui::Context) {
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        let count = self.editor.session().tracks.len();
+        self.track_meters.resize(count, MeterState::default());
+        let meters = self.editor.meters();
+        for (index, meter) in self.track_meters.iter_mut().enumerate() {
+            meter.update(meters.take_track(index), dt);
+        }
+        self.master_meter.update(meters.take_master(), dt);
+        let live = !self.master_meter.is_idle() || self.track_meters.iter().any(|m| !m.is_idle());
+        if live && self.player.is_none() {
+            ctx.request_repaint();
         }
     }
 
@@ -1240,6 +1263,14 @@ impl App {
                 0.0,
                 track_color(self.editor.session().tracks[index].color, index),
             );
+            if let Some(meter) = self.track_meters.get(index) {
+                let r = response.rect;
+                let bar = Rect::from_min_max(
+                    egui::pos2(r.left() + 10.0, r.bottom() - 5.0),
+                    egui::pos2(r.right() - 8.0, r.bottom() - 1.0),
+                );
+                shell::paint_meter_bars(ui.painter(), bar, meter, false);
+            }
             let click = response.interact(Sense::click());
             if click.clicked() {
                 self.editor.selected_track = Some(index);
@@ -3444,6 +3475,7 @@ impl eframe::App for App {
         }
         self.screenshot(ctx);
         self.poll_player(ctx);
+        self.poll_meters(ctx);
         self.poll_recorder(ctx);
         self.poll_imports(ctx);
         // Everything done during one mouse press is one undo step.
