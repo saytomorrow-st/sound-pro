@@ -2,6 +2,7 @@
 //! with position display, library, inspector, browser and the bottom area
 //! with mixer, editor and smart controls. Placeholders are marked as such.
 
+use audio_core::TrackKind;
 use daw_gui::layout::{
     Bottom, FADER_FLOOR_DB, MeterState, MeterZone, db_label, fader_gain, fader_position,
     lcd_position, meter_zone, pan_angle, pan_label,
@@ -600,6 +601,54 @@ fn window_buttons(ui: &mut egui::Ui) {
     ui.separator();
 }
 
+/// State of the «Новая дорожка» dialog (SPEC-049).
+pub struct NewTrack {
+    kind: TrackKind,
+    count: usize,
+    name: String,
+}
+
+impl NewTrack {
+    /// One track of `kind` with the default name.
+    pub const fn new(kind: TrackKind) -> Self {
+        Self {
+            kind,
+            count: 1,
+            name: String::new(),
+        }
+    }
+}
+
+/// Selectable card for one track type in the dialog.
+fn kind_card(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, hint: &str) -> bool {
+    let fill = if selected {
+        Color32::from_rgb(52, 84, 130)
+    } else {
+        Color32::from_gray(48)
+    };
+    let stroke = if selected {
+        Stroke::new(2.0_f32, Color32::from_rgb(110, 170, 255))
+    } else {
+        Stroke::new(1.0_f32, Color32::from_gray(70))
+    };
+    let response = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            ui.set_width(150.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(icon).size(28.0));
+                ui.label(RichText::new(title).strong());
+                ui.label(RichText::new(hint).small().color(Color32::from_gray(170)));
+            });
+        })
+        .response
+        .interact(Sense::click());
+    response.clicked()
+}
+
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong().color(Color32::from_gray(200)));
@@ -607,6 +656,76 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 impl App {
+    /// The «Новая дорожка» dialog (SPEC-049 §4): type, count and name.
+    pub(crate) fn new_track_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.new_track.take() else {
+            return;
+        };
+        let free = audio_core::MAX_TRACKS.saturating_sub(self.editor.session().tracks.len());
+        let (mut create, mut cancel) = (false, false);
+        egui::Modal::new(egui::Id::new("new_track")).show(ctx, |ui| {
+            ui.heading("Новая дорожка");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if kind_card(
+                    ui,
+                    dialog.kind == TrackKind::Instrument,
+                    "🎹",
+                    "Программный инструмент",
+                    "MIDI-регионы и пианоролл",
+                ) {
+                    dialog.kind = TrackKind::Instrument;
+                }
+                if kind_card(
+                    ui,
+                    dialog.kind == TrackKind::Audio,
+                    "🎤",
+                    "Аудио",
+                    "Запись и аудиофайлы",
+                ) {
+                    dialog.kind = TrackKind::Audio;
+                }
+            });
+            ui.add_space(8.0);
+            inspector_grid(ui, "new_track_grid", |ui| {
+                row_label(ui, "Количество");
+                ui.add(egui::DragValue::new(&mut dialog.count).range(1..=free.max(1)));
+                ui.end_row();
+                row_label(ui, "Имя");
+                let hint = match dialog.kind {
+                    TrackKind::Audio => "Аудио",
+                    TrackKind::Instrument => "Инструмент",
+                };
+                ui.add(egui::TextEdit::singleline(&mut dialog.name).hint_text(hint));
+                ui.end_row();
+            });
+            if free == 0 {
+                ui.colored_label(Color32::from_rgb(240, 120, 100), "Достигнут предел дорожек");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    create = ui
+                        .add_enabled(free > 0, egui::Button::new("Создать"))
+                        .clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    cancel = ui.button("Отмена").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
+            });
+        });
+        if create && free > 0 {
+            let result = self
+                .editor
+                .add_tracks(dialog.kind, dialog.count.min(free), &dialog.name);
+            if let Some(added) = self.report(result, "Дорожки добавлены") {
+                self.reveal_track = added.first().copied();
+            }
+        } else if !cancel {
+            self.new_track = Some(dialog);
+        }
+    }
+
     /// Top control bar: view buttons, transport, position display, modes.
     pub(crate) fn control_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -868,10 +987,10 @@ impl App {
             ui.separator();
             if ui
                 .add(egui::Button::new("＋ Дорожка").min_size(Vec2::new(0.0, TOOL_SIZE.y)))
-                .on_hover_text("Новая MIDI-дорожка")
+                .on_hover_text("Новые дорожки… (Ctrl+Alt+N)")
                 .clicked()
             {
-                self.add_midi_track();
+                self.new_track = Some(NewTrack::new(TrackKind::Audio));
             }
             ui.add_space(6.0);
             if let Some(tool) = tool_group(ui, self.tool) {
@@ -1251,10 +1370,7 @@ impl App {
         let track = &self.editor.session().tracks[index];
         let current = track.name.clone();
         let color = track.color;
-        let midi = track
-            .clips
-            .first()
-            .is_some_and(audio_core::session::Clip::is_midi);
+        let midi = track.kind == TrackKind::Instrument;
         let mut name = ui
             .data(|d| d.get_temp::<String>(id))
             .unwrap_or_else(|| current.clone());
@@ -1273,7 +1389,7 @@ impl App {
             ui.end_row();
             row_label(ui, "Тип");
             ui.label(if midi {
-                "Инструмент (MIDI)"
+                "Программный инструмент"
             } else {
                 "Аудио"
             });

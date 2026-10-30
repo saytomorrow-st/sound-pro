@@ -64,6 +64,22 @@ fn arrange(dir: &Scratch) -> Editor {
     editor
 }
 
+/// Like [`arrange`], but every track is an audio track, so clips may move
+/// between rows (SPEC-049 §4).
+fn audio_arrange(dir: &Scratch) -> Editor {
+    let mut editor = tracks(dir, 1);
+    editor
+        .add_tracks(audio_core::TrackKind::Audio, 2, "")
+        .unwrap();
+    editor.copy_clip(0, 0).unwrap();
+    editor.paste_clip(1, 0).unwrap();
+    editor.paste_clip(2, 0).unwrap();
+    editor.select_clip(Some((0, 0)), false);
+    editor.duplicate_clip(0, 0).unwrap();
+    editor.move_clip(0, 1, 2_000, 0).unwrap();
+    editor
+}
+
 #[test]
 fn toggle_adds_and_removes_clips() {
     let dir = Scratch::new("toggle");
@@ -151,7 +167,7 @@ fn group_move_keeps_offsets_and_undoes_at_once() {
 #[test]
 fn group_move_across_tracks_follows_selection() {
     let dir = Scratch::new("rows");
-    let mut editor = arrange(&dir);
+    let mut editor = audio_arrange(&dir);
     editor.select_clip(Some((0, 1)), false);
     editor.select_clip(Some((1, 0)), true);
     // Down by one row: track 0's clip goes to 1, track 1's to 2.

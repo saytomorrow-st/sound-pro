@@ -217,11 +217,13 @@ fn pasting_adds_the_copy_at_the_position_again_and_again() {
 fn pasting_onto_another_track_works() {
     let dir = Scratch::new("paste-other");
     let mut editor = one_clip(&dir);
-    editor.add_midi_track(0, 100).unwrap();
+    editor
+        .add_tracks(audio_core::TrackKind::Audio, 1, "")
+        .unwrap();
     editor.copy_clip(0, 0).unwrap();
-    assert_eq!(editor.paste_clip(1, 50).unwrap(), (1, 1));
-    assert_eq!(window(clip(&editor, 1, 1)), (50, 0, 1_000));
-    assert!(!clip(&editor, 1, 1).is_midi());
+    assert_eq!(editor.paste_clip(1, 50).unwrap(), (1, 0));
+    assert_eq!(window(clip(&editor, 1, 0)), (50, 0, 1_000));
+    assert!(!clip(&editor, 1, 0).is_midi());
 }
 
 #[test]

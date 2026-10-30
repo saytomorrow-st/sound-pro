@@ -136,7 +136,9 @@ fn midi_clips_join_with_their_notes_and_the_gap() {
 fn recording_goes_to_the_armed_track_first() {
     let dir = Scratch::new("armed");
     let mut editor = one_clip(&dir, "a.wav");
-    editor.add_midi_track(0, 1_000).unwrap();
+    editor
+        .add_tracks(audio_core::TrackKind::Audio, 1, "b")
+        .unwrap();
     editor.arm_track(Some(0));
     editor.selected_track = Some(1);
     let (track, _) = editor

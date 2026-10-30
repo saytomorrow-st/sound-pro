@@ -21,7 +21,7 @@ const fn note(pitch: u8, start: u64, length: u64) -> Note {
 fn midi_session(notes: Vec<Note>) -> Session {
     let mut clip = Clip::midi(0, SR.into());
     clip.notes = Some(notes);
-    let mut track = SessionTrack::new("keys");
+    let mut track = SessionTrack::instrument("keys");
     track.clips.push(clip);
     let mut session = Session::new("s", SR, 120.0);
     session.tracks.push(track);

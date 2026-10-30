@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use audio_core::{
     AutoPoint, Effect, EffectKind, EffectParam, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note,
-    TRACK_COLORS,
+    TRACK_COLORS, TrackKind,
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
@@ -407,6 +407,7 @@ enum RegionAction {
     Split,
     Delete,
     NewMidi,
+    NewAudio,
     FadeIn,
     FadeOut,
     NoFades,
@@ -511,6 +512,8 @@ struct App {
     /// The audio settings window is open, with the device names last listed.
     audio_open: bool,
     about_open: bool,
+    /// The «Новая дорожка» dialog, when open (SPEC-049).
+    new_track: Option<shell::NewTrack>,
     outputs: Vec<String>,
     inputs: Vec<String>,
     /// Visible panels of the main window (SPEC-034).
@@ -604,6 +607,7 @@ impl App {
             audio_path: daw_app::audio_settings::default_path(),
             audio_open: false,
             about_open: false,
+            new_track: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
             layout: Layout::default(),
@@ -1185,6 +1189,10 @@ impl App {
                 }
             });
             ui.menu_button("Дорожка", |ui| {
+                let new = egui::Button::new("Новые дорожки…").shortcut_text("Ctrl+Alt+N");
+                if ui.add(new).clicked() {
+                    self.open_new_track(TrackKind::Audio);
+                }
                 if ui.button("Новая MIDI-дорожка").clicked() {
                     self.add_midi_track();
                 }
@@ -1253,7 +1261,7 @@ impl App {
                         let track_monitor = track.input_monitor;
                         let (mut gain, mut pan) = (track.gain, track.pan);
                         let name = track.name.clone();
-                        let audio = track.clips.iter().any(|c| c.source.is_some());
+                        let audio = track.kind == TrackKind::Audio;
                         let color = track_color(track.color, index);
                         ui.horizontal(|ui| {
                             ui.add_space(6.0);
@@ -1901,6 +1909,16 @@ impl App {
 
         if let Some(at) = open_piano {
             self.open_clip_editor(at);
+        } else if response.double_clicked() && !lane_owned && !ruler_owned {
+            // SPEC-049 §6: a double click on an empty spot of an instrument
+            // track makes a MIDI region there.
+            if let Some(p) = pointer {
+                let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
+                if row >= 0.0 {
+                    let x = x_to_samples((p.x - area.min.x).max(0.0), rate_u32, self.zoom);
+                    self.new_region_on(row as usize, x);
+                }
+            }
         }
         if !lane_owned && !ruler_owned {
             self.region_menu(&response);
@@ -1936,7 +1954,11 @@ impl App {
         let rate = recorder.control.sample_rate().max(1);
         let project = self.editor.session().sample_rate;
         let tracks = self.editor.session().tracks.len();
-        let mut rows: Vec<usize> = self.editor.armed_tracks().collect();
+        let mut rows: Vec<usize> = self
+            .editor
+            .armed_tracks()
+            .filter(|&t| self.editor.session().tracks[t].kind == TrackKind::Audio)
+            .collect();
         if rows.is_empty() {
             rows.push(
                 self.editor
@@ -2628,6 +2650,29 @@ impl App {
         );
     }
 
+    fn open_new_track(&mut self, kind: TrackKind) {
+        self.new_track = Some(shell::NewTrack::new(kind));
+    }
+
+    /// Empty MIDI region at the bar under `at` on an instrument track.
+    fn new_region_on(&mut self, track: usize, at: u64) {
+        let is_instrument = self
+            .editor
+            .session()
+            .tracks
+            .get(track)
+            .is_some_and(|t| t.kind == TrackKind::Instrument);
+        if !is_instrument {
+            return;
+        }
+        let (_, length) = self.editor.new_midi_region(at);
+        let start = self.editor.new_clip_start(at);
+        let result = self.editor.add_midi_region(track, start, length);
+        if let Some(at) = self.report(result, "MIDI-регион создан") {
+            self.open_piano(at);
+        }
+    }
+
     fn add_midi_track(&mut self) {
         let (start, length) = self.editor.new_midi_region(self.playhead);
         let result = self.editor.add_midi_track(start, length);
@@ -2978,9 +3023,8 @@ impl App {
                 item(ui, "Вставить", "Ctrl+V", RegionAction::Paste);
                 item(ui, "Новая MIDI-дорожка", "", RegionAction::NewMidi);
                 ui.separator();
-                for stub in ["Новая аудиодорожка", "Выделить всё"] {
-                    ui.add_enabled(false, egui::Button::new(stub));
-                }
+                item(ui, "Новая аудиодорожка…", "", RegionAction::NewAudio);
+                ui.add_enabled(false, egui::Button::new("Выделить всё"));
             }
         });
         match action {
@@ -2995,6 +3039,7 @@ impl App {
             Some(RegionAction::Split) => self.split_clip(),
             Some(RegionAction::Delete) => self.delete_selected_clip(),
             Some(RegionAction::NewMidi) => self.add_midi_track(),
+            Some(RegionAction::NewAudio) => self.open_new_track(TrackKind::Audio),
             Some(RegionAction::Join) => {
                 if let Some((t, c)) = selected {
                     self.join_clip(t, c);
@@ -3181,6 +3226,11 @@ impl App {
             let xfade = ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::ALT, Key::X)
             });
+            if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::ALT, Key::N)
+            }) {
+                self.open_new_track(TrackKind::Audio);
+            }
             if xfade {
                 if let Some((t, c)) = self.editor.selected_clip {
                     self.crossfade_clip(t, c);
@@ -3869,6 +3919,7 @@ impl eframe::App for App {
         self.buses_window(ctx);
         self.audio_window(ctx);
         self.about_window(ctx);
+        self.new_track_window(ctx);
 
         if self.confirm_quit {
             egui::Window::new("Несохранённые изменения")

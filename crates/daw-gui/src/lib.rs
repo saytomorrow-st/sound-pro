@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track};
+use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track, TrackKind};
 use audio_core::{
     Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Marker, Project,
     ProjectError, SessionError,
@@ -131,6 +131,10 @@ pub enum EditorError {
     /// The clip has no neighbour that touches or overlaps it (SPEC-043).
     #[error("no touching clip to crossfade with")]
     CannotCrossfade,
+    /// An audio region cannot go on an instrument track or a MIDI region on
+    /// an audio track (SPEC-049).
+    #[error("the region does not fit this track type")]
+    WrongTrackKind,
     /// Nothing has been copied yet (SPEC-027).
     #[error("nothing to paste")]
     EmptyClipboard,
@@ -420,7 +424,12 @@ impl Editor {
         }
         let name = clip_name(&path);
         let mut session = self.project.session.clone();
-        let track_index = match track.filter(|&t| t < session.tracks.len()) {
+        let track_index = match track.filter(|&t| {
+            session
+                .tracks
+                .get(t)
+                .is_some_and(|t| t.kind == TrackKind::Audio)
+        }) {
             Some(t) => t,
             None => {
                 session.tracks.push(Track::new(&name));
@@ -514,10 +523,18 @@ impl Editor {
             return Err(EditorError::EmptyRecording);
         }
         let mut session = self.project.session.clone();
-        let mut targets: Vec<usize> = self.armed_tracks().collect();
+        let mut targets: Vec<usize> = self
+            .armed_tracks()
+            .filter(|&t| session.tracks[t].kind == TrackKind::Audio)
+            .collect();
         if targets.is_empty() {
             targets.push(
-                match self.selected_track.filter(|&t| t < session.tracks.len()) {
+                match self.selected_track.filter(|&t| {
+                    session
+                        .tracks
+                        .get(t)
+                        .is_some_and(|t| t.kind == TrackKind::Audio)
+                }) {
                     Some(t) => t,
                     None => {
                         session.tracks.push(Track::new("Запись"));
@@ -795,6 +812,9 @@ impl Editor {
             (track, clip)
         } else {
             let target = &session.tracks[to_track];
+            if !target.kind.accepts(&session.tracks[track].clips[clip]) {
+                return Err(EditorError::WrongTrackKind);
+            }
             if target.clips.len() >= MAX_CLIPS_PER_TRACK {
                 return Err(SessionError::TooManyClips {
                     track: to_track,
@@ -1557,6 +1577,9 @@ impl Editor {
             }
             for ((t, c), clip) in moved.into_iter().rev() {
                 let to = t.saturating_add_signed(delta_tracks);
+                if !session.tracks[to].kind.accepts(&clip) {
+                    return Err(EditorError::WrongTrackKind);
+                }
                 session.tracks[to].clips.push(clip);
                 let at = (to, session.tracks[to].clips.len() - 1);
                 if primary == Some((t, c)) {
@@ -1693,6 +1716,9 @@ impl Editor {
         if track >= self.project.session.tracks.len() {
             return Err(EditorError::NoClip);
         }
+        if !self.project.session.tracks[track].kind.accepts(&clip) {
+            return Err(EditorError::WrongTrackKind);
+        }
         clip.start_samples = at;
         let mut session = self.project.session.clone();
         let clips = &mut session.tracks[track].clips;
@@ -1746,7 +1772,7 @@ impl Editor {
             return Err(EditorError::EmptyClip);
         }
         let mut session = self.project.session.clone();
-        let mut track = Track::new("MIDI");
+        let mut track = Track::instrument("MIDI");
         let mut clip = Clip::midi(start, length);
         clip.name = "MIDI".to_owned();
         track.clips.push(clip);
@@ -1754,6 +1780,80 @@ impl Editor {
         let at = (session.tracks.len() - 1, 0);
         self.commit(session, at)?;
         Ok(at)
+    }
+
+    /// Adds `count` empty tracks of `kind` below the last track (SPEC-049).
+    ///
+    /// Names are `name` (or "Аудио"/"Инструмент" when blank) with " N"
+    /// appended for N > 1. One undo step; the first new track is selected.
+    /// Returns the new indices.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::EmptyClip`] for `count == 0`, [`EditorError::Session`]
+    /// when the tracks would exceed [`audio_core::MAX_TRACKS`] or the name
+    /// is too long; `self` is unchanged.
+    pub fn add_tracks(
+        &mut self,
+        kind: TrackKind,
+        count: usize,
+        name: &str,
+    ) -> Result<Vec<usize>, EditorError> {
+        if count == 0 {
+            return Err(EditorError::EmptyClip);
+        }
+        let base = match (name.trim(), kind) {
+            ("", TrackKind::Audio) => "Аудио",
+            ("", TrackKind::Instrument) => "Инструмент",
+            (n, _) => n,
+        };
+        let mut session = self.project.session.clone();
+        let first = session.tracks.len();
+        if first + count > audio_core::MAX_TRACKS {
+            return Err(SessionError::TooManyTracks {
+                max: audio_core::MAX_TRACKS,
+            }
+            .into());
+        }
+        for n in 0..count {
+            let name = if count == 1 {
+                base.to_owned()
+            } else {
+                format!("{base} {}", n + 1)
+            };
+            session.tracks.push(match kind {
+                TrackKind::Audio => Track::new(&name),
+                TrackKind::Instrument => Track::instrument(&name),
+            });
+        }
+        self.commit_track(session, first)?;
+        self.selected_clip = None;
+        Ok((first..first + count).collect())
+    }
+
+    /// Adds an empty MIDI region to an instrument track (SPEC-049) and
+    /// selects it.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for a bad track, [`EditorError::WrongTrackKind`]
+    /// for an audio track, [`EditorError::EmptyClip`] for `length == 0`,
+    /// [`EditorError::Session`] for a full track; `self` is unchanged.
+    pub fn add_midi_region(
+        &mut self,
+        track: usize,
+        start: u64,
+        length: u64,
+    ) -> Result<(usize, usize), EditorError> {
+        if length == 0 {
+            return Err(EditorError::EmptyClip);
+        }
+        if track >= self.project.session.tracks.len() {
+            return Err(EditorError::NoClip);
+        }
+        let mut clip = Clip::midi(start, length);
+        clip.name = self.project.session.tracks[track].name.clone();
+        self.append_clip(track, clip, start)
     }
 
     /// Adds `note` to a MIDI clip; notes stay sorted by `(start, pitch)`.
