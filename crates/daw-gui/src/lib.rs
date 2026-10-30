@@ -128,6 +128,9 @@ pub enum EditorError {
     /// (SPEC-038).
     #[error("these clips cannot be joined")]
     CannotJoin,
+    /// The clip has no neighbour that touches or overlaps it (SPEC-043).
+    #[error("no touching clip to crossfade with")]
+    CannotCrossfade,
     /// Nothing has been copied yet (SPEC-027).
     #[error("nothing to paste")]
     EmptyClipboard,
@@ -202,6 +205,9 @@ impl Peaks {
 
 /// How many edits [`Editor::undo`] can step back.
 pub const UNDO_LIMIT: usize = 100;
+
+/// Crossfade length for two clips that only touch, in samples (SPEC-043 §2).
+pub const DEFAULT_XFADE: u64 = 960;
 
 /// The window's model: one open project and what the user selected.
 #[derive(Debug)]
@@ -949,6 +955,215 @@ impl Editor {
         let mut session = self.project.session.clone();
         session.tracks[track].clips[clip].gain = gain;
         self.commit(session, (track, clip))
+    }
+
+    /// Crossfades a clip with the neighbour it touches or overlaps
+    /// (SPEC-043 §2): the earlier clip fades out and the later one fades in
+    /// across the overlap, or across [`DEFAULT_XFADE`] when they only touch.
+    /// One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices,
+    /// [`EditorError::CannotCrossfade`] when no neighbour touches the clip;
+    /// `self` is unchanged.
+    pub fn crossfade(&mut self, track: usize, clip: usize) -> Result<(), EditorError> {
+        self.clip_ref(track, clip)?;
+        let clips = &self.project.session.tracks[track].clips;
+        let touches =
+            |early: usize, late: usize| clips[late].start_samples <= clips[early].end_samples();
+        let pair = self
+            .next_clip(track, clip)
+            .filter(|&next| touches(clip, next))
+            .map(|next| (clip, next))
+            .or_else(|| {
+                (0..clips.len())
+                    .find(|&i| i != clip && self.next_clip(track, i) == Some(clip))
+                    .filter(|&prev| touches(prev, clip))
+                    .map(|prev| (prev, clip))
+            })
+            .ok_or(EditorError::CannotCrossfade)?;
+        let (early, late) = (&clips[pair.0], &clips[pair.1]);
+        let overlap = early.end_samples() - late.start_samples;
+        let length = if overlap == 0 { DEFAULT_XFADE } else { overlap }
+            .min(early.length_samples)
+            .min(late.length_samples);
+        let mut session = self.project.session.clone();
+        let early = &mut session.tracks[track].clips[pair.0];
+        early.fade_out_samples = length;
+        early.fade_in_samples = early.fade_in_samples.min(early.length_samples - length);
+        let late = &mut session.tracks[track].clips[pair.1];
+        late.fade_in_samples = length;
+        late.fade_out_samples = late.fade_out_samples.min(late.length_samples - length);
+        self.commit(session, (track, clip))
+    }
+
+    /// Moves every note start of a MIDI clip to the nearest `1/division`
+    /// note of the project grid (SPEC-043 §3); `division` is 4, 8, 16 or 32.
+    /// Notes stay inside the clip's data. One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip or another division; `self` is unchanged.
+    pub fn quantize_notes(
+        &mut self,
+        track: usize,
+        clip: usize,
+        division: u32,
+    ) -> Result<(), EditorError> {
+        if ![4, 8, 16, 32].contains(&division) {
+            return Err(EditorError::InvalidNote);
+        }
+        let session = &self.project.session;
+        let step = (sixteenth_samples(session.sample_rate, session.tempo_bpm) * 16
+            / u64::from(division))
+        .max(1);
+        let c = self.clip_ref(track, clip)?;
+        let origin = i128::from(c.start_samples) - i128::from(c.offset_samples);
+        let last = c.source_length.saturating_sub(1);
+        let source_length = c.source_length;
+        self.map_notes(track, clip, |n| {
+            let at = origin + i128::from(n.start);
+            let step = i128::from(step);
+            let snapped = (at + step / 2).div_euclid(step) * step - origin;
+            let start = u64::try_from(snapped.max(0)).unwrap_or(0).min(last);
+            Note {
+                start,
+                length: n.length.min(source_length - start).max(1),
+                ..n
+            }
+        })
+    }
+
+    /// Shifts every note of a MIDI clip by `semitones` (`-96..=96`), clamped
+    /// to the MIDI range (SPEC-043 §3). One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip or a shift out of range; `self` is unchanged.
+    pub fn transpose_notes(
+        &mut self,
+        track: usize,
+        clip: usize,
+        semitones: i32,
+    ) -> Result<(), EditorError> {
+        if !(-96..=96).contains(&semitones) {
+            return Err(EditorError::InvalidNote);
+        }
+        self.map_notes(track, clip, |n| Note {
+            pitch: u8::try_from((i32::from(n.pitch) + semitones).clamp(0, 127)).unwrap_or(0),
+            ..n
+        })
+    }
+
+    /// Adds `delta` (`-99..=99`) to every note velocity of a MIDI clip,
+    /// clamped to `1..=127` (SPEC-043 §3). One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip or a delta out of range; `self` is unchanged.
+    pub fn offset_velocity(
+        &mut self,
+        track: usize,
+        clip: usize,
+        delta: i32,
+    ) -> Result<(), EditorError> {
+        if !(-99..=99).contains(&delta) {
+            return Err(EditorError::InvalidNote);
+        }
+        self.map_notes(track, clip, |n| Note {
+            velocity: u8::try_from((i32::from(n.velocity) + delta).clamp(1, 127)).unwrap_or(1),
+            ..n
+        })
+    }
+
+    /// Scales every note length of a MIDI clip to `percent` (`25..=200`),
+    /// at least one sample and no further than the clip's data (SPEC-043 §3).
+    /// One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip or a percentage out of range; `self` is unchanged.
+    pub fn scale_gate(
+        &mut self,
+        track: usize,
+        clip: usize,
+        percent: u32,
+    ) -> Result<(), EditorError> {
+        if !(25..=200).contains(&percent) {
+            return Err(EditorError::InvalidNote);
+        }
+        let source_length = self.clip_ref(track, clip)?.source_length;
+        self.map_notes(track, clip, |n| Note {
+            length: ((n.length * u64::from(percent) + 50) / 100)
+                .min(source_length - n.start)
+                .max(1),
+            ..n
+        })
+    }
+
+    fn map_notes(
+        &mut self,
+        track: usize,
+        clip: usize,
+        f: impl Fn(Note) -> Note,
+    ) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let notes = midi_notes(&mut session, track, clip)?;
+        for note in notes.iter_mut() {
+            *note = f(*note);
+        }
+        notes.sort_by_key(|n| (n.start, n.pitch));
+        if session == self.project.session {
+            return Ok(());
+        }
+        self.commit_notes(session, (track, clip))
+    }
+
+    /// Replaces a track's notes text (SPEC-043 §6). One undo step unless
+    /// grouped or unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for a bad index, [`EditorError::Session`] when
+    /// the text is longer than [`audio_core::MAX_NOTES_BYTES`].
+    pub fn set_track_notes(&mut self, track: usize, text: &str) -> Result<(), EditorError> {
+        let current = &self
+            .project
+            .session
+            .tracks
+            .get(track)
+            .ok_or(EditorError::NoClip)?
+            .notes;
+        if current == text {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        session.tracks[track].notes = text.to_owned();
+        self.commit_track(session, track)
+    }
+
+    /// Replaces the project notes text (SPEC-043 §6).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::Session`] when the text is longer than
+    /// [`audio_core::MAX_NOTES_BYTES`].
+    pub fn set_project_notes(&mut self, text: &str) -> Result<(), EditorError> {
+        if self.project.session.notes == text {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        session.notes = text.to_owned();
+        session.validate()?;
+        self.record();
+        self.project.session = session;
+        self.dirty = true;
+        Ok(())
     }
 
     /// Index of the clip that starts next after `clip` on its track.
