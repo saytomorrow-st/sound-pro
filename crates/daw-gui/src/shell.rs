@@ -75,6 +75,26 @@ fn lcd_text(ui: &mut egui::Ui, value: &str) -> egui::Response {
     )
 }
 
+/// Makes an editable LCD value (the tempo) look like the read-only ones next
+/// to it: same font and height, no button frame, so the cells line up
+/// (SPEC-045 §8).
+fn lcd_style(ui: &mut egui::Ui) {
+    let style = ui.style_mut();
+    style.override_font_id = Some(egui::FontId::monospace(18.0));
+    style.spacing.interact_size.y = 24.0;
+    style.spacing.button_padding.y = 0.0;
+    for w in [
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+    ] {
+        w.weak_bg_fill = Color32::TRANSPARENT;
+        w.bg_fill = Color32::TRANSPARENT;
+        w.bg_stroke = Stroke::NONE;
+        w.fg_stroke.color = LCD_TEXT;
+    }
+}
+
 /// Greyed menu entry for a feature that is not ready yet.
 fn menu_stub(ui: &mut egui::Ui, text: &str) {
     ui.add_enabled(false, egui::Button::new(text))
@@ -547,6 +567,9 @@ fn window_buttons(ui: &mut egui::Ui) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
     }
     if ui.button("🗕").on_hover_text("Свернуть").clicked() {
+        // Most window managers ignore a minimize request from a full-screen
+        // window, so leave full screen first (SPEC-045 §7).
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
     ui.separator();
@@ -703,7 +726,10 @@ impl App {
                     self.position_menu(&r);
                     ui.separator();
                     ui.visuals_mut().override_text_color = Some(LCD_TEXT);
-                    lcd_slot(ui, 96.0, "ТЕМП", |ui| self.tempo_field(ui));
+                    lcd_slot(ui, 96.0, "ТЕМП", |ui| {
+                        lcd_style(ui);
+                        self.tempo_field(ui);
+                    });
                     ui.separator();
                     lcd_slot(ui, 96.0, "РАЗМЕР", |ui| self.meter_field(ui));
                     ui.separator();
@@ -1023,6 +1049,7 @@ impl App {
             };
             let _ = self.editor.set_fades(t, c, fi, fo);
         }
+        self.fade_curve_rows(ui, t, c, (region.fade_in_curve, region.fade_out_curve));
         ui.label("Кроссфейд");
         if ui
             .button("Создать")
@@ -1032,6 +1059,51 @@ impl App {
             self.crossfade_clip(t, c);
         }
         ui.end_row();
+    }
+
+    /// Fade shapes (SPEC-045 §9): a curve slider per fade plus the
+    /// Logic-like presets — linear, exponential (slow start) and logarithmic
+    /// (fast start). Drawn into the region inspector grid.
+    fn fade_curve_rows(&mut self, ui: &mut egui::Ui, t: usize, c: usize, curves: (f32, f32)) {
+        let (mut fade_in, mut fade_out) = curves;
+        let mut changed = false;
+        for (label, curve) in [("Форма In", &mut fade_in), ("Форма Out", &mut fade_out)] {
+            ui.label(label);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let r = ui.add(
+                    egui::DragValue::new(curve)
+                        .range(-1.0..=1.0)
+                        .speed(0.01)
+                        .max_decimals(2),
+                );
+                self.group_drag(&r);
+                changed |= r.changed();
+                for (text, value, hint) in [
+                    ("╱", 0.0, "Линейная"),
+                    ("⌣", -0.5, "Экспоненциальная (медленное начало)"),
+                    ("⌒", 0.5, "Логарифмическая (быстрое начало)"),
+                ] {
+                    #[allow(clippy::float_cmp, reason = "presets are exact constants")]
+                    let on = *curve == value;
+                    if ui
+                        .add(egui::Button::new(text).selected(on).small())
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        *curve = value;
+                        changed = true;
+                    }
+                }
+            });
+            ui.end_row();
+        }
+        if changed {
+            let result = self.editor.set_fade_curves(t, c, fade_in, fade_out);
+            if let Err(e) = result {
+                self.status = format!("Ошибка: {e}");
+            }
+        }
     }
 
     fn midi_region_rows(&mut self, ui: &mut egui::Ui, t: usize, c: usize) {

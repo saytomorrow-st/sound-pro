@@ -21,6 +21,8 @@ fn clip(start: u64, length: u64, source: u64) -> Clip {
         notes: None,
         fade_in_samples: 0,
         fade_out_samples: 0,
+        fade_in_curve: 0.0,
+        fade_out_curve: 0.0,
     }
 }
 

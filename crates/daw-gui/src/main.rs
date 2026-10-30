@@ -116,23 +116,32 @@ const FADE_HANDLE_PX: f32 = 14.0;
 /// `None` means the tool does not drag.
 /// `fades` are the fade-in and fade-out widths in pixels: a handle sits
 /// where its ramp meets the top edge and is grabbed there (SPEC-040 §3).
-fn press_mode(tool: Tool, rect: Rect, p: Pos2, fades: (f32, f32)) -> Option<DragMode> {
+/// `inside` tells whether the start and the end lie inside another clip:
+/// such an edge is part of a crossfade and has no fade handle (SPEC-045 §5).
+fn press_mode(
+    tool: Tool,
+    rect: Rect,
+    p: Pos2,
+    fades: (f32, f32),
+    inside: (bool, bool),
+) -> Option<DragMode> {
     let left_half = p.x < rect.center().x;
     match tool {
         Tool::Scissors | Tool::Glue => None,
-        Tool::Fade => Some(if left_half {
-            DragMode::FadeIn
-        } else {
-            DragMode::FadeOut
-        }),
+        Tool::Fade => match (left_half, inside) {
+            (true, (true, _)) | (false, (_, true)) => None,
+            (true, _) => Some(DragMode::FadeIn),
+            (false, _) => Some(DragMode::FadeOut),
+        },
         Tool::Pointer => {
             let handle = FADE_HANDLE_PX.min(rect.width() / 3.0);
             let top = p.y <= rect.min.y + FADE_HANDLE_PX;
             let fade_in = rect.min.x + fades.0.min(rect.width());
             let fade_out = rect.max.x - fades.1.min(rect.width());
-            if top && p.x <= (rect.min.x + handle).max(fade_in + handle / 2.0) {
+            if top && !inside.0 && p.x <= (rect.min.x + handle).max(fade_in + handle / 2.0) {
                 Some(DragMode::FadeIn)
-            } else if top && p.x >= (rect.max.x - handle).min(fade_out - handle / 2.0) {
+            } else if top && !inside.1 && p.x >= (rect.max.x - handle).min(fade_out - handle / 2.0)
+            {
                 Some(DragMode::FadeOut)
             } else {
                 Some(edge_mode(rect, p.x))
@@ -162,47 +171,70 @@ fn edge_mode(rect: Rect, x: f32) -> DragMode {
     }
 }
 
-/// Fade ramps on a region: shading over the faded part and a line from the
-/// silent corner to full level; on the selected or hovered region, handles
-/// on the top corners (SPEC-038 §7, SPEC-040 §3).
+/// Fade ramps on a region: shading over the faded part and the real gain
+/// curve from the silent corner to full level (SPEC-045 §1); on the selected
+/// or hovered region, handles on the top corners (SPEC-040 §3). An edge that
+/// lies inside another clip belongs to a crossfade and gets no handle
+/// (SPEC-045 §5). `(show, (start_inside, end_inside))`.
 #[allow(clippy::cast_precision_loss)]
 fn draw_fades(
     painter: &egui::Painter,
     rect: Rect,
     clip: &audio_core::session::Clip,
     px_per_sample: f32,
-    selected: bool,
+    (show, (start_inside, end_inside)): (bool, (bool, bool)),
 ) {
-    let shade = Color32::from_black_alpha(110);
-    let line = Stroke::new(1.5_f32, Color32::from_gray(235));
     let fade_in = (clip.fade_in_samples as f32 * px_per_sample).min(rect.width());
     let fade_out = (clip.fade_out_samples as f32 * px_per_sample).min(rect.width());
     if fade_in >= 1.0 {
-        let top = Pos2::new(rect.min.x + fade_in, rect.min.y);
-        painter.add(egui::Shape::convex_polygon(
-            vec![rect.left_top(), top, rect.left_bottom()],
-            shade,
-            Stroke::NONE,
-        ));
-        painter.line_segment([rect.left_bottom(), top], line);
+        draw_fade_curve(painter, rect, rect.min.x, fade_in, clip.fade_in_curve);
     }
     if fade_out >= 1.0 {
-        let top = Pos2::new(rect.max.x - fade_out, rect.min.y);
-        painter.add(egui::Shape::convex_polygon(
-            vec![top, rect.right_top(), rect.right_bottom()],
-            shade,
-            Stroke::NONE,
-        ));
-        painter.line_segment([top, rect.right_bottom()], line);
+        draw_fade_curve(painter, rect, rect.max.x, -fade_out, clip.fade_out_curve);
     }
-    if selected && rect.width() > FADE_HANDLE_PX * 2.0 {
-        for x in [rect.min.x + fade_in, rect.max.x - fade_out] {
+    if show && rect.width() > FADE_HANDLE_PX * 2.0 {
+        let handles = [
+            (!start_inside, rect.min.x + fade_in),
+            (!end_inside, rect.max.x - fade_out),
+        ];
+        for (_, x) in handles.into_iter().filter(|(on, _)| *on) {
             let x = x.clamp(rect.min.x + 4.0, rect.max.x - 4.0);
             let at = Pos2::new(x, rect.min.y + 4.0);
             painter.circle_filled(at, 4.0, Color32::WHITE);
             painter.circle_stroke(at, 4.0, Stroke::new(1.0_f32, Color32::from_gray(40)));
         }
     }
+}
+
+/// One fade ramp starting at the silent edge `x0` and spanning `width`
+/// pixels (negative for a fade-out, which runs leftwards from the end).
+/// The area above the curve is shaded in thin strips, so curved shapes
+/// shade correctly where a convex polygon cannot.
+#[allow(clippy::cast_precision_loss)]
+fn draw_fade_curve(painter: &egui::Painter, rect: Rect, x0: f32, width: f32, curve: f32) {
+    const STEPS: usize = 32;
+    let shade = Color32::from_black_alpha(110);
+    let line = Stroke::new(1.5_f32, Color32::from_gray(235));
+    let y = |gain: f32| rect.max.y - gain * rect.height();
+    let points: Vec<Pos2> = (0..=STEPS)
+        .map(|i| {
+            let f = i as f32 / STEPS as f32;
+            Pos2::new(x0 + f * width, y(audio_core::shape_fade(f, curve)))
+        })
+        .collect();
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let (lo, hi) = (a.x.min(b.x), a.x.max(b.x));
+        let bottom = a.y.min(b.y);
+        if bottom > rect.min.y {
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(lo, rect.min.y), Pos2::new(hi, bottom)),
+                0.0,
+                shade,
+            );
+        }
+    }
+    painter.add(egui::Shape::line(points, line));
 }
 
 /// Width left for a track name once the header's right-hand buttons
@@ -223,7 +255,7 @@ fn draw_overlap_zone(
     top: f32,
     px_per_sample: f32,
     colors: &daw_gui::layout::RegionColors,
-) {
+) -> Rect {
     let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
     let x0 = left + start as f32 * px_per_sample;
     let x1 = (left + end as f32 * px_per_sample).max(x0 + 2.0);
@@ -236,13 +268,63 @@ fn draw_overlap_zone(
     let body = Rect::from_min_max(Pos2::new(rect.min.x, header.max.y), rect.max);
     // The header keeps the top clip's name; only the body merges.
     painter.rect_filled(body, 0.0, rgb(colors.body).gamma_multiply(0.92));
-    painter.rect_filled(body, 0.0, Color32::from_black_alpha(50));
-    let line = Stroke::new(1.5_f32, Color32::from_gray(235));
-    painter.line_segment([body.left_bottom(), body.right_top()], line);
-    painter.line_segment([body.left_top(), body.right_bottom()], line);
+    painter.rect_filled(body, 0.0, Color32::from_black_alpha(25));
     let edge = Stroke::new(1.0_f32, Color32::from_black_alpha(140));
     painter.hline(rect.x_range(), rect.min.y + 0.5, edge);
     painter.hline(rect.x_range(), rect.max.y - 0.5, edge);
+    body
+}
+
+/// The thin X over a crossfade zone, drawn above the waveforms.
+fn draw_crossfade_x(painter: &egui::Painter, body: Rect) {
+    let line = Stroke::new(1.0_f32, Color32::from_white_alpha(170));
+    painter.line_segment([body.left_bottom(), body.right_top()], line);
+    painter.line_segment([body.left_top(), body.right_bottom()], line);
+}
+
+fn rgb_detail(colors: &daw_gui::layout::RegionColors) -> Color32 {
+    let [r, g, b] = colors.detail;
+    Color32::from_rgb(r, g, b)
+}
+
+/// The waveform of `clip` drawn into `body`; `rect` is the whole region.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "pixel columns and sample positions stay far below 2^24"
+)]
+fn draw_peaks(
+    painter: &egui::Painter,
+    rect: Rect,
+    body: Rect,
+    clip: &audio_core::session::Clip,
+    peaks: &daw_gui::Peaks,
+    detail: Color32,
+) {
+    let mid = body.center().y;
+    let half = body.height() * 0.45;
+    let visible = painter.clip_rect().intersect(rect);
+    if visible.width() <= 0.0 {
+        return;
+    }
+    let first = (visible.min.x - rect.min.x).floor().max(0.0) as usize;
+    let last = (visible.max.x - rect.min.x).ceil().min(rect.width().ceil()) as usize;
+    let per_px = clip.length_samples as f32 / rect.width();
+    for px in first..last {
+        let from = clip.offset_samples + (px as f32 * per_px) as u64;
+        let to = clip.offset_samples + ((px + 1) as f32 * per_px).ceil() as u64;
+        if let Some((lo, hi)) = peaks.range(from, to) {
+            let x = rect.min.x + px as f32 + 0.5;
+            painter.line_segment(
+                [
+                    Pos2::new(x, mid - hi.clamp(-1.0, 1.0) * half),
+                    Pos2::new(x, mid - lo.clamp(-1.0, 1.0) * half + 1.0),
+                ],
+                Stroke::new(1.0_f32, detail),
+            );
+        }
+    }
 }
 
 fn main() -> eframe::Result {
@@ -613,6 +695,11 @@ impl App {
 
     #[cfg(feature = "audio")]
     fn start_recording(&mut self) {
+        // SPEC-045 §4: only an armed track records.
+        if self.editor.armed_track().is_none() {
+            self.status = "Включите R (готовность к записи) на дорожке".into();
+            return;
+        }
         let rate = self.editor.session().sample_rate;
         match daw_app::realtime::start_input_with(rate, 30, &self.audio) {
             Ok((control, stream)) => {
@@ -1670,27 +1757,17 @@ impl App {
                     }
                 }
                 if let Some(peaks) = self.editor.peaks(clip) {
-                    let mid = body.center().y;
-                    let half = body.height() * 0.45;
-                    let columns = rect.width().ceil() as usize;
-                    let per_px = clip.length_samples as f32 / rect.width();
-                    for px in 0..columns {
-                        let from = clip.offset_samples + (px as f32 * per_px) as u64;
-                        let to = clip.offset_samples + ((px + 1) as f32 * per_px).ceil() as u64;
-                        if let Some((lo, hi)) = peaks.range(from, to) {
-                            let x = rect.min.x + px as f32 + 0.5;
-                            painter.line_segment(
-                                [
-                                    Pos2::new(x, mid - hi.clamp(-1.0, 1.0) * half),
-                                    Pos2::new(x, mid - lo.clamp(-1.0, 1.0) * half + 1.0),
-                                ],
-                                Stroke::new(1.0_f32, detail),
-                            );
-                        }
-                    }
+                    draw_peaks(&painter, rect, body, clip, peaks, detail);
                 }
                 let hovered = pointer.is_some_and(|p| rect.contains(p));
-                draw_fades(&painter, rect, clip, px_per_sample, selected || hovered);
+                let handles = daw_gui::layout::edges_in_overlap(&track.clips, c);
+                draw_fades(
+                    &painter,
+                    rect,
+                    clip,
+                    px_per_sample,
+                    (selected || hovered, handles),
+                );
                 painter
                     .with_clip_rect(header.intersect(painter.clip_rect()))
                     .text(
@@ -1725,7 +1802,25 @@ impl App {
                 !self.editor.session().is_audible(t),
             );
             for zone in daw_gui::layout::overlap_zones(&track.clips) {
-                draw_overlap_zone(&painter, zone, area.min.x, top, px_per_sample, &colors);
+                let body =
+                    draw_overlap_zone(&painter, zone, area.min.x, top, px_per_sample, &colors);
+                // The merged body must not hide the sound (SPEC-045 §6): the
+                // waveforms of every clip under the zone are drawn over it.
+                let zone_painter = painter.with_clip_rect(body.intersect(painter.clip_rect()));
+                for (c, clip) in track.clips.iter().enumerate() {
+                    let Some(rect) = rects.iter().find(|(at, _)| *at == (t, c)).map(|(_, r)| *r)
+                    else {
+                        continue;
+                    };
+                    if !rect.intersects(body) {
+                        continue;
+                    }
+                    if let Some(peaks) = self.editor.peaks(clip) {
+                        let wave = Rect::from_min_max(Pos2::new(rect.min.x, body.min.y), rect.max);
+                        draw_peaks(&zone_painter, rect, wave, clip, peaks, rgb_detail(&colors));
+                    }
+                }
+                draw_crossfade_x(&painter, body);
             }
             if let Some((rect, border)) = selected_rect {
                 painter.rect_stroke(rect, 4.0, border, StrokeKind::Inside);
@@ -2314,7 +2409,10 @@ impl App {
                 )
             })
         };
-        let mode_at = |p: Pos2| hit(p).and_then(|(at, r)| press_mode(tool, r, p, fades(at)));
+        let inside =
+            |(t, c): (usize, usize)| daw_gui::layout::edges_in_overlap(&session.tracks[t].clips, c);
+        let mode_at =
+            |p: Pos2| hit(p).and_then(|(at, r)| press_mode(tool, r, p, fades(at), inside(at)));
         if self.drag.is_none() {
             if let Some(p) = response.hover_pos() {
                 let icon = match (tool, mode_at(p)) {

@@ -544,22 +544,25 @@ impl Track {
     ) -> (f32, f32) {
         let frames = dst.len();
         // SPEC-044 §2: where clips overlap the later-starting one crossfades
-        // over the earlier one (`Clip::overlap_weight`); the result does not
+        // over the earlier one (`Clip::layer_weight`, SPEC-045 §2: explicit
+        // fades replace the automatic ramp, never multiply); the result does not
         // depend on the list order. Covering clips are walked from the one
         // above all others down; what a clip leaves uncovered shows the
         // clips below, so a fade over another clip still reveals it.
         for (index, slot) in dst.iter_mut().enumerate() {
             let position = position.saturating_add(index as u64);
             let mut current = self.next_below(position, None);
+            let mut above: Option<usize> = None;
             let mut sum = 0.0_f32;
             let mut remaining = 1.0_f32;
             while let Some(at) = current {
                 let clip = &self.clips[at];
                 let below = self.next_below(position, Some(at));
-                let mut weight = clip.fade_gain(position);
-                if let Some(lower) = below {
-                    weight *= clip.overlap_weight(&self.clips[lower], position);
-                }
+                let weight = clip.layer_weight(
+                    above.map(|a| &self.clips[a]),
+                    below.map(|b| &self.clips[b]),
+                    position,
+                );
                 if weight > 0.0 {
                     sum +=
                         remaining * weight * clip_sample(clip, self.sources[at].as_ref(), position);
@@ -568,6 +571,7 @@ impl Track {
                 if remaining <= 0.0 {
                     break;
                 }
+                above = Some(at);
                 current = below;
             }
             *slot = sum;

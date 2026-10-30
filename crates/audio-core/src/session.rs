@@ -131,6 +131,13 @@ pub enum SessionError {
         /// Index of the clip inside the track.
         clip: usize,
     },
+    /// A fade curve is not finite or outside `[-1, 1]` (SPEC-045 §1).
+    InvalidFadeCurve {
+        /// Index of the track holding the clip.
+        track: usize,
+        /// Index of the clip inside the track.
+        clip: usize,
+    },
     /// A MIDI clip note is out of range, ends past the clip's content, or the
     /// clip has both notes and a file source (SPEC-021).
     InvalidNote {
@@ -253,6 +260,9 @@ impl fmt::Display for SessionError {
                     "track {track}, clip {clip}: fades are longer than the clip"
                 )
             }
+            Self::InvalidFadeCurve { track, clip } => {
+                write!(f, "track {track}, clip {clip}: fade curve is invalid")
+            }
         }
     }
 }
@@ -284,6 +294,27 @@ pub struct Clip {
     pub fade_in_samples: u64,
     /// Linear fade-out to the clip end, in samples (SPEC-038).
     pub fade_out_samples: u64,
+    /// Shape of the fade-in, `-1.0..=1.0`; `0.0` is linear (SPEC-045 §1,
+    /// see [`shape_fade`]).
+    pub fade_in_curve: f32,
+    /// Shape of the fade-out, `-1.0..=1.0`; `0.0` is linear (SPEC-045 §1).
+    pub fade_out_curve: f32,
+}
+
+/// Shaped fade multiplier for progress `x` in `0.0..=1.0` (SPEC-045 §1).
+///
+/// A power curve `x^(2^(-2 * curve))`, the exponential-family fade of
+/// Roads, *The Computer Music Tutorial* (1996), ch. 2: `curve > 0` rises
+/// fast (convex, exponent down to `1/4`), `curve < 0` rises slowly
+/// (concave, exponent up to `4`). `curve == 0.0` returns `x` unchanged, so
+/// a linear fade is bit-identical to SPEC-038.
+#[must_use]
+pub fn shape_fade(x: f32, curve: f32) -> f32 {
+    if curve == 0.0 {
+        x
+    } else {
+        x.powf((-2.0 * curve).exp2())
+    }
 }
 
 /// Longest edge ramp of a clip lying inside another: 10 ms at 48 kHz
@@ -335,6 +366,8 @@ impl Clip {
             notes: None,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
         }
     }
 
@@ -395,12 +428,87 @@ impl Clip {
         let r = self.length_samples.saturating_sub(t).saturating_sub(1);
         let mut gain = 1.0_f32;
         if t < self.fade_in_samples {
-            gain = gain.min(t as f32 / self.fade_in_samples as f32);
+            gain = gain.min(shape_fade(
+                t as f32 / self.fade_in_samples as f32,
+                self.fade_in_curve,
+            ));
         }
         if r < self.fade_out_samples {
-            gain = gain.min(r as f32 / self.fade_out_samples as f32);
+            gain = gain.min(shape_fade(
+                r as f32 / self.fade_out_samples as f32,
+                self.fade_out_curve,
+            ));
         }
         gain
+    }
+
+    /// Weight of this clip in a mix where it lies above `lower` (or above
+    /// nothing) at `position` (SPEC-045 §2).
+    ///
+    /// Without `lower` this is [`Clip::fade_gain`]. Over `lower`, an edge
+    /// with an explicit fade uses that fade instead of the automatic ramp
+    /// of [`Clip::overlap_weight`]; the two never multiply, so an explicit
+    /// crossfade does not dip. Without fades this equals `overlap_weight`.
+    ///
+    /// `above` is the clip sounding over this one, if any: when it starts
+    /// inside this clip and runs past its end, this clip's own fade-out is
+    /// ignored, because `above` already fades this clip out.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "an overlap longer than 2^24 samples only loses ramp precision"
+    )]
+    pub fn layer_weight(&self, above: Option<&Self>, lower: Option<&Self>, position: u64) -> f32 {
+        let crossed = above.is_some_and(|a| {
+            a.start_samples > self.start_samples && a.end_samples() >= self.end_samples()
+        });
+        let Some(lower) = lower else {
+            if crossed {
+                let t = position.wrapping_sub(self.start_samples);
+                return if t < self.fade_in_samples {
+                    shape_fade(t as f32 / self.fade_in_samples as f32, self.fade_in_curve)
+                } else {
+                    1.0
+                };
+            }
+            return self.fade_gain(position);
+        };
+        let start = self.start_samples;
+        let end = self.end_samples();
+        let lower_end = lower.end_samples();
+        let t = position.wrapping_sub(start);
+        let r = end.saturating_sub(position).saturating_sub(1);
+        let start_inside = start > lower.start_samples;
+        let runs_past = start_inside && end >= lower_end;
+        let n = CROSSFADE_SAMPLES.min(self.length_samples / 2).max(1);
+        let head = if self.fade_in_samples > 0 {
+            if t < self.fade_in_samples {
+                shape_fade(t as f32 / self.fade_in_samples as f32, self.fade_in_curve)
+            } else {
+                1.0
+            }
+        } else if runs_past {
+            let n = lower_end.saturating_sub(start).max(1);
+            (t as f32 / n as f32).min(1.0)
+        } else if start_inside && t < n {
+            t as f32 / n as f32
+        } else {
+            1.0
+        };
+        let tail = if crossed {
+            1.0
+        } else if self.fade_out_samples > 0 {
+            if r < self.fade_out_samples {
+                shape_fade(r as f32 / self.fade_out_samples as f32, self.fade_out_curve)
+            } else {
+                1.0
+            }
+        } else if !runs_past && end < lower_end && r < n {
+            r as f32 / n as f32
+        } else {
+            1.0
+        };
+        head.min(tail)
     }
 
     /// Whether this clip sounds over `other` where both cover a position
@@ -1002,6 +1110,15 @@ fn validate_clip(clip: &Clip, track_index: usize, clip_index: usize) -> Result<(
             clip: clip_index,
         });
     }
+    if ![clip.fade_in_curve, clip.fade_out_curve]
+        .iter()
+        .all(|c| c.is_finite() && (-1.0..=1.0).contains(c))
+    {
+        return Err(SessionError::InvalidFadeCurve {
+            track: track_index,
+            clip: clip_index,
+        });
+    }
     if clip.length_samples == 0 {
         return Err(SessionError::EmptyClip {
             track: track_index,
@@ -1319,6 +1436,8 @@ mod tests {
             notes: None,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            fade_in_curve: 0.0,
+            fade_out_curve: 0.0,
         };
         assert!(!clip.covers(99));
         assert!(clip.covers(100));

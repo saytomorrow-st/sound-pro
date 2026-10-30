@@ -390,6 +390,14 @@ fn write_clip(out: &mut String, clip: &crate::session::Clip) {
         out.push_str(",\n            \"fade_out\": ");
         out.push_str(&clip.fade_out_samples.to_string());
     }
+    if clip.fade_in_curve != 0.0 {
+        out.push_str(",\n            \"fade_in_curve\": ");
+        out.push_str(&format_number(f64::from(clip.fade_in_curve)));
+    }
+    if clip.fade_out_curve != 0.0 {
+        out.push_str(",\n            \"fade_out_curve\": ");
+        out.push_str(&format_number(f64::from(clip.fade_out_curve)));
+    }
     if let Some(notes) = &clip.notes {
         write_notes(out, notes);
     }
@@ -1167,11 +1175,14 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
     let mut notes = None;
     let mut fade_in = 0;
     let mut fade_out = 0;
+    let mut curves = (0.0, 0.0);
     for (key, value) in entries {
         match key.as_str() {
             "notes" => notes = Some(notes_from_value(value)?),
             "fade_in" => fade_in = require_u64(value)?,
             "fade_out" => fade_out = require_u64(value)?,
+            "fade_in_curve" => curves.0 = require_f32(value)?,
+            "fade_out_curve" => curves.1 = require_f32(value)?,
             "start" => start = Some(require_u64(value)?),
             "length" => length = Some(require_u64(value)?),
             "offset" => offset = Some(require_u64(value)?),
@@ -1209,6 +1220,8 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
         notes,
         fade_in_samples: fade_in,
         fade_out_samples: fade_out,
+        fade_in_curve: curves.0,
+        fade_out_curve: curves.1,
     })
 }
 

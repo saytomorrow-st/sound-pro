@@ -379,3 +379,30 @@ pub fn overlap_zones(clips: &[audio_core::session::Clip]) -> Vec<(u64, u64)> {
     }
     zones
 }
+
+/// Whether the start and the end of clip `index` lie inside another clip of
+/// the same track (SPEC-045 §3). Such an edge belongs to a crossfade: the
+/// editor draws no fade handle there, so a second fade cannot be dragged
+/// over the crossfade. Bad indices give `(false, false)`.
+#[must_use]
+pub fn edges_in_overlap(clips: &[audio_core::session::Clip], index: usize) -> (bool, bool) {
+    let Some(clip) = clips.get(index) else {
+        return (false, false);
+    };
+    let (start, end) = (clip.start_samples, clip.end_samples());
+    let inside = |p: u64, at_end: bool| {
+        clips.iter().enumerate().any(|(i, o)| {
+            i != index
+                && o.length_samples > 0
+                && if at_end {
+                    o.start_samples < p && p <= o.end_samples()
+                } else {
+                    o.start_samples <= p && p < o.end_samples()
+                }
+        })
+    };
+    (
+        clip.length_samples > 0 && inside(start, false),
+        clip.length_samples > 0 && inside(end, true),
+    )
+}

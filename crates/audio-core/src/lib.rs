@@ -49,7 +49,7 @@ pub use session::{
     AutoPoint, Automation, Bus, BusSend, CROSSFADE_SAMPLES, Clip, DIM_GAIN, EffectLane, Lane,
     MAX_AUTOMATION_POINTS, MAX_BUSES, MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS,
     MAX_NOTES_BYTES, MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES, MAX_TRACKS, Marker, Note, Session,
-    SessionError, TRACK_COLORS, Track as SessionTrack, pan_law, valid_time_signature,
+    SessionError, TRACK_COLORS, Track as SessionTrack, pan_law, shape_fade, valid_time_signature,
 };
 pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz, render_notes};
 pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
