@@ -433,7 +433,7 @@ pub fn build_session_graph_metered(
     let master = if with_buses {
         1.0
     } else {
-        job.session.master_gain
+        job.session.master_level()
     };
     let mut mixed = Vec::new();
     for (index, source) in job.tracks.into_iter().enumerate() {
@@ -456,7 +456,7 @@ pub fn build_session_graph_metered(
         let mixer = nodes::Mixer::new(
             mixed,
             &job.session.buses,
-            job.session.master_gain,
+            job.session.master_level(),
             job.sample_rate,
             job.block_frames.next_power_of_two(),
         );

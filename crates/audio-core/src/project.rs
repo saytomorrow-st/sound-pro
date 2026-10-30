@@ -364,6 +364,38 @@ fn write_string(out: &mut String, value: &str) {
     out.push('"');
 }
 
+/// Writes one clip object at the indent used inside a track's `"clips"`.
+fn write_clip(out: &mut String, clip: &crate::session::Clip) {
+    out.push_str("\n          {\n            \"start\": ");
+    out.push_str(&clip.start_samples.to_string());
+    out.push_str(",\n            \"length\": ");
+    out.push_str(&clip.length_samples.to_string());
+    out.push_str(",\n            \"offset\": ");
+    out.push_str(&clip.offset_samples.to_string());
+    out.push_str(",\n            \"source_length\": ");
+    out.push_str(&clip.source_length.to_string());
+    out.push_str(",\n            \"gain\": ");
+    out.push_str(&format_number(f64::from(clip.gain)));
+    out.push_str(",\n            \"name\": ");
+    write_string(out, &clip.name);
+    if let Some(source) = &clip.source {
+        out.push_str(",\n            \"source\": ");
+        write_string(out, source);
+    }
+    if clip.fade_in_samples > 0 {
+        out.push_str(",\n            \"fade_in\": ");
+        out.push_str(&clip.fade_in_samples.to_string());
+    }
+    if clip.fade_out_samples > 0 {
+        out.push_str(",\n            \"fade_out\": ");
+        out.push_str(&clip.fade_out_samples.to_string());
+    }
+    if let Some(notes) = &clip.notes {
+        write_notes(out, notes);
+    }
+    out.push_str("\n          }");
+}
+
 /// Writes a session object at the two-space indent used inside `"session"`.
 ///
 /// Nested one level deeper than `params`: `session` → track → clip → field.
@@ -376,6 +408,13 @@ fn write_session(out: &mut String, session: &Session) {
     out.push_str(&format_number(session.tempo_bpm));
     out.push_str(",\n    \"master_gain\": ");
     out.push_str(&format_number(f64::from(session.master_gain)));
+    // Written only when set, so older documents keep their exact text.
+    if session.master_mute {
+        out.push_str(",\n    \"master_mute\": true");
+    }
+    if session.master_dim {
+        out.push_str(",\n    \"master_dim\": true");
+    }
     // Written only when it differs from 4/4, so older documents keep their
     // exact text (SPEC-026).
     if session.time_signature != TimeSignature::default() {
@@ -400,39 +439,15 @@ fn write_session(out: &mut String, session: &Session) {
         out.push_str(if track.mute { "true" } else { "false" });
         out.push_str(",\n        \"solo\": ");
         out.push_str(if track.solo { "true" } else { "false" });
+        if track.input_monitor {
+            out.push_str(",\n        \"input_monitor\": true");
+        }
         out.push_str(",\n        \"clips\": [");
         for (clip_index, clip) in track.clips.iter().enumerate() {
             if clip_index > 0 {
                 out.push(',');
             }
-            out.push_str("\n          {\n            \"start\": ");
-            out.push_str(&clip.start_samples.to_string());
-            out.push_str(",\n            \"length\": ");
-            out.push_str(&clip.length_samples.to_string());
-            out.push_str(",\n            \"offset\": ");
-            out.push_str(&clip.offset_samples.to_string());
-            out.push_str(",\n            \"source_length\": ");
-            out.push_str(&clip.source_length.to_string());
-            out.push_str(",\n            \"gain\": ");
-            out.push_str(&format_number(f64::from(clip.gain)));
-            out.push_str(",\n            \"name\": ");
-            write_string(out, &clip.name);
-            if let Some(source) = &clip.source {
-                out.push_str(",\n            \"source\": ");
-                write_string(out, source);
-            }
-            if clip.fade_in_samples > 0 {
-                out.push_str(",\n            \"fade_in\": ");
-                out.push_str(&clip.fade_in_samples.to_string());
-            }
-            if clip.fade_out_samples > 0 {
-                out.push_str(",\n            \"fade_out\": ");
-                out.push_str(&clip.fade_out_samples.to_string());
-            }
-            if let Some(notes) = &clip.notes {
-                write_notes(out, notes);
-            }
-            out.push_str("\n          }");
+            write_clip(out, clip);
         }
         if track.clips.is_empty() {
             out.push(']');
@@ -651,6 +666,8 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut sample_rate = None;
     let mut tempo_bpm = None;
     let mut master_gain = None;
+    let mut master_mute = None;
+    let mut master_dim = None;
     let mut time_signature = None;
     let mut tracks = None;
     let mut buses = None;
@@ -665,6 +682,8 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
             "sample_rate" => sample_rate = Some(require_u32(value)?),
             "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
             "master_gain" => master_gain = Some(require_f32(value)?),
+            "master_mute" => master_mute = Some(require_bool(value)?),
+            "master_dim" => master_dim = Some(require_bool(value)?),
             "time_signature" => time_signature = Some(time_signature_from_value(value)?),
             "tracks" => {
                 let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
@@ -703,6 +722,9 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         })?,
         // Optional since SPEC-013 so older documents keep loading.
         master_gain: master_gain.unwrap_or(1.0),
+        // Optional since SPEC-044.
+        master_mute: master_mute.unwrap_or(false),
+        master_dim: master_dim.unwrap_or(false),
         // Optional since SPEC-026; absent means 4/4.
         time_signature: time_signature.unwrap_or_default(),
         tracks: tracks.ok_or(ProjectError::MissingField {
@@ -737,6 +759,7 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut pan = None;
     let mut mute = None;
     let mut solo = None;
+    let mut input_monitor = None;
     let mut clips = None;
     let mut effects = None;
     let mut automation = None;
@@ -755,6 +778,7 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
             "pan" => pan = Some(require_f32(value)?),
             "mute" => mute = Some(require_bool(value)?),
             "solo" => solo = Some(require_bool(value)?),
+            "input_monitor" => input_monitor = Some(require_bool(value)?),
             "clips" => {
                 let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
                 // Same reasoning as for tracks: cap before decoding.
@@ -790,6 +814,8 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
             field: "session.tracks[].mute",
         })?,
         solo: solo.unwrap_or(false),
+        // Optional since SPEC-044.
+        input_monitor: input_monitor.unwrap_or(false),
         clips: clips.ok_or(ProjectError::MissingField {
             field: "session.tracks[].clips",
         })?,

@@ -331,3 +331,51 @@ pub fn slider_anchor(playhead_x: f32, offset: f32, view_width: f32) -> f32 {
         view_width / 2.0
     }
 }
+
+/// Clip indices of one track from bottom to top (SPEC-044 §3): drawn in this
+/// order and hit-tested in reverse, so the clip heard over an overlap is the
+/// one seen and clicked there. Independent of the list order except for
+/// clips with identical spans, like the mix itself.
+#[must_use]
+pub fn draw_order(clips: &[audio_core::session::Clip]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..clips.len()).collect();
+    order.sort_by(|&a, &b| {
+        if clips[a].is_above(a, &clips[b], b) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Less
+        }
+    });
+    order
+}
+
+/// Spans `(start, end)` in samples where two or more clips of a track sound
+/// together, merged and sorted (SPEC-044 §3). The editor draws them as one
+/// crossfaded region instead of one clip on top of the other.
+#[must_use]
+pub fn overlap_zones(clips: &[audio_core::session::Clip]) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = clips
+        .iter()
+        .filter(|c| c.length_samples > 0)
+        .map(|c| {
+            (
+                c.start_samples,
+                c.start_samples.saturating_add(c.length_samples),
+            )
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut zones: Vec<(u64, u64)> = Vec::new();
+    let mut reach = 0_u64;
+    for (i, &(start, end)) in spans.iter().enumerate() {
+        if i > 0 && start < reach {
+            let zone = (start, end.min(reach));
+            match zones.last_mut() {
+                Some(last) if zone.0 <= last.1 => last.1 = last.1.max(zone.1),
+                _ => zones.push(zone),
+            }
+        }
+        reach = reach.max(end);
+    }
+    zones
+}

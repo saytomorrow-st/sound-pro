@@ -1602,3 +1602,44 @@ fn notes_longer_than_the_limit_fail_validation() {
     session.notes = "x".repeat(audio_core::MAX_NOTES_BYTES);
     assert!(session.validate().is_ok());
 }
+
+// --- SPEC-044 §1: master mute/dim and input monitoring --------------------
+
+#[test]
+fn master_mute_dim_and_input_monitor_survive_the_round_trip() {
+    let (graph, _) = demo_graph();
+    let mut session = demo_session();
+    session.master_mute = true;
+    session.master_dim = true;
+    session.tracks[0].input_monitor = true;
+    let project = Project::with_session(Project::capture("demo", SR, 120.0, &graph), session);
+    let text = project.to_json();
+    assert!(text.contains("\"master_mute\": true"), "{text}");
+    assert!(text.contains("\"master_dim\": true"), "{text}");
+    assert!(text.contains("\"input_monitor\": true"), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back, project);
+}
+
+#[test]
+fn unset_master_and_monitor_flags_are_not_written() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    for key in ["master_mute", "master_dim", "input_monitor"] {
+        assert!(!text.contains(key), "{key} written: {text}");
+    }
+    let back = Project::from_json(&text).unwrap();
+    assert!(!back.session().master_mute && !back.session().master_dim);
+}
+
+#[test]
+fn master_level_folds_mute_and_dim_into_the_gain() {
+    let mut session = audio_core::Session::new("s", SR, 120.0);
+    session.master_gain = 0.8;
+    assert!((session.master_level() - 0.8).abs() < 1e-6);
+    session.master_dim = true;
+    assert!((session.master_level() - 0.8 * audio_core::DIM_GAIN).abs() < 1e-6);
+    session.master_mute = true;
+    assert!(session.master_level() == 0.0);
+}
