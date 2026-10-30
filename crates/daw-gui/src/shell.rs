@@ -519,12 +519,37 @@ const MIN_REGION_DB: f32 = -60.0;
 /// Note values offered by Quantize (SPEC-043 §3).
 pub(crate) const QUANTIZE_DIVISIONS: [u32; 4] = [4, 8, 16, 32];
 
-/// Greyed inspector row for a parameter that is not ready yet.
-fn grey_row(ui: &mut egui::Ui, name: &str) {
-    ui.add_enabled(false, egui::Label::new(name));
-    ui.add_enabled(false, egui::Button::new("—").small())
-        .on_disabled_hover_text("Скоро");
-    ui.end_row();
+/// Parameters that are not ready yet, folded into one collapsed «Ещё»
+/// line so they do not clutter the inspector (SPEC-048 §3).
+fn more_block(ui: &mut egui::Ui, id: &str, names: &[&str]) {
+    egui::CollapsingHeader::new(RichText::new("Ещё").weak())
+        .id_salt(id)
+        .default_open(false)
+        .show(ui, |ui| {
+            for name in names {
+                ui.add_enabled(false, egui::Label::new(*name))
+                    .on_disabled_hover_text("Скоро");
+            }
+        });
+}
+
+/// Left column label of an inspector row, right-aligned like Logic.
+fn row_label(ui: &mut egui::Ui, text: &str) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(RichText::new(text).color(Color32::from_gray(170)));
+    });
+}
+
+/// Width of the label column of the inspector grids.
+const LABEL_WIDTH: f32 = 78.0;
+
+/// Two-column grid of an inspector section.
+fn inspector_grid(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .min_col_width(LABEL_WIDTH)
+        .spacing([8.0, 4.0])
+        .show(ui, body);
 }
 
 /// Collapsible inspector block that always spans the full panel width.
@@ -543,7 +568,7 @@ fn inspector_block(
             ui.set_width(width - 12.0);
             egui::CollapsingHeader::new(RichText::new(title).strong())
                 .id_salt(id)
-                .default_open(false)
+                .default_open(true)
                 .show(ui, body);
         });
     ui.add_space(2.0);
@@ -910,15 +935,16 @@ impl App {
             .editor
             .selected_clip
             .filter(|&(t, c)| t == index && c < self.editor.session().tracks[t].clips.len());
+        let count = self.editor.selected_clips().len();
         let title = match clip {
-            Some((t, c)) if self.editor.session().tracks[t].clips[c].is_midi() => "Регион: MIDI",
-            Some(_) => "Регион: аудио",
-            None => "Регион",
+            _ if count > 1 => format!("Регион: выбрано {count}"),
+            Some((t, c)) => format!("Регион: {}", self.editor.session().tracks[t].clips[c].name),
+            None => "Регион".to_owned(),
         };
-        inspector_block(ui, width, "inspector_region", title, |ui| {
+        inspector_block(ui, width, "inspector_region", &title, |ui| {
             self.region_body(ui, clip);
         });
-        let name = self.editor.session().tracks[index].name.clone();
+        let name = format!("Дорожка: {}", self.editor.session().tracks[index].name);
         inspector_block(ui, width, "inspector_track", &name, |ui| {
             self.track_body(ui, index);
         });
@@ -939,47 +965,84 @@ impl App {
         ui.add_space(4.0);
         self.notes_tabs(ui, index);
     }
-    /// Region section: audio gain and fades or MIDI note functions; the
-    /// rest is greyed (SPEC-043 §3).
+    /// Region section (SPEC-048 §2): name, type, position and length, then
+    /// audio gain and fades or MIDI note functions; parameters that are not
+    /// ready are folded into «Ещё».
     fn region_body(&mut self, ui: &mut egui::Ui, clip: Option<(usize, usize)>) {
         let Some((t, c)) = clip else {
-            ui.label(RichText::new("Выберите клип на дорожке").weak());
+            ui.label(RichText::new("Выберите регион на дорожке").weak());
             return;
         };
         let region = self.editor.session().tracks[t].clips[c].clone();
-        egui::Grid::new("region_grid")
-            .num_columns(2)
-            .spacing([6.0, 3.0])
-            .show(ui, |ui| {
-                if region.is_midi() {
-                    self.midi_region_rows(ui, t, c);
-                    for name in [
-                        "Mute",
-                        "Loop",
-                        "Q-Swing",
-                        "Fine Tune",
-                        "Dynamics",
-                        "Clip Length",
-                        "Score",
-                    ] {
-                        grey_row(ui, name);
-                    }
-                } else {
-                    self.audio_region_rows(ui, t, c, &region);
-                    for name in [
-                        "Mute",
-                        "Loop",
-                        "Quantize (Flex)",
-                        "Transpose",
-                        "Fine Tune",
-                        "Flex Time",
-                        "Curve",
-                        "Speed Fade",
-                    ] {
-                        grey_row(ui, name);
-                    }
-                }
+        inspector_grid(ui, "region_grid", |ui| {
+            self.region_name_row(ui, t, c, &region.name);
+            row_label(ui, "Тип");
+            ui.label(if region.is_midi() {
+                "MIDI"
+            } else {
+                "Аудио"
             });
+            ui.end_row();
+            let session = self.editor.session();
+            let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+            let per_bar = u32::from(session.time_signature.numerator);
+            row_label(ui, "Позиция");
+            ui.label(daw_gui::bars_in(region.start_samples, rate, tempo, per_bar));
+            ui.end_row();
+            row_label(ui, "Длина");
+            ui.label(format!(
+                "{:.2} с",
+                region.length_samples as f64 / f64::from(rate.max(1))
+            ));
+            ui.end_row();
+            if region.is_midi() {
+                self.midi_region_rows(ui, t, c);
+            } else {
+                self.audio_region_rows(ui, t, c, &region);
+            }
+        });
+        let more: &[&str] = if region.is_midi() {
+            &[
+                "Mute",
+                "Loop",
+                "Q-Swing",
+                "Fine Tune",
+                "Dynamics",
+                "Clip Length",
+                "Score",
+            ]
+        } else {
+            &[
+                "Mute",
+                "Loop",
+                "Quantize (Flex)",
+                "Transpose",
+                "Fine Tune",
+                "Flex Time",
+                "Speed Fade",
+            ]
+        };
+        more_block(ui, "region_more", more);
+    }
+
+    /// Editable region name; committed when the field loses focus.
+    fn region_name_row(&mut self, ui: &mut egui::Ui, t: usize, c: usize, current: &str) {
+        let id = ui.id().with(("region_name", t, c));
+        let mut name = ui
+            .data(|d| d.get_temp::<String>(id))
+            .unwrap_or_else(|| current.to_owned());
+        row_label(ui, "Имя");
+        let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+        if r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(id, name.clone()));
+        } else {
+            if r.lost_focus() && name.trim() != current {
+                let result = self.editor.rename_clip(t, c, &name);
+                self.report(result, "Регион переименован");
+            }
+            ui.data_mut(|d| d.remove::<String>(id));
+        }
+        ui.end_row();
     }
 
     fn audio_region_rows(
@@ -990,7 +1053,7 @@ impl App {
         region: &audio_core::session::Clip,
     ) {
         let rate = f64::from(self.editor.session().sample_rate.max(1));
-        ui.label("Gain");
+        row_label(ui, "Gain");
         let mut db = if region.gain > 0.0 {
             (20.0 * region.gain.log10()).max(MIN_REGION_DB)
         } else {
@@ -1010,14 +1073,22 @@ impl App {
             } else {
                 10f32.powf(db / 20.0)
             };
-            let _ = self.editor.set_clip_gain(t, c, gain);
+            // SPEC-048 §4: the gain goes to every selected region.
+            let mut targets = self.editor.selected_clips();
+            if !targets.contains(&(t, c)) {
+                targets = vec![(t, c)];
+            }
+            let result = self.editor.set_clips_gain(&targets, gain);
+            if let Err(e) = result {
+                self.status = format!("Ошибка: {e}");
+            }
         }
         ui.end_row();
         let ms = |samples: u64| samples as f64 * 1000.0 / rate;
         let to_samples = |ms: f64| (ms.max(0.0) * rate / 1000.0).round() as u64;
         let (mut fade_in, mut fade_out) = (ms(region.fade_in_samples), ms(region.fade_out_samples));
         let max = ms(region.length_samples);
-        ui.label("Fade In");
+        row_label(ui, "Fade In");
         let a = ui.add(
             egui::DragValue::new(&mut fade_in)
                 .range(0.0..=max)
@@ -1026,7 +1097,7 @@ impl App {
                 .suffix(" мс"),
         );
         ui.end_row();
-        ui.label("Fade Out");
+        row_label(ui, "Fade Out");
         let b = ui.add(
             egui::DragValue::new(&mut fade_out)
                 .range(0.0..=max)
@@ -1050,7 +1121,7 @@ impl App {
             let _ = self.editor.set_fades(t, c, fi, fo);
         }
         self.fade_curve_rows(ui, t, c, (region.fade_in_curve, region.fade_out_curve));
-        ui.label("Кроссфейд");
+        row_label(ui, "Кроссфейд");
         if ui
             .button("Создать")
             .on_hover_text("С соседним клипом (Ctrl+Alt+X)")
@@ -1068,7 +1139,7 @@ impl App {
         let (mut fade_in, mut fade_out) = curves;
         let mut changed = false;
         for (label, curve) in [("Форма In", &mut fade_in), ("Форма Out", &mut fade_out)] {
-            ui.label(label);
+            row_label(ui, label);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let r = ui.add(
@@ -1107,7 +1178,7 @@ impl App {
     }
 
     fn midi_region_rows(&mut self, ui: &mut egui::Ui, t: usize, c: usize) {
-        ui.label("Quantize");
+        row_label(ui, "Quantize");
         ui.horizontal(|ui| {
             for division in QUANTIZE_DIVISIONS {
                 if ui.small_button(format!("1/{division}")).clicked() {
@@ -1120,7 +1191,7 @@ impl App {
         let (mut transpose, mut velocity, mut gate) = ui
             .data(|d| d.get_temp::<(i32, i32, u32)>(id))
             .unwrap_or((0, 0, 100));
-        ui.label("Transpose");
+        row_label(ui, "Transpose");
         ui.horizontal(|ui| {
             ui.add(
                 egui::DragValue::new(&mut transpose)
@@ -1134,7 +1205,7 @@ impl App {
             }
         });
         ui.end_row();
-        ui.label("Velocity");
+        row_label(ui, "Velocity");
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut velocity).range(-99..=99));
             if ui.small_button("Применить").clicked() && velocity != 0 {
@@ -1144,7 +1215,7 @@ impl App {
             }
         });
         ui.end_row();
-        ui.label("Gate Time");
+        row_label(ui, "Gate Time");
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut gate).range(25..=200).suffix(" %"));
             if ui.small_button("Применить").clicked() && gate != 100 {
@@ -1173,46 +1244,82 @@ impl App {
         }
     }
 
-    /// Track section: name and channel number; the rest is greyed
-    /// (SPEC-043 §4).
+    /// Track section (SPEC-048 §6): name, type, channel and colour; the
+    /// rest is folded into «Ещё».
     fn track_body(&mut self, ui: &mut egui::Ui, index: usize) {
         let id = ui.id().with(("track_name", index));
-        let current = self.editor.session().tracks[index].name.clone();
+        let track = &self.editor.session().tracks[index];
+        let current = track.name.clone();
+        let color = track.color;
+        let midi = track
+            .clips
+            .first()
+            .is_some_and(audio_core::session::Clip::is_midi);
         let mut name = ui
             .data(|d| d.get_temp::<String>(id))
             .unwrap_or_else(|| current.clone());
-        egui::Grid::new("track_grid")
-            .num_columns(2)
-            .spacing([6.0, 3.0])
-            .show(ui, |ui| {
-                ui.label("Имя");
-                let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(110.0));
-                if r.has_focus() {
-                    ui.data_mut(|d| d.insert_temp(id, name.clone()));
-                } else {
-                    if r.lost_focus() && name.trim() != current {
-                        let result = self.editor.rename_track(index, name.trim());
-                        self.report(result, "Дорожка переименована");
-                    }
-                    ui.data_mut(|d| d.remove::<String>(id));
+        inspector_grid(ui, "track_grid", |ui| {
+            row_label(ui, "Имя");
+            let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(id, name.clone()));
+            } else {
+                if r.lost_focus() && name.trim() != current {
+                    let result = self.editor.rename_track(index, name.trim());
+                    self.report(result, "Дорожка переименована");
                 }
-                ui.end_row();
-                ui.label("Канал");
-                ui.label(format!("{}", index + 1));
-                ui.end_row();
-                for name in [
-                    "Freeze",
-                    "VCA",
-                    "Automation Mode",
-                    "Flex Mode",
-                    "Key Limit",
-                    "Velocity Limit",
-                    "Delay",
-                    "No Transpose",
-                ] {
-                    grey_row(ui, name);
+                ui.data_mut(|d| d.remove::<String>(id));
+            }
+            ui.end_row();
+            row_label(ui, "Тип");
+            ui.label(if midi {
+                "Инструмент (MIDI)"
+            } else {
+                "Аудио"
+            });
+            ui.end_row();
+            row_label(ui, "Канал");
+            ui.label(format!("{}", index + 1));
+            ui.end_row();
+            row_label(ui, "Цвет");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for c in 0..super::TRACK_COLORS {
+                    let fill = track_color(Some(c), 0);
+                    let on = color == Some(c);
+                    let (rect, r) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::click());
+                    ui.painter().rect_filled(rect, 2.0, fill);
+                    if on {
+                        ui.painter().rect_stroke(
+                            rect,
+                            2.0,
+                            Stroke::new(1.5_f32, Color32::WHITE),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    if r.clicked() {
+                        let value = if on { None } else { Some(c) };
+                        let result = self.editor.set_track_color(index, value);
+                        self.report(result, "Цвет изменён");
+                    }
                 }
             });
+            ui.end_row();
+        });
+        more_block(
+            ui,
+            "track_more",
+            &[
+                "Freeze",
+                "VCA",
+                "Automation Mode",
+                "Flex Mode",
+                "Key Limit",
+                "Velocity Limit",
+                "Delay",
+                "No Transpose",
+            ],
+        );
     }
 
     /// Track and project notes tabs at the bottom (SPEC-043 §6).
