@@ -969,6 +969,70 @@ impl Editor {
         self.commit(session, (track, clip))
     }
 
+    /// Sets the gain of several clips at once, limited like
+    /// [`Self::set_clip_gain`] (SPEC-048 §4). One undo step; bad indices are
+    /// skipped, the selection is kept.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] when no index is valid; `self` is unchanged.
+    pub fn set_clips_gain(
+        &mut self,
+        clips: &[(usize, usize)],
+        gain: f32,
+    ) -> Result<(), EditorError> {
+        let gain = if gain.is_nan() {
+            0.0
+        } else {
+            gain.clamp(0.0, 1.0)
+        };
+        let mut session = self.project.session.clone();
+        let mut found = false;
+        let mut changed = false;
+        for &(t, c) in clips {
+            if let Some(clip) = session.tracks.get_mut(t).and_then(|tr| tr.clips.get_mut(c)) {
+                found = true;
+                if clip.gain.to_bits() != gain.to_bits() {
+                    clip.gain = gain;
+                    changed = true;
+                }
+            }
+        }
+        if !found {
+            return Err(EditorError::NoClip);
+        }
+        if changed {
+            self.commit_session(session)?;
+        }
+        Ok(())
+    }
+
+    /// Renames a clip; surrounding spaces are trimmed (SPEC-048 §5). One
+    /// undo step unless the name is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::EmptyName`]
+    /// for a blank name, [`EditorError::Session`] for a too long one.
+    pub fn rename_clip(
+        &mut self,
+        track: usize,
+        clip: usize,
+        name: &str,
+    ) -> Result<(), EditorError> {
+        let name = name.trim();
+        let current = &self.clip_ref(track, clip)?.name;
+        if name.is_empty() {
+            return Err(EditorError::EmptyName);
+        }
+        if current == name {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        name.clone_into(&mut session.tracks[track].clips[clip].name);
+        self.commit(session, (track, clip))
+    }
+
     /// Crossfades a clip with the neighbour it touches or overlaps
     /// (SPEC-043 §2): the earlier clip fades out and the later one fades in
     /// across the overlap, or across [`DEFAULT_XFADE`] when they only touch.
