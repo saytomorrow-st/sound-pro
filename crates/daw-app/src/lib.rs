@@ -29,6 +29,7 @@ use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
 
 pub mod audio_file;
 pub mod audio_settings;
+pub mod meters;
 pub mod nodes;
 pub mod piano;
 
@@ -395,6 +396,19 @@ pub struct SessionReport {
 /// Returns [`audio_core::SessionError`] when the model is invalid, [`SessionError`]
 /// when the job's tracks or clips do not line up, or a graph error.
 pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error::Error>> {
+    build_session_graph_metered(job, None)
+}
+
+/// [`build_session_graph`] whose tracks also report their post-fader levels
+/// into `meters` (SPEC-042); the sound is the same with or without them.
+///
+/// # Errors
+///
+/// As [`build_session_graph`].
+pub fn build_session_graph_metered(
+    job: SessionJob,
+    meters: Option<&meters::Meters>,
+) -> Result<Graph, Box<dyn std::error::Error>> {
     job.session.validate()?;
     if job.tracks.len() != job.session.tracks.len() {
         return Err(Box::new(SessionError::TrackCountMismatch {
@@ -427,6 +441,10 @@ pub fn build_session_graph(job: SessionJob) -> Result<Graph, Box<dyn std::error:
             .with_mix(job.session.is_audible(index), master)
             .with_effects(&source.track.effects, job.sample_rate)
             .with_automation(&source.track.automation);
+        let node = match meters {
+            Some(meters) => node.with_meter(meters, index),
+            None => node,
+        };
         if with_buses {
             mixed.push((node, source.track.sends.clone()));
         } else {

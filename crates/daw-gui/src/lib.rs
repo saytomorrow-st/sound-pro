@@ -235,6 +235,8 @@ pub struct Editor {
     clipboard: Option<Clip>,
     /// Track armed for recording; not saved (SPEC-038).
     armed: Option<usize>,
+    /// Live levels of playback, shared by every graph it plays (SPEC-042).
+    meters: daw_app::meters::Meters,
 }
 
 impl Default for Editor {
@@ -272,6 +274,7 @@ impl Editor {
             metronome: false,
             armed: None,
             clipboard: None,
+            meters: daw_app::meters::Meters::new(),
         }
     }
 
@@ -336,6 +339,7 @@ impl Editor {
             metronome: self.metronome,
             clipboard: None,
             armed: None,
+            meters: self.meters.clone(),
         };
         Ok(())
     }
@@ -660,6 +664,7 @@ impl Editor {
             start = from.min(end);
         }
         let (mut control, engine) = daw_app::playback::playback(graph, rate, start, end);
+        let engine = engine.with_meters(self.meters.clone());
         control.set_cycle(cycle);
         control.set_metronome(self.metronome);
         let session = &self.project.session;
@@ -681,9 +686,16 @@ impl Editor {
         let mut job = self.load(PathBuf::new())?;
         job.block_frames = daw_app::playback::PLAYBACK_BLOCK;
         let rate = job.sample_rate;
-        let graph =
-            daw_app::build_session_graph(job).map_err(|e| EditorError::Render(e.to_string()))?;
+        let graph = daw_app::build_session_graph_metered(job, Some(&self.meters))
+            .map_err(|e| EditorError::Render(e.to_string()))?;
         Ok((graph, rate))
+    }
+
+    /// Live levels of playback: track `i` of the session is meter `i`
+    /// (SPEC-042).
+    #[must_use]
+    pub fn meters(&self) -> &daw_app::meters::Meters {
+        &self.meters
     }
 
     /// The cycle region, even while it is turned off (SPEC-025).

@@ -347,6 +347,9 @@ pub struct Track {
     // `left`/`right` so an automated pan can be re-scaled per sample.
     automation: audio_core::Automation,
     master: f32,
+    // SPEC-042: pan gains without the master, for the post-fader meter.
+    pan: (f32, f32),
+    meter: Option<(crate::meters::Meters, usize)>,
 }
 
 impl Track {
@@ -380,6 +383,8 @@ impl Track {
             scratch: Vec::new(),
             automation: audio_core::Automation::default(),
             master: 1.0,
+            pan: (left, right),
+            meter: None,
         })
     }
 
@@ -414,6 +419,14 @@ impl Track {
     pub fn with_automation(mut self, automation: &audio_core::Automation) -> Self {
         self.automation = automation.clone();
         self.automation.prune();
+        self
+    }
+
+    /// Reports this track's post-fader level, without the master, into
+    /// `meters` as track `index` (SPEC-042). The sound is unchanged.
+    #[must_use]
+    pub fn with_meter(mut self, meters: &crate::meters::Meters, index: usize) -> Self {
+        self.meter = Some((meters.clone(), index));
         self
     }
 
@@ -487,7 +500,6 @@ impl Track {
     /// Renders one quantum into `left` (and `right` when stereo); both slices
     /// hold exactly the quantum. Allocation-free.
     fn render(&mut self, position: u64, left: &mut [f32], mut right: Option<&mut [f32]>) {
-        let frames = left.len();
         if let Some(right) = right.as_deref_mut() {
             right.fill(0.0);
         }
@@ -496,6 +508,21 @@ impl Track {
         if self.mute || (self.automation.gain.is_empty() && self.gain == 0.0) {
             return;
         }
+        let peaks = self.render_unmetered(position, dst, right);
+        if let Some((meters, index)) = &self.meter {
+            meters.record_track(*index, &[peaks.0], Some(&[peaks.1]));
+        }
+    }
+
+    /// Renders an audible quantum and returns its post-fader peaks without
+    /// the master (SPEC-042).
+    fn render_unmetered(
+        &mut self,
+        position: u64,
+        dst: &mut [f32],
+        right: Option<&mut [f32]>,
+    ) -> (f32, f32) {
+        let frames = dst.len();
         // SPEC-038/040: clips are layers, the later one in the list on top.
         // Each layer covers what lies below it by its weight: its own fade
         // times the automatic crossfade over the next covering layer. What a
@@ -535,9 +562,16 @@ impl Track {
             self.process_automated_effects(position, dst);
         }
         if !(self.automation.gain.is_empty() && self.automation.pan.is_empty()) {
-            self.apply_automation(position, dst, right);
-            return;
+            return self.apply_automation(position, dst, right);
         }
+        let mono = if self.meter.is_some() {
+            dst.iter()
+                .map(|sample| sample.abs())
+                .filter(|level| level.is_finite())
+                .fold(0.0, f32::max)
+        } else {
+            0.0
+        };
         if let Some(right) = right {
             let gain = self.gain * self.right;
             for (out, mono) in right.iter_mut().zip(dst.iter()) {
@@ -548,6 +582,8 @@ impl Track {
         for slot in &mut dst[..frames] {
             *slot *= gain;
         }
+        let level = mono * self.gain.abs();
+        (level * self.pan.0, level * self.pan.1)
     }
 
     /// Runs the insert chain in steps of [`EFFECT_AUTOMATION_STEP`] frames,
@@ -583,24 +619,36 @@ impl Track {
     }
 
     /// Per-sample gain and pan from the lanes (SPEC-023); allocation-free.
-    fn apply_automation(&self, position: u64, left: &mut [f32], mut right: Option<&mut [f32]>) {
+    /// Returns the post-fader peaks without the master (SPEC-042).
+    fn apply_automation(
+        &self,
+        position: u64,
+        left: &mut [f32],
+        mut right: Option<&mut [f32]>,
+    ) -> (f32, f32) {
         use audio_core::Automation;
+        let mut peaks = (0.0_f32, 0.0_f32);
         for (index, slot) in left.iter_mut().enumerate() {
             let time = position.saturating_add(index as u64);
             let gain = Automation::value_at(&self.automation.gain, time).unwrap_or(self.gain);
-            let (l, r) = match Automation::value_at(&self.automation.pan, time) {
+            let ((l, r), (pl, pr)) = match Automation::value_at(&self.automation.pan, time) {
                 Some(pan) => {
                     let (l, r) = audio_core::pan_law(pan);
-                    (l * self.master, r * self.master)
+                    ((l * self.master, r * self.master), (l, r))
                 }
-                None => (self.left, self.right),
+                None => ((self.left, self.right), self.pan),
             };
             let mono = *slot;
             if let Some(right) = right.as_deref_mut() {
                 right[index] = mono * (gain * r);
             }
             *slot = mono * (gain * l);
+            let level = (mono * gain).abs();
+            if level.is_finite() {
+                peaks = (peaks.0.max(level * pl), peaks.1.max(level * pr));
+            }
         }
+        peaks
     }
 }
 

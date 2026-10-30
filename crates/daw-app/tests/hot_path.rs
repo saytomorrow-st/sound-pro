@@ -372,3 +372,53 @@ fn a_track_with_effect_automation_does_not_allocate() {
     let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
     assert_eq!(count, 0, "effect automation allocated {count} times");
 }
+
+#[test]
+fn a_metered_session_and_its_engine_do_not_allocate() {
+    use daw_app::build_session_graph_metered;
+    use daw_app::meters::Meters;
+    let job = || {
+        let mut session = Session::new("s", RATE, 120.0);
+        session.tracks.push(overlapping_track());
+        session.buses.push(audio_core::Bus::new("Aux"));
+        let mut track = overlapping_track();
+        track.sends.push(audio_core::BusSend { bus: 0, level: 0.5 });
+        session.tracks.push(track.clone());
+        SessionJob {
+            session,
+            tracks: vec![
+                TrackSource {
+                    track: overlapping_track(),
+                    clips: sources(),
+                },
+                TrackSource {
+                    track,
+                    clips: sources(),
+                },
+            ],
+            sample_rate: RATE,
+            block_frames: BLOCK,
+            frames: None,
+            output: std::path::PathBuf::new(),
+        }
+    };
+    let meters = Meters::new();
+    let mut renderer = renderer_for(build_session_graph_metered(job(), Some(&meters)).unwrap());
+    let mut mix = AudioBuffer::new(2, BLOCK);
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(count, 0, "metered graph allocated {count} times");
+    assert!(meters.take_track(1).0 > 0.0);
+
+    let graph = build_session_graph_metered(job(), Some(&meters)).unwrap();
+    let (mut control, engine) = daw_app::playback::playback(graph, RATE, 0, 10_000);
+    let mut engine = engine.with_meters(meters.clone());
+    control.play();
+    let mut out = vec![0.0f32; BLOCK * 2];
+    let count = allocations_of(|| {
+        for _ in 0..50 {
+            engine.fill(&mut out, 2);
+        }
+    });
+    assert_eq!(count, 0, "metered engine allocated {count} times");
+    assert!(meters.take_master().0 > 0.0);
+}

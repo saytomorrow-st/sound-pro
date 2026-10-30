@@ -242,6 +242,7 @@ pub struct PlaybackEngine {
     applied: u64,
     graphs: Consumer<Graph>,
     retired: Producer<Graph>,
+    meters: Option<crate::meters::Meters>,
 }
 
 /// The click being played: frames since its start and its kind.
@@ -310,11 +311,20 @@ pub fn playback(
             applied: 0,
             graphs: incoming,
             retired: outgoing,
+            meters: None,
         },
     )
 }
 
 impl PlaybackEngine {
+    /// Reports every rendered quantum's master level, before the metronome
+    /// click, into `meters` (SPEC-042).
+    #[must_use]
+    pub fn with_meters(mut self, meters: crate::meters::Meters) -> Self {
+        self.meters = Some(meters);
+        self
+    }
+
     /// Fills an interleaved device buffer of `channels` channels.
     ///
     /// Realtime-safe: no allocation, locking, I/O or panics. Reaching the end
@@ -368,6 +378,15 @@ impl PlaybackEngine {
                 self.renderer
                     .transport_mut()
                     .apply(TransportCommand::SeekSamples(start));
+            }
+            if let Some(meters) = &self.meters {
+                let left = &self.scratch.channel(0)[..n];
+                let right = if self.scratch.channels() > 1 {
+                    &self.scratch.channel(1)[..n]
+                } else {
+                    left
+                };
+                meters.record_master(left, right);
             }
             let dst = &mut out[offset * channels..(offset + n) * channels];
             interleave_into(&self.scratch, n, channels, dst);
