@@ -1562,3 +1562,43 @@ fn empty_effect_lanes_are_not_written() {
         Project::with_session(Project::capture("demo", SR, 120.0, &graph), session).to_json();
     assert!(!text.contains("automation"), "{text}");
 }
+
+// --- SPEC-043: track and project notes ---------------------------------------
+
+fn noted_session() -> audio_core::Session {
+    let mut session = demo_session();
+    session.notes = "Релиз в пятницу\n\"финал\"".into();
+    session.tracks[0].notes = "SM57, 10 см".into();
+    session
+}
+
+#[test]
+fn notes_survive_the_round_trip() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), noted_session())
+        .to_json();
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &noted_session());
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn empty_notes_write_no_notes_key() {
+    let (graph, _) = demo_graph();
+    let text = Project::with_session(Project::capture("demo", SR, 120.0, &graph), demo_session())
+        .to_json();
+    assert!(!text.contains("\"notes\""), "{text}");
+}
+
+#[test]
+fn notes_longer_than_the_limit_fail_validation() {
+    let mut session = demo_session();
+    session.tracks[0].notes = "x".repeat(audio_core::MAX_NOTES_BYTES + 1);
+    assert_eq!(
+        session.validate(),
+        Err(audio_core::SessionError::NotesTooLong)
+    );
+    let mut session = demo_session();
+    session.notes = "x".repeat(audio_core::MAX_NOTES_BYTES);
+    assert!(session.validate().is_ok());
+}

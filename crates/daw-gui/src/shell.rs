@@ -421,6 +421,20 @@ fn name_plate(ui: &mut egui::Ui, name: &str, color: Color32) {
         });
 }
 
+/// Lowest region gain the inspector shows; below it the clip is silent.
+const MIN_REGION_DB: f32 = -60.0;
+
+/// Note values offered by Quantize (SPEC-043 §3).
+pub(crate) const QUANTIZE_DIVISIONS: [u32; 4] = [4, 8, 16, 32];
+
+/// Greyed inspector row for a parameter that is not ready yet.
+fn grey_row(ui: &mut egui::Ui, name: &str) {
+    ui.add_enabled(false, egui::Label::new(name));
+    ui.add_enabled(false, egui::Button::new("—").small())
+        .on_disabled_hover_text("Скоро");
+    ui.end_row();
+}
+
 /// Collapsible inspector block that always spans the full panel width.
 fn inspector_block(
     ui: &mut egui::Ui,
@@ -700,7 +714,28 @@ impl App {
                     self.buses_open = true;
                     ui.close();
                 }
-                ui.add_enabled(false, egui::Button::new("Квантизация (скоро)"));
+                let midi = self.editor.selected_clip.filter(|&(t, c)| {
+                    self.editor
+                        .session()
+                        .tracks
+                        .get(t)
+                        .and_then(|track| track.clips.get(c))
+                        .is_some_and(audio_core::session::Clip::is_midi)
+                });
+                ui.add_enabled_ui(midi.is_some(), |ui| {
+                    ui.menu_button("Квантизация", |ui| {
+                        for division in QUANTIZE_DIVISIONS {
+                            if ui.button(format!("1/{division}")).clicked() {
+                                if let Some((t, c)) = midi {
+                                    self.quantize(t, c, division);
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
+                })
+                .response
+                .on_disabled_hover_text("Выберите MIDI-клип");
             });
             ui.menu_button("Вид", |ui| {
                 ui.checkbox(&mut self.layout.library, "Библиотека");
@@ -726,6 +761,18 @@ impl App {
                 }
             }
             ui.separator();
+            egui::ComboBox::from_id_salt("drag_mode")
+                .selected_text(if self.drag_xfade {
+                    "Перетаскивание: X-Fade"
+                } else {
+                    "Перетаскивание: Наложение"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.drag_xfade, false, "Наложение");
+                    ui.selectable_value(&mut self.drag_xfade, true, "X-Fade");
+                })
+                .response
+                .on_hover_text("X-Fade: перемещённый клип делает кроссфейд с соседним");
             ui.checkbox(&mut self.snap, "Сетка: доля")
                 .on_hover_text("Привязка клипов к долям. Shift при перетаскивании отключает.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -758,7 +805,8 @@ impl App {
         }
     }
 
-    /// Inspector of the selected track: region, channel strip, sends.
+    /// Inspector of the selected track (SPEC-043): region, track, the
+    /// track's strip with its output or selected send, notes.
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui) {
         section(ui, "Инспектор");
         let Some(index) = self
@@ -770,19 +818,300 @@ impl App {
             return;
         };
         let width = ui.available_width();
-        inspector_block(ui, width, "inspector_region", "Регион", |ui| {
-            ui.label(RichText::new("Петля, транспонирование: скоро").weak());
+        let clip = self
+            .editor
+            .selected_clip
+            .filter(|&(t, c)| t == index && c < self.editor.session().tracks[t].clips.len());
+        let title = match clip {
+            Some((t, c)) if self.editor.session().tracks[t].clips[c].is_midi() => "Регион: MIDI",
+            Some(_) => "Регион: аудио",
+            None => "Регион",
+        };
+        inspector_block(ui, width, "inspector_region", title, |ui| {
+            self.region_body(ui, clip);
         });
         let name = self.editor.session().tracks[index].name.clone();
         inspector_block(ui, width, "inspector_track", &name, |ui| {
-            ui.label(RichText::new("Параметры дорожки: скоро").weak());
+            self.track_body(ui, index);
         });
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             let height = self.channel_strip(ui, index, true);
-            self.master_strip(ui, 150.0, Some(height));
+            let bus = self
+                .selected_send
+                .filter(|&b| b < self.editor.session().buses.len());
+            if let Some(bus) = bus {
+                self.bus_strip(ui, bus);
+            } else {
+                self.selected_send = None;
+                self.master_strip(ui, 150.0, Some(height));
+            }
         });
+        ui.add_space(4.0);
+        self.notes_tabs(ui, index);
+    }
+    /// Region section: audio gain and fades or MIDI note functions; the
+    /// rest is greyed (SPEC-043 §3).
+    fn region_body(&mut self, ui: &mut egui::Ui, clip: Option<(usize, usize)>) {
+        let Some((t, c)) = clip else {
+            ui.label(RichText::new("Выберите клип на дорожке").weak());
+            return;
+        };
+        let region = self.editor.session().tracks[t].clips[c].clone();
+        egui::Grid::new("region_grid")
+            .num_columns(2)
+            .spacing([6.0, 3.0])
+            .show(ui, |ui| {
+                if region.is_midi() {
+                    self.midi_region_rows(ui, t, c);
+                    for name in [
+                        "Mute",
+                        "Loop",
+                        "Q-Swing",
+                        "Fine Tune",
+                        "Dynamics",
+                        "Clip Length",
+                        "Score",
+                    ] {
+                        grey_row(ui, name);
+                    }
+                } else {
+                    self.audio_region_rows(ui, t, c, &region);
+                    for name in [
+                        "Mute",
+                        "Loop",
+                        "Quantize (Flex)",
+                        "Transpose",
+                        "Fine Tune",
+                        "Flex Time",
+                        "Curve",
+                        "Speed Fade",
+                    ] {
+                        grey_row(ui, name);
+                    }
+                }
+            });
+    }
+
+    fn audio_region_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        t: usize,
+        c: usize,
+        region: &audio_core::session::Clip,
+    ) {
+        let rate = f64::from(self.editor.session().sample_rate.max(1));
+        ui.label("Gain");
+        let mut db = if region.gain > 0.0 {
+            (20.0 * region.gain.log10()).max(MIN_REGION_DB)
+        } else {
+            MIN_REGION_DB
+        };
+        let r = ui.add(
+            egui::DragValue::new(&mut db)
+                .range(MIN_REGION_DB..=0.0)
+                .speed(0.2)
+                .max_decimals(1)
+                .suffix(" dB"),
+        );
+        self.group_drag(&r);
+        if r.changed() {
+            let gain = if db <= MIN_REGION_DB {
+                0.0
+            } else {
+                10f32.powf(db / 20.0)
+            };
+            let _ = self.editor.set_clip_gain(t, c, gain);
+        }
+        ui.end_row();
+        let ms = |samples: u64| samples as f64 * 1000.0 / rate;
+        let to_samples = |ms: f64| (ms.max(0.0) * rate / 1000.0).round() as u64;
+        let (mut fade_in, mut fade_out) = (ms(region.fade_in_samples), ms(region.fade_out_samples));
+        let max = ms(region.length_samples);
+        ui.label("Fade In");
+        let a = ui.add(
+            egui::DragValue::new(&mut fade_in)
+                .range(0.0..=max)
+                .speed(1.0)
+                .max_decimals(0)
+                .suffix(" мс"),
+        );
+        ui.end_row();
+        ui.label("Fade Out");
+        let b = ui.add(
+            egui::DragValue::new(&mut fade_out)
+                .range(0.0..=max)
+                .speed(1.0)
+                .max_decimals(0)
+                .suffix(" мс"),
+        );
+        ui.end_row();
+        self.group_drag(&a);
+        self.group_drag(&b);
+        if a.changed() || b.changed() {
+            let (fi, fo) = (to_samples(fade_in), to_samples(fade_out));
+            // The edited fade wins; the other one shrinks to fit.
+            let (fi, fo) = if a.changed() {
+                let fi = fi.min(region.length_samples);
+                (fi, fo.min(region.length_samples - fi))
+            } else {
+                let fo = fo.min(region.length_samples);
+                (fi.min(region.length_samples - fo), fo)
+            };
+            let _ = self.editor.set_fades(t, c, fi, fo);
+        }
+        ui.label("Кроссфейд");
+        if ui
+            .button("Создать")
+            .on_hover_text("С соседним клипом (Ctrl+Alt+X)")
+            .clicked()
+        {
+            self.crossfade_clip(t, c);
+        }
+        ui.end_row();
+    }
+
+    fn midi_region_rows(&mut self, ui: &mut egui::Ui, t: usize, c: usize) {
+        ui.label("Quantize");
+        ui.horizontal(|ui| {
+            for division in QUANTIZE_DIVISIONS {
+                if ui.small_button(format!("1/{division}")).clicked() {
+                    self.quantize(t, c, division);
+                }
+            }
+        });
+        ui.end_row();
+        let id = ui.id().with(("region_amounts", t, c));
+        let (mut transpose, mut velocity, mut gate) = ui
+            .data(|d| d.get_temp::<(i32, i32, u32)>(id))
+            .unwrap_or((0, 0, 100));
+        ui.label("Transpose");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut transpose)
+                    .range(-96..=96)
+                    .suffix(" пт"),
+            );
+            if ui.small_button("Применить").clicked() && transpose != 0 {
+                let r = self.editor.transpose_notes(t, c, transpose);
+                self.report(r, "Ноты транспонированы");
+                transpose = 0;
+            }
+        });
+        ui.end_row();
+        ui.label("Velocity");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut velocity).range(-99..=99));
+            if ui.small_button("Применить").clicked() && velocity != 0 {
+                let r = self.editor.offset_velocity(t, c, velocity);
+                self.report(r, "Сила нажатия изменена");
+                velocity = 0;
+            }
+        });
+        ui.end_row();
+        ui.label("Gate Time");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut gate).range(25..=200).suffix(" %"));
+            if ui.small_button("Применить").clicked() && gate != 100 {
+                let r = self.editor.scale_gate(t, c, gate);
+                self.report(r, "Длина нот изменена");
+                gate = 100;
+            }
+        });
+        ui.end_row();
+        ui.data_mut(|d| d.insert_temp(id, (transpose, velocity, gate)));
+    }
+
+    /// Quantizes a MIDI clip to `1/division` notes (SPEC-043 §3).
+    pub(crate) fn quantize(&mut self, t: usize, c: usize, division: u32) {
+        let r = self.editor.quantize_notes(t, c, division);
+        self.report(r, &format!("Квантизация 1/{division}"));
+    }
+
+    /// One undo step for a whole drag of a value field.
+    fn group_drag(&mut self, response: &egui::Response) {
+        if response.drag_started() || response.gained_focus() {
+            self.editor.begin_group();
+        }
+        if response.drag_stopped() || response.lost_focus() {
+            self.editor.end_group();
+        }
+    }
+
+    /// Track section: name and channel number; the rest is greyed
+    /// (SPEC-043 §4).
+    fn track_body(&mut self, ui: &mut egui::Ui, index: usize) {
+        let id = ui.id().with(("track_name", index));
+        let current = self.editor.session().tracks[index].name.clone();
+        let mut name = ui
+            .data(|d| d.get_temp::<String>(id))
+            .unwrap_or_else(|| current.clone());
+        egui::Grid::new("track_grid")
+            .num_columns(2)
+            .spacing([6.0, 3.0])
+            .show(ui, |ui| {
+                ui.label("Имя");
+                let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(110.0));
+                if r.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(id, name.clone()));
+                } else {
+                    if r.lost_focus() && name.trim() != current {
+                        let result = self.editor.rename_track(index, name.trim());
+                        self.report(result, "Дорожка переименована");
+                    }
+                    ui.data_mut(|d| d.remove::<String>(id));
+                }
+                ui.end_row();
+                ui.label("Канал");
+                ui.label(format!("{}", index + 1));
+                ui.end_row();
+                for name in [
+                    "Freeze",
+                    "VCA",
+                    "Automation Mode",
+                    "Flex Mode",
+                    "Key Limit",
+                    "Velocity Limit",
+                    "Delay",
+                    "No Transpose",
+                ] {
+                    grey_row(ui, name);
+                }
+            });
+    }
+
+    /// Track and project notes tabs at the bottom (SPEC-043 §6).
+    fn notes_tabs(&mut self, ui: &mut egui::Ui, index: usize) {
+        let id = ui.id().with("notes_tab");
+        let mut project = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut project, false, "Заметки дорожки");
+            ui.selectable_value(&mut project, true, "Заметки проекта");
+        });
+        ui.data_mut(|d| d.insert_temp(id, project));
+        let mut text = if project {
+            self.editor.session().notes.clone()
+        } else {
+            self.editor.session().tracks[index].notes.clone()
+        };
+        let r = ui.add(
+            egui::TextEdit::multiline(&mut text)
+                .desired_rows(5)
+                .desired_width(f32::INFINITY)
+                .hint_text("Текст, настройки, напоминания…"),
+        );
+        self.group_drag(&r);
+        if r.changed() {
+            let result = if project {
+                self.editor.set_project_notes(&text)
+            } else {
+                self.editor.set_track_notes(index, &text)
+            };
+            if let Err(e) = result {
+                self.status = format!("Ошибка: {e}");
+            }
+        }
     }
 
     /// One channel strip; `full` adds effect slots and sends.
@@ -834,12 +1163,16 @@ impl App {
                         let buses = self.editor.session().buses.clone();
                         for (bus, b) in buses.iter().enumerate() {
                             let mut level = track.send_level(bus);
+                            let chosen = self.selected_send == Some(bus);
                             if ui
-                                .add(
-                                    egui::Slider::new(&mut level, 0.0..=1.0)
-                                        .text(RichText::new(&b.name).size(9.0))
-                                        .show_value(false),
-                                )
+                                .selectable_label(chosen, RichText::new(&b.name).size(9.0))
+                                .on_hover_text("Показать шину справа")
+                                .clicked()
+                            {
+                                self.selected_send = (!chosen).then_some(bus);
+                            }
+                            if ui
+                                .add(egui::Slider::new(&mut level, 0.0..=1.0).show_value(false))
                                 .changed()
                             {
                                 let _ = self.editor.set_send(index, bus, level);
@@ -903,6 +1236,14 @@ impl App {
                             }
                         }
                     });
+                    if full {
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            pill_stub(ui, "R");
+                            pill_stub(ui, "I");
+                        });
+                    }
                     name_plate(ui, &track.name, track_color(track.color, index));
                 });
             })

@@ -452,6 +452,7 @@ fn write_session(out: &mut String, session: &Session) {
             out.push_str(",\n        \"color\": ");
             out.push_str(&color.to_string());
         }
+        write_text_notes(out, "        ", &track.notes);
         out.push_str("\n      }");
     }
     if session.tracks.is_empty() {
@@ -468,6 +469,8 @@ fn write_session(out: &mut String, session: &Session) {
     if !session.markers.is_empty() {
         write_markers(out, &session.markers);
     }
+    // Written only when present (SPEC-043).
+    write_text_notes(out, "    ", &session.notes);
     out.push_str("\n  }");
 }
 
@@ -652,8 +655,10 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut tracks = None;
     let mut buses = None;
     let mut markers = None;
+    let mut notes = None;
     for (key, value) in entries {
         match key.as_str() {
+            "notes" => notes = Some(require_string(value)?),
             "buses" => buses = Some(buses_from_value(value)?),
             "markers" => markers = Some(markers_from_value(value)?),
             "name" => name = Some(require_string(value)?),
@@ -707,6 +712,8 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         buses: buses.unwrap_or_default(),
         // Optional since SPEC-030.
         markers: markers.unwrap_or_default(),
+        // Optional since SPEC-043.
+        notes: notes.unwrap_or_default(),
     })
 }
 
@@ -735,8 +742,10 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut automation = None;
     let mut sends = None;
     let mut color = None;
+    let mut notes = None;
     for (key, value) in entries {
         match key.as_str() {
+            "notes" => notes = Some(require_string(value)?),
             "color" => color = Some(require_u8(value)?),
             "sends" => sends = Some(sends_from_value(value)?),
             "effects" => effects = Some(effects_from_value(value)?),
@@ -792,6 +801,8 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
         sends: sends.unwrap_or_default(),
         // Optional since SPEC-029.
         color,
+        // Optional since SPEC-043.
+        notes: notes.unwrap_or_default(),
     })
 }
 
@@ -1173,6 +1184,17 @@ fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {
         fade_in_samples: fade_in,
         fade_out_samples: fade_out,
     })
+}
+
+/// Appends a track or session `"notes"` text, only when it is not empty
+/// (SPEC-043 §6).
+fn write_text_notes(out: &mut String, indent: &str, notes: &str) {
+    if !notes.is_empty() {
+        out.push_str(",\n");
+        out.push_str(indent);
+        out.push_str("\"notes\": ");
+        write_string(out, notes);
+    }
 }
 
 /// Appends a MIDI clip's `"notes"` array, one note per line (SPEC-021).

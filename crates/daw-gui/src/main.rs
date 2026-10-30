@@ -29,6 +29,9 @@ use eframe::egui::{
 
 const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 24.0;
+/// Distance in pixels from a clip boundary where the Fade tool makes a
+/// crossfade instead of a fade (SPEC-043 §2).
+const XFADE_GRAB: f32 = 6.0;
 const MIN_ZOOM: f32 = 5.0;
 const MAX_ZOOM: f32 = 2_000.0;
 /// Width of the grab zone on each clip edge used for trimming.
@@ -363,6 +366,11 @@ struct App {
     fx: Option<FxTarget>,
     /// The buses window is open (SPEC-028).
     buses_open: bool,
+    /// Drag mode X-Fade: a moved clip crossfades with its neighbour
+    /// (SPEC-043 §2).
+    drag_xfade: bool,
+    /// Bus whose strip the inspector shows on the right (SPEC-043 §5).
+    selected_send: Option<usize>,
     /// Track whose name is being edited and the text typed so far (SPEC-029).
     rename: Option<(usize, String)>,
     /// Track whose automation lane is shown (SPEC-023).
@@ -463,6 +471,8 @@ impl App {
             piano_offset: None,
             fx: None,
             buses_open: false,
+            drag_xfade: false,
+            selected_send: None,
             rename: None,
             auto: None,
             auto_lane: Lane::Gain,
@@ -1663,10 +1673,7 @@ impl App {
             || response.clicked()
             || response.secondary_clicked()
             || response.drag_stopped();
-        let press_on_ruler = !on_flag
-            && ui
-                .input(|i| i.pointer.press_origin())
-                .is_some_and(|p| ruler.contains(p));
+        let press_on_ruler = !on_flag && ui.input(press_pos).is_some_and(|p| ruler.contains(p));
         let ruler_owned = self.drag.is_none()
             && self.auto_drag.is_none()
             && (self.cycle_drag.is_some()
@@ -1675,10 +1682,8 @@ impl App {
             && self.drag.is_none()
             && (self.auto_drag.is_some()
                 || (pressed
-                    && auto_row.is_some_and(|row| {
-                        ui.input(|i| i.pointer.press_origin())
-                            .is_some_and(|p| row.contains(p))
-                    })));
+                    && auto_row
+                        .is_some_and(|row| ui.input(press_pos).is_some_and(|p| row.contains(p)))));
 
         self.draw_take(&painter, area);
 
@@ -1819,7 +1824,7 @@ impl App {
             painter.galley(flag.min + Vec2::new(4.0, 0.5), galley, Color32::BLACK);
             flags.push((index, marker.position, flag));
         }
-        let origin = ui.input(|i| i.pointer.press_origin());
+        let origin = ui.input(press_pos);
         let on_flag = self.marker_drag.is_some()
             || origin.is_some_and(|p| flags.iter().any(|(_, _, flag)| flag.contains(p)));
         for (index, position, flag) in flags {
@@ -1961,7 +1966,7 @@ impl App {
                 snap_to_beat(raw(x), rate, tempo)
             }
         };
-        let Some(origin) = ui.input(|i| i.pointer.press_origin()) else {
+        let Some(origin) = ui.input(press_pos) else {
             self.cycle_drag = None;
             return;
         };
@@ -2286,6 +2291,13 @@ impl App {
         }
         if response.drag_started() {
             let origin = ui.input(|i| i.pointer.press_origin());
+            if tool == Tool::Fade {
+                if let Some(pair) = origin.and_then(|p| self.boundary_clip(hit(p)?, p)) {
+                    self.drag = None;
+                    self.crossfade_clip(pair.0, pair.1);
+                    return;
+                }
+            }
             self.drag = origin.and_then(|p| {
                 let ((track, clip), _) = hit(p)?;
                 let start = self.editor.session().tracks[track].clips[clip].start_samples;
@@ -2307,6 +2319,13 @@ impl App {
         if response.drag_stopped() {
             self.drag = None;
             self.status = "Клип изменён".into();
+            if drag.mode == DragMode::Move && self.drag_xfade {
+                match self.editor.crossfade(drag.track, drag.clip) {
+                    Ok(()) => self.status = "Клип перемещён, кроссфейд создан".into(),
+                    Err(EditorError::CannotCrossfade) => {}
+                    Err(e) => self.status = format!("Ошибка: {e}"),
+                }
+            }
             return;
         }
         let Some(p) = response.interact_pointer_pos() else {
@@ -2766,6 +2785,52 @@ impl App {
     }
 
     /// Joins a clip with the next one on its track (SPEC-038 §5).
+    /// Clip to crossfade when the Fade tool presses within
+    /// [`XFADE_GRAB`] pixels of a boundary with a touching neighbour
+    /// (SPEC-043 §2): the left clip of the pair.
+    fn boundary_clip(
+        &self,
+        ((t, c), r): ((usize, usize), Rect),
+        p: Pos2,
+    ) -> Option<(usize, usize)> {
+        let clips = &self.editor.session().tracks.get(t)?.clips;
+        let clip = clips.get(c)?;
+        if r.max.x - p.x <= XFADE_GRAB {
+            let end = clip.end_samples();
+            clips
+                .iter()
+                .enumerate()
+                .any(|(i, o)| {
+                    i != c && o.start_samples > clip.start_samples && o.start_samples <= end
+                })
+                .then_some((t, c))
+        } else if p.x - r.min.x <= XFADE_GRAB {
+            clips
+                .iter()
+                .enumerate()
+                .filter(|&(i, o)| {
+                    i != c
+                        && o.start_samples < clip.start_samples
+                        && o.end_samples() >= clip.start_samples
+                })
+                .max_by_key(|(_, o)| o.start_samples)
+                .map(|(i, _)| (t, i))
+        } else {
+            None
+        }
+    }
+
+    /// Crossfade of a clip with its neighbour, with a status message.
+    fn crossfade_clip(&mut self, track: usize, clip: usize) {
+        self.drag = None;
+        self.note_drag = None;
+        self.status = match self.editor.crossfade(track, clip) {
+            Ok(()) => "Кроссфейд создан".into(),
+            Err(EditorError::CannotCrossfade) => "Нет соседнего клипа для кроссфейда".into(),
+            Err(e) => format!("Не удалось: {e}"),
+        };
+    }
+
     fn join_clip(&mut self, track: usize, clip: usize) {
         self.drag = None;
         self.note_drag = None;
@@ -2894,6 +2959,14 @@ impl App {
             });
             if front || back_layer {
                 self.reorder_selected(front);
+            }
+            let xfade = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::ALT, Key::X)
+            });
+            if xfade {
+                if let Some((t, c)) = self.editor.selected_clip {
+                    self.crossfade_clip(t, c);
+                }
             }
             if bar_back || bar_forward {
                 self.step_bar(bar_forward);
@@ -3465,6 +3538,19 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
+}
+
+/// Where the current press began. egui clears `press_origin` on the release
+/// frame, which is exactly when `clicked()` fires, so a click falls back to
+/// the release position (a click barely moves, SPEC-043 §1).
+fn press_pos(input: &egui::InputState) -> Option<Pos2> {
+    let pointer = &input.pointer;
+    pointer.press_origin().or_else(|| {
+        pointer
+            .any_released()
+            .then(|| pointer.interact_pos())
+            .flatten()
+    })
 }
 
 impl eframe::App for App {

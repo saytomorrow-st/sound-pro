@@ -38,6 +38,9 @@ pub const MAX_NOTES_PER_CLIP: usize = 4096;
 /// Most points one automation lane may hold (SPEC-023).
 pub const MAX_AUTOMATION_POINTS: usize = 1024;
 
+/// Longest track or project notes text, in bytes (SPEC-043).
+pub const MAX_NOTES_BYTES: usize = 64 * 1024;
+
 /// Most buses a session may hold (SPEC-028).
 pub const MAX_BUSES: usize = 4;
 
@@ -50,6 +53,8 @@ pub enum SessionError {
     InvalidTempo,
     /// A session, track or clip name is longer than [`MAX_NAME_BYTES`].
     NameTooLong,
+    /// Track or project notes are longer than [`MAX_NOTES_BYTES`].
+    NotesTooLong,
     /// The track list is longer than [`MAX_TRACKS`].
     TooManyTracks {
         /// Accepted maximum.
@@ -191,6 +196,7 @@ impl fmt::Display for SessionError {
             Self::InvalidSampleRate => write!(f, "sample rate must be non-zero"),
             Self::InvalidTempo => write!(f, "tempo must be finite and positive"),
             Self::NameTooLong => write!(f, "name longer than {MAX_NAME_BYTES} bytes"),
+            Self::NotesTooLong => write!(f, "notes longer than {MAX_NOTES_BYTES} bytes"),
             Self::TooManyTracks { max } => write!(f, "more than {max} tracks"),
             Self::TooManyClips { track, max } => {
                 write!(f, "track {track} holds more than {max} clips")
@@ -641,6 +647,8 @@ pub struct Track {
     /// Palette index below [`TRACK_COLORS`]; `None` is the default colour.
     /// Display only (SPEC-029).
     pub color: Option<u8>,
+    /// Free text from the inspector's track notes tab (SPEC-043).
+    pub notes: String,
 }
 
 /// A post-fader copy of a track's sound sent to one bus (SPEC-028).
@@ -691,6 +699,7 @@ impl Track {
             automation: Automation::default(),
             sends: Vec::new(),
             color: None,
+            notes: String::new(),
         }
     }
 
@@ -736,6 +745,8 @@ pub struct Session {
     pub buses: Vec<Bus>,
     /// Named positions on the timeline, sorted by position (SPEC-030).
     pub markers: Vec<Marker>,
+    /// Free text from the inspector's project notes tab (SPEC-043).
+    pub notes: String,
 }
 
 /// A named position on the timeline; display only (SPEC-030).
@@ -760,6 +771,7 @@ impl Session {
             tracks: Vec::new(),
             buses: Vec::new(),
             markers: Vec::new(),
+            notes: String::new(),
         }
     }
 
@@ -809,6 +821,11 @@ impl Session {
     pub fn validate(&self) -> Result<(), SessionError> {
         if self.name.len() > MAX_NAME_BYTES {
             return Err(SessionError::NameTooLong);
+        }
+        if self.notes.len() > MAX_NOTES_BYTES
+            || self.tracks.iter().any(|t| t.notes.len() > MAX_NOTES_BYTES)
+        {
+            return Err(SessionError::NotesTooLong);
         }
         if self.sample_rate == 0 {
             return Err(SessionError::InvalidSampleRate);
