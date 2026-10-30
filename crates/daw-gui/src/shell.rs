@@ -1396,12 +1396,12 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            let mut armed = self.editor.armed_track() == Some(index);
+                            let mut armed = self.editor.is_armed(index);
                             if pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
                                 .on_hover_text("Запись на эту дорожку")
                                 .changed()
                             {
-                                self.editor.arm_track(armed.then_some(index));
+                                self.editor.set_armed(index, armed);
                             }
                             let mut monitor = track.input_monitor;
                             if pill(ui, &mut monitor, "I", Color32::from_rgb(240, 160, 60))

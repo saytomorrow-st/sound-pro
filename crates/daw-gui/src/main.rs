@@ -1355,12 +1355,12 @@ impl App {
                             let s =
                                 shell::pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
                                     .on_hover_text("Соло");
-                            let mut armed = self.editor.armed_track() == Some(index);
+                            let mut armed = self.editor.is_armed(index);
                             if shell::pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
                                 .on_hover_text("Запись на эту дорожку")
                                 .changed()
                             {
-                                self.editor.arm_track(armed.then_some(index));
+                                self.editor.set_armed(index, armed);
                             }
                             let mut monitor = track_monitor;
                             let i =
@@ -1916,43 +1916,24 @@ impl App {
         let rate = recorder.control.sample_rate().max(1);
         let project = self.editor.session().sample_rate;
         let tracks = self.editor.session().tracks.len();
-        let row = self
-            .editor
-            .armed_track()
-            .or(self.editor.selected_track)
-            .filter(|&t| t < tracks)
-            .unwrap_or(tracks);
-        let top = area.min.y + RULER_HEIGHT + row as f32 * TRACK_HEIGHT;
+        let mut rows: Vec<usize> = self.editor.armed_tracks().collect();
+        if rows.is_empty() {
+            rows.push(
+                self.editor
+                    .selected_track
+                    .filter(|&t| t < tracks)
+                    .unwrap_or(tracks),
+            );
+        }
         let left = area.min.x + samples_to_x(recorder.start, project, self.zoom);
         let seconds = samples.len() as f32 / rate as f32;
-        let rect = Rect::from_min_size(
-            Pos2::new(left, top + 3.0),
-            Vec2::new((seconds * self.zoom).max(2.0), TRACK_HEIGHT - 6.0),
-        );
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(170, 40, 40));
-        let columns = rect.width().ceil() as usize;
-        if columns == 0 || samples.is_empty() {
-            return;
-        }
-        let per_px = samples.len() as f32 / rect.width();
-        let (mid, half) = (rect.center().y, rect.height() * 0.4);
-        for px in 0..columns.min(20_000) {
-            let from = (px as f32 * per_px) as usize;
-            let to = (((px + 1) as f32 * per_px).ceil() as usize).min(samples.len());
-            let peak = samples
-                .get(from..to.max(from + 1).min(samples.len()))
-                .unwrap_or(&[])
-                .iter()
-                .fold(0.0f32, |m, s| m.max(s.abs()))
-                .min(1.0);
-            let x = rect.min.x + px as f32;
-            painter.line_segment(
-                [
-                    Pos2::new(x, mid - peak * half),
-                    Pos2::new(x, mid + peak * half),
-                ],
-                Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 200)),
+        for row in rows {
+            let top = area.min.y + RULER_HEIGHT + row as f32 * TRACK_HEIGHT;
+            let rect = Rect::from_min_size(
+                Pos2::new(left, top + 3.0),
+                Vec2::new((seconds * self.zoom).max(2.0), TRACK_HEIGHT - 6.0),
             );
+            draw_take_rect(painter, rect, samples);
         }
     }
 
@@ -3872,4 +3853,40 @@ fn y_to_value(lane: Lane, y: f32, row: Rect) -> f32 {
     let (top, bottom) = (row.min.y + POINT_RADIUS, row.max.y - POINT_RADIUS);
     let norm = ((bottom - y) / (bottom - top)).clamp(0.0, 1.0);
     lo + norm * (hi - lo)
+}
+
+/// One growing take box with its live waveform (SPEC-035).
+#[cfg(feature = "audio")]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "pixel columns"
+)]
+fn draw_take_rect(painter: &egui::Painter, rect: Rect, samples: &[f32]) {
+    painter.rect_filled(rect, 4.0, Color32::from_rgb(170, 40, 40));
+    let columns = rect.width().ceil() as usize;
+    if columns == 0 || samples.is_empty() {
+        return;
+    }
+    let per_px = samples.len() as f32 / rect.width();
+    let (mid, half) = (rect.center().y, rect.height() * 0.4);
+    for px in 0..columns.min(20_000) {
+        let from = (px as f32 * per_px) as usize;
+        let to = (((px + 1) as f32 * per_px).ceil() as usize).min(samples.len());
+        let peak = samples
+            .get(from..to.max(from + 1).min(samples.len()))
+            .unwrap_or(&[])
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+            .min(1.0);
+        let x = rect.min.x + px as f32;
+        painter.line_segment(
+            [
+                Pos2::new(x, mid - peak * half),
+                Pos2::new(x, mid + peak * half),
+            ],
+            Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 200)),
+        );
+    }
 }
