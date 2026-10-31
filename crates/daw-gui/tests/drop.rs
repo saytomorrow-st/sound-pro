@@ -582,3 +582,49 @@ fn the_owner_drop_is_independent_of_window_size() {
         assert_eq!(local, (581.0, 214.0));
     }
 }
+
+// The owner's live X11 bug (PR #62): XQueryPointer reported window coords
+// measured from the *frame* (including a 32pt title bar), so a cursor near
+// the bottom of a track read 32pt too low and fell below the tracks, landing
+// on a new track instead. Converting from root coords minus the client origin
+// removes that offset, so the drop lands on the track the user aimed at.
+#[test]
+fn a_title_bar_offset_does_not_push_the_drop_below_the_tracks() {
+    // Two tracks, ruler 24pt, row height 72pt, area top at y=118. Track 1
+    // therefore spans y=214..286 in window points.
+    let audio = [true, true];
+    let area_min_y = 118.0_f32;
+    let title_bar_pt = 32.0_f32;
+    // The cursor is over track 1, 15pt above its bottom edge (egui y=271).
+    let cursor_window_y = 271.0_f32;
+
+    // Buggy path: XQueryPointer's frame-relative value includes the title bar,
+    // so the same cursor reads 32pt lower (303), which is below track 1.
+    let frame_relative_y = cursor_window_y + title_bar_pt - area_min_y;
+    let wrong = daw_gui::drop_target(
+        Some((0.0, frame_relative_y)),
+        24.0,
+        72.0,
+        &audio,
+        RATE,
+        100.0,
+        120.0,
+        false,
+    );
+    assert_eq!(wrong.track, None, "frame coords include the title bar");
+
+    // Fixed path: root minus the client origin (title bar removed) recovers
+    // the true client y, which is over track 1.
+    let client_y = cursor_window_y - area_min_y;
+    let fixed = daw_gui::drop_target(
+        Some((0.0, client_y)),
+        24.0,
+        72.0,
+        &audio,
+        RATE,
+        100.0,
+        120.0,
+        false,
+    );
+    assert_eq!(fixed.track, Some(1), "client coords drop onto track 1");
+}

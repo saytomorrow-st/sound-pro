@@ -285,6 +285,23 @@ fn draw_crossfade_x(painter: &egui::Painter, body: Rect) {
     painter.line_segment([body.left_top(), body.right_bottom()], line);
 }
 
+/// A bright crosshair plus a label at `p`, used by the drop debug overlay to
+/// show where the OS cursor and egui's pointer each think the cursor is.
+fn draw_cross(painter: &egui::Painter, p: egui::Pos2, color: Color32, label: &str) {
+    let r = 12.0;
+    let stroke = Stroke::new(2.0_f32, color);
+    painter.line_segment([Pos2::new(p.x - r, p.y), Pos2::new(p.x + r, p.y)], stroke);
+    painter.line_segment([Pos2::new(p.x, p.y - r), Pos2::new(p.x, p.y + r)], stroke);
+    painter.circle_stroke(p, r, stroke);
+    painter.text(
+        Pos2::new(p.x + r + 3.0, p.y + r + 3.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(14.0),
+        color,
+    );
+}
+
 fn rgb_detail(colors: &daw_gui::layout::RegionColors) -> Color32 {
     let [r, g, b] = colors.detail;
     Color32::from_rgb(r, g, b)
@@ -520,6 +537,9 @@ struct App {
     /// `XdndPosition` during an external drag, so egui's pointer is stale.
     #[cfg(target_os = "linux")]
     x11_cursor: Option<x11_cursor::X11Cursor>,
+    /// Draw the XQueryPointer / egui pointer debug crosses while a file is
+    /// hovered (set `SOUND_PRO_DROP_DEBUG=1`). Read once at startup.
+    drop_debug: bool,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -655,6 +675,7 @@ impl App {
             drop_tracker: daw_gui::DropTracker::default(),
             #[cfg(target_os = "linux")]
             x11_cursor: None,
+            drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
@@ -1948,6 +1969,20 @@ impl App {
             // Repaint as fast as possible while dragging so the hover preview
             // tracks the OS cursor (egui receives no motion events during XDND).
             ui.ctx().request_repaint();
+            if self.drop_debug {
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("drop-debug-cross"),
+                ));
+                // Red cross: the live OS cursor we use for the drop target.
+                if let Some(p) = effective_pointer {
+                    draw_cross(&painter, p, Color32::RED, "xq");
+                }
+                // Green cross: egui's own pointer (may be frozen during XDND).
+                if let Some(p) = pointer {
+                    draw_cross(&painter, p, Color32::GREEN, "eg");
+                }
+            }
         } else if dropped.is_empty() {
             self.probes.clear();
             self.drop_tracker.cancel();
@@ -1961,12 +1996,17 @@ impl App {
         // fall back to the last preview (`DropTracker`).
         #[cfg(target_os = "linux")]
         {
-            if let Some((dbg_win_x, dbg_win_y, dbg_root_x, dbg_root_y, dbg_same)) =
-                self.x11_cursor.as_ref().and_then(|c| c.position_debug())
-            {
+            if let Some(dbg) = self.x11_cursor.as_ref().and_then(|c| c.position_debug()) {
                 eprintln!(
-                    "DROP-DEBUG xquery win=({dbg_win_x},{dbg_win_y}) root=({dbg_root_x},{dbg_root_y}) same_screen={dbg_same} \
+                    "DROP-DEBUG xquery client=({:.1},{:.1}) root=({},{}) origin_root=({},{}) same_screen={} \
                      ppp={} os_points={:?} egui_pointer={:?} area_min=({:.1},{:.1})",
+                    dbg.client.0,
+                    dbg.client.1,
+                    dbg.root.0,
+                    dbg.root.1,
+                    dbg.origin_root.0,
+                    dbg.origin_root.1,
+                    dbg.same_screen,
                     ui.ctx().pixels_per_point(),
                     os_points,
                     pointer,
