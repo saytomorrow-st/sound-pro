@@ -513,7 +513,7 @@ struct App {
     hover_tx: std::sync::mpsc::Sender<HoverBlocks>,
     hover_rx: std::sync::mpsc::Receiver<HoverBlocks>,
     /// Last pointer position over the window; a drop no longer has one.
-    last_pointer: Option<Pos2>,
+    drop_tracker: daw_gui::DropTracker,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -646,7 +646,7 @@ impl App {
             hover_peaks: HashMap::new(),
             hover_tx,
             hover_rx,
-            last_pointer: None,
+            drop_tracker: daw_gui::DropTracker::default(),
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
@@ -1818,12 +1818,6 @@ impl App {
             )
         });
         let hovering = !hovered.is_empty() || ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
-        // The pointer is gone by the time a drop arrives, so the last
-        // position seen is the one that counts.
-        if pointer.is_some() {
-            self.last_pointer = pointer;
-        }
-        let pointer = pointer.or(self.last_pointer);
         let session = self.editor.session();
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
         let audio_rows: Vec<bool> = session
@@ -1848,6 +1842,7 @@ impl App {
         if hovering {
             let painter = ui.painter_at(area);
             let target = pointer.map(target_at);
+            self.drop_tracker.hover(target);
             let band = match target.and_then(|t| t.track) {
                 Some(t) => {
                     let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
@@ -1923,19 +1918,13 @@ impl App {
                 .request_repaint_after(std::time::Duration::from_millis(100));
         } else if dropped.is_empty() {
             self.probes.clear();
+            self.drop_tracker.cancel();
         }
         if dropped.is_empty() {
             return;
         }
         self.probes.clear();
-        let target = pointer.map_or_else(
-            || daw_gui::DropTarget {
-                track: None,
-                start: 0,
-            },
-            target_at,
-        );
-        self.last_pointer = None;
+        let target = self.drop_tracker.release(pointer.map(target_at));
         self.import_in_background(dropped, target.track, Some(target.start));
     }
 
