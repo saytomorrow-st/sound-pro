@@ -624,6 +624,14 @@ impl Track {
         let peaks = self.render_unmetered(position, dst, right);
         if let Some((meters, index)) = &self.meter {
             meters.record_track(*index, &[peaks.0], Some(&[peaks.1]));
+            // SPEC-052: gain reduction of every insert, the larger channel.
+            for (slot, effect) in self.effects.iter().enumerate() {
+                let right = self
+                    .effects_right
+                    .get(slot)
+                    .map_or(0.0, audio_core::EffectProcessor::gain_reduction_db);
+                meters.record_reduction(*index, slot, effect.gain_reduction_db().max(right));
+            }
         }
     }
 

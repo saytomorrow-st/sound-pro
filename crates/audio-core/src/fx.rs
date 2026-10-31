@@ -55,6 +55,8 @@ pub enum EffectKind {
         release_ms: f32,
         /// Make-up gain, dB, `0..=24`.
         makeup_db: f32,
+        /// Knee width, dB, `0..=24`. Zero = hard knee (SPEC-022), non-zero = soft knee.
+        knee_db: f32,
     },
     /// Mono Schroeder–Moorer reverb in the Freeverb layout.
     Reverb {
@@ -71,6 +73,26 @@ pub enum EffectKind {
         /// The eight bands; the index determines the shape.
         bands: [ChannelEqBand; 8],
     },
+    /// Noise gate with attack, hold and release.
+    Gate {
+        /// Threshold, dBFS, `-80..=0`.
+        threshold_db: f32,
+        /// Attenuation depth when closed, dB, `0..=80`.
+        range_db: f32,
+        /// Opening time, ms, `0.1..=100`.
+        attack_ms: f32,
+        /// Hold time after envelope falls below threshold, ms, `0..=500`.
+        hold_ms: f32,
+        /// Closing time, ms, `10..=1000`.
+        release_ms: f32,
+    },
+    /// Peak limiter with instant attack and exponential release.
+    Limiter {
+        /// Output ceiling, dBFS, `-24..=0`.
+        ceiling_db: f32,
+        /// Recovery time, ms, `10..=1000`.
+        release_ms: f32,
+    },
 }
 
 impl EffectKind {
@@ -85,7 +107,8 @@ impl EffectKind {
         }
     }
 
-    /// Compressor at -18 dB, 4:1, 10 ms attack, 100 ms release, no make-up.
+    /// Compressor at -18 dB, 4:1, 10 ms attack, 100 ms release, no make-up
+    /// and a hard knee.
     #[must_use]
     pub const fn compressor() -> Self {
         Self::Compressor {
@@ -94,6 +117,28 @@ impl EffectKind {
             attack_ms: 10.0,
             release_ms: 100.0,
             makeup_db: 0.0,
+            knee_db: 0.0,
+        }
+    }
+
+    /// Gate at -40 dBFS, -60 dB range, 1 ms attack, 50 ms hold, 100 ms release.
+    #[must_use]
+    pub const fn gate() -> Self {
+        Self::Gate {
+            threshold_db: -40.0,
+            range_db: 60.0,
+            attack_ms: 1.0,
+            hold_ms: 50.0,
+            release_ms: 100.0,
+        }
+    }
+
+    /// Limiter with a -0.5 dBFS ceiling and 50 ms release.
+    #[must_use]
+    pub const fn limiter() -> Self {
+        Self::Limiter {
+            ceiling_db: -0.5,
+            release_ms: 50.0,
         }
     }
 
@@ -173,6 +218,8 @@ impl EffectKind {
             Self::Compressor { .. } => "compressor",
             Self::Reverb { .. } => "reverb",
             Self::ChannelEq { .. } => "channel_eq",
+            Self::Gate { .. } => "gate",
+            Self::Limiter { .. } => "limiter",
         }
     }
 
@@ -199,16 +246,35 @@ impl EffectKind {
                 attack_ms,
                 release_ms,
                 makeup_db,
+                knee_db,
             } => {
                 within(threshold_db, -60.0, 0.0)
                     && within(ratio, 1.0, 20.0)
                     && within(attack_ms, 0.1, 100.0)
                     && within(release_ms, 10.0, 1000.0)
                     && within(makeup_db, 0.0, 24.0)
+                    && within(knee_db, 0.0, 24.0)
             }
             Self::Reverb { room, damp, mix } => {
                 within(room, 0.0, 1.0) && within(damp, 0.0, 1.0) && within(mix, 0.0, 1.0)
             }
+            Self::Gate {
+                threshold_db,
+                range_db,
+                attack_ms,
+                hold_ms,
+                release_ms,
+            } => {
+                within(threshold_db, -80.0, 0.0)
+                    && within(range_db, 0.0, 80.0)
+                    && within(attack_ms, 0.1, 100.0)
+                    && within(hold_ms, 0.0, 500.0)
+                    && within(release_ms, 10.0, 1000.0)
+            }
+            Self::Limiter {
+                ceiling_db,
+                release_ms,
+            } => within(ceiling_db, -24.0, 0.0) && within(release_ms, 10.0, 1000.0),
             Self::ChannelEq { bands } => bands.iter().all(|band| {
                 within(band.hz, 20.0, 20_000.0)
                     && within(band.db, -24.0, 24.0)
@@ -240,6 +306,8 @@ pub enum EffectParam {
     ReleaseMs,
     /// Compressor make-up gain, dB.
     MakeupDb,
+    /// Compressor knee width, dB.
+    KneeDb,
     /// Reverb room size.
     Room,
     /// Reverb damping.
@@ -282,12 +350,26 @@ pub enum EffectParam {
     HighShelfDb,
     /// Channel EQ low-pass corner, Hz.
     LpHz,
+    /// Gate threshold, dBFS.
+    GateThresholdDb,
+    /// Gate suppression depth, dB.
+    GateRangeDb,
+    /// Gate attack, ms.
+    GateAttackMs,
+    /// Gate hold, ms.
+    GateHoldMs,
+    /// Gate release, ms.
+    GateReleaseMs,
+    /// Limiter ceiling, dBFS.
+    CeilingDb,
+    /// Limiter release, ms.
+    LimiterReleaseMs,
 }
 
 impl EffectParam {
     /// Every parameter, EQ first, then compressor, then reverb, then
-    /// channel EQ (SPEC-051).
-    pub const ALL: [Self; 30] = [
+    /// channel EQ (SPEC-051), then gate and limiter (SPEC-052).
+    pub const ALL: [Self; 38] = [
         Self::LowDb,
         Self::MidDb,
         Self::MidHz,
@@ -297,6 +379,7 @@ impl EffectParam {
         Self::AttackMs,
         Self::ReleaseMs,
         Self::MakeupDb,
+        Self::KneeDb,
         Self::Room,
         Self::Damp,
         Self::Mix,
@@ -318,6 +401,13 @@ impl EffectParam {
         Self::HighHz,
         Self::HighShelfDb,
         Self::LpHz,
+        Self::GateThresholdDb,
+        Self::GateRangeDb,
+        Self::GateAttackMs,
+        Self::GateHoldMs,
+        Self::GateReleaseMs,
+        Self::CeilingDb,
+        Self::LimiterReleaseMs,
     ];
 
     /// Key used in project files, e.g. `"mix"`.
@@ -333,6 +423,7 @@ impl EffectParam {
             Self::AttackMs => "attack_ms",
             Self::ReleaseMs => "release_ms",
             Self::MakeupDb => "makeup_db",
+            Self::KneeDb => "knee_db",
             Self::Room => "room",
             Self::Damp => "damp",
             Self::Mix => "mix",
@@ -354,6 +445,13 @@ impl EffectParam {
             Self::HighHz => "high_hz",
             Self::HighShelfDb => "high_shelf_db",
             Self::LpHz => "lp_hz",
+            Self::GateThresholdDb => "gate_threshold_db",
+            Self::GateRangeDb => "gate_range_db",
+            Self::GateAttackMs => "gate_attack_ms",
+            Self::GateHoldMs => "gate_hold_ms",
+            Self::GateReleaseMs => "gate_release_ms",
+            Self::CeilingDb => "ceiling_db",
+            Self::LimiterReleaseMs => "limiter_release_ms",
         }
     }
 
@@ -379,9 +477,13 @@ impl EffectParam {
             Self::MidHz => (100.0, 10_000.0),
             Self::ThresholdDb => (-60.0, 0.0),
             Self::Ratio => (1.0, 20.0),
-            Self::AttackMs => (0.1, 100.0),
-            Self::ReleaseMs => (10.0, 1000.0),
-            Self::MakeupDb => (0.0, 24.0),
+            Self::AttackMs | Self::GateAttackMs => (0.1, 100.0),
+            Self::ReleaseMs | Self::GateReleaseMs | Self::LimiterReleaseMs => (10.0, 1000.0),
+            Self::MakeupDb | Self::KneeDb => (0.0, 24.0),
+            Self::GateThresholdDb => (-80.0, 0.0),
+            Self::GateRangeDb => (0.0, 80.0),
+            Self::GateHoldMs => (0.0, 500.0),
+            Self::CeilingDb => (-24.0, 0.0),
             Self::Room | Self::Damp | Self::Mix => (0.0, 1.0),
             Self::HpHz
             | Self::LowHz
@@ -400,9 +502,11 @@ impl EffectParam {
     pub fn of(kind: &EffectKind) -> &'static [Self] {
         match kind {
             EffectKind::Eq { .. } => &Self::ALL[0..4],
-            EffectKind::Compressor { .. } => &Self::ALL[4..9],
-            EffectKind::Reverb { .. } => &Self::ALL[9..12],
-            EffectKind::ChannelEq { .. } => &Self::ALL[12..30],
+            EffectKind::Compressor { .. } => &Self::ALL[4..10],
+            EffectKind::Reverb { .. } => &Self::ALL[10..13],
+            EffectKind::ChannelEq { .. } => &Self::ALL[13..31],
+            EffectKind::Gate { .. } => &Self::ALL[31..36],
+            EffectKind::Limiter { .. } => &Self::ALL[36..38],
         }
     }
 
@@ -430,14 +534,22 @@ impl EffectParam {
             (Self::MidDb, EffectKind::Eq { mid_db, .. }) => Some(mid_db),
             (Self::MidHz, EffectKind::Eq { mid_hz, .. }) => Some(mid_hz),
             (Self::HighDb, EffectKind::Eq { high_db, .. }) => Some(high_db),
-            (Self::ThresholdDb, EffectKind::Compressor { threshold_db, .. }) => Some(threshold_db),
+            (Self::ThresholdDb, EffectKind::Compressor { threshold_db, .. })
+            | (Self::GateThresholdDb, EffectKind::Gate { threshold_db, .. }) => Some(threshold_db),
             (Self::Ratio, EffectKind::Compressor { ratio, .. }) => Some(ratio),
-            (Self::AttackMs, EffectKind::Compressor { attack_ms, .. }) => Some(attack_ms),
-            (Self::ReleaseMs, EffectKind::Compressor { release_ms, .. }) => Some(release_ms),
+            (Self::AttackMs, EffectKind::Compressor { attack_ms, .. })
+            | (Self::GateAttackMs, EffectKind::Gate { attack_ms, .. }) => Some(attack_ms),
+            (Self::ReleaseMs, EffectKind::Compressor { release_ms, .. })
+            | (Self::GateReleaseMs, EffectKind::Gate { release_ms, .. })
+            | (Self::LimiterReleaseMs, EffectKind::Limiter { release_ms, .. }) => Some(release_ms),
             (Self::MakeupDb, EffectKind::Compressor { makeup_db, .. }) => Some(makeup_db),
+            (Self::KneeDb, EffectKind::Compressor { knee_db, .. }) => Some(knee_db),
             (Self::Room, EffectKind::Reverb { room, .. }) => Some(room),
             (Self::Damp, EffectKind::Reverb { damp, .. }) => Some(damp),
             (Self::Mix, EffectKind::Reverb { mix, .. }) => Some(mix),
+            (Self::GateRangeDb, EffectKind::Gate { range_db, .. }) => Some(range_db),
+            (Self::GateHoldMs, EffectKind::Gate { hold_ms, .. }) => Some(hold_ms),
+            (Self::CeilingDb, EffectKind::Limiter { ceiling_db, .. }) => Some(ceiling_db),
             (param, EffectKind::ChannelEq { bands }) => {
                 let (index, field) = param.channel_eq_band()?;
                 let band = &mut bands[index];
@@ -660,22 +772,49 @@ impl Biquad {
 ///
 /// Envelope: one-pole follower `e ← c·e + (1 − c)·|x|` with
 /// `c = exp(−1 / (t·Fs))`, `t` = attack while `|x| > e`, release otherwise.
-/// Gain computer: `L = 20·log10 e`; above the threshold `T` the gain drops by
-/// `(L − T)(1 − 1/ratio)` dB; make-up is added afterwards.
+/// Gain computer: `L = 20·log10 e`, `over = L − T`, `s = 1 − 1/ratio`,
+/// knee width `W` (SPEC-052). With `W = 0` the gain drops by `over·s` dB
+/// above the threshold (hard knee, SPEC-022). With `W > 0`: no reduction for
+/// `2·over < −W`, `s·(over + W/2)² / (2W)` dB inside the knee and `over·s` dB
+/// above it. Make-up is added afterwards.
 #[derive(Debug, Clone, Copy)]
 struct Compressor {
     threshold_db: f32,
     slope: f32,
+    knee_db: f32,
     attack: f32,
     release: f32,
     makeup: f32,
     envelope: f32,
+    /// Largest gain reduction of the last `process` call, dB, `>= 0`.
+    reduction_db: f32,
+}
+
+/// One-pole smoothing coefficient `exp(−1 / (t·Fs))` for a time in ms.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "sample rates are far below 2^24"
+)]
+fn time_coefficient(ms: f32, sample_rate: u32) -> f32 {
+    let rate = sample_rate as f32;
+    (-1.0 / (ms.max(0.001) * 0.001 * rate)).exp()
+}
+
+/// Gain in dB (`<= 0`) of a factor in `(0, 1]`, as a positive reduction.
+fn reduction_of(gain: f32) -> f32 {
+    if gain >= 1.0 {
+        0.0
+    } else if gain <= 0.0 {
+        f32::INFINITY
+    } else {
+        -20.0 * gain.log10()
+    }
 }
 
 impl Compressor {
     #[allow(
-        clippy::cast_precision_loss,
-        reason = "sample rates are far below 2^24"
+        clippy::too_many_arguments,
+        reason = "mirrors the EffectKind::Compressor fields"
     )]
     fn new(
         threshold_db: f32,
@@ -683,22 +822,28 @@ impl Compressor {
         attack_ms: f32,
         release_ms: f32,
         makeup_db: f32,
+        knee_db: f32,
         sample_rate: u32,
     ) -> Self {
-        let rate = sample_rate as f32;
-        let coefficient = |ms: f32| (-1.0 / (ms.max(0.001) * 0.001 * rate)).exp();
         Self {
             threshold_db,
             slope: 1.0 - 1.0 / ratio.max(1.0),
-            attack: coefficient(attack_ms),
-            release: coefficient(release_ms),
+            knee_db: knee_db.max(0.0),
+            attack: time_coefficient(attack_ms, sample_rate),
+            release: time_coefficient(release_ms, sample_rate),
             makeup: db_to_gain(makeup_db),
             envelope: 0.0,
+            reduction_db: 0.0,
         }
     }
 
     fn process(&mut self, samples: &mut [f32]) {
         let threshold = db_to_gain(self.threshold_db);
+        let half_knee = self.knee_db * 0.5;
+        // Envelope level where the soft knee starts; equal to the threshold
+        // for a hard knee.
+        let knee_start = db_to_gain(self.threshold_db - half_knee);
+        let mut reduction_db = 0.0_f32;
         for sample in samples {
             let level = sample.abs();
             let c = if level > self.envelope {
@@ -708,13 +853,165 @@ impl Compressor {
             };
             self.envelope = flush(c.mul_add(self.envelope, (1.0 - c) * level));
             let mut gain = self.makeup;
-            if self.envelope > threshold && self.slope > 0.0 {
+            if self.envelope > knee_start && self.slope > 0.0 {
                 let over_db = 20.0 * (self.envelope / threshold).log10();
-                gain *= db_to_gain(-over_db * self.slope);
+                let reduction = if self.knee_db > 0.0 && over_db <= half_knee {
+                    let into = over_db + half_knee;
+                    self.slope * into * into / (2.0 * self.knee_db)
+                } else {
+                    over_db * self.slope
+                };
+                reduction_db = reduction_db.max(reduction);
+                gain *= db_to_gain(-reduction);
             }
             // Multiplying by exactly 1.0 is exact, so no special case.
             *sample *= gain;
         }
+        self.reduction_db = reduction_db;
+    }
+}
+
+/// Noise gate (SPEC-052).
+///
+/// Detector: the compressor's one-pole peak follower (attack coefficient
+/// while rising, release while falling). The gate is open while the envelope
+/// is above the threshold and for `hold` samples after it falls below. The
+/// gain moves exponentially towards 1 (open, attack time) or towards
+/// `10^(−range/20)` (closed, release time).
+#[derive(Debug, Clone, Copy)]
+struct Gate {
+    threshold: f32,
+    floor: f32,
+    attack: f32,
+    release: f32,
+    hold_samples: u32,
+    envelope: f32,
+    gain: f32,
+    hold_left: u32,
+    reduction_db: f32,
+}
+
+impl Gate {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "hold_ms is validated to 0..=500, the product fits u32"
+    )]
+    fn new(
+        threshold_db: f32,
+        range_db: f32,
+        attack_ms: f32,
+        hold_ms: f32,
+        release_ms: f32,
+        sample_rate: u32,
+    ) -> Self {
+        let floor = db_to_gain(-range_db.max(0.0));
+        Self {
+            threshold: db_to_gain(threshold_db),
+            floor,
+            attack: time_coefficient(attack_ms, sample_rate),
+            release: time_coefficient(release_ms, sample_rate),
+            hold_samples: (hold_ms.max(0.0) * 0.001 * sample_rate as f32) as u32,
+            envelope: 0.0,
+            gain: floor,
+            hold_left: 0,
+            reduction_db: 0.0,
+        }
+    }
+
+    /// New parameters, same envelope, gain and hold state.
+    fn retune(&mut self, fresh: Self) {
+        *self = Self {
+            envelope: self.envelope,
+            gain: self.gain.clamp(fresh.floor, 1.0),
+            hold_left: self.hold_left.min(fresh.hold_samples),
+            reduction_db: self.reduction_db,
+            ..fresh
+        };
+    }
+
+    fn process(&mut self, samples: &mut [f32]) {
+        let mut lowest = 1.0_f32;
+        for sample in samples {
+            let level = sample.abs();
+            let c = if level > self.envelope {
+                self.attack
+            } else {
+                self.release
+            };
+            self.envelope = flush(c.mul_add(self.envelope, (1.0 - c) * level));
+            let open = if self.envelope > self.threshold {
+                self.hold_left = self.hold_samples;
+                true
+            } else if self.hold_left > 0 {
+                self.hold_left -= 1;
+                true
+            } else {
+                false
+            };
+            let (target, c) = if open {
+                (1.0, self.attack)
+            } else {
+                (self.floor, self.release)
+            };
+            let next = c.mul_add(self.gain - target, target);
+            // Snap once within float noise (or stalled by f32 rounding near
+            // 1.0) so a settled gate is exact.
+            self.gain = if next.to_bits() == self.gain.to_bits() || (next - target).abs() < 1.0e-6 {
+                target
+            } else {
+                next
+            };
+            lowest = lowest.min(self.gain);
+            *sample *= self.gain;
+        }
+        self.reduction_db = reduction_of(lowest).min(80.0);
+    }
+}
+
+/// Peak limiter (SPEC-052): instant attack, one-pole release.
+///
+/// Envelope: `e ← |x|` when `|x| > e`, otherwise `e ← c·e + (1 − c)·|x|`, so
+/// `e >= |x|` always. Gain `ceiling / e` above the ceiling, 1 below; the
+/// output is also clamped to the ceiling against rounding.
+#[derive(Debug, Clone, Copy)]
+struct Limiter {
+    ceiling: f32,
+    release: f32,
+    envelope: f32,
+    reduction_db: f32,
+}
+
+impl Limiter {
+    fn new(ceiling_db: f32, release_ms: f32, sample_rate: u32) -> Self {
+        Self {
+            ceiling: db_to_gain(ceiling_db),
+            release: time_coefficient(release_ms, sample_rate),
+            envelope: 0.0,
+            reduction_db: 0.0,
+        }
+    }
+
+    fn process(&mut self, samples: &mut [f32]) {
+        let mut lowest = 1.0_f32;
+        for sample in samples {
+            let level = sample.abs();
+            self.envelope = if level > self.envelope {
+                level
+            } else {
+                flush(
+                    self.release
+                        .mul_add(self.envelope, (1.0 - self.release) * level),
+                )
+            };
+            if self.envelope > self.ceiling {
+                let gain = self.ceiling / self.envelope;
+                lowest = lowest.min(gain);
+                *sample = (*sample * gain).clamp(-self.ceiling, self.ceiling);
+            }
+        }
+        self.reduction_db = reduction_of(lowest);
     }
 }
 
@@ -874,6 +1171,8 @@ enum State {
     ChannelEq(ChannelEqState),
     Compressor(Compressor),
     Reverb(Reverb),
+    Gate(Gate),
+    Limiter(Limiter),
 }
 
 /// `(shape, frequency, gain, q)` of each EQ band.
@@ -983,17 +1282,37 @@ impl EffectProcessor {
                     attack_ms,
                     release_ms,
                     makeup_db,
+                    knee_db,
                 } => State::Compressor(Compressor::new(
                     threshold_db,
                     ratio,
                     attack_ms,
                     release_ms,
                     makeup_db,
+                    knee_db,
                     sample_rate,
                 )),
                 EffectKind::Reverb { room, damp, mix } => {
                     State::Reverb(Reverb::new(room, damp, mix, sample_rate))
                 }
+                EffectKind::Gate {
+                    threshold_db,
+                    range_db,
+                    attack_ms,
+                    hold_ms,
+                    release_ms,
+                } => State::Gate(Gate::new(
+                    threshold_db,
+                    range_db,
+                    attack_ms,
+                    hold_ms,
+                    release_ms,
+                    sample_rate,
+                )),
+                EffectKind::Limiter {
+                    ceiling_db,
+                    release_ms,
+                } => State::Limiter(Limiter::new(ceiling_db, release_ms, sample_rate)),
             }
         };
         Self { state, sample_rate }
@@ -1038,15 +1357,53 @@ impl EffectProcessor {
                     attack_ms,
                     release_ms,
                     makeup_db,
+                    knee_db,
                 },
             ) => {
                 let envelope = compressor.envelope;
-                *compressor =
-                    Compressor::new(threshold_db, ratio, attack_ms, release_ms, makeup_db, rate);
+                let reduction = compressor.reduction_db;
+                *compressor = Compressor::new(
+                    threshold_db,
+                    ratio,
+                    attack_ms,
+                    release_ms,
+                    makeup_db,
+                    knee_db,
+                    rate,
+                );
                 compressor.envelope = envelope;
+                compressor.reduction_db = reduction;
             }
             (State::Reverb(reverb), EffectKind::Reverb { room, damp, mix }) => {
                 reverb.retune(room, damp, mix);
+            }
+            (
+                State::Gate(gate),
+                EffectKind::Gate {
+                    threshold_db,
+                    range_db,
+                    attack_ms,
+                    hold_ms,
+                    release_ms,
+                },
+            ) => gate.retune(Gate::new(
+                threshold_db,
+                range_db,
+                attack_ms,
+                hold_ms,
+                release_ms,
+                rate,
+            )),
+            (
+                State::Limiter(limiter),
+                EffectKind::Limiter {
+                    ceiling_db,
+                    release_ms,
+                },
+            ) => {
+                let envelope = limiter.envelope;
+                *limiter = Limiter::new(ceiling_db, release_ms, rate);
+                limiter.envelope = envelope;
             }
             _ => {}
         }
@@ -1072,6 +1429,20 @@ impl EffectProcessor {
             }
             State::Compressor(compressor) => compressor.process(samples),
             State::Reverb(reverb) => reverb.process(samples),
+            State::Gate(gate) => gate.process(samples),
+            State::Limiter(limiter) => limiter.process(samples),
+        }
+    }
+
+    /// Largest gain reduction, in non-negative dB, applied during the last
+    /// processed block (SPEC-052). Zero for effects without dynamics.
+    #[must_use]
+    pub const fn gain_reduction_db(&self) -> f32 {
+        match &self.state {
+            State::Compressor(compressor) => compressor.reduction_db,
+            State::Gate(gate) => gate.reduction_db,
+            State::Limiter(limiter) => limiter.reduction_db,
+            _ => 0.0,
         }
     }
 }
@@ -1134,6 +1505,7 @@ mod tests {
                 attack_ms,
                 release_ms,
                 makeup_db,
+                knee_db: 0.0,
             };
         assert!(!compressor(-18.0, 0.5, 10.0, 100.0, 0.0).is_valid());
         assert!(!compressor(1.0, 4.0, 10.0, 100.0, 0.0).is_valid());
@@ -1242,6 +1614,7 @@ mod tests {
             attack_ms: 10.0,
             release_ms: 100.0,
             makeup_db: 6.0,
+            knee_db: 0.0,
         };
         let gain = peak(&run(kind, &input)) / 0.05;
         assert!((1.98..2.0).contains(&gain), "{gain}");
@@ -1255,11 +1628,194 @@ mod tests {
             attack_ms: 1.0,
             release_ms: 100.0,
             makeup_db: 0.0,
+            knee_db: 0.0,
         };
         let out = run(kind, &sine(440.0, 1.0, 48_000));
         let level_db = 20.0 * peak(&out[24_000..]).log10();
         assert!(level_db <= -17.0, "{level_db} dB");
         assert!(level_db > -24.0, "{level_db} dB");
+    }
+
+    fn compressor_with_knee(knee_db: f32) -> EffectKind {
+        EffectKind::Compressor {
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 1.0,
+            release_ms: 100.0,
+            makeup_db: 0.0,
+            knee_db,
+        }
+    }
+
+    #[test]
+    fn soft_knee_reduces_less_at_the_threshold_and_the_same_far_above() {
+        // A sine at the threshold: the hard knee does nothing, the soft knee
+        // already compresses a little (W/8·s dB at over = 0).
+        let at = sine(440.0, 0.1, 24_000);
+        let hard = peak(&run(compressor_with_knee(0.0), &at)[12_000..]);
+        let soft = peak(&run(compressor_with_knee(12.0), &at)[12_000..]);
+        assert!(soft < hard, "{soft} vs {hard}");
+        // Far above the knee both curves coincide.
+        let loud = sine(440.0, 1.0, 24_000);
+        let hard = peak(&run(compressor_with_knee(0.0), &loud)[12_000..]);
+        let soft = peak(&run(compressor_with_knee(12.0), &loud)[12_000..]);
+        assert!((hard - soft).abs() < 1.0e-4, "{soft} vs {hard}");
+    }
+
+    #[test]
+    fn soft_knee_leaves_a_signal_well_below_it_exact() {
+        let input = sine(440.0, 0.01, 4096);
+        assert_eq!(run(compressor_with_knee(24.0), &input), input);
+    }
+
+    #[test]
+    fn compressor_reports_gain_reduction() {
+        let mut processor = EffectProcessor::new(&Effect::new(compressor_with_knee(0.0)), RATE);
+        let mut loud = sine(440.0, 1.0, 4800);
+        for block in loud.chunks_mut(128) {
+            processor.process(block);
+        }
+        // 0 dB peak, threshold −20, ratio 4 → about 15 dB at the peaks.
+        let reduction = processor.gain_reduction_db();
+        assert!((10.0..=15.1).contains(&reduction), "{reduction}");
+        let mut silence = vec![0.0; 48_000];
+        for block in silence.chunks_mut(128) {
+            processor.process(block);
+        }
+        assert_eq!(processor.gain_reduction_db(), 0.0);
+        assert!(silence.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn effects_without_dynamics_report_no_gain_reduction() {
+        for kind in [
+            EffectKind::eq(),
+            EffectKind::reverb(),
+            EffectKind::channel_eq(),
+        ] {
+            let mut processor = EffectProcessor::new(&Effect::new(kind), RATE);
+            let mut block = sine(440.0, 1.0, 128);
+            processor.process(&mut block);
+            assert_eq!(processor.gain_reduction_db(), 0.0, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn new_dynamics_defaults_are_valid() {
+        assert!(EffectKind::compressor().is_valid());
+        assert!(EffectKind::gate().is_valid());
+        assert!(EffectKind::limiter().is_valid());
+        assert_eq!(EffectKind::gate().type_name(), "gate");
+        assert_eq!(EffectKind::limiter().type_name(), "limiter");
+    }
+
+    #[test]
+    fn dynamics_out_of_range_parameters_are_invalid() {
+        let knee = |knee_db| EffectKind::Compressor {
+            threshold_db: -18.0,
+            ratio: 4.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            makeup_db: 0.0,
+            knee_db,
+        };
+        assert!(knee(24.0).is_valid());
+        assert!(!knee(-0.1).is_valid());
+        assert!(!knee(24.1).is_valid());
+        assert!(!knee(f32::NAN).is_valid());
+        let gate = |threshold_db, range_db, attack_ms, hold_ms, release_ms| EffectKind::Gate {
+            threshold_db,
+            range_db,
+            attack_ms,
+            hold_ms,
+            release_ms,
+        };
+        assert!(!gate(1.0, 60.0, 1.0, 50.0, 100.0).is_valid());
+        assert!(!gate(-81.0, 60.0, 1.0, 50.0, 100.0).is_valid());
+        assert!(!gate(-40.0, 81.0, 1.0, 50.0, 100.0).is_valid());
+        assert!(!gate(-40.0, 60.0, 0.0, 50.0, 100.0).is_valid());
+        assert!(!gate(-40.0, 60.0, 1.0, 501.0, 100.0).is_valid());
+        assert!(!gate(-40.0, 60.0, 1.0, 50.0, 5.0).is_valid());
+        assert!(!gate(f32::NAN, 60.0, 1.0, 50.0, 100.0).is_valid());
+        let limiter = |ceiling_db, release_ms| EffectKind::Limiter {
+            ceiling_db,
+            release_ms,
+        };
+        assert!(!limiter(0.1, 50.0).is_valid());
+        assert!(!limiter(-25.0, 50.0).is_valid());
+        assert!(!limiter(-1.0, 5.0).is_valid());
+        assert!(!limiter(f32::INFINITY, 50.0).is_valid());
+    }
+
+    #[test]
+    fn gate_attenuates_a_quiet_signal_by_its_range() {
+        let quiet = sine(440.0, 0.001, 24_000); // −60 dB, under −40 dB
+        let out = run(EffectKind::gate(), &quiet);
+        let attenuation = 20.0 * (peak(&quiet[12_000..]) / peak(&out[12_000..])).log10();
+        assert!((59.0..=61.0).contains(&attenuation), "{attenuation} dB");
+    }
+
+    #[test]
+    fn gate_passes_a_loud_signal() {
+        let loud = sine(440.0, 0.5, 24_000);
+        let out = run(EffectKind::gate(), &loud);
+        assert_eq!(&out[12_000..], &loud[12_000..]);
+        let mut processor = EffectProcessor::new(&Effect::new(EffectKind::gate()), RATE);
+        let mut block = loud[12_000..12_128].to_vec();
+        processor.process(&mut block);
+        let mut settle = loud.clone();
+        for chunk in settle.chunks_mut(128) {
+            processor.process(chunk);
+        }
+        assert_eq!(processor.gain_reduction_db(), 0.0);
+    }
+
+    #[test]
+    fn gate_keeps_silence_exact_and_reports_its_range() {
+        let mut processor = EffectProcessor::new(&Effect::new(EffectKind::gate()), RATE);
+        let mut silence = vec![0.0; 1024];
+        processor.process(&mut silence);
+        assert!(silence.iter().all(|&s| s == 0.0));
+        let reduction = processor.gain_reduction_db();
+        assert!((reduction - 60.0).abs() < 1.0e-3, "{reduction}");
+    }
+
+    #[test]
+    fn gate_hold_keeps_it_open_after_the_signal_drops() {
+        let mut input = sine(440.0, 0.5, 9600);
+        input.extend(sine(440.0, 0.001, 960)); // 20 ms quiet, hold is 50 ms
+        let out = run(EffectKind::gate(), &input);
+        // The envelope falls with a 100 ms release, so the gate stays open.
+        let tail = peak(&out[9600 + 480..]) / peak(&input[9600 + 480..]);
+        assert!(tail > 0.9, "{tail}");
+    }
+
+    #[test]
+    fn limiter_keeps_peaks_under_the_ceiling() {
+        let kind = EffectKind::Limiter {
+            ceiling_db: -6.0,
+            release_ms: 50.0,
+        };
+        let ceiling = db_to_gain(-6.0);
+        let out = run(kind, &sine(440.0, 1.0, 24_000));
+        assert!(peak(&out) <= ceiling, "{}", peak(&out));
+        assert!(peak(&out) > ceiling * 0.99, "{}", peak(&out));
+        let mut impulse = vec![0.0; 256];
+        impulse[10] = 4.0;
+        let out = run(kind, &impulse);
+        assert!(peak(&out) <= ceiling, "{}", peak(&out));
+    }
+
+    #[test]
+    fn limiter_leaves_quiet_signals_exact_and_reports_reduction() {
+        let quiet = sine(440.0, 0.5, 4096);
+        assert_eq!(run(EffectKind::limiter(), &quiet), quiet);
+        let mut processor = EffectProcessor::new(&Effect::new(EffectKind::limiter()), RATE);
+        let mut loud = sine(440.0, 2.0, 1024);
+        processor.process(&mut loud);
+        let reduction = processor.gain_reduction_db();
+        // 2.0 → −0.5 dB ceiling: 6.02 + 0.5 dB.
+        assert!((reduction - 6.52).abs() < 0.05, "{reduction}");
     }
 
     #[test]
@@ -1341,6 +1897,7 @@ mod tests {
                     attack_ms: 1.0,
                     release_ms: 50.0,
                     makeup_db: 3.0,
+                    knee_db: 6.0,
                 },
             ),
             (
@@ -1585,7 +2142,7 @@ mod tests {
 
     #[test]
     fn channel_eq_params_round_trip_and_ranges_match_validation() {
-        assert_eq!(EffectParam::ALL.len(), 30);
+        assert_eq!(EffectParam::ALL.len(), 38);
         let kind = EffectKind::channel_eq();
         let params = EffectParam::of(&kind);
         assert_eq!(params.len(), 18);

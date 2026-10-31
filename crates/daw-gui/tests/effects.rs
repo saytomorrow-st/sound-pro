@@ -119,6 +119,7 @@ fn a_full_chain_and_out_of_range_values_are_rejected() {
         attack_ms: 10.0,
         release_ms: 100.0,
         makeup_db: 0.0,
+        knee_db: 0.0,
     });
     assert!(matches!(
         editor.set_effect(0, 0, bad),

@@ -1734,3 +1734,98 @@ fn an_out_of_range_channel_eq_value_fails_validation() {
         })
     );
 }
+
+// --- SPEC-052: compressor knee, gate, limiter -------------------------------
+
+fn dynamics_session(knee_db: f32) -> audio_core::Session {
+    use audio_core::{Effect, EffectKind, EffectParam};
+    let mut compressor = EffectKind::compressor();
+    assert!(EffectParam::KneeDb.set(&mut compressor, knee_db));
+    let mut gate = EffectKind::gate();
+    assert!(EffectParam::GateThresholdDb.set(&mut gate, -45.0));
+    assert!(EffectParam::GateHoldMs.set(&mut gate, 20.0));
+    let mut limiter = EffectKind::limiter();
+    assert!(EffectParam::CeilingDb.set(&mut limiter, -1.5));
+    let mut session = demo_session();
+    session.tracks[0].effects = vec![
+        Effect::new(gate),
+        Effect::new(compressor),
+        Effect::new(limiter),
+    ];
+    session
+}
+
+fn dynamics_json(knee_db: f32) -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        dynamics_session(knee_db),
+    )
+    .to_json()
+}
+
+#[test]
+fn gate_compressor_knee_and_limiter_survive_the_round_trip() {
+    let text = dynamics_json(6.0);
+    for key in [
+        "\"gate\"",
+        "\"gate_threshold_db\": -45",
+        "\"gate_range_db\"",
+        "\"gate_attack_ms\"",
+        "\"gate_hold_ms\": 20",
+        "\"gate_release_ms\"",
+        "\"knee_db\": 6",
+        "\"limiter\"",
+        "\"ceiling_db\": -1.5",
+        "\"limiter_release_ms\"",
+    ] {
+        assert!(text.contains(key), "{key} missing in {text}");
+    }
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &dynamics_session(6.0));
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn a_hard_knee_is_not_written_and_reads_back_as_zero() {
+    let text = dynamics_json(0.0);
+    assert!(!text.contains("knee_db"), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &dynamics_session(0.0));
+}
+
+#[test]
+fn an_unknown_gate_or_limiter_key_is_rejected() {
+    let text = dynamics_json(0.0).replace("\"gate_hold_ms\"", "\"hold_ms\"");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "hold_ms".to_owned()
+        }
+    );
+    let text = dynamics_json(0.0).replace("\"ceiling_db\"", "\"ceiling\"");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "ceiling".to_owned()
+        }
+    );
+}
+
+#[test]
+fn an_out_of_range_knee_or_ceiling_fails_validation() {
+    let invalid = |text: &str, effect| {
+        assert_eq!(
+            Project::from_json(text).unwrap_err(),
+            ProjectError::Session(audio_core::SessionError::InvalidEffect { track: 0, effect })
+        );
+    };
+    invalid(
+        &dynamics_json(6.0).replace("\"knee_db\": 6", "\"knee_db\": 30"),
+        1,
+    );
+    invalid(
+        &dynamics_json(0.0).replace("\"ceiling_db\": -1.5", "\"ceiling_db\": 2"),
+        2,
+    );
+}

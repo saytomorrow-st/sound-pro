@@ -4,17 +4,21 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use audio_core::MAX_EFFECTS_PER_TRACK;
 use audio_core::session::MAX_TRACKS;
 
 /// Meter slots: two per track, then two for the master.
 const SLOTS: usize = 2 * MAX_TRACKS + 2;
 const MASTER: usize = 2 * MAX_TRACKS;
+/// Gain-reduction slots (SPEC-052): one per insert of every track.
+const GR_SLOTS: usize = MAX_TRACKS * MAX_EFFECTS_PER_TRACK;
 
 /// Peak levels since the last read, shared by the audio thread and the
 /// window. Cloning gives another handle to the same bank.
 #[derive(Debug, Clone)]
 pub struct Meters {
     slots: Arc<[AtomicU32; SLOTS]>,
+    reduction: Arc<[AtomicU32; GR_SLOTS]>,
 }
 
 impl Default for Meters {
@@ -38,6 +42,7 @@ impl Meters {
     pub fn new() -> Self {
         Self {
             slots: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
+            reduction: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
         }
     }
 
@@ -90,6 +95,33 @@ impl Meters {
     pub fn take_master(&self) -> (f32, f32) {
         (self.take(MASTER), self.take(MASTER + 1))
     }
+
+    /// Records the gain reduction, dB, of insert `effect` on track `track`
+    /// (SPEC-052); the largest value since the last read is kept.
+    /// Realtime-safe; out-of-range slots, non-positive and non-finite
+    /// values are ignored.
+    pub fn record_reduction(&self, track: usize, effect: usize, db: f32) {
+        if track >= MAX_TRACKS || effect >= MAX_EFFECTS_PER_TRACK || !db.is_finite() || db <= 0.0 {
+            return;
+        }
+        if let Some(atomic) = self.reduction.get(track * MAX_EFFECTS_PER_TRACK + effect) {
+            atomic.fetch_max(db.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// The largest gain reduction, dB, of insert `effect` on track `track`
+    /// since the last read, then zero; unknown slots read `0`.
+    #[must_use]
+    pub fn take_reduction(&self, track: usize, effect: usize) -> f32 {
+        if track >= MAX_TRACKS || effect >= MAX_EFFECTS_PER_TRACK {
+            return 0.0;
+        }
+        self.reduction
+            .get(track * MAX_EFFECTS_PER_TRACK + effect)
+            .map_or(0.0, |atomic| {
+                f32::from_bits(atomic.swap(0, Ordering::Relaxed))
+            })
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +154,30 @@ mod tests {
         other.record_master(&[0.25], &[1.5]);
         assert_eq!(meters.take_master(), (0.25, 1.5));
         assert_eq!(other.take_master(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn reduction_keeps_the_largest_value_per_insert_until_read() {
+        let meters = Meters::new();
+        meters.record_reduction(2, 1, 3.0);
+        meters.record_reduction(2, 1, 7.5);
+        meters.record_reduction(2, 1, 1.0);
+        meters.record_reduction(2, 0, 4.0);
+        assert_eq!(meters.take_reduction(2, 1), 7.5);
+        assert_eq!(meters.take_reduction(2, 1), 0.0);
+        assert_eq!(meters.take_reduction(2, 0), 4.0);
+        assert_eq!(meters.take_reduction(3, 1), 0.0);
+    }
+
+    #[test]
+    fn reduction_ignores_bad_values_and_slots() {
+        let meters = Meters::new();
+        meters.record_reduction(0, 0, f32::NAN);
+        meters.record_reduction(0, 0, -2.0);
+        meters.record_reduction(MAX_TRACKS, 0, 5.0);
+        meters.record_reduction(0, MAX_EFFECTS_PER_TRACK, 5.0);
+        assert_eq!(meters.take_reduction(0, 0), 0.0);
+        assert_eq!(meters.take_reduction(MAX_TRACKS, 0), 0.0);
+        assert_eq!(meters.take_reduction(0, MAX_EFFECTS_PER_TRACK), 0.0);
     }
 }
