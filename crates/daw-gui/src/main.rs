@@ -406,8 +406,6 @@ enum RegionAction {
     Duplicate,
     Split,
     Delete,
-    NewMidi,
-    NewAudio,
     FadeIn,
     FadeOut,
     NoFades,
@@ -421,6 +419,19 @@ enum TrackAction {
     Color(usize, Option<u8>),
     Move(usize, usize),
     Duplicate(usize),
+    New(TrackKind),
+}
+
+/// «New track» items of the track-header menus (SPEC-050 §4).
+fn new_track_items(ui: &mut egui::Ui, action: &mut Option<TrackAction>) {
+    if ui.button("Новая дорожка…").clicked() {
+        *action = Some(TrackAction::New(TrackKind::Audio));
+        ui.close();
+    }
+    if ui.button("Новая MIDI-дорожка").clicked() {
+        *action = Some(TrackAction::New(TrackKind::Instrument));
+        ui.close();
+    }
 }
 
 /// Display colour of the track at `index`; tracks without their own colour
@@ -1484,6 +1495,8 @@ impl App {
                     delete = Some(index);
                     ui.close();
                 }
+                ui.separator();
+                new_track_items(ui, &mut action);
             });
         }
         if let Some(action) = action {
@@ -1500,10 +1513,30 @@ impl App {
         if count == 0 {
             ui.label("Нет дорожек");
         }
+        // SPEC-050 §4: tracks are created from the header panel, never from
+        // empty timeline space.
+        let add = ui.button("＋").on_hover_text("Новая дорожка (Ctrl+Alt+N)");
+        if add.clicked() {
+            action = Some(TrackAction::New(TrackKind::Audio));
+        }
+        let rest = ui.available_rect_before_wrap();
+        let empty = ui.interact(rest, ui.id().with("headers_empty"), Sense::click());
+        empty.context_menu(|ui| new_track_items(ui, &mut action));
+        if let Some(action) = action {
+            self.track_action(action);
+        }
     }
 
     fn track_action(&mut self, action: TrackAction) {
         let result = match action {
+            TrackAction::New(TrackKind::Instrument) => {
+                self.add_midi_track();
+                return;
+            }
+            TrackAction::New(kind) => {
+                self.open_new_track(kind);
+                return;
+            }
             TrackAction::Rename(track) => {
                 let Some((_, text)) = self.rename.take() else {
                     return;
@@ -3021,9 +3054,6 @@ impl App {
                 item(ui, "Удалить", "Del", RegionAction::Delete);
             } else {
                 item(ui, "Вставить", "Ctrl+V", RegionAction::Paste);
-                item(ui, "Новая MIDI-дорожка", "", RegionAction::NewMidi);
-                ui.separator();
-                item(ui, "Новая аудиодорожка…", "", RegionAction::NewAudio);
                 ui.add_enabled(false, egui::Button::new("Выделить всё"));
             }
         });
@@ -3038,8 +3068,6 @@ impl App {
             Some(RegionAction::Duplicate) => self.duplicate_clip(),
             Some(RegionAction::Split) => self.split_clip(),
             Some(RegionAction::Delete) => self.delete_selected_clip(),
-            Some(RegionAction::NewMidi) => self.add_midi_track(),
-            Some(RegionAction::NewAudio) => self.open_new_track(TrackKind::Audio),
             Some(RegionAction::Join) => {
                 if let Some((t, c)) = selected {
                     self.join_clip(t, c);
@@ -3882,8 +3910,8 @@ impl eframe::App for App {
         if self.layout.inspector {
             egui::SidePanel::left("inspector")
                 .resizable(true)
-                .default_width(176.0)
-                .min_width(176.0)
+                .default_width(shell::INSPECTOR_WIDTH)
+                .min_width(shell::INSPECTOR_WIDTH)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("inspector")
