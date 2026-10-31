@@ -43,15 +43,23 @@ impl X11Cursor {
     /// track the cursor even during an XDND drag, unlike egui's pointer.
     #[must_use]
     pub fn position(&self) -> Option<(f32, f32)> {
-        // A fresh connection is opened and dropped here so the event buffer
-        // cannot grow over the session. The window id is server-global, so a
-        // new connection can query the window eframe owns.
+        self.query()
+            .map(|r| (f32::from(r.win_x), f32::from(r.win_y)))
+    }
+
+    /// Debugging helper: window-relative and root-relative physical coords,
+    /// plus `same_screen`, to disambiguate coordinate spaces in the logs.
+    #[must_use]
+    pub fn position_debug(&self) -> Option<(i16, i16, i16, i16, bool)> {
+        self.query()
+            .map(|r| (r.win_x, r.win_y, r.root_x, r.root_y, r.same_screen))
+    }
+
+    /// Open a fresh connection and query the pointer; returns the raw reply.
+    /// `same_screen == false` means the pointer is on another screen.
+    fn query(&self) -> Option<x11rb::protocol::xproto::QueryPointerReply> {
         let (conn, _screen) = x11rb::connect(None).ok()?;
         let reply = conn.query_pointer(self.window).ok()?.reply().ok()?;
-        if reply.same_screen {
-            Some((f32::from(reply.win_x), f32::from(reply.win_y)))
-        } else {
-            None
-        }
+        reply.same_screen.then_some(reply)
     }
 }

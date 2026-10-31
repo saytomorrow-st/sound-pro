@@ -1850,9 +1850,29 @@ impl App {
         // `p` is window-local in egui points; `drop_target` wants the position
         // measured from the timeline's top-left corner.
         let target_at = |p: Pos2| to_target((p.x - area.min.x, p.y - area.min.y));
+        // During an external XDND drag egui receives no pointer motion, so its
+        // `latest_pos` freezes. Read the OS cursor directly (X11 `QueryPointer`)
+        // and convert physical px to egui points with the real pixels-per-point
+        // (which folds in `native_pixels_per_point` AND the UI zoom factor).
+        #[cfg(target_os = "linux")]
+        let os_points: Option<(f32, f32)> = self.x11_cursor.as_ref().and_then(|cursor| {
+            let (x, y) = cursor.position()?;
+            let ppp = ui.ctx().pixels_per_point();
+            let ppp = if ppp.is_finite() && ppp > 0.0 {
+                ppp
+            } else {
+                1.0
+            };
+            Some((x / ppp, y / ppp))
+        });
+        #[cfg(not(target_os = "linux"))]
+        let os_points: Option<(f32, f32)> = None;
+        // Prefer the live OS cursor over egui's frozen pointer for both the
+        // hover preview and the drop itself.
+        let effective_pointer = os_points.map(|(x, y)| Pos2::new(x, y)).or(pointer);
         if hovering {
             let painter = ui.painter_at(area);
-            let target = pointer.map(target_at);
+            let target = effective_pointer.map(target_at);
             self.drop_tracker.hover(target);
             let band = match target.and_then(|t| t.track) {
                 Some(t) => {
@@ -1925,8 +1945,9 @@ impl App {
                     self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
                 }
             }
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
+            // Repaint as fast as possible while dragging so the hover preview
+            // tracks the OS cursor (egui receives no motion events during XDND).
+            ui.ctx().request_repaint();
         } else if dropped.is_empty() {
             self.probes.clear();
             self.drop_tracker.cancel();
@@ -1935,39 +1956,42 @@ impl App {
             return;
         }
         self.probes.clear();
-        // During an XDND drag winit drops `XdndPosition`, so egui's pointer is
-        // frozen or missing at release. Read the OS cursor directly (X11 only)
-        // so the drop lands under the pointer; otherwise fall back to the last
-        // hover preview (`DropTracker`).
+        // The live OS cursor (already converted to window points above) wins
+        // over the stale hover preview. On non-X11 or when the query fails,
+        // fall back to the last preview (`DropTracker`).
         #[cfg(target_os = "linux")]
-        let os_target = self.x11_cursor.as_ref().and_then(|cursor| {
-            let (x, y) = cursor.position()?;
-            let scale = ui
-                .ctx()
-                .input(|i| i.viewport().native_pixels_per_point)
-                .unwrap_or(1.0)
-                .max(f32::EPSILON);
-            // `position()` is window-relative in physical pixels (the window
-            // origin is already baked in), so the conversion subtracts nothing
-            // but the timeline's own top-left corner.
-            let local = daw_gui::native_pointer_to_timeline(
-                (x, y),
-                (0.0, 0.0),
-                scale,
-                (area.min.x, area.min.y),
-            );
-            Some(to_target(local))
-        });
-        #[cfg(not(target_os = "linux"))]
-        let os_target = None;
-        let target = match os_target {
-            Some(fresh) => {
-                // The live cursor wins over the stale hover preview.
-                self.drop_tracker.cancel();
-                fresh
+        {
+            if let Some((dbg_win_x, dbg_win_y, dbg_root_x, dbg_root_y, dbg_same)) =
+                self.x11_cursor.as_ref().and_then(|c| c.position_debug())
+            {
+                eprintln!(
+                    "DROP-DEBUG xquery win=({dbg_win_x},{dbg_win_y}) root=({dbg_root_x},{dbg_root_y}) same_screen={dbg_same} \
+                     ppp={} os_points={:?} egui_pointer={:?} area_min=({:.1},{:.1})",
+                    ui.ctx().pixels_per_point(),
+                    os_points,
+                    pointer,
+                    area.min.x,
+                    area.min.y,
+                );
+            } else {
+                eprintln!(
+                    "DROP-DEBUG xquery=UNAVAILABLE egui_pointer={:?} area_min=({:.1},{:.1})",
+                    pointer, area.min.x, area.min.y,
+                );
             }
-            None => self.drop_tracker.release(pointer.map(target_at)),
+        }
+        let target = match effective_pointer {
+            Some(p) if os_points.is_some() => {
+                // Live OS cursor wins over the stale hover preview.
+                self.drop_tracker.cancel();
+                target_at(p)
+            }
+            _ => self.drop_tracker.release(pointer.map(target_at)),
         };
+        eprintln!(
+            "DROP-DEBUG target: track={:?} start={}",
+            target.track, target.start
+        );
         self.import_in_background(dropped, target.track, Some(target.start));
     }
 
