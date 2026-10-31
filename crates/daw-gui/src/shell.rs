@@ -30,6 +30,10 @@ pub fn apply_theme(ctx: &egui::Context) {
 const LCD_BG: Color32 = Color32::from_rgb(22, 26, 30);
 const LCD_TEXT: Color32 = Color32::from_rgb(170, 220, 255);
 const STRIP_WIDTH: f32 = 74.0;
+/// Inspector panel width that fits the track strip and the output/bus strip
+/// side by side (SPEC-050 §3): two framed strips (margins 8 + stroke 2), the
+/// 3-point gap, the panel's margins and the scroll bar.
+pub(crate) const INSPECTOR_WIDTH: f32 = 2.0 * (STRIP_WIDTH + 10.0) + 3.0 + 16.0 + 12.0;
 
 const LCD_CELL_HEIGHT: f32 = 38.0;
 
@@ -601,6 +605,26 @@ fn window_buttons(ui: &mut egui::Ui) {
     ui.separator();
 }
 
+/// Height left under a strip's top block of `used` points so that the
+/// strip's outer height equals `match_height` (frame margins and stroke take
+/// 10 points), but never less than `minimum`.
+fn strip_rest(match_height: Option<f32>, used: f32, minimum: f32) -> f32 {
+    let inner = match_height.map_or(0.0, |h| h - 10.0);
+    (inner - used).max(minimum)
+}
+
+/// Viewport commands for a drag on the bare control-bar strip: in full
+/// screen the window leaves it and the system starts moving it.
+fn window_drag_commands(
+    fullscreen: bool,
+    drag_started: bool,
+) -> Option<[egui::ViewportCommand; 2]> {
+    (fullscreen && drag_started).then_some([
+        egui::ViewportCommand::Fullscreen(false),
+        egui::ViewportCommand::StartDrag,
+    ])
+}
+
 /// State of the «Новая дорожка» dialog (SPEC-049).
 pub struct NewTrack {
     kind: TrackKind,
@@ -728,6 +752,21 @@ impl App {
 
     /// Top control bar: view buttons, transport, position display, modes.
     pub(crate) fn control_bar(&mut self, ui: &mut egui::Ui) {
+        // Registered before the buttons so they keep their clicks; dragging
+        // the bare strip in full screen leaves it and lets the system move
+        // the window (SPEC-050 §1).
+        let strip = ui.interact(
+            ui.max_rect(),
+            ui.id().with("control_bar_drag"),
+            Sense::click_and_drag(),
+        );
+        let ctx = ui.ctx().clone();
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if let Some(commands) = window_drag_commands(fullscreen, strip.drag_started()) {
+            for command in commands {
+                ctx.send_viewport_cmd(command);
+            }
+        }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let l = &mut self.layout;
@@ -1075,7 +1114,7 @@ impl App {
                 .selected_send
                 .filter(|&b| b < self.editor.session().buses.len());
             if let Some(bus) = bus {
-                self.bus_strip(ui, bus);
+                self.bus_strip(ui, bus, Some(height));
             } else {
                 self.selected_send = None;
                 self.master_strip(ui, 150.0, Some(height));
@@ -1663,8 +1702,7 @@ impl App {
                     stub_slot(ui, "");
                 });
                 // Outer height minus the frame's margins and stroke.
-                let inner = match_height.map_or(0.0, |h| h - 10.0);
-                let rest = (inner - (ui.cursor().top() - top)).max(height + 70.0);
+                let rest = strip_rest(match_height, ui.cursor().top() - top, height + 70.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(STRIP_WIDTH, rest),
                     egui::Layout::bottom_up(egui::Align::Center),
@@ -1700,7 +1738,9 @@ impl App {
             });
     }
 
-    fn bus_strip(&mut self, ui: &mut egui::Ui, index: usize) {
+    /// Bus channel strip. With `match_height` it is stretched like the
+    /// master strip so it lines up with the neighbouring channel strip.
+    fn bus_strip(&mut self, ui: &mut egui::Ui, index: usize, match_height: Option<f32>) {
         let bus = self.editor.session().buses[index].clone();
         egui::Frame::new()
             .fill(Color32::from_gray(42))
@@ -1710,6 +1750,7 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(STRIP_WIDTH);
                 ui.spacing_mut().item_spacing.y = 3.0;
+                let top = ui.cursor().top();
                 ui.vertical_centered(|ui| {
                     stub_slot(ui, "Settings");
                     eq_thumb(ui);
@@ -1724,17 +1765,24 @@ impl App {
                     if ui.add(button).clicked() {
                         self.fx = Some(FxTarget::Bus(index));
                     }
-                    ui.add_space(34.0);
-                    let mut gain = bus.gain;
-                    // Buses have no measurement of their own yet (SPEC-042).
-                    let mut meter = MeterState::default();
-                    level_labels(ui, gain, &mut meter);
-                    if fader(ui, &mut gain, true, 130.0, &meter).changed() {
-                        let _ = self.editor.set_bus_gain(index, gain);
-                    }
-                    ui.add_space(18.0);
-                    name_plate(ui, &bus.name, Color32::from_rgb(140, 150, 170));
                 });
+                let used = ui.cursor().top() - top;
+                let rest = strip_rest(match_height, used, 130.0 + 70.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(STRIP_WIDTH, rest),
+                    egui::Layout::bottom_up(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(Vec2::new(STRIP_WIDTH, rest));
+                        name_plate(ui, &bus.name, Color32::from_rgb(140, 150, 170));
+                        let mut gain = bus.gain;
+                        // Buses have no measurement of their own yet (SPEC-042).
+                        let mut meter = MeterState::default();
+                        if fader(ui, &mut gain, true, 130.0, &meter).changed() {
+                            let _ = self.editor.set_bus_gain(index, gain);
+                        }
+                        level_labels(ui, gain, &mut meter);
+                    },
+                );
             });
     }
 
@@ -1760,7 +1808,7 @@ impl App {
                     }
                     ui.separator();
                     for index in 0..self.editor.session().buses.len() {
-                        self.bus_strip(ui, index);
+                        self.bus_strip(ui, index, tallest);
                     }
                     self.master_strip(ui, 130.0, tallest);
                 });
@@ -1878,5 +1926,32 @@ impl App {
         for name in seen {
             ui.label(format!("🔊 {name}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_rest, window_drag_commands};
+
+    #[test]
+    fn matched_strips_fill_the_neighbour_height() {
+        // Top block 60, neighbour 400 tall: 400 - 10 (frame) - 60.
+        assert!((strip_rest(Some(400.0), 60.0, 200.0) - 330.0).abs() < f32::EPSILON);
+        assert!((strip_rest(Some(150.0), 60.0, 200.0) - 200.0).abs() < f32::EPSILON);
+        assert!((strip_rest(None, 60.0, 200.0) - 200.0).abs() < f32::EPSILON);
+    }
+    use eframe::egui::ViewportCommand;
+
+    #[test]
+    fn dragging_the_bar_in_full_screen_leaves_it_and_moves_the_window() {
+        assert_eq!(
+            window_drag_commands(true, true),
+            Some([
+                ViewportCommand::Fullscreen(false),
+                ViewportCommand::StartDrag
+            ])
+        );
+        assert_eq!(window_drag_commands(false, true), None);
+        assert_eq!(window_drag_commands(true, false), None);
     }
 }
