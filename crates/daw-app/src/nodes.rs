@@ -232,13 +232,17 @@ pub trait ClipSource {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MonoClip {
     samples: Vec<f32>,
+    right: Option<Vec<f32>>,
 }
 
 impl MonoClip {
     /// Takes ownership of `samples` as the clip's content.
     #[must_use]
     pub fn new(samples: Vec<f32>) -> Self {
-        Self { samples }
+        Self {
+            samples,
+            right: None,
+        }
     }
 
     /// A `freq_hz` sine of `frames` frames, generated off the audio thread.
@@ -247,6 +251,7 @@ impl MonoClip {
         let frames = usize::try_from(frames).unwrap_or(usize::MAX);
         Self {
             samples: sine(freq_hz, sample_rate, 0, frames),
+            right: None,
         }
     }
 
@@ -257,13 +262,35 @@ impl MonoClip {
     }
 }
 
+impl MonoClip {
+    /// Takes ownership of `left` and `right` as a stereo clip's content
+    /// (SPEC-050 §5) when they are the same length.
+    #[must_use]
+    pub fn stereo(left: Vec<f32>, right: Option<Vec<f32>>) -> Self {
+        match right {
+            Some(right) if right.len() == left.len() => Self {
+                samples: left,
+                right: Some(right),
+            },
+            _ => Self {
+                samples: left,
+                right: None,
+            },
+        }
+    }
+}
+
 impl ClipSource for MonoClip {
     fn frames(&self) -> u64 {
         self.samples.len() as u64
     }
 
     fn channel(&self, ch: usize) -> &[f32] {
-        if ch == 0 { &self.samples } else { &[] }
+        match (ch, &self.right) {
+            (0, _) => &self.samples,
+            (1, Some(right)) => right,
+            _ => &[],
+        }
     }
 }
 
@@ -273,6 +300,7 @@ impl ClipSource for MonoClip {
 #[derive(Debug, Clone)]
 pub struct SharedClip {
     samples: std::sync::Arc<Vec<f32>>,
+    right: Option<std::sync::Arc<Vec<f32>>>,
     frames: usize,
 }
 
@@ -281,7 +309,27 @@ impl SharedClip {
     #[must_use]
     pub fn new(samples: std::sync::Arc<Vec<f32>>, frames: u64) -> Option<Self> {
         let frames = usize::try_from(frames).ok()?;
-        (frames <= samples.len()).then_some(Self { samples, frames })
+        (frames <= samples.len()).then_some(Self {
+            samples,
+            right: None,
+            frames,
+        })
+    }
+
+    /// Stereo material: the first `frames` of `left` and `right`
+    /// (SPEC-050 §5); `None` when either is shorter.
+    #[must_use]
+    pub fn stereo(
+        left: std::sync::Arc<Vec<f32>>,
+        right: std::sync::Arc<Vec<f32>>,
+        frames: u64,
+    ) -> Option<Self> {
+        let frames = usize::try_from(frames).ok()?;
+        (frames <= left.len() && frames <= right.len()).then_some(Self {
+            samples: left,
+            right: Some(right),
+            frames,
+        })
     }
 }
 
@@ -290,7 +338,11 @@ impl SharedClip {
     #[must_use]
     pub fn whole(samples: std::sync::Arc<Vec<f32>>) -> Self {
         let frames = samples.len();
-        Self { samples, frames }
+        Self {
+            samples,
+            right: None,
+            frames,
+        }
     }
 }
 
@@ -300,10 +352,10 @@ impl ClipSource for SharedClip {
     }
 
     fn channel(&self, ch: usize) -> &[f32] {
-        if ch == 0 {
-            &self.samples[..self.frames]
-        } else {
-            &[]
+        match (ch, &self.right) {
+            (0, _) => &self.samples[..self.frames],
+            (1, Some(right)) => &right[..self.frames],
+            _ => &[],
         }
     }
 }
@@ -341,6 +393,8 @@ pub struct Track {
     right: f32,
     // SPEC-022: the insert chain, built once; processing never allocates.
     effects: Vec<audio_core::EffectProcessor>,
+    // SPEC-050 §5: the same chain for a stereo track's right channel.
+    effects_right: Vec<audio_core::EffectProcessor>,
     // SPEC-041: the chain's base parameters and a scratch copy that the
     // effect lanes write into, both sized at build time.
     kinds: Vec<audio_core::EffectKind>,
@@ -402,6 +456,7 @@ impl Track {
             left,
             right,
             effects: Vec::new(),
+            effects_right: Vec::new(),
             kinds: Vec::new(),
             scratch: Vec::new(),
             automation: audio_core::Automation::default(),
@@ -419,6 +474,12 @@ impl Track {
             .iter()
             .map(|effect| audio_core::EffectProcessor::new(effect, sample_rate))
             .collect();
+        if self.format == audio_core::TrackFormat::Stereo {
+            self.effects_right = effects
+                .iter()
+                .map(|effect| audio_core::EffectProcessor::new(effect, sample_rate))
+                .collect();
+        }
         self.kinds = effects.iter().map(|effect| effect.kind).collect();
         self.scratch.clone_from(&self.kinds);
         self
@@ -513,10 +574,13 @@ fn clip_sample(
     };
     // `source_length` is only a claim about the content: trust the slice,
     // not the model, so a mismatch is silence, not a panic.
-    source
-        .channel(0)
-        .get(source_index)
-        .map_or(0.0, |sample| sample * clip.gain)
+    let left = source.channel(0).get(source_index).copied().unwrap_or(0.0);
+    // A stereo source on a mono track plays as `(L + R) · 0.5` (SPEC-050 §5).
+    let sample = match source.channel(1).get(source_index) {
+        Some(right) => (left + right) * 0.5,
+        None => left,
+    };
+    sample * clip.gain
 }
 
 /// Reads channel `ch` of a clip at `position`; a missing channel returns
@@ -646,15 +710,49 @@ impl Track {
                 *slot = sum;
             }
         }
+        let stereo = stereo_track && right.is_some();
         if self.automation.effects.is_empty() {
             for effect in &mut self.effects {
                 effect.process(dst);
             }
+            if stereo && let Some(right) = right.as_deref_mut() {
+                for effect in &mut self.effects_right {
+                    effect.process(right);
+                }
+            }
         } else {
-            self.process_automated_effects(position, dst);
+            self.process_automated_effects(position, dst, false);
+            if stereo && let Some(right) = right.as_deref_mut() {
+                self.process_automated_effects(position, right, true);
+            }
         }
         if !(self.automation.gain.is_empty() && self.automation.pan.is_empty()) {
-            return self.apply_automation(position, dst, right);
+            return self.apply_automation(position, dst, right, stereo);
+        }
+        if stereo && let Some(right) = right {
+            // SPEC-050 §5: a stereo track's pan is a balance of its own
+            // two channels.
+            let peak = |data: &[f32]| {
+                data.iter()
+                    .map(|sample| sample.abs())
+                    .filter(|level| level.is_finite())
+                    .fold(0.0, f32::max)
+            };
+            let (peak_l, peak_r) = if self.meter.is_some() {
+                (peak(dst), peak(right))
+            } else {
+                (0.0, 0.0)
+            };
+            let gain_r = self.gain * self.right;
+            for out in right.iter_mut() {
+                *out *= gain_r;
+            }
+            let gain_l = self.gain * self.left;
+            for out in dst.iter_mut() {
+                *out *= gain_l;
+            }
+            let gain = self.gain.abs();
+            return (peak_l * gain * self.pan.0, peak_r * gain * self.pan.1);
         }
         let mono = if self.meter.is_some() {
             dst.iter()
@@ -681,7 +779,7 @@ impl Track {
     /// Runs the insert chain in steps of [`EFFECT_AUTOMATION_STEP`] frames,
     /// setting every automated parameter at the start of each step
     /// (SPEC-041); allocation-free.
-    fn process_automated_effects(&mut self, position: u64, dst: &mut [f32]) {
+    fn process_automated_effects(&mut self, position: u64, dst: &mut [f32], right: bool) {
         use audio_core::Automation;
         // Steps sit on a grid of absolute frames, so the sound does not
         // depend on the block size.
@@ -702,7 +800,12 @@ impl Track {
                 };
                 lane.param.set(kind, value);
             }
-            for (effect, kind) in self.effects.iter_mut().zip(&self.scratch) {
+            let chain = if right {
+                &mut self.effects_right
+            } else {
+                &mut self.effects
+            };
+            for (effect, kind) in chain.iter_mut().zip(&self.scratch) {
                 effect.update(kind);
                 effect.process(chunk);
             }
@@ -717,6 +820,7 @@ impl Track {
         position: u64,
         left: &mut [f32],
         mut right: Option<&mut [f32]>,
+        stereo: bool,
     ) -> (f32, f32) {
         use audio_core::Automation;
         let mut peaks = (0.0_f32, 0.0_f32);
@@ -731,13 +835,19 @@ impl Track {
                 None => ((self.left, self.right), self.pan),
             };
             let mono = *slot;
+            let mut level_r = (mono * gain).abs();
             if let Some(right) = right.as_deref_mut() {
-                right[index] = mono * (gain * r);
+                if stereo {
+                    level_r = (right[index] * gain).abs();
+                    right[index] *= gain * r;
+                } else {
+                    right[index] = mono * (gain * r);
+                }
             }
             *slot = mono * (gain * l);
             let level = (mono * gain).abs();
-            if level.is_finite() {
-                peaks = (peaks.0.max(level * pl), peaks.1.max(level * pr));
+            if level.is_finite() && level_r.is_finite() {
+                peaks = (peaks.0.max(level * pl), peaks.1.max(level_r * pr));
             }
         }
         peaks

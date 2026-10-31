@@ -575,11 +575,21 @@ pub fn load_session(
     load_session_cached(session, base, output, &mut NoCache)
 }
 
+/// Shared left and right samples of one stereo file.
+pub type StereoSamples = (std::sync::Arc<Vec<f32>>, std::sync::Arc<Vec<f32>>);
+
 /// Decoded material a caller already holds, so loading a session does not
 /// read files or render notes again (SPEC-035).
 pub trait ClipCache {
     /// Mono samples of file `source` at the session rate, if cached.
     fn audio(&mut self, source: &str) -> Option<std::sync::Arc<Vec<f32>>>;
+    /// Left and right samples of stereo file `source` at the session rate,
+    /// if cached (SPEC-050 §5). Asked first for every audio clip: a mono
+    /// track plays them as `(L + R) · 0.5`. A miss falls back to
+    /// [`ClipCache::audio`] and then to disk.
+    fn audio_stereo(&mut self, _source: &str) -> Option<StereoSamples> {
+        None
+    }
     /// Rendered `notes` of `frames` frames at `rate`, if cached.
     fn notes(
         &mut self,
@@ -667,6 +677,23 @@ pub fn load_session_cached(
                 clip: clip_index,
             })?;
             let file = base.join(source);
+            let stereo = track.format == audio_core::TrackFormat::Stereo;
+            if let Some((left, right)) = cache.audio_stereo(source) {
+                let file_frames = left.len().min(right.len()) as u64;
+                let shared = nodes::SharedClip::stereo(left, right, length).ok_or(
+                    LoadError::SourceTooShort {
+                        path: file,
+                        file_frames,
+                        source_length: length,
+                    },
+                )?;
+                clips.push(Box::new(shared));
+                continue;
+            }
+            if stereo && cache.audio(source).is_none() {
+                clips.push(Box::new(load_clip_stereo(&file, rate, length)?));
+                continue;
+            }
             if let Some(samples) = cache.audio(source) {
                 let file_frames = samples.len() as u64;
                 let shared =
@@ -695,6 +722,44 @@ pub fn load_session_cached(
     })
 }
 
+fn audio_file_error(path: &std::path::Path, e: audio_file::AudioFileError) -> LoadError {
+    let wav_error = |source| LoadError::Wav {
+        path: path.to_path_buf(),
+        source,
+    };
+    match e {
+        audio_file::AudioFileError::Wav(source) => wav_error(source),
+        audio_file::AudioFileError::Empty => wav_error(audio_core::WavError::Empty),
+        audio_file::AudioFileError::Mp3(message) => LoadError::Decode {
+            path: path.to_path_buf(),
+            message,
+        },
+    }
+}
+
+/// Reads `path` for a stereo track: a stereo file keeps its two channels,
+/// a mono one is played on both (SPEC-050 §5).
+fn load_clip_stereo(
+    path: &std::path::Path,
+    sample_rate: u32,
+    source_length: u64,
+) -> Result<nodes::SharedClip, LoadError> {
+    let channels =
+        audio_file::read_channels_at(path, sample_rate).map_err(|e| audio_file_error(path, e))?;
+    let file_frames = channels.frames() as u64;
+    let too_short = || LoadError::SourceTooShort {
+        path: path.to_path_buf(),
+        file_frames,
+        source_length,
+    };
+    let left = std::sync::Arc::new(channels.left);
+    match channels.right {
+        Some(right) => nodes::SharedClip::stereo(left, std::sync::Arc::new(right), source_length)
+            .ok_or_else(too_short),
+        None => nodes::SharedClip::new(left, source_length).ok_or_else(too_short),
+    }
+}
+
 /// Reads `path` as mono content of exactly `source_length` frames at
 /// `sample_rate`, converting the rate first when the file differs (SPEC-019).
 fn load_clip_file(
@@ -702,18 +767,8 @@ fn load_clip_file(
     sample_rate: u32,
     source_length: u64,
 ) -> Result<Vec<f32>, LoadError> {
-    let wav_error = |source| LoadError::Wav {
-        path: path.to_path_buf(),
-        source,
-    };
-    let mono = audio_file::read_mono_at(path, sample_rate).map_err(|e| match e {
-        audio_file::AudioFileError::Wav(source) => wav_error(source),
-        audio_file::AudioFileError::Empty => wav_error(audio_core::WavError::Empty),
-        audio_file::AudioFileError::Mp3(message) => LoadError::Decode {
-            path: path.to_path_buf(),
-            message,
-        },
-    })?;
+    let mono =
+        audio_file::read_mono_at(path, sample_rate).map_err(|e| audio_file_error(path, e))?;
     let file_frames = mono.len() as u64;
     if file_frames < source_length {
         return Err(LoadError::SourceTooShort {
