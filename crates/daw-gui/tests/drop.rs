@@ -164,3 +164,73 @@ fn a_broken_mp3_reports_an_error_and_changes_nothing() {
     assert!(!editor.is_dirty());
     assert!(!editor.can_undo());
 }
+
+#[test]
+fn peaks_fill_in_as_the_decoder_advances() {
+    let total = 4 * 256 + 100;
+    let mut peaks = daw_gui::Peaks::empty(total as u64);
+    let signal: Vec<f32> = (0..total).map(|i| (i % 7) as f32 / 10.0 - 0.3).collect();
+
+    // Half decoded: only blocks the data fully covers are produced.
+    let first = peaks.blocks_from(&signal[..600], RATE, RATE, 0);
+    assert_eq!(first.len(), 2);
+    peaks.set_blocks(0, &first);
+    assert_eq!(peaks.range(0, 512), Some((-0.3, 0.3)));
+
+    // The rest continues from the blocks already sent, including the tail.
+    let rest = peaks.blocks_from(&signal, RATE, RATE, first.len());
+    assert_eq!(rest.len(), 3);
+    peaks.set_blocks(first.len(), &rest);
+    let whole = daw_gui::Peaks::empty(total as u64);
+    let all = whole.blocks_from(&signal, RATE, RATE, 0);
+    assert_eq!([first, rest].concat(), all);
+}
+
+#[test]
+fn peak_blocks_follow_the_source_rate() {
+    let peaks = daw_gui::Peaks::empty(48_000);
+    let half_rate = vec![0.5f32; 12_000];
+    let blocks = peaks.blocks_from(&half_rate, 24_000, RATE, 0);
+    // 12 000 source frames cover 24 000 project frames.
+    assert_eq!(blocks.len(), 24_000 / 256);
+}
+
+#[test]
+fn a_cached_file_is_read_without_decoding_and_a_changed_one_is_not() {
+    let dir = Scratch::new("cache");
+    let wav = dir.join("a.wav");
+    write_wav(&wav, 1000);
+    let cache = daw_app::pcm_cache::PcmCache::new(dir.join("cache"));
+    let mut calls = 0;
+    let first =
+        daw_gui::read_source_cached(&wav, RATE, Some(&cache), &mut |_, _| calls += 1).unwrap();
+    assert_eq!(first.left.len(), 1000);
+    // Served from the cache: the progress callback is not called.
+    let before = calls;
+    let again =
+        daw_gui::read_source_cached(&wav, RATE, Some(&cache), &mut |_, _| calls += 1).unwrap();
+    assert_eq!(again.left, first.left);
+    assert_eq!(calls, before);
+
+    write_wav(&wav, 1500);
+    let changed = daw_gui::read_source_cached(&wav, RATE, Some(&cache), &mut |_, _| {}).unwrap();
+    assert_eq!(changed.left.len(), 1500);
+}
+
+#[test]
+fn drop_start_snaps_and_clamps() {
+    assert_eq!(daw_gui::drop_start(0.0, RATE, 100.0, 120.0, true), 0);
+    let free = daw_gui::drop_start(100.0, RATE, 100.0, 120.0, false);
+    assert_eq!(free, RATE as u64);
+    let snapped = daw_gui::drop_start(98.0, RATE, 100.0, 120.0, true);
+    assert_eq!(snapped % u64::from(RATE / 2), 0);
+}
+
+#[test]
+fn probe_len_comes_from_the_header_for_mp3_and_wav() {
+    let dir = Scratch::new("probe");
+    let wav = dir.join("p.wav");
+    write_wav(&wav, 2400);
+    assert_eq!(daw_gui::probe_len(&wav, RATE).unwrap(), 2400);
+    assert!(daw_gui::probe_len(&sine_mp3(), RATE).unwrap() >= 24_000);
+}

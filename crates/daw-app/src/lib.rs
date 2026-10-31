@@ -31,6 +31,7 @@ pub mod audio_file;
 pub mod audio_settings;
 pub mod meters;
 pub mod nodes;
+pub mod pcm_cache;
 pub mod piano;
 
 /// Errors from assembling a session graph (SPEC-010).
