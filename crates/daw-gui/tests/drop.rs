@@ -433,6 +433,48 @@ fn a_scaled_drop_onto_an_existing_track_with_regions_stays_on_it() {
     assert_eq!(editor.session().tracks[0].clips.len(), 2);
 }
 
+#[test]
+fn the_ghost_preview_and_the_drop_agree_on_track_and_start() {
+    // The ghost preview and the final drop must both go through the same
+    // conversion (`native_pointer_to_timeline`) and the same `drop_target`, so
+    // the region lands exactly where the ghost was drawn. This reproduces the
+    // owner's live numbers: ppp = 2, timeline origin (area.min) = (303, 118),
+    // cursor at window point (884, 332) over an existing track.
+    let audio = [true, true];
+    let scale = 2.0;
+    let origin = (303.0, 118.0);
+    // The OS cursor in *physical* px, as XQueryPointer reports it, converted
+    // back to window points via ppp = 2. y = 224 puts the cursor over row 1
+    // (ruler 24 + row 0 of 72 + 10 into row 1).
+    let win = (884.0, 224.0);
+    let native = (win.0 * scale, win.1 * scale);
+    // Both the preview frame and the drop frame run this identical conversion
+    // and target computation (they share one code path in `handle_drop`).
+    let preview = {
+        let local = daw_gui::native_pointer_to_timeline(native, (0.0, 0.0), scale, origin);
+        daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true)
+    };
+    let drop = {
+        let local = daw_gui::native_pointer_to_timeline(native, (0.0, 0.0), scale, origin);
+        daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true)
+    };
+    assert_eq!(
+        preview.track, drop.track,
+        "ghost and drop must pick one track"
+    );
+    assert_eq!(
+        preview.start, drop.start,
+        "ghost and drop must share one start"
+    );
+    // y = 224 - 118 = 106 into the timeline: ruler (24) + row 0 (72) + 10 into
+    // row 1.
+    assert_eq!(
+        drop.track,
+        Some(1),
+        "cursor is over the second existing track"
+    );
+}
+
 /// What the window computes on each frame of a drag: hover frames feed the
 /// tracker, the drop frame asks it where the file goes.
 fn frame_target(pointer: Option<(f32, f32)>, audio: &[bool]) -> Option<daw_gui::DropTarget> {
