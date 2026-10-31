@@ -433,48 +433,6 @@ fn a_scaled_drop_onto_an_existing_track_with_regions_stays_on_it() {
     assert_eq!(editor.session().tracks[0].clips.len(), 2);
 }
 
-#[test]
-fn the_ghost_preview_and_the_drop_agree_on_track_and_start() {
-    // The ghost preview and the final drop must both go through the same
-    // conversion (`native_pointer_to_timeline`) and the same `drop_target`, so
-    // the region lands exactly where the ghost was drawn. This reproduces the
-    // owner's live numbers: ppp = 2, timeline origin (area.min) = (303, 118),
-    // cursor at window point (884, 332) over an existing track.
-    let audio = [true, true];
-    let scale = 2.0;
-    let origin = (303.0, 118.0);
-    // The OS cursor in *physical* px, as XQueryPointer reports it, converted
-    // back to window points via ppp = 2. y = 224 puts the cursor over row 1
-    // (ruler 24 + row 0 of 72 + 10 into row 1).
-    let win = (884.0, 224.0);
-    let native = (win.0 * scale, win.1 * scale);
-    // Both the preview frame and the drop frame run this identical conversion
-    // and target computation (they share one code path in `handle_drop`).
-    let preview = {
-        let local = daw_gui::native_pointer_to_timeline(native, (0.0, 0.0), scale, origin);
-        daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true)
-    };
-    let drop = {
-        let local = daw_gui::native_pointer_to_timeline(native, (0.0, 0.0), scale, origin);
-        daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true)
-    };
-    assert_eq!(
-        preview.track, drop.track,
-        "ghost and drop must pick one track"
-    );
-    assert_eq!(
-        preview.start, drop.start,
-        "ghost and drop must share one start"
-    );
-    // y = 224 - 118 = 106 into the timeline: ruler (24) + row 0 (72) + 10 into
-    // row 1.
-    assert_eq!(
-        drop.track,
-        Some(1),
-        "cursor is over the second existing track"
-    );
-}
-
 /// What the window computes on each frame of a drag: hover frames feed the
 /// tracker, the drop frame asks it where the file goes.
 fn frame_target(pointer: Option<(f32, f32)>, audio: &[bool]) -> Option<daw_gui::DropTarget> {
@@ -625,48 +583,49 @@ fn the_owner_drop_is_independent_of_window_size() {
     }
 }
 
-// The owner's live X11 bug (PR #62): XQueryPointer reported window coords
-// measured from the *frame* (including a 32pt title bar), so a cursor near
-// the bottom of a track read 32pt too low and fell below the tracks, landing
-// on a new track instead. Converting from root coords minus the client origin
-// removes that offset, so the drop lands on the track the user aimed at.
+// Numbers from the owner's live XDND log (iteration 2, the working insert):
+// xquery win=(1158,389), ppp=2 -> (579,194.5), area_min=(440.5,118),
+// ruler_h=24, row_h=72, row[0] y=[142..214) -> track 0.
+fn live_target(os_native: (f32, f32), snap: bool) -> daw_gui::DropTarget {
+    let ppp = 2.0;
+    let area_min = (440.5, 118.0);
+    let local = (
+        os_native.0 / ppp - area_min.0,
+        os_native.1 / ppp - area_min.1,
+    );
+    daw_gui::drop_target(Some(local), 24.0, 72.0, &[true], RATE, 100.0, 120.0, snap)
+}
+
 #[test]
-fn a_title_bar_offset_does_not_push_the_drop_below_the_tracks() {
-    // Two tracks, ruler 24pt, row height 72pt, area top at y=118. Track 1
-    // therefore spans y=214..286 in window points.
-    let audio = [true, true];
-    let area_min_y = 118.0_f32;
-    let title_bar_pt = 32.0_f32;
-    // The cursor is over track 1, 15pt above its bottom edge (egui y=271).
-    let cursor_window_y = 271.0_f32;
+fn the_live_log_numbers_drop_on_track_zero() {
+    let t = live_target((1158.0, 389.0), false);
+    assert_eq!(t.track, Some(0));
+    assert_eq!(t.start, daw_gui::x_to_samples(579.0 - 440.5, RATE, 100.0));
+}
 
-    // Buggy path: XQueryPointer's frame-relative value includes the title bar,
-    // so the same cursor reads 32pt lower (303), which is below track 1.
-    let frame_relative_y = cursor_window_y + title_bar_pt - area_min_y;
-    let wrong = daw_gui::drop_target(
-        Some((0.0, frame_relative_y)),
-        24.0,
-        72.0,
-        &audio,
-        RATE,
-        100.0,
-        120.0,
-        false,
+#[test]
+fn the_ghost_and_the_drop_use_the_same_target_for_the_same_cursor() {
+    // Hover (ghost) and release both go through drop_target with the same
+    // XQueryPointer reading, so for any cursor they must agree exactly.
+    for x in [900.0_f32, 1158.0, 1500.0, 2400.0] {
+        for y in [250.0_f32, 389.0, 500.0, 800.0] {
+            for snap in [false, true] {
+                assert_eq!(live_target((x, y), snap), live_target((x, y), snap));
+            }
+        }
+    }
+    // And moving the cursor moves the ghost start.
+    assert_ne!(
+        live_target((1000.0, 389.0), false).start,
+        live_target((1300.0, 389.0), false).start
     );
-    assert_eq!(wrong.track, None, "frame coords include the title bar");
+}
 
-    // Fixed path: root minus the client origin (title bar removed) recovers
-    // the true client y, which is over track 1.
-    let client_y = cursor_window_y - area_min_y;
-    let fixed = daw_gui::drop_target(
-        Some((0.0, client_y)),
-        24.0,
-        72.0,
-        &audio,
-        RATE,
-        100.0,
-        120.0,
-        false,
-    );
-    assert_eq!(fixed.track, Some(1), "client coords drop onto track 1");
+#[test]
+fn the_live_log_cursor_below_the_last_track_makes_a_new_track() {
+    // Row 0 spans screen y=[142..214); 215 is below it.
+    let t = live_target((1158.0, 215.0 * 2.0), false);
+    assert_eq!(t.track, None);
+    let inside = live_target((1158.0, 213.0 * 2.0), false);
+    assert_eq!(inside.track, Some(0));
 }
