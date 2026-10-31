@@ -555,6 +555,7 @@ fn a_compressor_lowers_a_loud_signal() {
         attack_ms: 1.0,
         release_ms: 100.0,
         makeup_db: 0.0,
+        knee_db: 0.0,
     });
     let buf = render_mix(
         &mut scratch,

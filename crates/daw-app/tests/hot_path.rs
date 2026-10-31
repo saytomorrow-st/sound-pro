@@ -461,3 +461,51 @@ fn a_metered_session_and_its_engine_do_not_allocate() {
     assert_eq!(count, 0, "metered engine allocated {count} times");
     assert!(meters.take_master().0 > 0.0);
 }
+
+#[test]
+fn a_track_with_gate_compressor_knee_and_limiter_does_not_allocate() {
+    use audio_core::{Effect, EffectKind, EffectParam};
+    use daw_app::build_session_graph_metered;
+    use daw_app::meters::Meters;
+    let mut gate = EffectKind::gate();
+    assert!(EffectParam::GateThresholdDb.set(&mut gate, -50.0));
+    assert!(EffectParam::GateHoldMs.set(&mut gate, 10.0));
+    let mut compressor = EffectKind::compressor();
+    assert!(EffectParam::KneeDb.set(&mut compressor, 12.0));
+    assert!(EffectParam::ThresholdDb.set(&mut compressor, -20.0));
+    let mut limiter = EffectKind::limiter();
+    assert!(EffectParam::CeilingDb.set(&mut limiter, -2.0));
+    let mut track = overlapping_track();
+    track.effects = vec![
+        Effect::new(gate),
+        Effect::new(compressor),
+        Effect::new(limiter),
+    ];
+    let mut session = Session::new("s", RATE, 120.0);
+    session.tracks.push(track.clone());
+    let meters = Meters::new();
+    let job = SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: sources(),
+        }],
+        sample_rate: RATE,
+        block_frames: BLOCK,
+        frames: None,
+        output: std::path::PathBuf::new(),
+    };
+    let mut renderer = renderer_for(build_session_graph_metered(job, Some(&meters)).unwrap());
+    let mut mix = AudioBuffer::new(2, BLOCK);
+    renderer.render(BLOCK, &mut mix).unwrap();
+    assert!(mix.channel(0).iter().any(|&s| s != 0.0), "track sounds");
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(
+        count, 0,
+        "gate+compressor+limiter chain allocated {count} times"
+    );
+    assert!(
+        meters.take_reduction(0, 1) > 0.0 || meters.take_reduction(0, 2) > 0.0,
+        "GR was recorded"
+    );
+}

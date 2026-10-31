@@ -498,6 +498,8 @@ struct App {
     reveal_track: Option<usize>,
     /// Shown level of each track, by track index (SPEC-042).
     track_meters: Vec<MeterState>,
+    /// Shown gain reduction, dB, of every insert of every track (SPEC-052).
+    track_reduction: Vec<[f32; MAX_EFFECTS_PER_TRACK]>,
     /// Shown level of the master (SPEC-042).
     master_meter: MeterState,
     /// Horizontal scroll offset and width of the visible timeline.
@@ -618,6 +620,7 @@ impl App {
             zoom_anchor: None,
             reveal_track: None,
             track_meters: Vec::new(),
+            track_reduction: Vec::new(),
             master_meter: MeterState::default(),
             timeline_view: (0.0, 0.0),
             title: String::new(),
@@ -887,7 +890,19 @@ impl App {
             meter.update(meters.take_track(index), dt);
         }
         self.master_meter.update(meters.take_master(), dt);
-        let live = !self.master_meter.is_idle() || self.track_meters.iter().any(|m| !m.is_idle());
+        self.track_reduction
+            .resize(count, [0.0; MAX_EFFECTS_PER_TRACK]);
+        for (track, shown) in self.track_reduction.iter_mut().enumerate() {
+            for (slot, value) in shown.iter_mut().enumerate() {
+                *value = reduction_step(*value, meters.take_reduction(track, slot), dt);
+            }
+        }
+        let live = !self.master_meter.is_idle()
+            || self.track_meters.iter().any(|m| !m.is_idle())
+            || self
+                .track_reduction
+                .iter()
+                .any(|shown| shown.iter().any(|&value| value > 0.0));
         if live && self.player.is_none() {
             ctx.request_repaint();
         }
@@ -3522,6 +3537,28 @@ impl App {
     }
 }
 
+/// Fall speed of the shown gain reduction, dB per second (SPEC-052).
+const REDUCTION_FALL_DB_PER_S: f32 = 30.0;
+
+/// The next shown gain reduction: jumps up to a larger `fresh` value,
+/// otherwise falls towards it at [`REDUCTION_FALL_DB_PER_S`].
+fn reduction_step(shown: f32, fresh: f32, dt: f32) -> f32 {
+    if fresh >= shown {
+        fresh
+    } else {
+        (shown - REDUCTION_FALL_DB_PER_S * dt).max(fresh)
+    }
+}
+
+/// Text of the gain-reduction readout: «—» when nothing is reduced.
+fn reduction_text(db: f32) -> String {
+    if db < 0.05 {
+        "—".into()
+    } else {
+        format!("{db:.1} дБ")
+    }
+}
+
 /// Russian label of an effect type for the effects window.
 const fn effect_title(kind: &EffectKind) -> &'static str {
     match kind {
@@ -3529,6 +3566,8 @@ const fn effect_title(kind: &EffectKind) -> &'static str {
         EffectKind::Compressor { .. } => "Компрессор",
         EffectKind::Reverb { .. } => "Реверб",
         EffectKind::ChannelEq { .. } => "Канальный эквалайзер",
+        EffectKind::Gate { .. } => "Гейт",
+        EffectKind::Limiter { .. } => "Лимитер",
     }
 }
 
@@ -3575,12 +3614,34 @@ fn effect_sliders(ui: &mut egui::Ui, kind: &mut EffectKind) -> bool {
             attack_ms,
             release_ms,
             makeup_db,
+            knee_db,
         } => {
             slider(ui, threshold_db, -60.0..=0.0, "порог, дБ", false);
             slider(ui, ratio, 1.0..=20.0, "степень", true);
             slider(ui, attack_ms, 0.1..=100.0, "атака, мс", true);
             slider(ui, release_ms, 10.0..=1000.0, "спад, мс", true);
+            slider(ui, knee_db, 0.0..=24.0, "колено, дБ", false);
             slider(ui, makeup_db, 0.0..=24.0, "усиление, дБ", false);
+        }
+        EffectKind::Gate {
+            threshold_db,
+            range_db,
+            attack_ms,
+            hold_ms,
+            release_ms,
+        } => {
+            slider(ui, threshold_db, -80.0..=0.0, "порог, дБ", false);
+            slider(ui, range_db, 0.0..=80.0, "глубина, дБ", false);
+            slider(ui, attack_ms, 0.1..=100.0, "атака, мс", true);
+            slider(ui, hold_ms, 0.0..=500.0, "удержание, мс", false);
+            slider(ui, release_ms, 10.0..=1000.0, "спад, мс", true);
+        }
+        EffectKind::Limiter {
+            ceiling_db,
+            release_ms,
+        } => {
+            slider(ui, ceiling_db, -24.0..=0.0, "потолок, дБ", false);
+            slider(ui, release_ms, 10.0..=1000.0, "спад, мс", true);
         }
         EffectKind::Reverb { room, damp, mix } => {
             slider(ui, room, 0.0..=1.0, "комната", false);
@@ -3654,6 +3715,12 @@ impl App {
             if ui.button("+ Канальный эквалайзер").clicked() {
                 add = Some(EffectKind::channel_eq());
             }
+            if ui.button("+ Гейт").clicked() {
+                add = Some(EffectKind::gate());
+            }
+            if ui.button("+ Лимитер").clicked() {
+                add = Some(EffectKind::limiter());
+            }
             if let Some(kind) = add {
                 let added = match target {
                     FxTarget::Track(track) => self.editor.add_effect(track, kind),
@@ -3674,6 +3741,10 @@ impl App {
             ui.label("Эффектов нет. Звук идёт без обработки.");
         }
         let last = effects.len().saturating_sub(1);
+        let reduction = match target {
+            FxTarget::Track(track) => self.track_reduction.get(track).copied(),
+            FxTarget::Bus(_) => None,
+        };
         let mut action = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, effect) in effects.into_iter().enumerate() {
@@ -3706,6 +3777,19 @@ impl App {
                 ui.add_enabled_ui(!edited.bypass, |ui| {
                     changed |= effect_sliders(ui, &mut edited.kind);
                 });
+                if matches!(effect.kind, EffectKind::Compressor { .. })
+                    && let Some(shown) = reduction
+                {
+                    let db = shown.get(index).copied().unwrap_or(0.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Снижение усиления:");
+                        ui.add(
+                            egui::ProgressBar::new((db / 24.0).clamp(0.0, 1.0))
+                                .desired_width(120.0)
+                                .text(reduction_text(db)),
+                        );
+                    });
+                }
                 if changed {
                     action = Some(FxAction::Set(index, edited));
                 }
@@ -4196,6 +4280,14 @@ const fn param_label(param: EffectParam) -> &'static str {
         EffectParam::HighHz => "Верх. полка, Гц",
         EffectParam::HighShelfDb => "Верх. полка, дБ",
         EffectParam::LpHz => "ФНЧ, Гц",
+        EffectParam::KneeDb => "Колено",
+        EffectParam::GateThresholdDb => "Порог гейта",
+        EffectParam::GateRangeDb => "Глубина гейта",
+        EffectParam::GateAttackMs => "Атака гейта",
+        EffectParam::GateHoldMs => "Удержание гейта",
+        EffectParam::GateReleaseMs => "Восстановление гейта",
+        EffectParam::CeilingDb => "Потолок",
+        EffectParam::LimiterReleaseMs => "Восстановление лимитера",
     }
 }
 

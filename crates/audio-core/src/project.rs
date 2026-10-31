@@ -1053,42 +1053,7 @@ fn write_effects(out: &mut String, effects: &[Effect]) {
         out.push_str(", \"bypass\": ");
         out.push_str(if effect.bypass { "true" } else { "false" });
         if let EffectKind::ChannelEq { bands } = &effect.kind {
-            // Channel EQ (SPEC-051) also writes per-band enable flags.
-            const BAND_KEYS: [&str; 8] = ["hp", "low", "p1", "p2", "p3", "p4", "high", "lp"];
-            for (index, band) in bands.iter().enumerate() {
-                let mut key = String::from(BAND_KEYS[index]);
-                key.push_str("_on");
-                out.push_str(", ");
-                write_string(out, &key);
-                out.push_str(": ");
-                out.push_str(if band.enabled { "true" } else { "false" });
-            }
-            let fields: [(&str, f32); 18] = [
-                ("hp_hz", bands[0].hz),
-                ("low_hz", bands[1].hz),
-                ("low_shelf_db", bands[1].db),
-                ("p1_hz", bands[2].hz),
-                ("p1_db", bands[2].db),
-                ("p1_q", bands[2].q),
-                ("p2_hz", bands[3].hz),
-                ("p2_db", bands[3].db),
-                ("p2_q", bands[3].q),
-                ("p3_hz", bands[4].hz),
-                ("p3_db", bands[4].db),
-                ("p3_q", bands[4].q),
-                ("p4_hz", bands[5].hz),
-                ("p4_db", bands[5].db),
-                ("p4_q", bands[5].q),
-                ("high_hz", bands[6].hz),
-                ("high_shelf_db", bands[6].db),
-                ("lp_hz", bands[7].hz),
-            ];
-            for (key, value) in fields {
-                out.push_str(", ");
-                write_string(out, key);
-                out.push_str(": ");
-                out.push_str(&format_number(f64::from(value)));
-            }
+            write_channel_eq(out, bands);
             out.push('}');
             continue;
         }
@@ -1110,27 +1075,96 @@ fn write_effects(out: &mut String, effects: &[Effect]) {
                 attack_ms,
                 release_ms,
                 makeup_db,
-            } => &[
-                ("threshold_db", threshold_db),
-                ("ratio", ratio),
-                ("attack_ms", attack_ms),
-                ("release_ms", release_ms),
-                ("makeup_db", makeup_db),
-            ],
+                knee_db,
+            } => {
+                let mut pairs = vec![
+                    ("threshold_db", threshold_db),
+                    ("ratio", ratio),
+                    ("attack_ms", attack_ms),
+                    ("release_ms", release_ms),
+                    ("makeup_db", makeup_db),
+                ];
+                if knee_db != 0.0 {
+                    pairs.push(("knee_db", knee_db));
+                }
+                write_fields(out, &pairs);
+                out.push('}');
+                continue;
+            }
             EffectKind::Reverb { room, damp, mix } => {
                 &[("room", room), ("damp", damp), ("mix", mix)]
             }
+            EffectKind::Gate {
+                threshold_db,
+                range_db,
+                attack_ms,
+                hold_ms,
+                release_ms,
+            } => &[
+                ("gate_threshold_db", threshold_db),
+                ("gate_range_db", range_db),
+                ("gate_attack_ms", attack_ms),
+                ("gate_hold_ms", hold_ms),
+                ("gate_release_ms", release_ms),
+            ],
+            EffectKind::Limiter {
+                ceiling_db,
+                release_ms,
+            } => &[
+                ("ceiling_db", ceiling_db),
+                ("limiter_release_ms", release_ms),
+            ],
             EffectKind::ChannelEq { .. } => &[],
         };
-        for (key, value) in fields {
-            out.push_str(", ");
-            write_string(out, key);
-            out.push_str(": ");
-            out.push_str(&format_number(f64::from(*value)));
-        }
+        write_fields(out, fields);
         out.push('}');
     }
     out.push_str("\n        ]");
+}
+
+/// Appends a channel EQ's band flags and parameters (SPEC-051).
+fn write_channel_eq(out: &mut String, bands: &[ChannelEqBand; 8]) {
+    // Channel EQ (SPEC-051) also writes per-band enable flags.
+    const BAND_KEYS: [&str; 8] = ["hp", "low", "p1", "p2", "p3", "p4", "high", "lp"];
+    for (index, band) in bands.iter().enumerate() {
+        let mut key = String::from(BAND_KEYS[index]);
+        key.push_str("_on");
+        out.push_str(", ");
+        write_string(out, &key);
+        out.push_str(": ");
+        out.push_str(if band.enabled { "true" } else { "false" });
+    }
+    let fields: [(&str, f32); 18] = [
+        ("hp_hz", bands[0].hz),
+        ("low_hz", bands[1].hz),
+        ("low_shelf_db", bands[1].db),
+        ("p1_hz", bands[2].hz),
+        ("p1_db", bands[2].db),
+        ("p1_q", bands[2].q),
+        ("p2_hz", bands[3].hz),
+        ("p2_db", bands[3].db),
+        ("p2_q", bands[3].q),
+        ("p3_hz", bands[4].hz),
+        ("p3_db", bands[4].db),
+        ("p3_q", bands[4].q),
+        ("p4_hz", bands[5].hz),
+        ("p4_db", bands[5].db),
+        ("p4_q", bands[5].q),
+        ("high_hz", bands[6].hz),
+        ("high_shelf_db", bands[6].db),
+        ("lp_hz", bands[7].hz),
+    ];
+    write_fields(out, &fields);
+}
+
+/// Appends `, "key": value` for every pair.
+fn write_fields(out: &mut String, fields: &[(&str, f32)]) {
+    for (key, value) in fields {
+        out.push_str(", ");
+        write_string(out, key);
+        out.push_str(": ");
+        out.push_str(&format_number(f64::from(*value)));
+    }
 }
 
 fn effects_from_value(value: &Value) -> Result<Vec<Effect>, ProjectError> {
@@ -1172,11 +1206,20 @@ fn effect_from_value(value: &Value) -> Result<Effect, ProjectError> {
             "attack_ms",
             "release_ms",
             "makeup_db",
+            "knee_db",
         ],
         "reverb" => &["room", "damp", "mix"],
+        "gate" => &[
+            "gate_threshold_db",
+            "gate_range_db",
+            "gate_attack_ms",
+            "gate_hold_ms",
+            "gate_release_ms",
+        ],
+        "limiter" => &["ceiling_db", "limiter_release_ms"],
         _ => return Err(ProjectError::Malformed { at: 0 }),
     };
-    let mut values = [None; 5];
+    let mut values = [None; 6];
     for (key, value) in entries {
         if key == "type" || key == "bypass" {
             continue;
@@ -1204,6 +1247,19 @@ fn effect_from_value(value: &Value) -> Result<Effect, ProjectError> {
             attack_ms: get(2)?,
             release_ms: get(3)?,
             makeup_db: get(4)?,
+            // Optional so documents written before SPEC-052 keep loading.
+            knee_db: values[5].unwrap_or(0.0),
+        },
+        "gate" => EffectKind::Gate {
+            threshold_db: get(0)?,
+            range_db: get(1)?,
+            attack_ms: get(2)?,
+            hold_ms: get(3)?,
+            release_ms: get(4)?,
+        },
+        "limiter" => EffectKind::Limiter {
+            ceiling_db: get(0)?,
+            release_ms: get(1)?,
         },
         _ => EffectKind::Reverb {
             room: get(0)?,

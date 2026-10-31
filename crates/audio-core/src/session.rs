@@ -1544,6 +1544,7 @@ mod tests {
                 attack_ms: 10.0,
                 release_ms: 100.0,
                 makeup_db: 0.0,
+                knee_db: 0.0,
             }),
         ];
         assert_eq!(
