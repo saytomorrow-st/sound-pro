@@ -12,7 +12,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use crate::fx::{Effect, EffectKind, EffectParam, MAX_EFFECTS_PER_TRACK};
+use crate::fx::{ChannelEqBand, Effect, EffectKind, EffectParam, MAX_EFFECTS_PER_TRACK};
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
@@ -1052,6 +1052,46 @@ fn write_effects(out: &mut String, effects: &[Effect]) {
         write_string(out, effect.kind.type_name());
         out.push_str(", \"bypass\": ");
         out.push_str(if effect.bypass { "true" } else { "false" });
+        if let EffectKind::ChannelEq { bands } = &effect.kind {
+            // Channel EQ (SPEC-051) also writes per-band enable flags.
+            const BAND_KEYS: [&str; 8] = ["hp", "low", "p1", "p2", "p3", "p4", "high", "lp"];
+            for (index, band) in bands.iter().enumerate() {
+                let mut key = String::from(BAND_KEYS[index]);
+                key.push_str("_on");
+                out.push_str(", ");
+                write_string(out, &key);
+                out.push_str(": ");
+                out.push_str(if band.enabled { "true" } else { "false" });
+            }
+            let fields: [(&str, f32); 18] = [
+                ("hp_hz", bands[0].hz),
+                ("low_hz", bands[1].hz),
+                ("low_shelf_db", bands[1].db),
+                ("p1_hz", bands[2].hz),
+                ("p1_db", bands[2].db),
+                ("p1_q", bands[2].q),
+                ("p2_hz", bands[3].hz),
+                ("p2_db", bands[3].db),
+                ("p2_q", bands[3].q),
+                ("p3_hz", bands[4].hz),
+                ("p3_db", bands[4].db),
+                ("p3_q", bands[4].q),
+                ("p4_hz", bands[5].hz),
+                ("p4_db", bands[5].db),
+                ("p4_q", bands[5].q),
+                ("high_hz", bands[6].hz),
+                ("high_shelf_db", bands[6].db),
+                ("lp_hz", bands[7].hz),
+            ];
+            for (key, value) in fields {
+                out.push_str(", ");
+                write_string(out, key);
+                out.push_str(": ");
+                out.push_str(&format_number(f64::from(value)));
+            }
+            out.push('}');
+            continue;
+        }
         let fields: &[(&str, f32)] = match effect.kind {
             EffectKind::Eq {
                 low_db,
@@ -1080,6 +1120,7 @@ fn write_effects(out: &mut String, effects: &[Effect]) {
             EffectKind::Reverb { room, damp, mix } => {
                 &[("room", room), ("damp", damp), ("mix", mix)]
             }
+            EffectKind::ChannelEq { .. } => &[],
         };
         for (key, value) in fields {
             out.push_str(", ");
@@ -1120,6 +1161,9 @@ fn effect_from_value(value: &Value) -> Result<Effect, ProjectError> {
     let kind_name = kind_name.ok_or(ProjectError::MissingField {
         field: "session.tracks[].effects[].type",
     })?;
+    if kind_name == "channel_eq" {
+        return channel_eq_from_value(entries, bypass);
+    }
     let allowed: &[&str] = match kind_name.as_str() {
         "eq" => &["low_db", "mid_db", "mid_hz", "high_db"],
         "compressor" => &[
@@ -1178,6 +1222,95 @@ fn require_bool(value: &Value) -> Result<bool, ProjectError> {
         Value::Bool(flag) => Ok(*flag),
         _ => Err(ProjectError::Malformed { at: 0 }),
     }
+}
+
+/// Decodes one `"channel_eq"` effect: 8 enable flags plus 18 numbers
+/// (SPEC-051). Unknown, missing or mistyped fields are rejected.
+fn channel_eq_from_value(
+    entries: &[(String, Value)],
+    bypass: Option<bool>,
+) -> Result<Effect, ProjectError> {
+    const ON_KEYS: [&str; 8] = [
+        "hp_on", "low_on", "p1_on", "p2_on", "p3_on", "p4_on", "high_on", "lp_on",
+    ];
+    const NUMBER_KEYS: [&str; 18] = [
+        "hp_hz",
+        "low_hz",
+        "low_shelf_db",
+        "p1_hz",
+        "p1_db",
+        "p1_q",
+        "p2_hz",
+        "p2_db",
+        "p2_q",
+        "p3_hz",
+        "p3_db",
+        "p3_q",
+        "p4_hz",
+        "p4_db",
+        "p4_q",
+        "high_hz",
+        "high_shelf_db",
+        "lp_hz",
+    ];
+    // Per band: slots of hz, db and q in NUMBER_KEYS; `None` keeps the default.
+    const LAYOUT: [(usize, Option<usize>, Option<usize>); 8] = [
+        (0, None, None),
+        (1, Some(2), None),
+        (3, Some(4), Some(5)),
+        (6, Some(7), Some(8)),
+        (9, Some(10), Some(11)),
+        (12, Some(13), Some(14)),
+        (15, Some(16), None),
+        (17, None, None),
+    ];
+    let mut on = [None; 8];
+    let mut numbers = [None; 18];
+    for (key, value) in entries {
+        match key.as_str() {
+            "type" | "bypass" => {}
+            _ => {
+                if let Some(slot) = ON_KEYS.iter().position(|name| *name == key) {
+                    on[slot] = Some(require_bool(value)?);
+                } else if let Some(slot) = NUMBER_KEYS.iter().position(|name| *name == key) {
+                    numbers[slot] = Some(require_f32(value)?);
+                } else {
+                    return Err(ProjectError::UnknownField { field: key.clone() });
+                }
+            }
+        }
+    }
+    let need = |slot: usize| {
+        numbers[slot].ok_or(ProjectError::MissingField {
+            field: "session.tracks[].effects[] parameter",
+        })
+    };
+    let flag = |slot: usize| {
+        on[slot].ok_or(ProjectError::MissingField {
+            field: "session.tracks[].effects[] channel_eq band",
+        })
+    };
+    let mut bands = [ChannelEqBand {
+        enabled: false,
+        hz: 0.0,
+        db: 0.0,
+        q: 1.0,
+    }; 8];
+    for (index, (hz, db, q)) in LAYOUT.into_iter().enumerate() {
+        let band = &mut bands[index];
+        band.enabled = flag(index)?;
+        band.hz = need(hz)?;
+        if let Some(db) = db {
+            band.db = need(db)?;
+        }
+        if let Some(q) = q {
+            band.q = need(q)?;
+        }
+    }
+    Ok(Effect {
+        bypass: bypass.unwrap_or(false),
+        kind: EffectKind::ChannelEq { bands },
+    })
 }
 
 fn clip_from_value(value: &Value) -> Result<Clip, ProjectError> {

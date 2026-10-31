@@ -36,7 +36,9 @@ pub mod wav;
 
 pub use buffer::{AudioBuffer, Sample};
 pub use commands::{CommandConsumer, CommandQueue};
-pub use fx::{Effect, EffectKind, EffectParam, EffectProcessor, MAX_EFFECTS_PER_TRACK};
+pub use fx::{
+    ChannelEqBand, Effect, EffectKind, EffectParam, EffectProcessor, MAX_EFFECTS_PER_TRACK,
+};
 pub use graph::{Graph, GraphError, Node, NodeId, NodeProcessor};
 pub use midi::{MidiError, MidiEvent, MidiFile, MidiMessage, parse_smf};
 pub use offline::{OfflineError, OfflineRenderer};

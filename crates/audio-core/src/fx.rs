@@ -1,4 +1,5 @@
-//! Track effects (SPEC-022): three-band EQ, compressor and reverb.
+//! Track effects (SPEC-022, SPEC-051): three-band EQ, eight-band channel EQ,
+//! compressor and reverb.
 //!
 //! [`Effect`] is the plain, serialisable description stored in a session;
 //! [`EffectProcessor`] is its stateful runtime. All memory is allocated in
@@ -12,6 +13,20 @@ pub const MAX_EFFECTS_PER_TRACK: usize = 8;
 pub const EQ_LOW_HZ: f32 = 200.0;
 /// Corner frequency of the EQ high shelf, in hertz.
 pub const EQ_HIGH_HZ: f32 = 5000.0;
+
+/// One band of the eight-band channel EQ (SPEC-051). The band index fixes
+/// the shape: 0 high-pass, 1 low shelf, 2–5 peak, 6 high shelf, 7 low-pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelEqBand {
+    /// Whether the band is applied at all.
+    pub enabled: bool,
+    /// Corner or centre frequency, Hz, `20..=20000`.
+    pub hz: f32,
+    /// Gain, dB, `-24..=24`; ignored by the filter bands 0 and 7.
+    pub db: f32,
+    /// Quality factor, `0.1..=18`; ignored by every band except peaks 2–5.
+    pub q: f32,
+}
 
 /// Parameters of one effect type.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,6 +65,12 @@ pub enum EffectKind {
         /// Wet share, `0..=1`; the dry share is `1 - mix`.
         mix: f32,
     },
+    /// Eight-band channel EQ (SPEC-051): high-pass, low shelf, four peaks,
+    /// high shelf and low-pass, in that order.
+    ChannelEq {
+        /// The eight bands; the index determines the shape.
+        bands: [ChannelEqBand; 8],
+    },
 }
 
 impl EffectKind {
@@ -86,13 +107,72 @@ impl EffectKind {
         }
     }
 
-    /// Type tag used in project files: `"eq"`, `"compressor"` or `"reverb"`.
+    /// Flat channel EQ (SPEC-051): filters disabled, every gain at 0 dB, so
+    /// the effect passes audio through bit-exactly.
+    #[must_use]
+    pub const fn channel_eq() -> Self {
+        Self::ChannelEq {
+            bands: [
+                ChannelEqBand {
+                    enabled: false,
+                    hz: 20.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+                ChannelEqBand {
+                    enabled: true,
+                    hz: 100.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+                ChannelEqBand {
+                    enabled: true,
+                    hz: 300.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+                ChannelEqBand {
+                    enabled: true,
+                    hz: 1000.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+                ChannelEqBand {
+                    enabled: true,
+                    hz: 3000.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+                ChannelEqBand {
+                    enabled: true,
+                    hz: 8000.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+                ChannelEqBand {
+                    enabled: true,
+                    hz: 10_000.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+                ChannelEqBand {
+                    enabled: false,
+                    hz: 20_000.0,
+                    db: 0.0,
+                    q: 1.0,
+                },
+            ],
+        }
+    }
+
+    /// Type tag used in project files, e.g. `"eq"` or `"channel_eq"`.
     #[must_use]
     pub const fn type_name(&self) -> &'static str {
         match self {
             Self::Eq { .. } => "eq",
             Self::Compressor { .. } => "compressor",
             Self::Reverb { .. } => "reverb",
+            Self::ChannelEq { .. } => "channel_eq",
         }
     }
 
@@ -129,6 +209,11 @@ impl EffectKind {
             Self::Reverb { room, damp, mix } => {
                 within(room, 0.0, 1.0) && within(damp, 0.0, 1.0) && within(mix, 0.0, 1.0)
             }
+            Self::ChannelEq { bands } => bands.iter().all(|band| {
+                within(band.hz, 20.0, 20_000.0)
+                    && within(band.db, -24.0, 24.0)
+                    && within(band.q, 0.1, 18.0)
+            }),
         }
     }
 }
@@ -161,11 +246,48 @@ pub enum EffectParam {
     Damp,
     /// Reverb wet share.
     Mix,
+    /// Channel EQ high-pass corner, Hz (SPEC-051).
+    HpHz,
+    /// Channel EQ low shelf corner, Hz.
+    LowHz,
+    /// Channel EQ low shelf gain, dB.
+    LowShelfDb,
+    /// Channel EQ peak 1 centre, Hz.
+    P1Hz,
+    /// Channel EQ peak 1 gain, dB.
+    P1Db,
+    /// Channel EQ peak 1 Q.
+    P1Q,
+    /// Channel EQ peak 2 centre, Hz.
+    P2Hz,
+    /// Channel EQ peak 2 gain, dB.
+    P2Db,
+    /// Channel EQ peak 2 Q.
+    P2Q,
+    /// Channel EQ peak 3 centre, Hz.
+    P3Hz,
+    /// Channel EQ peak 3 gain, dB.
+    P3Db,
+    /// Channel EQ peak 3 Q.
+    P3Q,
+    /// Channel EQ peak 4 centre, Hz.
+    P4Hz,
+    /// Channel EQ peak 4 gain, dB.
+    P4Db,
+    /// Channel EQ peak 4 Q.
+    P4Q,
+    /// Channel EQ high shelf corner, Hz.
+    HighHz,
+    /// Channel EQ high shelf gain, dB.
+    HighShelfDb,
+    /// Channel EQ low-pass corner, Hz.
+    LpHz,
 }
 
 impl EffectParam {
-    /// Every parameter, EQ first, then compressor, then reverb.
-    pub const ALL: [Self; 12] = [
+    /// Every parameter, EQ first, then compressor, then reverb, then
+    /// channel EQ (SPEC-051).
+    pub const ALL: [Self; 30] = [
         Self::LowDb,
         Self::MidDb,
         Self::MidHz,
@@ -178,6 +300,24 @@ impl EffectParam {
         Self::Room,
         Self::Damp,
         Self::Mix,
+        Self::HpHz,
+        Self::LowHz,
+        Self::LowShelfDb,
+        Self::P1Hz,
+        Self::P1Db,
+        Self::P1Q,
+        Self::P2Hz,
+        Self::P2Db,
+        Self::P2Q,
+        Self::P3Hz,
+        Self::P3Db,
+        Self::P3Q,
+        Self::P4Hz,
+        Self::P4Db,
+        Self::P4Q,
+        Self::HighHz,
+        Self::HighShelfDb,
+        Self::LpHz,
     ];
 
     /// Key used in project files, e.g. `"mix"`.
@@ -196,6 +336,24 @@ impl EffectParam {
             Self::Room => "room",
             Self::Damp => "damp",
             Self::Mix => "mix",
+            Self::HpHz => "hp_hz",
+            Self::LowHz => "low_hz",
+            Self::LowShelfDb => "low_shelf_db",
+            Self::P1Hz => "p1_hz",
+            Self::P1Db => "p1_db",
+            Self::P1Q => "p1_q",
+            Self::P2Hz => "p2_hz",
+            Self::P2Db => "p2_db",
+            Self::P2Q => "p2_q",
+            Self::P3Hz => "p3_hz",
+            Self::P3Db => "p3_db",
+            Self::P3Q => "p3_q",
+            Self::P4Hz => "p4_hz",
+            Self::P4Db => "p4_db",
+            Self::P4Q => "p4_q",
+            Self::HighHz => "high_hz",
+            Self::HighShelfDb => "high_shelf_db",
+            Self::LpHz => "lp_hz",
         }
     }
 
@@ -209,7 +367,15 @@ impl EffectParam {
     #[must_use]
     pub const fn range(self) -> (f32, f32) {
         match self {
-            Self::LowDb | Self::MidDb | Self::HighDb => (-24.0, 24.0),
+            Self::LowDb
+            | Self::MidDb
+            | Self::HighDb
+            | Self::LowShelfDb
+            | Self::HighShelfDb
+            | Self::P1Db
+            | Self::P2Db
+            | Self::P3Db
+            | Self::P4Db => (-24.0, 24.0),
             Self::MidHz => (100.0, 10_000.0),
             Self::ThresholdDb => (-60.0, 0.0),
             Self::Ratio => (1.0, 20.0),
@@ -217,6 +383,15 @@ impl EffectParam {
             Self::ReleaseMs => (10.0, 1000.0),
             Self::MakeupDb => (0.0, 24.0),
             Self::Room | Self::Damp | Self::Mix => (0.0, 1.0),
+            Self::HpHz
+            | Self::LowHz
+            | Self::HighHz
+            | Self::LpHz
+            | Self::P1Hz
+            | Self::P2Hz
+            | Self::P3Hz
+            | Self::P4Hz => (20.0, 20_000.0),
+            Self::P1Q | Self::P2Q | Self::P3Q | Self::P4Q => (0.1, 18.0),
         }
     }
 
@@ -227,6 +402,7 @@ impl EffectParam {
             EffectKind::Eq { .. } => &Self::ALL[0..4],
             EffectKind::Compressor { .. } => &Self::ALL[4..9],
             EffectKind::Reverb { .. } => &Self::ALL[9..12],
+            EffectKind::ChannelEq { .. } => &Self::ALL[12..30],
         }
     }
 
@@ -262,9 +438,50 @@ impl EffectParam {
             (Self::Room, EffectKind::Reverb { room, .. }) => Some(room),
             (Self::Damp, EffectKind::Reverb { damp, .. }) => Some(damp),
             (Self::Mix, EffectKind::Reverb { mix, .. }) => Some(mix),
+            (param, EffectKind::ChannelEq { bands }) => {
+                let (index, field) = param.channel_eq_band()?;
+                let band = &mut bands[index];
+                Some(match field {
+                    BandField::Hz => &mut band.hz,
+                    BandField::Db => &mut band.db,
+                    BandField::Q => &mut band.q,
+                })
+            }
             _ => None,
         }
     }
+
+    /// Band index and field of a channel EQ parameter (SPEC-051).
+    const fn channel_eq_band(self) -> Option<(usize, BandField)> {
+        Some(match self {
+            Self::HpHz => (0, BandField::Hz),
+            Self::LowHz => (1, BandField::Hz),
+            Self::LowShelfDb => (1, BandField::Db),
+            Self::P1Hz => (2, BandField::Hz),
+            Self::P1Db => (2, BandField::Db),
+            Self::P1Q => (2, BandField::Q),
+            Self::P2Hz => (3, BandField::Hz),
+            Self::P2Db => (3, BandField::Db),
+            Self::P2Q => (3, BandField::Q),
+            Self::P3Hz => (4, BandField::Hz),
+            Self::P3Db => (4, BandField::Db),
+            Self::P3Q => (4, BandField::Q),
+            Self::P4Hz => (5, BandField::Hz),
+            Self::P4Db => (5, BandField::Db),
+            Self::P4Q => (5, BandField::Q),
+            Self::HighHz => (6, BandField::Hz),
+            Self::HighShelfDb => (6, BandField::Db),
+            Self::LpHz => (7, BandField::Hz),
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BandField {
+    Hz,
+    Db,
+    Q,
 }
 
 /// One slot in a track's effect chain.
@@ -318,6 +535,10 @@ enum Shape {
     LowShelf,
     Peak,
     HighShelf,
+    /// Butterworth high-pass, 12 dB/octave, Q = 1/√2.
+    HighPass,
+    /// Butterworth low-pass, 12 dB/octave, Q = 1/√2.
+    LowPass,
 }
 
 impl Biquad {
@@ -325,15 +546,18 @@ impl Biquad {
     /// biquad filter coefficients":
     ///
     /// `A = 10^(dB/40)`, `w0 = 2π·f0/Fs`.
-    /// Peak (Q = 1): `α = sin w0 / 2`,
+    /// Peak (Q = q): `α = sin w0 / (2q)`,
     /// `b = [1 + αA, −2cos w0, 1 − αA]`, `a = [1 + α/A, −2cos w0, 1 − α/A]`.
     /// Shelves (S = 1): `α = sin w0 / 2 · √2`, `k = 2√A·α`,
     /// low: `b = [A((A+1) − (A−1)c + k), 2A((A−1) − (A+1)c), A((A+1) − (A−1)c − k)]`,
     /// `a = [(A+1) + (A−1)c + k, −2((A−1) + (A+1)c), (A+1) + (A−1)c − k]`;
     /// high: the same with every `(A−1)` replaced by `−(A−1)`.
+    /// HP/LP (Butterworth, Q = 1/√2): `α = sin w0 / √2`,
+    /// HP: `b = [(1+c)/2, −(1+c), (1+c)/2]`, `a = [1+α, −2c, 1−α]`;
+    /// LP: `b = [(1−c)/2, 1−c, (1−c)/2]`, `a = [1+α, −2c, 1−α]`.
     ///
     /// `f0` is clamped below Nyquist so low sample rates stay stable.
-    fn design(shape: Shape, f0: f32, db: f32, sample_rate: u32) -> Self {
+    fn design(shape: Shape, f0: f32, db: f32, q: f32, sample_rate: u32) -> Self {
         let rate = f64::from(sample_rate);
         let f0 = f64::from(f0).min(rate * 0.45);
         let a = 10.0_f64.powf(f64::from(db) / 40.0);
@@ -341,7 +565,7 @@ impl Biquad {
         let (sin, cos) = w0.sin_cos();
         let (b0, b1, b2, a0, a1, a2) = match shape {
             Shape::Peak => {
-                let alpha = sin / 2.0;
+                let alpha = sin / (2.0 * f64::from(q));
                 (
                     1.0 + alpha * a,
                     -2.0 * cos,
@@ -369,6 +593,28 @@ impl Biquad {
                     (a + 1.0) + am1 * cos - k,
                 )
             }
+            Shape::HighPass => {
+                let alpha = sin / std::f64::consts::SQRT_2;
+                (
+                    f64::midpoint(1.0, cos),
+                    -(1.0 + cos),
+                    f64::midpoint(1.0, cos),
+                    1.0 + alpha,
+                    -2.0 * cos,
+                    1.0 - alpha,
+                )
+            }
+            Shape::LowPass => {
+                let alpha = sin / std::f64::consts::SQRT_2;
+                (
+                    (1.0 - cos) / 2.0,
+                    1.0 - cos,
+                    (1.0 - cos) / 2.0,
+                    1.0 + alpha,
+                    -2.0 * cos,
+                    1.0 - alpha,
+                )
+            }
         };
         Self {
             b0: b0 / a0,
@@ -382,8 +628,8 @@ impl Biquad {
     }
 
     /// New coefficients, same `z1`/`z2` state.
-    fn retune(&mut self, shape: Shape, f0: f32, db: f32, sample_rate: u32) {
-        let fresh = Self::design(shape, f0, db, sample_rate);
+    fn retune(&mut self, shape: Shape, f0: f32, db: f32, q: f32, sample_rate: u32) {
+        let fresh = Self::design(shape, f0, db, q, sample_rate);
         *self = Self {
             z1: self.z1,
             z2: self.z2,
@@ -609,21 +855,98 @@ struct Eq {
     active: [bool; 3],
 }
 
+/// The eight channel-EQ bands in processing order (SPEC-051).
+#[derive(Debug, Clone, Copy)]
+struct ChannelEqState {
+    bands: [Biquad; 8],
+    /// Inactive bands are skipped so a flat EQ stays bit-exact.
+    active: [bool; 8],
+}
+
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "states live inline in a preallocated processor; boxing would allocate on update"
+)]
 enum State {
     Bypass,
     Eq(Eq),
+    ChannelEq(ChannelEqState),
     Compressor(Compressor),
     Reverb(Reverb),
 }
 
-/// `(shape, frequency, gain)` of each EQ band.
-const fn eq_bands(low_db: f32, mid_db: f32, mid_hz: f32, high_db: f32) -> [(Shape, f32, f32); 3] {
+/// `(shape, frequency, gain, q)` of each EQ band.
+const fn eq_bands(
+    low_db: f32,
+    mid_db: f32,
+    mid_hz: f32,
+    high_db: f32,
+) -> [(Shape, f32, f32, f32); 3] {
     [
-        (Shape::LowShelf, EQ_LOW_HZ, low_db),
-        (Shape::Peak, mid_hz, mid_db),
-        (Shape::HighShelf, EQ_HIGH_HZ, high_db),
+        (Shape::LowShelf, EQ_LOW_HZ, low_db, 1.0),
+        (Shape::Peak, mid_hz, mid_db, 1.0),
+        (Shape::HighShelf, EQ_HIGH_HZ, high_db, 1.0),
     ]
+}
+
+/// Shape of each channel-EQ band by index (SPEC-051).
+const CHANNEL_EQ_SHAPES: [Shape; 8] = [
+    Shape::HighPass,
+    Shape::LowShelf,
+    Shape::Peak,
+    Shape::Peak,
+    Shape::Peak,
+    Shape::Peak,
+    Shape::HighShelf,
+    Shape::LowPass,
+];
+
+/// Whether a channel-EQ band is active given its parameters and shape index.
+const fn channel_eq_band_active(index: usize, band: &ChannelEqBand) -> bool {
+    if !band.enabled {
+        return false;
+    }
+    // Filter bands (0, 7) are active when enabled; gain bands need db != 0.
+    matches!(index, 0 | 7) || band.db != 0.0
+}
+
+/// Builds the initial channel-EQ state from band parameters.
+fn channel_eq_state(bands: &[ChannelEqBand; 8], sample_rate: u32) -> ChannelEqState {
+    let mut biquads = [Biquad::design(Shape::Peak, 1000.0, 0.0, 1.0, sample_rate); 8];
+    let mut active = [false; 8];
+    for i in 0..8 {
+        let shape = CHANNEL_EQ_SHAPES[i];
+        let q = if matches!(shape, Shape::Peak) {
+            bands[i].q
+        } else {
+            1.0
+        };
+        biquads[i] = Biquad::design(shape, bands[i].hz, bands[i].db, q, sample_rate);
+        active[i] = channel_eq_band_active(i, &bands[i]);
+    }
+    ChannelEqState {
+        bands: biquads,
+        active,
+    }
+}
+
+/// Retunes channel-EQ bands in place, preserving filter state.
+fn update_channel_eq(state: &mut ChannelEqState, bands: &[ChannelEqBand; 8], rate: u32) {
+    for i in 0..8 {
+        let shape = CHANNEL_EQ_SHAPES[i];
+        let q = if matches!(shape, Shape::Peak) {
+            bands[i].q
+        } else {
+            1.0
+        };
+        state.bands[i].retune(shape, bands[i].hz, bands[i].db, q, rate);
+        if !state.active[i] {
+            state.bands[i].z1 = 0.0;
+            state.bands[i].z2 = 0.0;
+        }
+        state.active[i] = channel_eq_band_active(i, &bands[i]);
+    }
 }
 
 impl EffectProcessor {
@@ -645,10 +968,14 @@ impl EffectProcessor {
                 } => {
                     let bands = eq_bands(low_db, mid_db, mid_hz, high_db);
                     State::Eq(Eq {
-                        bands: bands
-                            .map(|(shape, hz, db)| Biquad::design(shape, hz, db, sample_rate)),
-                        active: bands.map(|(_, _, db)| db != 0.0),
+                        bands: bands.map(|(shape, hz, db, q)| {
+                            Biquad::design(shape, hz, db, q, sample_rate)
+                        }),
+                        active: bands.map(|(_, _, db, _)| db != 0.0),
                     })
+                }
+                EffectKind::ChannelEq { bands } => {
+                    State::ChannelEq(channel_eq_state(&bands, sample_rate))
                 }
                 EffectKind::Compressor {
                     threshold_db,
@@ -688,10 +1015,10 @@ impl EffectProcessor {
                 },
             ) => {
                 let bands = eq_bands(low_db, mid_db, mid_hz, high_db);
-                for ((band, active), (shape, hz, db)) in
+                for ((band, active), (shape, hz, db, q)) in
                     eq.bands.iter_mut().zip(&mut eq.active).zip(bands)
                 {
-                    band.retune(shape, hz, db, rate);
+                    band.retune(shape, hz, db, q, rate);
                     if !*active {
                         // A skipped band starts clean, not from stale state.
                         band.z1 = 0.0;
@@ -699,6 +1026,9 @@ impl EffectProcessor {
                     }
                     *active = db != 0.0;
                 }
+            }
+            (State::ChannelEq(state), EffectKind::ChannelEq { bands }) => {
+                update_channel_eq(state, &bands, rate);
             }
             (
                 State::Compressor(compressor),
@@ -728,6 +1058,13 @@ impl EffectProcessor {
             State::Bypass => {}
             State::Eq(eq) => {
                 for (band, active) in eq.bands.iter_mut().zip(eq.active) {
+                    if active {
+                        band.process(samples);
+                    }
+                }
+            }
+            State::ChannelEq(state) => {
+                for (band, active) in state.bands.iter_mut().zip(state.active) {
                     if active {
                         band.process(samples);
                     }
@@ -1074,5 +1411,259 @@ mod tests {
         let mut out = input.clone();
         processor.process(&mut out);
         assert_eq!(out, input);
+    }
+
+    // --- SPEC-051: channel EQ -------------------------------------------
+
+    fn channel(edit: impl FnOnce(&mut [ChannelEqBand; 8])) -> EffectKind {
+        let mut kind = EffectKind::channel_eq();
+        if let EffectKind::ChannelEq { bands } = &mut kind {
+            edit(bands);
+        }
+        kind
+    }
+
+    /// Steady-state gain of `kind` on a sine at `hz`, ignoring the onset.
+    fn gain_at(kind: EffectKind, hz: f32) -> f32 {
+        let input = sine(hz, 0.25, 24_000);
+        let out = run(kind, &input);
+        peak(&out[12_000..]) / peak(&input[12_000..])
+    }
+
+    fn db(ratio: f32) -> f32 {
+        20.0 * ratio.log10()
+    }
+
+    #[test]
+    fn channel_eq_default_is_valid_and_bit_exact() {
+        let kind = EffectKind::channel_eq();
+        assert!(kind.is_valid());
+        let input = sine(440.0, 0.5, 4096);
+        assert_eq!(run(kind, &input), input);
+        let silence = vec![0.0; 1024];
+        assert_eq!(run(kind, &silence), silence);
+    }
+
+    #[test]
+    fn channel_eq_with_every_band_off_or_flat_is_bit_exact() {
+        let input = sine(1000.0, 0.5, 2048);
+        let off = channel(|bands| bands.iter_mut().for_each(|b| b.enabled = false));
+        assert_eq!(run(off, &input), input);
+        let flat_but_tweaked = channel(|bands| {
+            for band in &mut bands[1..7] {
+                band.hz = 2500.0;
+                band.q = 8.0;
+            }
+        });
+        assert_eq!(run(flat_but_tweaked, &input), input);
+    }
+
+    #[test]
+    fn a_bypassed_channel_eq_is_bit_exact() {
+        let kind = channel(|bands| {
+            bands[0].enabled = true;
+            bands[3].db = 12.0;
+        });
+        let mut processor = EffectProcessor::new(&Effect { bypass: true, kind }, RATE);
+        let input = sine(1000.0, 0.5, 1024);
+        let mut out = input.clone();
+        processor.process(&mut out);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn channel_eq_peaks_boost_and_cut_their_centre() {
+        for (index, hz) in [(2, 300.0), (3, 1000.0), (4, 3000.0), (5, 8000.0)] {
+            let boost = channel(|bands| bands[index].db = 12.0);
+            let at = db(gain_at(boost, hz));
+            assert!((at - 12.0).abs() < 0.5, "band {index} boost {at} dB");
+            let cut = channel(|bands| bands[index].db = -12.0);
+            let at = db(gain_at(cut, hz));
+            assert!((at + 12.0).abs() < 0.5, "band {index} cut {at} dB");
+        }
+    }
+
+    #[test]
+    fn a_narrow_peak_leaves_distant_frequencies_alone() {
+        let kind = channel(|bands| {
+            bands[3].db = 12.0;
+            bands[3].q = 10.0;
+        });
+        assert!(db(gain_at(kind, 1000.0)) > 11.5);
+        assert!(db(gain_at(kind, 100.0)).abs() < 0.5);
+        assert!(db(gain_at(kind, 10_000.0)).abs() < 0.5);
+    }
+
+    #[test]
+    fn channel_eq_shelves_lift_their_side_only() {
+        let low = channel(|bands| bands[1].db = 9.0);
+        assert!((db(gain_at(low, 30.0)) - 9.0).abs() < 0.5);
+        assert!(db(gain_at(low, 5000.0)).abs() < 0.5);
+        let high = channel(|bands| bands[6].db = -9.0);
+        assert!((db(gain_at(high, 20_000.0)) + 9.0).abs() < 1.0);
+        assert!(db(gain_at(high, 200.0)).abs() < 0.5);
+    }
+
+    #[test]
+    fn channel_eq_high_and_low_pass_attenuate_their_side() {
+        let hp = channel(|bands| {
+            bands[0].enabled = true;
+            bands[0].hz = 1000.0;
+        });
+        assert!(db(gain_at(hp, 100.0)) < -35.0, "HP lets lows through");
+        assert!(db(gain_at(hp, 10_000.0)).abs() < 0.5);
+        assert!(
+            (db(gain_at(hp, 1000.0)) + 3.0).abs() < 0.5,
+            "Butterworth corner"
+        );
+        let lp = channel(|bands| {
+            bands[7].enabled = true;
+            bands[7].hz = 1000.0;
+        });
+        assert!(db(gain_at(lp, 10_000.0)) < -35.0, "LP lets highs through");
+        assert!(db(gain_at(lp, 100.0)).abs() < 0.5);
+    }
+
+    #[test]
+    fn filter_bands_ignore_db_and_q() {
+        let plain = channel(|bands| {
+            bands[0].enabled = true;
+            bands[0].hz = 500.0;
+        });
+        let noisy = channel(|bands| {
+            bands[0].enabled = true;
+            bands[0].hz = 500.0;
+            bands[0].db = 18.0;
+            bands[0].q = 12.0;
+        });
+        let input = sine(300.0, 0.5, 2048);
+        assert_eq!(run(plain, &input), run(noisy, &input));
+    }
+
+    #[test]
+    fn channel_eq_stays_stable_at_a_low_sample_rate() {
+        let kind = channel(|bands| {
+            for band in bands.iter_mut() {
+                band.enabled = true;
+                band.hz = 20_000.0;
+                band.db = 24.0;
+                band.q = 18.0;
+            }
+        });
+        let mut processor = EffectProcessor::new(&Effect::new(kind), 8000);
+        let mut block = sine(440.0, 0.5, 16_000);
+        for chunk in block.chunks_mut(128) {
+            processor.process(chunk);
+        }
+        assert!(block.iter().all(|s| s.is_finite() && s.abs() < 100.0));
+    }
+
+    #[test]
+    fn channel_eq_validation_rejects_bad_values_and_accepts_bounds() {
+        for (field, value, ok) in [
+            (0, 20.0, true),
+            (0, 20_000.0, true),
+            (0, 19.9, false),
+            (0, f32::NAN, false),
+            (1, 24.0, true),
+            (1, -24.0, true),
+            (1, 24.1, false),
+            (1, f32::INFINITY, false),
+            (2, 0.1, true),
+            (2, 18.0, true),
+            (2, 0.09, false),
+            (2, f32::NAN, false),
+        ] {
+            let kind = channel(|bands| match field {
+                0 => bands[4].hz = value,
+                1 => bands[4].db = value,
+                _ => bands[4].q = value,
+            });
+            assert_eq!(kind.is_valid(), ok, "field {field} = {value}");
+        }
+    }
+
+    #[test]
+    fn channel_eq_params_round_trip_and_ranges_match_validation() {
+        assert_eq!(EffectParam::ALL.len(), 30);
+        let kind = EffectKind::channel_eq();
+        let params = EffectParam::of(&kind);
+        assert_eq!(params.len(), 18);
+        for &param in params {
+            assert_eq!(EffectParam::from_name(param.name()), Some(param));
+            assert!(param.get(&kind).is_some(), "{param:?}");
+            let (low, high) = param.range();
+            for (value, ok) in [(low, true), (high, true), (high + 1.0, false)] {
+                let mut changed = kind;
+                assert!(param.set(&mut changed, value));
+                assert_eq!(param.get(&changed), Some(value));
+                assert_eq!(changed.is_valid(), ok, "{param:?} = {value}");
+            }
+        }
+        assert!(!EffectParam::LowDb.set(&mut EffectKind::channel_eq(), 1.0));
+        assert!(!EffectParam::P1Db.set(&mut EffectKind::eq(), 1.0));
+        let mut kind = EffectKind::channel_eq();
+        assert!(EffectParam::P2Q.set(&mut kind, 4.0));
+        let EffectKind::ChannelEq { bands } = kind else {
+            unreachable!()
+        };
+        assert!((bands[3].q - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn channel_eq_update_matches_a_fresh_processor_on_silence_history() {
+        let to = channel(|bands| {
+            bands[0].enabled = true;
+            bands[0].hz = 80.0;
+            bands[2].db = 6.0;
+            bands[6].db = -4.0;
+        });
+        let mut updated = EffectProcessor::new(&Effect::new(EffectKind::channel_eq()), RATE);
+        updated.update(&to);
+        let input = sine(440.0, 0.5, 2048);
+        let mut a = input.clone();
+        for chunk in a.chunks_mut(128) {
+            updated.process(chunk);
+        }
+        assert_eq!(a, run(to, &input));
+    }
+
+    #[test]
+    fn channel_eq_update_keeps_state_and_returns_to_bit_exact() {
+        let boosted = channel(|bands| bands[3].db = 12.0);
+        let input = sine(1000.0, 0.5, 2048);
+        let mut processor = EffectProcessor::new(&Effect::new(boosted), RATE);
+        let mut warm = input.clone();
+        processor.process(&mut warm[..1024]);
+        // Retuning keeps the filter history: the result differs from a cold
+        // processor with the new settings.
+        let retuned = channel(|bands| bands[3].db = 6.0);
+        processor.update(&retuned);
+        let mut continued = input[1024..1152].to_vec();
+        processor.process(&mut continued);
+        let mut cold = EffectProcessor::new(&Effect::new(retuned), RATE);
+        let mut fresh = input[1024..1152].to_vec();
+        cold.process(&mut fresh);
+        assert_ne!(continued, fresh, "update must keep the biquad state");
+        processor.update(&EffectKind::channel_eq());
+        let mut out = input.clone();
+        processor.process(&mut out);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn channel_eq_update_ignores_another_type() {
+        let mut processor = EffectProcessor::new(&Effect::new(EffectKind::channel_eq()), RATE);
+        processor.update(&EffectKind::eq());
+        processor.update(&channel(|bands| bands[3].db = 12.0));
+        let input = sine(1000.0, 0.5, 512);
+        let mut out = input.clone();
+        processor.process(&mut out);
+        assert_ne!(out, input, "same-type update applies");
+        let mut other = EffectProcessor::new(&Effect::new(EffectKind::eq()), RATE);
+        other.update(&channel(|bands| bands[3].db = 12.0));
+        let mut out = input.clone();
+        other.process(&mut out);
+        assert_eq!(out, input, "another type is ignored");
     }
 }

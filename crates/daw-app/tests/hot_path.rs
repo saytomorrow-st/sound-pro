@@ -290,6 +290,45 @@ fn a_track_with_an_effect_chain_does_not_allocate() {
 }
 
 #[test]
+fn a_track_with_a_channel_eq_does_not_allocate() {
+    use audio_core::{Effect, EffectKind, EffectParam};
+    let mut eq = EffectKind::channel_eq();
+    for (param, value) in [
+        (EffectParam::LowShelfDb, 4.0),
+        (EffectParam::P2Db, -6.0),
+        (EffectParam::P2Q, 4.0),
+        (EffectParam::HighShelfDb, 3.0),
+    ] {
+        assert!(param.set(&mut eq, value));
+    }
+    if let EffectKind::ChannelEq { bands } = &mut eq {
+        bands[0].enabled = true;
+        bands[7].enabled = true;
+    }
+    let mut track = overlapping_track();
+    track.effects = vec![Effect::new(eq), Effect::new(EffectKind::reverb())];
+    let mut session = Session::new("s", RATE, 120.0);
+    session.tracks.push(track.clone());
+    let job = SessionJob {
+        session,
+        tracks: vec![TrackSource {
+            track,
+            clips: sources(),
+        }],
+        sample_rate: RATE,
+        block_frames: BLOCK,
+        frames: None,
+        output: std::path::PathBuf::new(),
+    };
+    let mut renderer = renderer_for(build_session_graph(job).unwrap());
+    let mut mix = AudioBuffer::new(2, BLOCK);
+    renderer.render(BLOCK, &mut mix).unwrap();
+    assert!(mix.channel(0).iter().any(|&s| s != 0.0), "track sounds");
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(count, 0, "channel EQ chain allocated {count} times");
+}
+
+#[test]
 fn a_track_with_automation_does_not_allocate() {
     use audio_core::AutoPoint;
     let mut track = overlapping_track();
