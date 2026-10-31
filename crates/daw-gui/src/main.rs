@@ -1980,6 +1980,46 @@ impl App {
                 );
             }
         }
+        // Comprehensive DROP-DEBUG: layout + per-row hit-test (temporary).
+        {
+            let clip = ui.clip_rect();
+            let scroll_off = Vec2::new(clip.min.x - area.min.x, clip.min.y - area.min.y);
+            eprintln!(
+                "DROP-DEBUG layout: area=[({:.1},{:.1})..({:.1},{:.1})] clip=[({:.1},{:.1})..({:.1},{:.1})] \
+                 scroll_offset=({:.1},{:.1}) ruler_h={} row_h={} tracks={} audio_rows={:?}",
+                area.min.x,
+                area.min.y,
+                area.max.x,
+                area.max.y,
+                clip.min.x,
+                clip.min.y,
+                clip.max.x,
+                clip.max.y,
+                scroll_off.x,
+                scroll_off.y,
+                RULER_HEIGHT,
+                TRACK_HEIGHT,
+                tracks,
+                audio_rows,
+            );
+            let p = effective_pointer;
+            eprintln!("DROP-DEBUG pointer: effective={:?}", p);
+            for (r, &is_audio) in audio_rows.iter().enumerate() {
+                let top = area.min.y + RULER_HEIGHT + r as f32 * TRACK_HEIGHT;
+                let bottom = top + TRACK_HEIGHT;
+                let hit = p.is_some_and(|p| p.y >= top && p.y < bottom);
+                eprintln!(
+                    "DROP-DEBUG row[{r}]: y=[{top:.1}..{bottom:.1}) kind={} pointer_inside={hit}",
+                    if is_audio { "audio" } else { "instrument" },
+                );
+            }
+            let below_top = area.min.y + RULER_HEIGHT + tracks as f32 * TRACK_HEIGHT;
+            let below = p.is_some_and(|p| p.y >= below_top && p.y < area.max.y);
+            eprintln!(
+                "DROP-DEBUG below-last: y=[{below_top:.1}..{:.1}) pointer_inside={below}",
+                area.max.y
+            );
+        }
         let target = match effective_pointer {
             Some(p) if os_points.is_some() => {
                 // Live OS cursor wins over the stale hover preview.

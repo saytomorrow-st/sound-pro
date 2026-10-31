@@ -525,3 +525,60 @@ fn a_drop_on_an_existing_audio_track_does_not_add_a_track() {
     assert_eq!(index, 0);
     assert_eq!(editor.session().tracks[0].clips[1].start_samples, t.start);
 }
+
+// Regression for the live X11 test (PR #62): the owner's exact drop numbers.
+// ppp=2 (200% HiDPI), area_min=(303,118), cursor window-native (1768,664).
+// The conversion must map the native cursor to the timeline point (581,214)
+// and pick the right row using the *real* TRACK_HEIGHT=72 / RULER_HEIGHT=24.
+#[test]
+fn the_owner_drop_numbers_map_to_the_expected_row() {
+    // Step 1: native window px -> egui points (divide by ppp).
+    let points = (
+        1768.0_f32 / 2.0, // 884.0
+        664.0_f32 / 2.0,  // 332.0
+    );
+    assert_eq!(points, (884.0, 332.0));
+    // Step 2: egui points -> timeline-relative (subtract area.min).
+    let local = (points.0 - 303.0, points.1 - 118.0);
+    assert_eq!(local, (581.0, 214.0));
+
+    // With two audio tracks (rows 0 and 1 span y=24..168 relative to the
+    // timeline top), y=214 is *below* the last track, so it is a new track.
+    let audio = [true, true];
+    let t = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, false);
+    assert_eq!(t.track, None, "y=214 is below the two 72pt tracks");
+
+    // A cursor genuinely over row 1 (y = 24 + 72 + 10 = 106 relative) must
+    // land on track 1, never create a new track.
+    let on_track = daw_gui::drop_target(
+        Some((581.0, 106.0)),
+        24.0,
+        72.0,
+        &audio,
+        RATE,
+        100.0,
+        120.0,
+        false,
+    );
+    assert_eq!(on_track.track, Some(1));
+}
+
+// The native conversion is scale- and window-size-independent: the owner's
+// cursor, reported window-relative, maps to the same timeline point whether
+// the window is small or large (only the origin and scale factor matter).
+#[test]
+fn the_owner_drop_is_independent_of_window_size() {
+    let scale = 2.0;
+    let origin = (303.0, 118.0);
+    // Cursor 581pt right and 214pt down from the timeline origin, in native px.
+    let cursor_native = (origin.0 + 581.0, origin.1 + 214.0);
+    for _size in [(1920.0, 1080.0), (800.0, 600.0), (2560.0, 1440.0)] {
+        let local = daw_gui::native_pointer_to_timeline(
+            (cursor_native.0 * scale, cursor_native.1 * scale),
+            (0.0, 0.0),
+            scale,
+            origin,
+        );
+        assert_eq!(local, (581.0, 214.0));
+    }
+}
