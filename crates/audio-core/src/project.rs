@@ -18,7 +18,7 @@ use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
     AutoPoint, Automation, Bus, BusSend, Clip, EffectLane, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
     MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker,
-    Note, Session, SessionError, Track, TrackKind,
+    Note, Session, SessionError, Track, TrackFormat, TrackKind,
 };
 use crate::transport::TimeSignature;
 
@@ -442,6 +442,9 @@ fn write_session(out: &mut String, session: &Session) {
         if track.kind == TrackKind::Instrument {
             out.push_str(",\n        \"kind\": \"instrument\"");
         }
+        if track.format == TrackFormat::Stereo {
+            out.push_str(",\n        \"format\": \"stereo\"");
+        }
         out.push_str(",\n        \"gain\": ");
         out.push_str(&format_number(f64::from(track.gain)));
         out.push_str(",\n        \"pan\": ");
@@ -778,9 +781,11 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut color = None;
     let mut notes = None;
     let mut kind = None;
+    let mut format = None;
     for (key, value) in entries {
         match key.as_str() {
             "kind" => kind = Some(kind_from_value(value)?),
+            "format" => format = Some(format_from_value(value)?),
             "notes" => notes = Some(require_string(value)?),
             "color" => color = Some(require_u8(value)?),
             "sends" => sends = Some(sends_from_value(value)?),
@@ -829,6 +834,7 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
             field: "session.tracks[].name",
         })?,
         kind,
+        format: format.unwrap_or_default(),
         gain: gain.ok_or(ProjectError::MissingField {
             field: "session.tracks[].gain",
         })?,
@@ -1595,6 +1601,15 @@ fn kind_from_value(value: &Value) -> Result<TrackKind, ProjectError> {
     match require_string(value)?.as_str() {
         "audio" => Ok(TrackKind::Audio),
         "instrument" => Ok(TrackKind::Instrument),
+        _ => Err(ProjectError::Malformed { at: 0 }),
+    }
+}
+
+/// `"mono"` or `"stereo"` (SPEC-050 §5).
+fn format_from_value(value: &Value) -> Result<TrackFormat, ProjectError> {
+    match require_string(value)?.as_str() {
+        "mono" => Ok(TrackFormat::Mono),
+        "stereo" => Ok(TrackFormat::Stereo),
         _ => Err(ProjectError::Malformed { at: 0 }),
     }
 }

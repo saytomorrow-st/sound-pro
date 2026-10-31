@@ -333,6 +333,8 @@ pub struct Track {
     // let the node and the model drift apart silently (SPEC-011 §2).
     clips: Vec<audio_core::session::Clip>,
     sources: Vec<Box<dyn ClipSource + Send>>,
+    /// Stereo or mono audio (SPEC-050 §5).
+    format: audio_core::TrackFormat,
     gain: f32,
     mute: bool,
     left: f32,
@@ -394,6 +396,7 @@ impl Track {
         Ok(Self {
             clips: track.clips.clone(),
             sources,
+            format: track.format,
             gain: track.gain,
             mute: track.mute,
             left,
@@ -516,6 +519,32 @@ fn clip_sample(
         .map_or(0.0, |sample| sample * clip.gain)
 }
 
+/// Reads channel `ch` of a clip at `position`; a missing channel returns
+/// the mono channel (duplicating mono into stereo, SPEC-050 §5).
+fn clip_sample_channel(
+    clip: &audio_core::session::Clip,
+    source: &(dyn ClipSource + Send),
+    position: u64,
+    ch: usize,
+) -> f32 {
+    if clip.gain == 0.0 {
+        return 0.0;
+    }
+    let Ok(source_index) = usize::try_from(clip.source_index(position)) else {
+        return 0.0;
+    };
+    let data = source.channel(ch);
+    if data.is_empty() {
+        // Mono source on a stereo track: duplicate channel 0.
+        return source
+            .channel(0)
+            .get(source_index)
+            .map_or(0.0, |sample| sample * clip.gain);
+    }
+    data.get(source_index)
+        .map_or(0.0, |sample| sample * clip.gain)
+}
+
 impl Track {
     /// Renders one quantum into `left` (and `right` when stereo); both slices
     /// hold exactly the quantum. Allocation-free.
@@ -540,41 +569,82 @@ impl Track {
         &mut self,
         position: u64,
         dst: &mut [f32],
-        right: Option<&mut [f32]>,
+        mut right: Option<&mut [f32]>,
     ) -> (f32, f32) {
         let frames = dst.len();
+        let stereo_track = self.format == audio_core::TrackFormat::Stereo;
         // SPEC-044 §2: where clips overlap the later-starting one crossfades
         // over the earlier one (`Clip::layer_weight`, SPEC-045 §2: explicit
         // fades replace the automatic ramp, never multiply); the result does not
         // depend on the list order. Covering clips are walked from the one
         // above all others down; what a clip leaves uncovered shows the
         // clips below, so a fade over another clip still reveals it.
-        for (index, slot) in dst.iter_mut().enumerate() {
-            let position = position.saturating_add(index as u64);
-            let mut current = self.next_below(position, None);
-            let mut above: Option<usize> = None;
-            let mut sum = 0.0_f32;
-            let mut remaining = 1.0_f32;
-            while let Some(at) = current {
-                let clip = &self.clips[at];
-                let below = self.next_below(position, Some(at));
-                let weight = clip.layer_weight(
-                    above.map(|a| &self.clips[a]),
-                    below.map(|b| &self.clips[b]),
-                    position,
-                );
-                if weight > 0.0 {
-                    sum +=
-                        remaining * weight * clip_sample(clip, self.sources[at].as_ref(), position);
+        if stereo_track {
+            // Stereo: render left into `dst`, right into `right`.
+            let mut right_slice = right.as_deref_mut();
+            for index in 0..frames {
+                let position = position.saturating_add(index as u64);
+                let mut current = self.next_below(position, None);
+                let mut above: Option<usize> = None;
+                let (mut sum_l, mut sum_r) = (0.0_f32, 0.0_f32);
+                let mut remaining = 1.0_f32;
+                while let Some(at) = current {
+                    let clip = &self.clips[at];
+                    let below = self.next_below(position, Some(at));
+                    let weight = clip.layer_weight(
+                        above.map(|a| &self.clips[a]),
+                        below.map(|b| &self.clips[b]),
+                        position,
+                    );
+                    if weight > 0.0 {
+                        sum_l += remaining
+                            * weight
+                            * clip_sample_channel(clip, self.sources[at].as_ref(), position, 0);
+                        sum_r += remaining
+                            * weight
+                            * clip_sample_channel(clip, self.sources[at].as_ref(), position, 1);
+                    }
+                    remaining *= 1.0 - weight;
+                    if remaining <= 0.0 {
+                        break;
+                    }
+                    above = Some(at);
+                    current = below;
                 }
-                remaining *= 1.0 - weight;
-                if remaining <= 0.0 {
-                    break;
+                dst[index] = sum_l;
+                if let Some(r) = right_slice.as_deref_mut() {
+                    r[index] = sum_r;
                 }
-                above = Some(at);
-                current = below;
             }
-            *slot = sum;
+        } else {
+            for (index, slot) in dst.iter_mut().enumerate() {
+                let position = position.saturating_add(index as u64);
+                let mut current = self.next_below(position, None);
+                let mut above: Option<usize> = None;
+                let mut sum = 0.0_f32;
+                let mut remaining = 1.0_f32;
+                while let Some(at) = current {
+                    let clip = &self.clips[at];
+                    let below = self.next_below(position, Some(at));
+                    let weight = clip.layer_weight(
+                        above.map(|a| &self.clips[a]),
+                        below.map(|b| &self.clips[b]),
+                        position,
+                    );
+                    if weight > 0.0 {
+                        sum += remaining
+                            * weight
+                            * clip_sample(clip, self.sources[at].as_ref(), position);
+                    }
+                    remaining *= 1.0 - weight;
+                    if remaining <= 0.0 {
+                        break;
+                    }
+                    above = Some(at);
+                    current = below;
+                }
+                *slot = sum;
+            }
         }
         if self.automation.effects.is_empty() {
             for effect in &mut self.effects {

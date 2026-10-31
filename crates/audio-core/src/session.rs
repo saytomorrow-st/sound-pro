@@ -764,6 +764,16 @@ pub enum TrackKind {
     Instrument,
 }
 
+/// Channel format of an audio track (SPEC-050 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackFormat {
+    /// Single channel; stereo sources are mixed down.
+    #[default]
+    Mono,
+    /// Two channels; mono sources are duplicated into both.
+    Stereo,
+}
+
 impl TrackKind {
     /// Whether a clip of this kind of content belongs on such a track.
     #[must_use]
@@ -782,6 +792,8 @@ pub struct Track {
     pub name: String,
     /// Audio or software instrument (SPEC-049).
     pub kind: TrackKind,
+    /// Mono or stereo audio (SPEC-050 §5).
+    pub format: TrackFormat,
     /// Linear track gain, `0.0..=1.0`.
     pub gain: f32,
     /// Balance pan, `-1.0` (left) ..= `1.0` (right); `0.0` is centre.
@@ -858,6 +870,7 @@ impl Track {
         Self {
             name: name.to_owned(),
             kind: TrackKind::Audio,
+            format: TrackFormat::Mono,
             gain: 1.0,
             pan: 0.0,
             mute: false,
@@ -869,6 +882,15 @@ impl Track {
             sends: Vec::new(),
             color: None,
             notes: String::new(),
+        }
+    }
+
+    /// Empty stereo audio track (SPEC-050 §5).
+    #[must_use]
+    pub fn stereo(name: &str) -> Self {
+        Self {
+            format: TrackFormat::Stereo,
+            ..Self::new(name)
         }
     }
 
