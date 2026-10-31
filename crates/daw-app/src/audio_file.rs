@@ -209,6 +209,65 @@ pub fn resample_parallel(
     Ok(parts.concat())
 }
 
+/// Length of `path` at `rate` in frames, read from the header without
+/// decoding the audio (SPEC-050 §2). MP3 files without a frame count in the
+/// header are measured by walking their packets, still without decoding.
+///
+/// # Errors
+///
+/// See [`AudioFileError`]; a file with no audio is [`AudioFileError::Empty`].
+pub fn probe_len_at(path: &Path, rate: u32) -> Result<u64, AudioFileError> {
+    let (frames, from) = if extension(path).as_deref() == Some("mp3") {
+        probe_mp3(path)?
+    } else {
+        let reader = hound::WavReader::open(path).map_err(audio_core::WavError::from)?;
+        (u64::from(reader.duration()), reader.spec().sample_rate)
+    };
+    if frames == 0 || from == 0 || rate == 0 {
+        return Err(AudioFileError::Empty);
+    }
+    Ok((u128::from(frames) * u128::from(rate)).div_ceil(u128::from(from)) as u64)
+}
+
+fn probe_mp3(path: &Path) -> Result<(u64, u32), AudioFileError> {
+    let mp3 = |e: &dyn std::fmt::Display| AudioFileError::Mp3(e.to_string());
+    let file = std::fs::File::open(path).map_err(|e| mp3(&e))?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let mut format = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| mp3(&e))?
+        .format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| AudioFileError::Mp3("no audio track".into()))?;
+    let rate = track.codec_params.sample_rate.unwrap_or(0);
+    if let Some(frames) = track.codec_params.n_frames {
+        return Ok((frames, rate));
+    }
+    let id = track.id;
+    let mut frames = 0u64;
+    loop {
+        match format.next_packet() {
+            Ok(packet) if packet.track_id() == id => frames += packet.dur,
+            Ok(_) => {}
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(e) => return Err(mp3(&e)),
+        }
+    }
+    Ok((frames, rate))
+}
+
 fn read_mp3(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
     let file = std::fs::File::open(path).map_err(|e| AudioFileError::Mp3(e.to_string()))?;
     decode_mp3(Box::new(file))

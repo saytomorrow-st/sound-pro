@@ -73,3 +73,38 @@ fn the_parallel_resampler_matches_the_plain_one_bit_for_bit() {
     }
     assert!(daw_app::audio_file::resample_parallel(&input, 0, 48_000).is_err());
 }
+
+#[test]
+fn the_header_gives_the_length_without_decoding() {
+    for rate in [48_000, 24_000] {
+        let probed = daw_app::audio_file::probe_len_at(&sine_mp3(), rate).unwrap();
+        let decoded = read_mono_at(&sine_mp3(), rate).unwrap().len() as u64;
+        assert!(
+            probed.abs_diff(decoded) <= u64::from(rate) / 100,
+            "{rate}: probed {probed}, decoded {decoded}"
+        );
+    }
+    let wav = std::env::temp_dir().join(format!("daw-probe-{}.wav", std::process::id()));
+    audio_core::wav::write_mono_slice(&wav, 44_100, &vec![0.25; 44_100]).unwrap();
+    assert_eq!(
+        daw_app::audio_file::probe_len_at(&wav, 44_100).unwrap(),
+        44_100
+    );
+    assert_eq!(
+        daw_app::audio_file::probe_len_at(&wav, 48_000).unwrap(),
+        audio_core::resampled_len(44_100, 44_100, 48_000).unwrap() as u64
+    );
+    let _ = std::fs::remove_file(&wav);
+}
+
+#[test]
+fn a_broken_file_has_no_probed_length() {
+    let path = std::env::temp_dir().join(format!("daw-probe-broken-{}.mp3", std::process::id()));
+    std::fs::write(&path, b"this is not an mp3 file at all").unwrap();
+    assert!(daw_app::audio_file::probe_len_at(&path, 48_000).is_err());
+    let wav = path.with_extension("wav");
+    std::fs::write(&wav, b"RIFF nonsense").unwrap();
+    assert!(daw_app::audio_file::probe_len_at(&wav, 48_000).is_err());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wav);
+}
