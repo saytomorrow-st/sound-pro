@@ -167,6 +167,18 @@ pub struct Peaks {
 }
 
 impl Peaks {
+    /// Zero placeholder peaks for `frames` so a clip is visible before
+    /// decoded data arrives.
+    #[must_use]
+    pub fn empty(frames: u64) -> Self {
+        let blocks = frames.div_ceil(PEAK_BLOCK as u64) as usize;
+        Self {
+            min: vec![0.0; blocks],
+            max: vec![0.0; blocks],
+            frames,
+        }
+    }
+
     /// Summarises `samples`; a shorter tail forms the last block.
     #[must_use]
     pub fn from_samples(samples: &[f32]) -> Self {
@@ -180,6 +192,46 @@ impl Peaks {
             min,
             max,
             frames: samples.len() as u64,
+        }
+    }
+
+    /// Peaks of blocks `first..` of this track's frames from `mono`, the
+    /// start of a signal at `from_rate`, mapped onto this track's rate.
+    /// Only blocks `mono` fully covers are returned, as `(min, max)` pairs;
+    /// call again with the returned count as `first` while decoding.
+    #[must_use]
+    pub fn blocks_from(
+        &self,
+        mono: &[f32],
+        from_rate: u32,
+        to_rate: u32,
+        first: usize,
+    ) -> Vec<(f32, f32)> {
+        let (from_rate, to_rate) = (u128::from(from_rate), u128::from(to_rate.max(1)));
+        let source_at = |frame: u64| (u128::from(frame) * from_rate / to_rate) as usize;
+        let mut out = Vec::new();
+        for block in first..self.min.len() {
+            let start = source_at(block as u64 * PEAK_BLOCK as u64);
+            let end = source_at(((block as u64 + 1) * PEAK_BLOCK as u64).min(self.frames));
+            if end > mono.len() || start >= end {
+                break;
+            }
+            let chunk = &mono[start..end];
+            out.push((
+                chunk.iter().copied().fold(f32::INFINITY, f32::min),
+                chunk.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            ));
+        }
+        out
+    }
+
+    /// Stores `blocks` from block `first` on; extra blocks are ignored.
+    pub fn set_blocks(&mut self, first: usize, blocks: &[(f32, f32)]) {
+        for (i, &(lo, hi)) in blocks.iter().enumerate() {
+            if let (Some(l), Some(h)) = (self.min.get_mut(first + i), self.max.get_mut(first + i)) {
+                *l = lo;
+                *h = hi;
+            }
         }
     }
 
@@ -227,6 +279,8 @@ pub struct Editor {
     stereo: HashMap<String, daw_app::StereoSamples>,
     /// Waveforms of the left and right channels of stereo files.
     stereo_waves: HashMap<String, (Peaks, Peaks)>,
+    /// On-disk decoded file cache.
+    pcm_cache: Option<daw_app::pcm_cache::PcmCache>,
     /// Rendered MIDI clips of the last playback or export (SPEC-035).
     rendered: Mutex<RenderedNotes>,
     undo: Vec<Session>,
@@ -284,6 +338,7 @@ impl Editor {
             sounds: HashMap::new(),
             stereo: HashMap::new(),
             stereo_waves: HashMap::new(),
+            pcm_cache: daw_app::pcm_cache::PcmCache::default_location(),
             rendered: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -368,6 +423,7 @@ impl Editor {
             sounds,
             stereo,
             stereo_waves,
+            pcm_cache: self.pcm_cache.clone(),
             rendered: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -439,6 +495,12 @@ impl Editor {
                 left: mono.to_vec(),
                 right: None,
             })
+    }
+
+    /// The on-disk cache of decoded files, if the platform has one.
+    #[must_use]
+    pub fn pcm_cache(&self) -> Option<daw_app::pcm_cache::PcmCache> {
+        self.pcm_cache.clone()
     }
 
     /// [`Editor::import_audio_at`] for a file already decoded with
@@ -3110,6 +3172,31 @@ pub fn read_samples(path: &Path, rate: u32) -> Result<Vec<f32>, EditorError> {
 /// As [`read_samples`].
 pub fn read_source(path: &Path, rate: u32) -> Result<daw_app::audio_file::Channels, EditorError> {
     daw_app::audio_file::read_channels_at(path, rate).map_err(|e| file_error(path, e))
+}
+
+/// [`read_source`] for import: looks in `cache` first (path, mtime, size and
+/// rate must match), uses the fast resampler, calls `progress` with the
+/// source rate and the channels decoded so far, and stores the result.
+///
+/// # Errors
+///
+/// As [`read_samples`].
+pub fn read_source_cached(
+    path: &Path,
+    rate: u32,
+    cache: Option<&daw_app::pcm_cache::PcmCache>,
+    progress: daw_app::audio_file::Progress<'_>,
+) -> Result<daw_app::audio_file::Channels, EditorError> {
+    if let Some(hit) = cache.and_then(|c| c.load(path, rate)) {
+        return Ok(hit);
+    }
+    let stamp = daw_app::pcm_cache::Stamp::of(path);
+    let channels = daw_app::audio_file::read_channels_fast_at(path, rate, progress)
+        .map_err(|e| file_error(path, e))?;
+    if let (Some(cache), Some(stamp)) = (cache, stamp) {
+        cache.store(&stamp, rate, &channels);
+    }
+    Ok(channels)
 }
 
 /// Length of a WAV or MP3 file in frames at `rate`, read from its header

@@ -23,6 +23,9 @@ use thiserror::Error;
 /// Zero crossings of the kernel on each side.
 pub const ZERO_CROSSINGS: usize = 32;
 
+/// Zero crossings of the kernel used by [`resample_fast`].
+pub const FAST_ZEROS: usize = 8;
+
 /// Table entries per zero crossing.
 const RESOLUTION: usize = 512;
 
@@ -83,6 +86,44 @@ pub fn resample_range(
     to: u32,
     range: std::ops::Range<usize>,
 ) -> Result<Vec<f32>, ResampleError> {
+    convert(input, from, to, range, ZERO_CROSSINGS, kernel_table())
+}
+
+/// [`resample`] with a short kernel ([`FAST_ZEROS`] zero crossings): about
+/// four times faster and still clean enough for a waveform and for
+/// auditioning an imported file. Not used for rendering goldens.
+///
+/// # Errors
+///
+/// [`ResampleError::ZeroRate`] when either rate is zero.
+pub fn resample_fast(input: &[f32], from: u32, to: u32) -> Result<Vec<f32>, ResampleError> {
+    let frames = resampled_len(input.len(), from, to)?;
+    resample_range_fast(input, from, to, 0..frames)
+}
+
+/// Output frames `range` of [`resample_fast`]; pieces of a split range joined
+/// in order equal [`resample_fast`] bit for bit.
+///
+/// # Errors
+///
+/// [`ResampleError::ZeroRate`] when either rate is zero.
+pub fn resample_range_fast(
+    input: &[f32],
+    from: u32,
+    to: u32,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<f32>, ResampleError> {
+    convert(input, from, to, range, FAST_ZEROS, fast_table())
+}
+
+fn convert(
+    input: &[f32],
+    from: u32,
+    to: u32,
+    range: std::ops::Range<usize>,
+    zero_crossings: usize,
+    table: &[f64],
+) -> Result<Vec<f32>, ResampleError> {
     let out_len = resampled_len(input.len(), from, to)?;
     if from == to {
         let end = range.end.min(out_len);
@@ -90,10 +131,9 @@ pub fn resample_range(
     }
     let len = input.len() as u64;
     let (from64, to64) = (u64::from(from), u64::from(to));
-    let table = kernel_table();
     let c = CUTOFF * (f64::from(to) / f64::from(from)).min(1.0);
     #[allow(clippy::cast_precision_loss)]
-    let zeros = ZERO_CROSSINGS as f64;
+    let zeros = zero_crossings as f64;
     let half_width = zeros / c;
     let end = range.end.min(out_len);
     let begin = range.start.min(end);
@@ -139,17 +179,24 @@ fn kernel(table: &[f64], x: f64) -> f64 {
 
 fn kernel_table() -> &'static [f64] {
     static TABLE: OnceLock<Vec<f64>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let size = ZERO_CROSSINGS * RESOLUTION + 2;
-        (0..size)
-            .map(|i| {
-                // Small table indices and constants: exact in f64.
-                #[allow(clippy::cast_precision_loss)]
-                let (x, zeros) = (i as f64 / RESOLUTION as f64, ZERO_CROSSINGS as f64);
-                sinc(x) * blackman(x / zeros)
-            })
-            .collect()
-    })
+    TABLE.get_or_init(|| build_table(ZERO_CROSSINGS))
+}
+
+fn fast_table() -> &'static [f64] {
+    static TABLE: OnceLock<Vec<f64>> = OnceLock::new();
+    TABLE.get_or_init(|| build_table(FAST_ZEROS))
+}
+
+fn build_table(zero_crossings: usize) -> Vec<f64> {
+    let size = zero_crossings * RESOLUTION + 2;
+    (0..size)
+        .map(|i| {
+            // Small table indices and constants: exact in f64.
+            #[allow(clippy::cast_precision_loss)]
+            let (x, zeros) = (i as f64 / RESOLUTION as f64, zero_crossings as f64);
+            sinc(x) * blackman(x / zeros)
+        })
+        .collect()
 }
 
 /// Normalised sinc: `sin(πx) / (πx)`, 1 at 0.
@@ -189,6 +236,25 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let n = x.len() as f64;
         (x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / n).sqrt()
+    }
+
+    #[test]
+    fn fast_resample_tracks_the_full_one_and_splits_exactly() {
+        let x = sine(1_000.0, 44_100, 20_000);
+        let full = resample(&x, 44_100, 48_000).unwrap();
+        let fast = resample_fast(&x, 44_100, 48_000).unwrap();
+        assert_eq!(full.len(), fast.len());
+        let mid = 2_000..full.len() - 2_000;
+        let worst = mid
+            .clone()
+            .map(|i| (full[i] - fast[i]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 0.01, "worst difference {worst}");
+        let mut joined = resample_range_fast(&x, 44_100, 48_000, 0..7_000).unwrap();
+        joined.extend(resample_range_fast(&x, 44_100, 48_000, 7_000..fast.len()).unwrap());
+        assert_eq!(joined, fast);
+        assert_eq!(resample_fast(&x, 44_100, 44_100).unwrap(), x);
+        assert_eq!(resample_fast(&x, 0, 1), Err(ResampleError::ZeroRate));
     }
 
     #[test]

@@ -45,7 +45,9 @@ pub use offline::{OfflineError, OfflineRenderer};
 pub use params::{MAX_SMOOTHING_MS, ParamError, ParamHandle, ParamId, ParamSpec};
 pub use project::{MAX_NAME_BYTES, ParamState, Project, ProjectError};
 pub use render::{RenderStats, Renderer};
-pub use resample::{ResampleError, resample, resample_range, resampled_len};
+pub use resample::{
+    ResampleError, resample, resample_fast, resample_range, resample_range_fast, resampled_len,
+};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
     AutoPoint, Automation, Bus, BusSend, CROSSFADE_SAMPLES, Clip, DIM_GAIN, EffectLane, Lane,

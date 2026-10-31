@@ -48,8 +48,27 @@ fn extension(path: &Path) -> Option<String> {
 ///
 /// See [`AudioFileError`].
 pub fn read_audio(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
+    read_audio_progress(path, &mut |_, _| {})
+}
+
+/// Called while an MP3 decodes with its sample rate and the channels
+/// decoded so far, after every packet.
+pub type Progress<'a> = &'a mut dyn FnMut(u32, &[Vec<f32>]);
+
+/// [`read_audio`] that reports a decoding MP3's content as it grows, so a
+/// waveform can be drawn before the file is finished. WAV files are read in
+/// one go and report nothing.
+///
+/// # Errors
+///
+/// See [`AudioFileError`].
+pub fn read_audio_progress(
+    path: &Path,
+    progress: Progress<'_>,
+) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
     if extension(path).as_deref() == Some("mp3") {
-        read_mp3(path)
+        let file = std::fs::File::open(path).map_err(|e| AudioFileError::Mp3(e.to_string()))?;
+        decode_mp3(Box::new(file), progress)
     } else {
         match audio_core::wav::read_wav_mono(path) {
             Err(audio_core::WavError::Empty) => Err(AudioFileError::Empty),
@@ -120,6 +139,21 @@ pub fn read_channels_at(path: &Path, rate: u32) -> Result<Channels, AudioFileErr
     channels_at(&spec, &buffer, rate)
 }
 
+/// [`read_channels_at`] for import: the fast resampler, and `progress`
+/// called with the source rate and the channels decoded so far.
+///
+/// # Errors
+///
+/// As [`read_channels_at`].
+pub fn read_channels_fast_at(
+    path: &Path,
+    rate: u32,
+    progress: Progress<'_>,
+) -> Result<Channels, AudioFileError> {
+    let (spec, buffer) = read_audio_progress(path, progress)?;
+    channels_with(&spec, &buffer, rate, true)
+}
+
 /// [`read_channels_at`] for content already decoded.
 ///
 /// # Errors
@@ -130,11 +164,20 @@ pub fn channels_at(
     buffer: &AudioBuffer,
     rate: u32,
 ) -> Result<Channels, AudioFileError> {
+    channels_with(spec, buffer, rate, false)
+}
+
+fn channels_with(
+    spec: &WavSpec,
+    buffer: &AudioBuffer,
+    rate: u32,
+    fast: bool,
+) -> Result<Channels, AudioFileError> {
     let convert = |data: Vec<f32>| -> Result<Vec<f32>, AudioFileError> {
         if spec.sample_rate == rate {
             Ok(data)
         } else {
-            resample_parallel(&data, spec.sample_rate, rate).map_err(|_| AudioFileError::Empty)
+            resample_split(&data, spec.sample_rate, rate, fast).map_err(|_| AudioFileError::Empty)
         }
     };
     let channels = if buffer.channels() == 2 {
@@ -184,21 +227,54 @@ pub fn resample_parallel(
     from: u32,
     to: u32,
 ) -> Result<Vec<f32>, audio_core::ResampleError> {
+    resample_split(input, from, to, false)
+}
+
+/// [`resample_parallel`] with the short kernel of
+/// [`audio_core::resample_fast`], for importing files.
+///
+/// # Errors
+///
+/// [`audio_core::ResampleError::ZeroRate`] when either rate is zero.
+pub fn resample_parallel_fast(
+    input: &[f32],
+    from: u32,
+    to: u32,
+) -> Result<Vec<f32>, audio_core::ResampleError> {
+    resample_split(input, from, to, true)
+}
+
+fn resample_split(
+    input: &[f32],
+    from: u32,
+    to: u32,
+    fast: bool,
+) -> Result<Vec<f32>, audio_core::ResampleError> {
+    let one = |range: std::ops::Range<usize>| {
+        if fast {
+            audio_core::resample_range_fast(input, from, to, range)
+        } else {
+            audio_core::resample_range(input, from, to, range)
+        }
+    };
     const MIN_PIECE: usize = 1 << 16;
     let len = audio_core::resampled_len(input.len(), from, to)?;
     let threads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZero::get)
         .min(len.div_ceil(MIN_PIECE))
         .max(1);
-    if threads == 1 || from == to {
+    if from == to {
         return audio_core::resample(input, from, to);
+    }
+    if threads == 1 {
+        return one(0..len);
     }
     let piece = len.div_ceil(threads);
     let parts = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|i| {
                 let range = i * piece..((i + 1) * piece).min(len);
-                scope.spawn(move || audio_core::resample_range(input, from, to, range))
+                scope.spawn(move || one(range))
             })
             .collect();
         handles
@@ -268,11 +344,6 @@ fn probe_mp3(path: &Path) -> Result<(u64, u32), AudioFileError> {
     Ok((frames, rate))
 }
 
-fn read_mp3(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
-    let file = std::fs::File::open(path).map_err(|e| AudioFileError::Mp3(e.to_string()))?;
-    decode_mp3(Box::new(file))
-}
-
 /// Decodes MP3 data held in memory, e.g. samples built into the program.
 ///
 /// # Errors
@@ -280,11 +351,12 @@ fn read_mp3(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
 /// [`AudioFileError::Mp3`] for undecodable data, [`AudioFileError::Empty`]
 /// when it holds no audio.
 pub fn decode_mp3_bytes(bytes: &'static [u8]) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
-    decode_mp3(Box::new(std::io::Cursor::new(bytes)))
+    decode_mp3(Box::new(std::io::Cursor::new(bytes)), &mut |_, _| {})
 }
 
 fn decode_mp3(
     source: Box<dyn symphonia::core::io::MediaSource>,
+    progress: Progress<'_>,
 ) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
     let mp3 = |e: &dyn std::fmt::Display| AudioFileError::Mp3(e.to_string());
     let stream = MediaSourceStream::new(source, Default::default());
@@ -347,6 +419,7 @@ fn decode_mp3(
                 out.push(frame.get(ch).copied().unwrap_or(0.0));
             }
         }
+        progress(rate, &channels);
     }
 
     let frames = channels.first().map_or(0, Vec::len);

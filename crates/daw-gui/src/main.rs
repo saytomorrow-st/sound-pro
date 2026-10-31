@@ -399,10 +399,30 @@ type Decoded = (
     Result<daw_app::audio_file::Channels, EditorError>,
 );
 
+/// What a decoding thread sends: waveform blocks as they become known, then
+/// the finished file.
+enum ImportMsg {
+    /// Peak blocks `first..` of the file at `path`.
+    Blocks(PathBuf, usize, Vec<(f32, f32)>),
+    Done(Decoded),
+}
+
+/// A region shown while its file still decodes (SPEC-050 §7): its length
+/// comes from the header, its waveform fills in as the decoder advances.
+struct Ghost {
+    path: PathBuf,
+    /// Row it is drawn on; equal to the track count for a new track.
+    row: usize,
+    start: u64,
+    clip: audio_core::session::Clip,
+    peaks: daw_gui::Peaks,
+}
+
 /// Files being decoded in the background, in the order they were asked for.
 struct Imports {
-    tx: std::sync::mpsc::Sender<Decoded>,
-    rx: std::sync::mpsc::Receiver<Decoded>,
+    tx: std::sync::mpsc::Sender<ImportMsg>,
+    rx: std::sync::mpsc::Receiver<ImportMsg>,
+    ghosts: Vec<Ghost>,
     /// Files still decoding.
     pending: usize,
     /// Track the next file of the same drop goes to.
@@ -606,6 +626,7 @@ impl App {
                 Imports {
                     tx,
                     rx,
+                    ghosts: Vec::new(),
                     pending: 0,
                     chain: None,
                     added: 0,
@@ -982,14 +1003,83 @@ impl App {
         let rate = self.editor.session().sample_rate;
         // Files a clip already uses are not decoded again (SPEC-050 §6).
         let cached: Vec<_> = paths.iter().map(|p| self.editor.cached_source(p)).collect();
+        let cache = self.editor.pcm_cache();
+        // Regions appear at once, sized from the headers.
+        let mut lens = Vec::with_capacity(paths.len());
+        let mut row = track.or(self.imports.chain);
+        let mut at = start;
+        for path in &paths {
+            let len = daw_gui::probe_len(path, rate).ok();
+            lens.push(len);
+            if let Some(len) = len {
+                let session = self.editor.session();
+                let row_index = row.unwrap_or(session.tracks.len());
+                let begin = at.unwrap_or_else(|| {
+                    self.imports
+                        .ghosts
+                        .iter()
+                        .rfind(|g| g.row == row_index)
+                        .map(|g| g.start + g.clip.length_samples)
+                        .or_else(|| session.tracks.get(row_index).map(|t| t.length_samples()))
+                        .unwrap_or(0)
+                });
+                let mut clip = audio_core::session::Clip::full(begin, len);
+                clip.name = path
+                    .file_stem()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                self.imports.ghosts.push(Ghost {
+                    path: path.clone(),
+                    row: row_index,
+                    start: begin,
+                    clip,
+                    peaks: daw_gui::Peaks::empty(len),
+                });
+                row = Some(row_index);
+                at = Some(begin + len);
+            }
+        }
         let tx = self.imports.tx.clone();
         std::thread::spawn(move || {
-            for (i, (path, cached)) in paths.into_iter().zip(cached).enumerate() {
-                let samples = cached.map_or_else(|| daw_gui::read_source(&path, rate), Ok);
+            for (i, ((path, cached), len)) in paths.into_iter().zip(cached).zip(lens).enumerate() {
+                let samples = match cached {
+                    Some(c) => Ok(c),
+                    None => {
+                        let template = len.map(daw_gui::Peaks::empty);
+                        let mut sent = 0;
+                        let mut last = std::time::Instant::now();
+                        let progress_tx = tx.clone();
+                        let progress_path = path.clone();
+                        daw_gui::read_source_cached(&path, rate, cache.as_ref(), &mut |from, ch| {
+                            let (Some(template), Some(left)) = (&template, ch.first()) else {
+                                return;
+                            };
+                            if last.elapsed() < std::time::Duration::from_millis(100) {
+                                return;
+                            }
+                            last = std::time::Instant::now();
+                            let blocks = template.blocks_from(left, from, rate, sent);
+                            if blocks.is_empty() {
+                                return;
+                            }
+                            let first = sent;
+                            sent += blocks.len();
+                            let _ = progress_tx.send(ImportMsg::Blocks(
+                                progress_path.clone(),
+                                first,
+                                blocks,
+                            ));
+                        })
+                    }
+                };
                 let at = if i == 0 { start } else { None };
                 let first = i == 0;
                 if tx
-                    .send((path, first.then_some(track).flatten(), at, samples))
+                    .send(ImportMsg::Done((
+                        path,
+                        first.then_some(track).flatten(),
+                        at,
+                        samples,
+                    )))
                     .is_err()
                 {
                     return;
@@ -998,12 +1088,50 @@ impl App {
         });
     }
 
+    /// Regions of files still decoding, with the waveform decoded so far
+    /// (SPEC-050 §7).
+    #[allow(clippy::cast_precision_loss)]
+    fn draw_ghosts(&self, painter: &egui::Painter, area: Rect) {
+        let rate = self.editor.session().sample_rate;
+        let px_per_sample = self.zoom / rate as f32;
+        for g in &self.imports.ghosts {
+            let top = area.min.y + RULER_HEIGHT + g.row as f32 * TRACK_HEIGHT;
+            let left = area.min.x + g.start as f32 * px_per_sample;
+            let w = (g.clip.length_samples as f32 * px_per_sample).max(2.0);
+            let rect =
+                Rect::from_min_size(Pos2::new(left, top + 3.0), Vec2::new(w, TRACK_HEIGHT - 6.0));
+            let base = track_color(None, g.row);
+            let colors = daw_gui::layout::region_colors([base.r(), base.g(), base.b()], false);
+            let [r, gr, b] = colors.body;
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(r, gr, b).gamma_multiply(0.6));
+            painter.rect_stroke(
+                rect,
+                4.0,
+                Stroke::new(1.0_f32, Color32::from_gray(160)),
+                StrokeKind::Inside,
+            );
+            draw_peaks(painter, rect, rect, &g.clip, &g.peaks, rgb_detail(&colors));
+        }
+    }
+
     /// Puts decoded files on the timeline as they arrive.
     fn poll_imports(&mut self, ctx: &egui::Context) {
         if self.imports.pending == 0 {
             return;
         }
-        while let Ok((path, track, start, samples)) = self.imports.rx.try_recv() {
+        while let Ok(msg) = self.imports.rx.try_recv() {
+            let (path, track, start, samples) = match msg {
+                ImportMsg::Blocks(path, first, blocks) => {
+                    if let Some(g) = self.imports.ghosts.iter_mut().find(|g| g.path == path) {
+                        g.peaks.set_blocks(first, &blocks);
+                    }
+                    continue;
+                }
+                ImportMsg::Done(done) => done,
+            };
+            if let Some(i) = self.imports.ghosts.iter().position(|g| g.path == path) {
+                self.imports.ghosts.remove(i);
+            }
             self.imports.pending -= 1;
             let target = track.or(self.imports.chain);
             let result = samples.and_then(|s| self.editor.import_channels(&path, s, target, start));
@@ -2036,6 +2164,7 @@ impl App {
                     && auto_row
                         .is_some_and(|row| ui.input(press_pos).is_some_and(|p| row.contains(p)))));
 
+        self.draw_ghosts(&painter, area);
         self.draw_take(&painter, area);
 
         let cursor = area.min.x + samples_to_x(self.playhead, rate_u32, self.zoom);
