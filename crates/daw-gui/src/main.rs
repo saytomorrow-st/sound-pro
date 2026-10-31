@@ -3528,12 +3528,26 @@ const fn effect_title(kind: &EffectKind) -> &'static str {
         EffectKind::Eq { .. } => "Эквалайзер",
         EffectKind::Compressor { .. } => "Компрессор",
         EffectKind::Reverb { .. } => "Реверб",
+        EffectKind::ChannelEq { .. } => "Канальный эквалайзер",
     }
 }
+
+/// Band names of the channel EQ in index order (SPEC-051).
+const CHANNEL_EQ_BANDS: [&str; 8] = [
+    "ФВЧ",
+    "Низ. полка",
+    "Пик 1",
+    "Пик 2",
+    "Пик 3",
+    "Пик 4",
+    "Верх. полка",
+    "ФНЧ",
+];
 
 /// Sliders for every parameter of `kind`; `true` if one moved.
 fn effect_sliders(ui: &mut egui::Ui, kind: &mut EffectKind) -> bool {
     let mut changed = false;
+    let mut toggled = false;
     let mut slider = |ui: &mut egui::Ui,
                       value: &mut f32,
                       range: std::ops::RangeInclusive<f32>,
@@ -3573,8 +3587,23 @@ fn effect_sliders(ui: &mut egui::Ui, kind: &mut EffectKind) -> bool {
             slider(ui, damp, 0.0..=1.0, "глушение", false);
             slider(ui, mix, 0.0..=1.0, "доля", false);
         }
+        EffectKind::ChannelEq { bands } => {
+            for (index, band) in bands.iter_mut().enumerate() {
+                let name = CHANNEL_EQ_BANDS[index];
+                ui.horizontal(|ui| {
+                    toggled |= ui.checkbox(&mut band.enabled, name).changed();
+                    slider(ui, &mut band.hz, 20.0..=20_000.0, "Гц", true);
+                    if (1..=6).contains(&index) {
+                        slider(ui, &mut band.db, -24.0..=24.0, "дБ", false);
+                    }
+                    if (2..=5).contains(&index) {
+                        slider(ui, &mut band.q, 0.1..=18.0, "Q", true);
+                    }
+                });
+            }
+        }
     }
-    changed
+    changed || toggled
 }
 
 impl App {
@@ -3621,6 +3650,9 @@ impl App {
             }
             if ui.button("+ Реверб").clicked() {
                 add = Some(EffectKind::reverb());
+            }
+            if ui.button("+ Канальный эквалайзер").clicked() {
+                add = Some(EffectKind::channel_eq());
             }
             if let Some(kind) = add {
                 let added = match target {
@@ -4146,6 +4178,24 @@ const fn param_label(param: EffectParam) -> &'static str {
         EffectParam::Room => "Комната",
         EffectParam::Damp => "Глушение",
         EffectParam::Mix => "Микс",
+        EffectParam::HpHz => "ФВЧ, Гц",
+        EffectParam::LowHz => "Низ. полка, Гц",
+        EffectParam::LowShelfDb => "Низ. полка, дБ",
+        EffectParam::P1Hz => "Пик 1, Гц",
+        EffectParam::P1Db => "Пик 1, дБ",
+        EffectParam::P1Q => "Пик 1, Q",
+        EffectParam::P2Hz => "Пик 2, Гц",
+        EffectParam::P2Db => "Пик 2, дБ",
+        EffectParam::P2Q => "Пик 2, Q",
+        EffectParam::P3Hz => "Пик 3, Гц",
+        EffectParam::P3Db => "Пик 3, дБ",
+        EffectParam::P3Q => "Пик 3, Q",
+        EffectParam::P4Hz => "Пик 4, Гц",
+        EffectParam::P4Db => "Пик 4, дБ",
+        EffectParam::P4Q => "Пик 4, Q",
+        EffectParam::HighHz => "Верх. полка, Гц",
+        EffectParam::HighShelfDb => "Верх. полка, дБ",
+        EffectParam::LpHz => "ФНЧ, Гц",
     }
 }
 

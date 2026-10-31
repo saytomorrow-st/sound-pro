@@ -12,7 +12,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use crate::fx::{Effect, ChannelEqBand, EffectKind, EffectParam, MAX_EFFECTS_PER_TRACK};
+use crate::fx::{ChannelEqBand, Effect, EffectKind, EffectParam, MAX_EFFECTS_PER_TRACK};
 use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
@@ -1253,6 +1253,17 @@ fn channel_eq_from_value(
         "high_shelf_db",
         "lp_hz",
     ];
+    // Per band: slots of hz, db and q in NUMBER_KEYS; `None` keeps the default.
+    const LAYOUT: [(usize, Option<usize>, Option<usize>); 8] = [
+        (0, None, None),
+        (1, Some(2), None),
+        (3, Some(4), Some(5)),
+        (6, Some(7), Some(8)),
+        (9, Some(10), Some(11)),
+        (12, Some(13), Some(14)),
+        (15, Some(16), None),
+        (17, None, None),
+    ];
     let mut on = [None; 8];
     let mut numbers = [None; 18];
     for (key, value) in entries {
@@ -1279,60 +1290,26 @@ fn channel_eq_from_value(
             field: "session.tracks[].effects[] channel_eq band",
         })
     };
+    let mut bands = [ChannelEqBand {
+        enabled: false,
+        hz: 0.0,
+        db: 0.0,
+        q: 1.0,
+    }; 8];
+    for (index, (hz, db, q)) in LAYOUT.into_iter().enumerate() {
+        let band = &mut bands[index];
+        band.enabled = flag(index)?;
+        band.hz = need(hz)?;
+        if let Some(db) = db {
+            band.db = need(db)?;
+        }
+        if let Some(q) = q {
+            band.q = need(q)?;
+        }
+    }
     Ok(Effect {
         bypass: bypass.unwrap_or(false),
-        kind: EffectKind::ChannelEq {
-            bands: [
-                ChannelEqBand {
-                    enabled: flag(0)?,
-                    hz: need(0)?,
-                    db: 0.0,
-                    q: 1.0,
-                },
-                ChannelEqBand {
-                    enabled: flag(1)?,
-                    hz: need(1)?,
-                    db: need(2)?,
-                    q: 1.0,
-                },
-                ChannelEqBand {
-                    enabled: flag(2)?,
-                    hz: need(3)?,
-                    db: need(4)?,
-                    q: need(5)?,
-                },
-                ChannelEqBand {
-                    enabled: flag(3)?,
-                    hz: need(6)?,
-                    db: need(7)?,
-                    q: need(8)?,
-                },
-                ChannelEqBand {
-                    enabled: flag(4)?,
-                    hz: need(9)?,
-                    db: need(10)?,
-                    q: need(11)?,
-                },
-                ChannelEqBand {
-                    enabled: flag(5)?,
-                    hz: need(12)?,
-                    db: need(13)?,
-                    q: need(14)?,
-                },
-                ChannelEqBand {
-                    enabled: flag(6)?,
-                    hz: need(15)?,
-                    db: need(16)?,
-                    q: 1.0,
-                },
-                ChannelEqBand {
-                    enabled: flag(7)?,
-                    hz: need(17)?,
-                    db: 0.0,
-                    q: 1.0,
-                },
-            ],
-        },
+        kind: EffectKind::ChannelEq { bands },
     })
 }
 

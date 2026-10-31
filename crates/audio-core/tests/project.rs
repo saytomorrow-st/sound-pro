@@ -1643,3 +1643,94 @@ fn master_level_folds_mute_and_dim_into_the_gain() {
     session.master_mute = true;
     assert!(session.master_level() == 0.0);
 }
+
+// --- SPEC-051: channel EQ -------------------------------------------------
+
+fn channel_eq_session() -> audio_core::Session {
+    use audio_core::{Effect, EffectKind, EffectParam};
+    let mut kind = EffectKind::channel_eq();
+    assert!(EffectParam::HpHz.set(&mut kind, 40.0));
+    assert!(EffectParam::P2Db.set(&mut kind, -4.5));
+    assert!(EffectParam::P2Q.set(&mut kind, 2.5));
+    assert!(EffectParam::HighShelfDb.set(&mut kind, 3.0));
+    if let EffectKind::ChannelEq { bands } = &mut kind {
+        bands[0].enabled = true;
+        bands[4].enabled = false;
+    }
+    let mut session = demo_session();
+    session.tracks[0].effects = vec![Effect::new(kind)];
+    session
+}
+
+fn channel_eq_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        channel_eq_session(),
+    )
+    .to_json()
+}
+
+#[test]
+fn a_channel_eq_survives_the_round_trip() {
+    let text = channel_eq_json();
+    for key in [
+        "\"channel_eq\"",
+        "\"hp_on\": true",
+        "\"hp_hz\"",
+        "\"low_shelf_db\"",
+        "\"p2_q\": 2.5",
+        "\"p3_on\": false",
+        "\"high_shelf_db\": 3",
+        "\"lp_hz\"",
+    ] {
+        assert!(text.contains(key), "{key} missing in {text}");
+    }
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &channel_eq_session());
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn an_unknown_channel_eq_key_is_rejected() {
+    let text = channel_eq_json().replace("\"lp_hz\"", "\"lp_db\"");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::UnknownField {
+            field: "lp_db".to_owned()
+        }
+    );
+}
+
+#[test]
+fn a_missing_channel_eq_key_is_reported() {
+    let text = channel_eq_json().replace("\"p4_q\"", "\"low_db\"");
+    assert!(Project::from_json(&text).is_err());
+    let text = channel_eq_json();
+    let start = text.find("\"p1_on\"").unwrap();
+    let end = start + text[start..].find(", ").unwrap() + 2;
+    let mut cut = text.clone();
+    cut.replace_range(start..end, "");
+    assert!(matches!(
+        Project::from_json(&cut).unwrap_err(),
+        ProjectError::MissingField { .. }
+    ));
+}
+
+#[test]
+fn a_channel_eq_flag_of_the_wrong_type_is_rejected() {
+    let text = channel_eq_json().replace("\"hp_on\": true", "\"hp_on\": 1");
+    assert!(Project::from_json(&text).is_err());
+}
+
+#[test]
+fn an_out_of_range_channel_eq_value_fails_validation() {
+    let text = channel_eq_json().replace("\"p2_q\": 2.5", "\"p2_q\": 40");
+    assert_eq!(
+        Project::from_json(&text).unwrap_err(),
+        ProjectError::Session(audio_core::SessionError::InvalidEffect {
+            track: 0,
+            effect: 0
+        })
+    );
+}
