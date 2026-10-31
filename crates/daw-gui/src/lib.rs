@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track, TrackKind};
+use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track, TrackFormat, TrackKind};
 use audio_core::{
     Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Marker, Project,
     ProjectError, SessionError,
@@ -223,6 +223,10 @@ pub struct Editor {
     /// Decoded mono files at the project rate, so playback starts without
     /// reading them again (SPEC-035).
     sounds: HashMap<String, Arc<Vec<f32>>>,
+    /// Both channels of decoded stereo files (SPEC-050 §5).
+    stereo: HashMap<String, daw_app::StereoSamples>,
+    /// Waveforms of the left and right channels of stereo files.
+    stereo_waves: HashMap<String, (Peaks, Peaks)>,
     /// Rendered MIDI clips of the last playback or export (SPEC-035).
     rendered: Mutex<RenderedNotes>,
     undo: Vec<Session>,
@@ -278,6 +282,8 @@ impl Editor {
             dirty: false,
             waves: HashMap::new(),
             sounds: HashMap::new(),
+            stereo: HashMap::new(),
+            stereo_waves: HashMap::new(),
             rendered: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -321,6 +327,8 @@ impl Editor {
         let base = path.parent().unwrap_or_else(|| Path::new(""));
         let mut waves = HashMap::new();
         let mut sounds = HashMap::new();
+        let mut stereo = HashMap::new();
+        let mut stereo_waves = HashMap::new();
         let rate = project.session.sample_rate;
         for track in &mut project.session.tracks {
             for clip in &mut track.clips {
@@ -332,9 +340,21 @@ impl Editor {
                     *source = text.to_owned();
                 }
                 if !waves.contains_key(source.as_str()) {
-                    if let Ok(samples) = read_samples(&resolved, rate) {
+                    if let Ok(channels) = read_source(&resolved, rate) {
+                        let samples = channels.mono();
                         waves.insert(source.clone(), Peaks::from_samples(&samples));
                         sounds.insert(source.clone(), Arc::new(samples));
+                        if let Some(right) = channels.right {
+                            stereo_waves.insert(
+                                source.clone(),
+                                (
+                                    Peaks::from_samples(&channels.left),
+                                    Peaks::from_samples(&right),
+                                ),
+                            );
+                            stereo
+                                .insert(source.clone(), (Arc::new(channels.left), Arc::new(right)));
+                        }
                     }
                 }
             }
@@ -346,6 +366,8 @@ impl Editor {
             dirty: false,
             waves,
             sounds,
+            stereo,
+            stereo_waves,
             rendered: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -392,8 +414,31 @@ impl Editor {
         track: Option<usize>,
         start: Option<u64>,
     ) -> Result<(usize, usize), EditorError> {
-        let samples = read_samples(path, self.project.session.sample_rate)?;
-        self.import_decoded(path, samples, track, start)
+        if let Some(channels) = self.cached_source(path) {
+            return self.import_channels(path, channels, track, start);
+        }
+        let channels = read_source(path, self.project.session.sample_rate)?;
+        self.import_channels(path, channels, track, start)
+    }
+
+    /// The decoded content of `path` if a clip already uses it, so a file
+    /// is not decoded and resampled twice (SPEC-050 §6).
+    #[must_use]
+    pub fn cached_source(&self, path: &Path) -> Option<daw_app::audio_file::Channels> {
+        let path = std::path::absolute(path).ok()?;
+        let source = path.to_str()?;
+        if let Some((left, right)) = self.stereo.get(source) {
+            return Some(daw_app::audio_file::Channels {
+                left: left.to_vec(),
+                right: Some(right.to_vec()),
+            });
+        }
+        self.sounds
+            .get(source)
+            .map(|mono| daw_app::audio_file::Channels {
+                left: mono.to_vec(),
+                right: None,
+            })
     }
 
     /// [`Editor::import_audio_at`] for a file already decoded with
@@ -410,6 +455,27 @@ impl Editor {
         track: Option<usize>,
         start: Option<u64>,
     ) -> Result<(usize, usize), EditorError> {
+        let channels = daw_app::audio_file::Channels {
+            left: samples,
+            right: None,
+        };
+        self.import_channels(path, channels, track, start)
+    }
+
+    /// [`Editor::import_decoded`] keeping a stereo file's two channels
+    /// (SPEC-050 §5). A new track made for a stereo file is stereo.
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::import_audio_at`]; nothing changes on error.
+    pub fn import_channels(
+        &mut self,
+        path: &Path,
+        channels: daw_app::audio_file::Channels,
+        track: Option<usize>,
+        start: Option<u64>,
+    ) -> Result<(usize, usize), EditorError> {
+        let samples = channels.mono();
         let path = std::path::absolute(path).map_err(|source| EditorError::Read {
             path: path.to_path_buf(),
             source,
@@ -432,7 +498,11 @@ impl Editor {
         }) {
             Some(t) => t,
             None => {
-                session.tracks.push(Track::new(&name));
+                let mut new = Track::new(&name);
+                if channels.right.is_some() {
+                    new.format = TrackFormat::Stereo;
+                }
+                session.tracks.push(new);
                 session.tracks.len() - 1
             }
         };
@@ -453,6 +523,17 @@ impl Editor {
         self.record();
         self.project.session = session;
         self.waves.insert(source.clone(), peaks);
+        if let Some(right) = channels.right {
+            self.stereo_waves.insert(
+                source.clone(),
+                (
+                    Peaks::from_samples(&channels.left),
+                    Peaks::from_samples(&right),
+                ),
+            );
+            self.stereo
+                .insert(source.clone(), (Arc::new(channels.left), Arc::new(right)));
+        }
         self.sounds.insert(source, Arc::new(samples));
         self.selected_track = Some(track_index);
         self.selected_clip = Some((track_index, clip_index));
@@ -662,6 +743,7 @@ impl Editor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut cache = EditorCache {
             sounds: &self.sounds,
+            stereo: &self.stereo,
             rendered: &mut rendered,
             used: HashMap::new(),
         };
@@ -1799,6 +1881,22 @@ impl Editor {
         count: usize,
         name: &str,
     ) -> Result<Vec<usize>, EditorError> {
+        self.add_tracks_with_format(kind, count, name, TrackFormat::Mono)
+    }
+
+    /// [`Editor::add_tracks`] with the audio tracks made mono or stereo
+    /// (SPEC-050 §5); instrument tracks ignore `format`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::add_tracks`].
+    pub fn add_tracks_with_format(
+        &mut self,
+        kind: TrackKind,
+        count: usize,
+        name: &str,
+        format: TrackFormat,
+    ) -> Result<Vec<usize>, EditorError> {
         if count == 0 {
             return Err(EditorError::EmptyClip);
         }
@@ -1822,7 +1920,11 @@ impl Editor {
                 format!("{base} {}", n + 1)
             };
             session.tracks.push(match kind {
-                TrackKind::Audio => Track::new(&name),
+                TrackKind::Audio => {
+                    let mut track = Track::new(&name);
+                    track.format = format;
+                    track
+                }
                 TrackKind::Instrument => Track::instrument(&name),
             });
         }
@@ -2473,6 +2575,32 @@ impl Editor {
         self.commit_session(session)
     }
 
+    /// Makes an audio track mono or stereo (SPEC-050 §5). One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for a bad index or an instrument track.
+    pub fn set_track_format(
+        &mut self,
+        track: usize,
+        format: TrackFormat,
+    ) -> Result<(), EditorError> {
+        let current = self
+            .project
+            .session
+            .tracks
+            .get(track)
+            .filter(|t| t.kind == TrackKind::Audio)
+            .ok_or(EditorError::NoClip)?
+            .format;
+        if current == format {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        session.tracks[track].format = format;
+        self.commit_session(session)
+    }
+
     /// Moves a track to position `to`; the others shift (SPEC-029).
     ///
     /// # Errors
@@ -2741,6 +2869,13 @@ impl Editor {
         self.waves.get(clip.source.as_deref()?)
     }
 
+    /// Left and right waveforms of a clip whose source is a stereo file
+    /// (SPEC-050 §5).
+    #[must_use]
+    pub fn stereo_peaks(&self, clip: &Clip) -> Option<&(Peaks, Peaks)> {
+        self.stereo_waves.get(clip.source.as_deref()?)
+    }
+
     /// Window title: file name and `*` for unsaved changes.
     #[must_use]
     pub fn title(&self) -> String {
@@ -2875,6 +3010,19 @@ pub fn x_to_samples(x: f32, rate: u32, zoom: f32) -> u64 {
     samples
 }
 
+/// Where a file dropped at offset `x` starts: under the pointer, snapped to
+/// the beat like regions when `snap` is on (SPEC-050 §2). The preview frame
+/// and the drop use the same value.
+#[must_use]
+pub fn drop_start(x: f32, rate: u32, zoom: f32, tempo_bpm: f64, snap: bool) -> u64 {
+    let samples = x_to_samples(x, rate, zoom);
+    if snap {
+        snap_to_beat(samples, rate, tempo_bpm)
+    } else {
+        samples
+    }
+}
+
 /// The beat (4/4 grid) nearest to `samples`; halfway rounds up. A bad tempo
 /// falls back to [`DEFAULT_TEMPO`].
 #[must_use]
@@ -2951,8 +3099,32 @@ pub fn bars_in(samples: u64, rate: u32, tempo_bpm: f64, beats_per_bar: u32) -> S
 /// [`EditorError::EmptyFile`], [`EditorError::Wav`] or
 /// [`EditorError::Decode`].
 pub fn read_samples(path: &Path, rate: u32) -> Result<Vec<f32>, EditorError> {
+    read_source(path, rate).map(|c| c.mono())
+}
+
+/// Reads a WAV or MP3 file at `rate`, keeping a stereo file's two channels
+/// (SPEC-050 §5). Slow for long files; call it off the window's thread.
+///
+/// # Errors
+///
+/// As [`read_samples`].
+pub fn read_source(path: &Path, rate: u32) -> Result<daw_app::audio_file::Channels, EditorError> {
+    daw_app::audio_file::read_channels_at(path, rate).map_err(|e| file_error(path, e))
+}
+
+/// Length of a WAV or MP3 file in frames at `rate`, read from its header
+/// without decoding (SPEC-050 §2).
+///
+/// # Errors
+///
+/// As [`read_samples`].
+pub fn probe_len(path: &Path, rate: u32) -> Result<u64, EditorError> {
+    daw_app::audio_file::probe_len_at(path, rate).map_err(|e| file_error(path, e))
+}
+
+fn file_error(path: &Path, e: daw_app::audio_file::AudioFileError) -> EditorError {
     use daw_app::audio_file::AudioFileError;
-    let mono = daw_app::audio_file::read_mono_at(path, rate).map_err(|e| match e {
+    match e {
         AudioFileError::Empty | AudioFileError::Wav(audio_core::WavError::Empty) => {
             EditorError::EmptyFile {
                 path: path.to_path_buf(),
@@ -2966,8 +3138,7 @@ pub fn read_samples(path: &Path, rate: u32) -> Result<Vec<f32>, EditorError> {
             path: path.to_path_buf(),
             message,
         },
-    })?;
-    Ok(mono)
+    }
 }
 
 type NotesKey = (Vec<Note>, u32, u64);
@@ -2980,6 +3151,7 @@ struct RenderedNotes(HashMap<NotesKey, Arc<Vec<f32>>>);
 /// the current session still uses.
 struct EditorCache<'a> {
     sounds: &'a HashMap<String, Arc<Vec<f32>>>,
+    stereo: &'a HashMap<String, daw_app::StereoSamples>,
     rendered: &'a mut RenderedNotes,
     used: HashMap<NotesKey, Arc<Vec<f32>>>,
 }
@@ -2987,6 +3159,10 @@ struct EditorCache<'a> {
 impl daw_app::ClipCache for EditorCache<'_> {
     fn audio(&mut self, source: &str) -> Option<Arc<Vec<f32>>> {
         self.sounds.get(source).cloned()
+    }
+
+    fn audio_stereo(&mut self, source: &str) -> Option<daw_app::StereoSamples> {
+        self.stereo.get(source).cloned()
     }
 
     fn notes(&mut self, notes: &[Note], rate: u32, frames: u64) -> Option<Arc<Vec<f32>>> {

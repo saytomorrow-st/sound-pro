@@ -8,11 +8,12 @@
 mod audio_editor;
 mod shell;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use audio_core::{
     AutoPoint, Effect, EffectKind, EffectParam, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note,
-    TRACK_COLORS, TrackKind,
+    TRACK_COLORS, TrackFormat, TrackKind,
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
@@ -287,6 +288,27 @@ fn rgb_detail(colors: &daw_gui::layout::RegionColors) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// The waveform of `clip`: one wave for a mono source, left over right in two
+/// halves of `body` for a stereo one (SPEC-050 §5).
+fn draw_clip_wave(
+    editor: &daw_gui::Editor,
+    painter: &egui::Painter,
+    rect: Rect,
+    body: Rect,
+    clip: &audio_core::session::Clip,
+    detail: Color32,
+) {
+    if let Some((left, right)) = editor.stereo_peaks(clip) {
+        let mid = body.center().y;
+        let top = Rect::from_min_max(body.min, Pos2::new(body.max.x, mid));
+        let bottom = Rect::from_min_max(Pos2::new(body.min.x, mid), body.max);
+        draw_peaks(painter, rect, top, clip, left, detail);
+        draw_peaks(painter, rect, bottom, clip, right, detail);
+    } else if let Some(peaks) = editor.peaks(clip) {
+        draw_peaks(painter, rect, body, clip, peaks, detail);
+    }
+}
+
 /// The waveform of `clip` drawn into `body`; `rect` is the whole region.
 #[allow(
     clippy::cast_precision_loss,
@@ -369,12 +391,12 @@ struct Player {
 const REFRESH_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// A file decoded on a background thread (SPEC-035): path, target track,
-/// start, and the samples at the project rate.
+/// start, and the channels at the project rate (SPEC-050 §5).
 type Decoded = (
     PathBuf,
     Option<usize>,
     Option<u64>,
-    Result<Vec<f32>, EditorError>,
+    Result<daw_app::audio_file::Channels, EditorError>,
 );
 
 /// Files being decoded in the background, in the order they were asked for.
@@ -386,6 +408,8 @@ struct Imports {
     /// Track the next file of the same drop goes to.
     chain: Option<usize>,
     added: usize,
+    /// Files asked for since the queue was last empty (SPEC-050 §6).
+    total: usize,
 }
 
 /// A microphone take in progress (SPEC-020).
@@ -460,6 +484,8 @@ struct App {
     playhead: u64,
     player: Option<Player>,
     imports: Imports,
+    /// File lengths read from headers while files hover (SPEC-050 §2).
+    probes: HashMap<PathBuf, Result<u64, String>>,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -581,8 +607,10 @@ impl App {
                     pending: 0,
                     chain: None,
                     added: 0,
+                    total: 0,
                 }
             },
+            probes: HashMap::new(),
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
@@ -927,14 +955,22 @@ impl App {
         if self.imports.pending == 0 {
             self.imports.chain = track;
             self.imports.added = 0;
+            self.imports.total = 0;
         }
         self.imports.pending += paths.len();
-        self.status = format!("Загрузка: {}…", paths.len());
+        self.imports.total += paths.len();
+        self.status = format!(
+            "Загрузка {}/{}…",
+            self.imports.total - self.imports.pending,
+            self.imports.total
+        );
         let rate = self.editor.session().sample_rate;
+        // Files a clip already uses are not decoded again (SPEC-050 §6).
+        let cached: Vec<_> = paths.iter().map(|p| self.editor.cached_source(p)).collect();
         let tx = self.imports.tx.clone();
         std::thread::spawn(move || {
-            for (i, path) in paths.into_iter().enumerate() {
-                let samples = daw_gui::read_samples(&path, rate);
+            for (i, (path, cached)) in paths.into_iter().zip(cached).enumerate() {
+                let samples = cached.map_or_else(|| daw_gui::read_source(&path, rate), Ok);
                 let at = if i == 0 { start } else { None };
                 let first = i == 0;
                 if tx
@@ -955,12 +991,20 @@ impl App {
         while let Ok((path, track, start, samples)) = self.imports.rx.try_recv() {
             self.imports.pending -= 1;
             let target = track.or(self.imports.chain);
-            let result = samples.and_then(|s| self.editor.import_decoded(&path, s, target, start));
+            let result = samples.and_then(|s| self.editor.import_channels(&path, s, target, start));
             match result {
                 Ok((t, _)) => {
                     self.imports.chain = Some(t);
                     self.imports.added += 1;
-                    self.status = format!("Добавлено файлов: {}", self.imports.added);
+                    self.status = if self.imports.pending > 0 {
+                        format!(
+                            "Загрузка {}/{}…",
+                            self.imports.total - self.imports.pending,
+                            self.imports.total
+                        )
+                    } else {
+                        format!("Добавлено файлов: {}", self.imports.added)
+                    };
                 }
                 Err(e) => self.status = format!("Ошибка ({}): {e}", path.display()),
             }
@@ -1270,6 +1314,7 @@ impl App {
                         let track = &self.editor.session().tracks[index];
                         let (mut mute, mut solo) = (track.mute, track.solo);
                         let track_monitor = track.input_monitor;
+                        let track_stereo = track.format == TrackFormat::Stereo;
                         let (mut gain, mut pan) = (track.gain, track.pan);
                         let name = track.name.clone();
                         let audio = track.kind == TrackKind::Audio;
@@ -1394,6 +1439,25 @@ impl App {
                                     t.mute = mute;
                                     t.solo = solo;
                                     t.input_monitor = monitor;
+                                }
+                            }
+                            if audio {
+                                let mut stereo = track_stereo;
+                                if shell::pill(
+                                    ui,
+                                    &mut stereo,
+                                    "◎",
+                                    Color32::from_rgb(120, 200, 140),
+                                )
+                                .on_hover_text("Стерео / моно")
+                                .changed()
+                                {
+                                    let format = if stereo {
+                                        TrackFormat::Stereo
+                                    } else {
+                                        TrackFormat::Mono
+                                    };
+                                    let _ = self.editor.set_track_format(index, format);
                                 }
                             }
                         });
@@ -1576,17 +1640,29 @@ impl App {
     #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     /// Drag and drop of WAV/MP3 files onto the timeline (SPEC-032).
     fn handle_drop(&mut self, ui: &egui::Ui, area: Rect, tracks: usize) {
-        let (hovering, dropped, pointer) = ui.ctx().input(|i| {
+        let (hovered, dropped, pointer, free) = ui.ctx().input(|i| {
             (
-                !i.raw.hovered_files.is_empty(),
+                i.raw
+                    .hovered_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect::<Vec<_>>(),
                 i.raw
                     .dropped_files
                     .iter()
                     .filter_map(|f| f.path.clone())
                     .collect::<Vec<_>>(),
                 i.pointer.latest_pos(),
+                i.modifiers.shift,
             )
         });
+        let hovering = !hovered.is_empty() || ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let session = self.editor.session();
+        let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+        let snap = self.snap && !free;
+        let start_at = |p: Pos2| {
+            daw_gui::drop_start((p.x - area.min.x).max(0.0), rate, self.zoom, tempo, snap)
+        };
         let row_at = |p: Pos2| {
             let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
             (row >= 0.0 && (row as usize) < tracks).then_some(row as usize)
@@ -1606,18 +1682,59 @@ impl App {
                     Rect::from_min_max(Pos2::new(area.min.x, top), area.max)
                 }
             };
-            painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(80, 140, 255, 40));
-            self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
+            // The first audio file's length comes from its header, read once
+            // per hover (SPEC-050 §2).
+            let first = hovered
+                .iter()
+                .find(|p| daw_app::audio_file::is_audio_file(p))
+                .cloned();
+            let probe = first.as_ref().map(|path| {
+                self.probes
+                    .entry(path.clone())
+                    .or_insert_with(|| daw_gui::probe_len(path, rate).map_err(|e| e.to_string()))
+                    .clone()
+            });
+            match (probe, pointer) {
+                (Some(Ok(len)), Some(p)) => {
+                    let start = start_at(p);
+                    let x0 = area.min.x + samples_to_x(start, rate, self.zoom);
+                    let x1 = area.min.x + samples_to_x(start + len, rate, self.zoom);
+                    let frame = Rect::from_min_max(
+                        Pos2::new(x0, band.min.y + 2.0),
+                        Pos2::new(x1.max(x0 + 2.0), band.min.y + TRACK_HEIGHT - 2.0),
+                    );
+                    painter.rect_filled(
+                        frame,
+                        4.0,
+                        Color32::from_rgba_unmultiplied(80, 140, 255, 70),
+                    );
+                    painter.rect_stroke(
+                        frame,
+                        4.0,
+                        Stroke::new(1.5_f32, Color32::from_rgb(120, 180, 255)),
+                        StrokeKind::Inside,
+                    );
+                    self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
+                }
+                (Some(Err(e)), _) => self.status = format!("Ошибка: {e}"),
+                _ => {
+                    painter.rect_filled(
+                        band,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(80, 140, 255, 40),
+                    );
+                    self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
+                }
+            }
+        } else if dropped.is_empty() {
+            self.probes.clear();
         }
         if dropped.is_empty() {
             return;
         }
-        let rate = self.editor.session().sample_rate;
+        self.probes.clear();
         let (track, start) = match pointer.filter(|p| area.contains(*p)) {
-            Some(p) => (
-                row_at(p),
-                x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom),
-            ),
+            Some(p) => (row_at(p), start_at(p)),
             None => (None, 0),
         };
         self.import_in_background(dropped, track, Some(start));
@@ -1803,9 +1920,7 @@ impl App {
                         );
                     }
                 }
-                if let Some(peaks) = self.editor.peaks(clip) {
-                    draw_peaks(&painter, rect, body, clip, peaks, detail);
-                }
+                draw_clip_wave(&self.editor, &painter, rect, body, clip, detail);
                 let hovered = pointer.is_some_and(|p| rect.contains(p));
                 let handles = daw_gui::layout::edges_in_overlap(&track.clips, c);
                 draw_fades(
@@ -1862,10 +1977,15 @@ impl App {
                     if !rect.intersects(body) {
                         continue;
                     }
-                    if let Some(peaks) = self.editor.peaks(clip) {
-                        let wave = Rect::from_min_max(Pos2::new(rect.min.x, body.min.y), rect.max);
-                        draw_peaks(&zone_painter, rect, wave, clip, peaks, rgb_detail(&colors));
-                    }
+                    let wave = Rect::from_min_max(Pos2::new(rect.min.x, body.min.y), rect.max);
+                    draw_clip_wave(
+                        &self.editor,
+                        &zone_painter,
+                        rect,
+                        wave,
+                        clip,
+                        rgb_detail(&colors),
+                    );
                 }
                 draw_crossfade_x(&painter, body);
             }

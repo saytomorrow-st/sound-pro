@@ -2,7 +2,7 @@
 //! with position display, library, inspector, browser and the bottom area
 //! with mixer, editor and smart controls. Placeholders are marked as such.
 
-use audio_core::TrackKind;
+use audio_core::{TrackFormat, TrackKind};
 use daw_gui::layout::{
     Bottom, FADER_FLOOR_DB, MeterState, MeterZone, db_label, fader_gain, fader_position,
     lcd_position, meter_zone, pan_angle, pan_label,
@@ -630,6 +630,7 @@ pub struct NewTrack {
     kind: TrackKind,
     count: usize,
     name: String,
+    format: TrackFormat,
 }
 
 impl NewTrack {
@@ -639,6 +640,7 @@ impl NewTrack {
             kind,
             count: 1,
             name: String::new(),
+            format: TrackFormat::Mono,
         }
     }
 }
@@ -671,6 +673,17 @@ fn kind_card(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, hint: &
         .response
         .interact(Sense::click());
     response.clicked()
+}
+
+/// «Моно» / «Стерео» toggle for an audio track (SPEC-050 §5); true when
+/// the choice changed.
+fn format_choice(ui: &mut egui::Ui, format: &mut TrackFormat) -> bool {
+    let before = *format;
+    ui.horizontal(|ui| {
+        ui.selectable_value(format, TrackFormat::Mono, "Моно");
+        ui.selectable_value(format, TrackFormat::Stereo, "Стерео");
+    });
+    *format != before
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -722,6 +735,11 @@ impl App {
                 };
                 ui.add(egui::TextEdit::singleline(&mut dialog.name).hint_text(hint));
                 ui.end_row();
+                if dialog.kind == TrackKind::Audio {
+                    row_label(ui, "Формат");
+                    format_choice(ui, &mut dialog.format);
+                    ui.end_row();
+                }
             });
             if free == 0 {
                 ui.colored_label(Color32::from_rgb(240, 120, 100), "Достигнут предел дорожек");
@@ -739,9 +757,12 @@ impl App {
             });
         });
         if create && free > 0 {
-            let result = self
-                .editor
-                .add_tracks(dialog.kind, dialog.count.min(free), &dialog.name);
+            let result = self.editor.add_tracks_with_format(
+                dialog.kind,
+                dialog.count.min(free),
+                &dialog.name,
+                dialog.format,
+            );
             if let Some(added) = self.report(result, "Дорожки добавлены") {
                 self.reveal_track = added.first().copied();
             }
@@ -1410,6 +1431,7 @@ impl App {
         let current = track.name.clone();
         let color = track.color;
         let midi = track.kind == TrackKind::Instrument;
+        let mut format = track.format;
         let mut name = ui
             .data(|d| d.get_temp::<String>(id))
             .unwrap_or_else(|| current.clone());
@@ -1433,6 +1455,14 @@ impl App {
                 "Аудио"
             });
             ui.end_row();
+            if !midi {
+                row_label(ui, "Формат");
+                if format_choice(ui, &mut format) {
+                    let result = self.editor.set_track_format(index, format);
+                    self.report(result, "Формат дорожки изменён");
+                }
+                ui.end_row();
+            }
             row_label(ui, "Канал");
             ui.label(format!("{}", index + 1));
             ui.end_row();

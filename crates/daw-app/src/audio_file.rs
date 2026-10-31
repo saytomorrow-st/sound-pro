@@ -65,6 +65,96 @@ pub fn read_audio(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError>
 /// See [`AudioFileError`]; a failed rate conversion is [`AudioFileError::Empty`].
 pub fn read_mono_at(path: &Path, rate: u32) -> Result<Vec<f32>, AudioFileError> {
     let (spec, buffer) = read_audio(path)?;
+    let mut mono = mix_down(&buffer);
+    if spec.sample_rate != rate {
+        mono =
+            resample_parallel(&mono, spec.sample_rate, rate).map_err(|_| AudioFileError::Empty)?;
+    }
+    if mono.is_empty() {
+        return Err(AudioFileError::Empty);
+    }
+    Ok(mono)
+}
+
+/// A file's content at the project rate: one channel, or left and right
+/// (SPEC-050 §5). Files with more than two channels are mixed to one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Channels {
+    /// The only channel, or the left one.
+    pub left: Vec<f32>,
+    /// The right channel of a stereo file, as long as `left`.
+    pub right: Option<Vec<f32>>,
+}
+
+impl Channels {
+    /// Frames per channel.
+    #[must_use]
+    pub fn frames(&self) -> usize {
+        self.left.len()
+    }
+
+    /// The content as one channel: stereo is `(left + right) · 0.5`, the
+    /// same mix [`read_mono_at`] makes.
+    #[must_use]
+    pub fn mono(&self) -> Vec<f32> {
+        match &self.right {
+            None => self.left.clone(),
+            Some(right) => self
+                .left
+                .iter()
+                .zip(right)
+                .map(|(l, r)| (l + r) * 0.5)
+                .collect(),
+        }
+    }
+}
+
+/// Reads `path` at `rate`, keeping a stereo file's two channels apart
+/// (SPEC-050 §5). A file already at `rate` is not resampled.
+///
+/// # Errors
+///
+/// See [`AudioFileError`]; a failed rate conversion is [`AudioFileError::Empty`].
+pub fn read_channels_at(path: &Path, rate: u32) -> Result<Channels, AudioFileError> {
+    let (spec, buffer) = read_audio(path)?;
+    channels_at(&spec, &buffer, rate)
+}
+
+/// [`read_channels_at`] for content already decoded.
+///
+/// # Errors
+///
+/// As [`read_channels_at`].
+pub fn channels_at(
+    spec: &WavSpec,
+    buffer: &AudioBuffer,
+    rate: u32,
+) -> Result<Channels, AudioFileError> {
+    let convert = |data: Vec<f32>| -> Result<Vec<f32>, AudioFileError> {
+        if spec.sample_rate == rate {
+            Ok(data)
+        } else {
+            resample_parallel(&data, spec.sample_rate, rate).map_err(|_| AudioFileError::Empty)
+        }
+    };
+    let channels = if buffer.channels() == 2 {
+        Channels {
+            left: convert(buffer.channel(0).to_vec())?,
+            right: Some(convert(buffer.channel(1).to_vec())?),
+        }
+    } else {
+        Channels {
+            left: convert(mix_down(buffer))?,
+            right: None,
+        }
+    };
+    if channels.left.is_empty() {
+        return Err(AudioFileError::Empty);
+    }
+    Ok(channels)
+}
+
+fn mix_down(buffer: &AudioBuffer) -> Vec<f32> {
     let channels = buffer.channels().max(1);
     let mut mono = buffer.channel(0).to_vec();
     if channels > 1 {
@@ -79,14 +169,7 @@ pub fn read_mono_at(path: &Path, rate: u32) -> Result<Vec<f32>, AudioFileError> 
             *out *= scale;
         }
     }
-    if spec.sample_rate != rate {
-        mono =
-            resample_parallel(&mono, spec.sample_rate, rate).map_err(|_| AudioFileError::Empty)?;
-    }
-    if mono.is_empty() {
-        return Err(AudioFileError::Empty);
-    }
-    Ok(mono)
+    mono
 }
 
 /// [`audio_core::resample`] split over the machine's cores (SPEC-035).
@@ -124,6 +207,65 @@ pub fn resample_parallel(
             .collect::<Result<Vec<_>, _>>()
     })?;
     Ok(parts.concat())
+}
+
+/// Length of `path` at `rate` in frames, read from the header without
+/// decoding the audio (SPEC-050 §2). MP3 files without a frame count in the
+/// header are measured by walking their packets, still without decoding.
+///
+/// # Errors
+///
+/// See [`AudioFileError`]; a file with no audio is [`AudioFileError::Empty`].
+pub fn probe_len_at(path: &Path, rate: u32) -> Result<u64, AudioFileError> {
+    let (frames, from) = if extension(path).as_deref() == Some("mp3") {
+        probe_mp3(path)?
+    } else {
+        let reader = hound::WavReader::open(path).map_err(audio_core::WavError::from)?;
+        (u64::from(reader.duration()), reader.spec().sample_rate)
+    };
+    if frames == 0 || from == 0 || rate == 0 {
+        return Err(AudioFileError::Empty);
+    }
+    Ok((u128::from(frames) * u128::from(rate)).div_ceil(u128::from(from)) as u64)
+}
+
+fn probe_mp3(path: &Path) -> Result<(u64, u32), AudioFileError> {
+    let mp3 = |e: &dyn std::fmt::Display| AudioFileError::Mp3(e.to_string());
+    let file = std::fs::File::open(path).map_err(|e| mp3(&e))?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let mut format = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| mp3(&e))?
+        .format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| AudioFileError::Mp3("no audio track".into()))?;
+    let rate = track.codec_params.sample_rate.unwrap_or(0);
+    if let Some(frames) = track.codec_params.n_frames {
+        return Ok((frames, rate));
+    }
+    let id = track.id;
+    let mut frames = 0u64;
+    loop {
+        match format.next_packet() {
+            Ok(packet) if packet.track_id() == id => frames += packet.dur,
+            Ok(_) => {}
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(e) => return Err(mp3(&e)),
+        }
+    }
+    Ok((frames, rate))
 }
 
 fn read_mp3(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
