@@ -297,3 +297,96 @@ fn a_negative_x_drops_at_zero() {
     let t = target(Some((-30.0, 40.0)), &[true], true);
     assert_eq!((t.track, t.start), (Some(0), 0));
 }
+
+/// What the window computes on each frame of a drag: hover frames feed the
+/// tracker, the drop frame asks it where the file goes.
+fn frame_target(pointer: Option<(f32, f32)>, audio: &[bool]) -> Option<daw_gui::DropTarget> {
+    pointer.map(|p| target(Some(p), audio, true))
+}
+
+#[test]
+fn a_drop_without_a_pointer_lands_where_the_preview_was_drawn() {
+    let audio = [true, true];
+    let mut tracker = daw_gui::DropTracker::default();
+    // The preview follows the pointer over row 1, about one second in.
+    tracker.hover(frame_target(Some((100.0, 24.0 + 80.0 + 10.0)), &audio));
+    let drawn = frame_target(Some((100.0, 24.0 + 80.0 + 10.0)), &audio).unwrap();
+    // The platform sends no pointer on the frame of the drop.
+    let landed = tracker.release(frame_target(None, &audio));
+    assert_eq!(landed, drawn);
+    assert_eq!(landed.track, Some(1));
+    assert_ne!(landed.start, 0, "the drop must not fall back to the start");
+}
+
+#[test]
+fn the_drop_position_follows_the_last_preview_not_a_fixed_bar() {
+    let audio = [true];
+    let bar3 = 2 * 4 * 60 * u64::from(RATE) / 120;
+    let mut starts = Vec::new();
+    for x in [50.0_f32, 300.0, 800.0] {
+        let mut tracker = daw_gui::DropTracker::default();
+        tracker.hover(frame_target(Some((x, 40.0)), &audio));
+        starts.push(tracker.release(None).start);
+    }
+    assert!(starts.windows(2).all(|w| w[0] < w[1]), "{starts:?}");
+    assert!(starts.iter().any(|&s| s != bar3), "{starts:?}");
+}
+
+#[test]
+fn a_drop_without_any_hover_or_pointer_makes_a_new_track_at_zero() {
+    let mut tracker = daw_gui::DropTracker::default();
+    assert_eq!(
+        tracker.release(None),
+        daw_gui::DropTarget {
+            track: None,
+            start: 0
+        }
+    );
+}
+
+#[test]
+fn a_hover_without_a_pointer_keeps_the_previous_preview() {
+    let audio = [true, true];
+    let mut tracker = daw_gui::DropTracker::default();
+    tracker.hover(frame_target(Some((100.0, 24.0 + 85.0)), &audio));
+    tracker.hover(frame_target(None, &audio));
+    assert_eq!(tracker.release(None).track, Some(1));
+}
+
+#[test]
+fn a_released_drop_does_not_leak_into_the_next_one() {
+    let audio = [true];
+    let mut tracker = daw_gui::DropTracker::default();
+    tracker.hover(frame_target(Some((100.0, 40.0)), &audio));
+    let _ = tracker.release(None);
+    assert_eq!(tracker.release(None).track, None);
+    tracker.hover(frame_target(Some((100.0, 40.0)), &audio));
+    tracker.cancel();
+    assert_eq!(tracker.release(None).start, 0);
+}
+
+#[test]
+fn a_drop_on_an_existing_audio_track_does_not_add_a_track() {
+    let dir = Scratch::new("existing-track");
+    let wav = dir.join("d.wav");
+    write_wav(&wav, 4800);
+    let mut editor = Editor::new();
+    let first = dir.join("a.wav");
+    write_wav(&first, 4800);
+    editor.import_audio_at(&first, None, None).unwrap();
+    let audio: Vec<bool> = editor
+        .session()
+        .tracks
+        .iter()
+        .map(|t| t.kind == audio_core::session::TrackKind::Audio)
+        .collect();
+    let mut tracker = daw_gui::DropTracker::default();
+    tracker.hover(frame_target(Some((200.0, 24.0 + 10.0)), &audio));
+    let t = tracker.release(frame_target(None, &audio));
+    let (index, _) = editor
+        .import_audio_at(&wav, t.track, Some(t.start))
+        .unwrap();
+    assert_eq!(editor.session().tracks.len(), 1);
+    assert_eq!(index, 0);
+    assert_eq!(editor.session().tracks[0].clips[1].start_samples, t.start);
+}

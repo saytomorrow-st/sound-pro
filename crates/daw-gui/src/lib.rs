@@ -3128,6 +3128,43 @@ pub fn drop_target(
     }
 }
 
+/// Remembers where the preview frame was last drawn so the drop lands there
+/// (SPEC-050 §2).
+///
+/// While a file is dragged over the window the platform may stop reporting
+/// the pointer (X11/XWayland send no pointer motion during a drag), so the
+/// position seen on the frame of the drop can be missing or stale. The frame
+/// the user watched is the one that counts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DropTracker {
+    hovered: Option<DropTarget>,
+}
+
+impl DropTracker {
+    /// Records the target drawn for the current hover frame; `None` (no
+    /// pointer known) keeps the previous one.
+    pub fn hover(&mut self, target: Option<DropTarget>) {
+        if target.is_some() {
+            self.hovered = target;
+        }
+    }
+
+    /// Forgets the hover, e.g. when the drag left the window without a drop.
+    pub fn cancel(&mut self) {
+        self.hovered = None;
+    }
+
+    /// The target for a file released now. The last hover target wins over
+    /// `at_release`, the target computed from the pointer on the drop frame;
+    /// without either the file gets a new track at 0. Clears the hover.
+    pub fn release(&mut self, at_release: Option<DropTarget>) -> DropTarget {
+        self.hovered.take().or(at_release).unwrap_or(DropTarget {
+            track: None,
+            start: 0,
+        })
+    }
+}
+
 /// The beat (4/4 grid) nearest to `samples`; halfway rounds up. A bad tempo
 /// falls back to [`DEFAULT_TEMPO`].
 #[must_use]
