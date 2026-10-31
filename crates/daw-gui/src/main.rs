@@ -7,6 +7,8 @@
 
 mod audio_editor;
 mod shell;
+#[cfg(target_os = "linux")]
+mod x11_cursor;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -514,6 +516,10 @@ struct App {
     hover_rx: std::sync::mpsc::Receiver<HoverBlocks>,
     /// Last pointer position over the window; a drop no longer has one.
     drop_tracker: daw_gui::DropTracker,
+    /// OS cursor query used at drop time (X11 only): winit drops
+    /// `XdndPosition` during an external drag, so egui's pointer is stale.
+    #[cfg(target_os = "linux")]
+    x11_cursor: Option<x11_cursor::X11Cursor>,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -647,6 +653,8 @@ impl App {
             hover_tx,
             hover_rx,
             drop_tracker: daw_gui::DropTracker::default(),
+            #[cfg(target_os = "linux")]
+            x11_cursor: None,
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
@@ -1827,9 +1835,9 @@ impl App {
             .collect();
         let snap = self.snap && !free;
         let zoom = self.zoom;
-        let target_at = |p: Pos2| {
+        let to_target = |local: (f32, f32)| {
             daw_gui::drop_target(
-                Some((p.x - area.min.x, p.y - area.min.y)),
+                Some(local),
                 RULER_HEIGHT,
                 TRACK_HEIGHT,
                 &audio_rows,
@@ -1839,6 +1847,9 @@ impl App {
                 snap,
             )
         };
+        // `p` is window-local in egui points; `drop_target` wants the position
+        // measured from the timeline's top-left corner.
+        let target_at = |p: Pos2| to_target((p.x - area.min.x, p.y - area.min.y));
         if hovering {
             let painter = ui.painter_at(area);
             let target = pointer.map(target_at);
@@ -1924,7 +1935,39 @@ impl App {
             return;
         }
         self.probes.clear();
-        let target = self.drop_tracker.release(pointer.map(target_at));
+        // During an XDND drag winit drops `XdndPosition`, so egui's pointer is
+        // frozen or missing at release. Read the OS cursor directly (X11 only)
+        // so the drop lands under the pointer; otherwise fall back to the last
+        // hover preview (`DropTracker`).
+        #[cfg(target_os = "linux")]
+        let os_target = self.x11_cursor.as_ref().and_then(|cursor| {
+            let (x, y) = cursor.position()?;
+            let scale = ui
+                .ctx()
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0)
+                .max(f32::EPSILON);
+            // `position()` is window-relative in physical pixels (the window
+            // origin is already baked in), so the conversion subtracts nothing
+            // but the timeline's own top-left corner.
+            let local = daw_gui::native_pointer_to_timeline(
+                (x, y),
+                (0.0, 0.0),
+                scale,
+                (area.min.x, area.min.y),
+            );
+            Some(to_target(local))
+        });
+        #[cfg(not(target_os = "linux"))]
+        let os_target = None;
+        let target = match os_target {
+            Some(fresh) => {
+                // The live cursor wins over the stale hover preview.
+                self.drop_tracker.cancel();
+                fresh
+            }
+            None => self.drop_tracker.release(pointer.map(target_at)),
+        };
         self.import_in_background(dropped, target.track, Some(target.start));
     }
 
@@ -4310,7 +4353,11 @@ fn press_pos(input: &egui::InputState) -> Option<Pos2> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "linux")]
+        if self.x11_cursor.is_none() {
+            self.x11_cursor = x11_cursor::X11Cursor::from_frame(frame);
+        }
         if !self.themed {
             shell::apply_theme(ctx);
             self.themed = true;

@@ -3085,6 +3085,32 @@ pub fn drop_start(x: f32, rate: u32, zoom: f32, tempo_bpm: f64, snap: bool) -> u
     }
 }
 
+/// Converts a pointer position reported in native (physical) pixels — the
+/// space the OS and the XDND drag protocol use — into an offset from the
+/// timeline area's top-left corner, in egui points.
+///
+/// This is the single place the OS scale factor (`pixels_per_point`, DPI) and
+/// the window origin are accounted for, so a dropped file lands under the
+/// cursor regardless of screen size or where the window sits on the desktop
+/// (SPEC-050 §2). A non-finite or non-positive scale falls back to `1.0`.
+#[must_use]
+pub fn native_pointer_to_timeline(
+    pointer_native: (f32, f32),
+    window_origin_native: (f32, f32),
+    pixels_per_point: f32,
+    timeline_origin_points: (f32, f32),
+) -> (f32, f32) {
+    let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    (
+        (pointer_native.0 - window_origin_native.0) / scale - timeline_origin_points.0,
+        (pointer_native.1 - window_origin_native.1) / scale - timeline_origin_points.1,
+    )
+}
+
 /// Where a dropped audio file lands (SPEC-050 §2, §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropTarget {

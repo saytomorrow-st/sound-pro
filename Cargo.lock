@@ -516,8 +516,11 @@ dependencies = [
  "audio-core",
  "daw-app",
  "eframe",
+ "raw-window-handle",
  "rfd",
  "thiserror 2.0.21",
+ "x11-dl",
+ "x11rb",
 ]
 
 [[package]]
