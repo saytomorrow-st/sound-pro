@@ -392,6 +392,8 @@ const REFRESH_DELAY: std::time::Duration = std::time::Duration::from_millis(120)
 
 /// A file decoded on a background thread (SPEC-035): path, target track,
 /// start, and the channels at the project rate (SPEC-050 §5).
+type HoverBlocks = (PathBuf, usize, Vec<(f32, f32)>);
+
 type Decoded = (
     PathBuf,
     Option<usize>,
@@ -506,6 +508,12 @@ struct App {
     imports: Imports,
     /// File lengths read from headers while files hover (SPEC-050 §2).
     probes: HashMap<PathBuf, Result<u64, String>>,
+    /// Waveforms of hovered files, filling in as they decode.
+    hover_peaks: HashMap<PathBuf, daw_gui::Peaks>,
+    hover_tx: std::sync::mpsc::Sender<HoverBlocks>,
+    hover_rx: std::sync::mpsc::Receiver<HoverBlocks>,
+    /// Last pointer position over the window; a drop no longer has one.
+    last_pointer: Option<Pos2>,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -616,6 +624,7 @@ fn buffer_label(frames: u32, rate: u32) -> String {
 
 impl App {
     fn new(start: Option<PathBuf>) -> Self {
+        let (hover_tx, hover_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             editor: Editor::new(),
             #[cfg(feature = "audio")]
@@ -634,6 +643,10 @@ impl App {
                 }
             },
             probes: HashMap::new(),
+            hover_peaks: HashMap::new(),
+            hover_tx,
+            hover_rx,
+            last_pointer: None,
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
@@ -1783,6 +1796,11 @@ impl App {
     #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     /// Drag and drop of WAV/MP3 files onto the timeline (SPEC-032).
     fn handle_drop(&mut self, ui: &egui::Ui, area: Rect, tracks: usize) {
+        while let Ok((path, first, blocks)) = self.hover_rx.try_recv() {
+            if let Some(p) = self.hover_peaks.get_mut(&path) {
+                p.set_blocks(first, &blocks);
+            }
+        }
         let (hovered, dropped, pointer, free) = ui.ctx().input(|i| {
             (
                 i.raw
@@ -1800,19 +1818,37 @@ impl App {
             )
         });
         let hovering = !hovered.is_empty() || ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        // The pointer is gone by the time a drop arrives, so the last
+        // position seen is the one that counts.
+        if pointer.is_some() {
+            self.last_pointer = pointer;
+        }
+        let pointer = pointer.or(self.last_pointer);
         let session = self.editor.session();
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+        let audio_rows: Vec<bool> = session
+            .tracks
+            .iter()
+            .map(|t| t.kind == audio_core::session::TrackKind::Audio)
+            .collect();
         let snap = self.snap && !free;
-        let start_at = |p: Pos2| {
-            daw_gui::drop_start((p.x - area.min.x).max(0.0), rate, self.zoom, tempo, snap)
-        };
-        let row_at = |p: Pos2| {
-            let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
-            (row >= 0.0 && (row as usize) < tracks).then_some(row as usize)
+        let zoom = self.zoom;
+        let target_at = |p: Pos2| {
+            daw_gui::drop_target(
+                Some((p.x - area.min.x, p.y - area.min.y)),
+                RULER_HEIGHT,
+                TRACK_HEIGHT,
+                &audio_rows,
+                rate,
+                zoom,
+                tempo,
+                snap,
+            )
         };
         if hovering {
             let painter = ui.painter_at(area);
-            let band = match pointer.and_then(row_at) {
+            let target = pointer.map(target_at);
+            let band = match target.and_then(|t| t.track) {
                 Some(t) => {
                     let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
                     Rect::from_min_size(
@@ -1837,11 +1873,13 @@ impl App {
                     .or_insert_with(|| daw_gui::probe_len(path, rate).map_err(|e| e.to_string()))
                     .clone()
             });
-            match (probe, pointer) {
-                (Some(Ok(len)), Some(p)) => {
-                    let start = start_at(p);
-                    let x0 = area.min.x + samples_to_x(start, rate, self.zoom);
-                    let x1 = area.min.x + samples_to_x(start + len, rate, self.zoom);
+            if let (Some(path), Some(Ok(len))) = (&first, &probe) {
+                self.start_hover_peaks(path, *len, rate);
+            }
+            match (probe, target) {
+                (Some(Ok(len)), Some(t)) => {
+                    let x0 = area.min.x + samples_to_x(t.start, rate, self.zoom);
+                    let x1 = area.min.x + samples_to_x(t.start + len, rate, self.zoom);
                     let frame = Rect::from_min_max(
                         Pos2::new(x0, band.min.y + 2.0),
                         Pos2::new(x1.max(x0 + 2.0), band.min.y + TRACK_HEIGHT - 2.0),
@@ -1851,6 +1889,18 @@ impl App {
                         4.0,
                         Color32::from_rgba_unmultiplied(80, 140, 255, 70),
                     );
+                    if let Some(peaks) = first.as_ref().and_then(|p| self.hover_peaks.get(p)) {
+                        let mut clip = audio_core::session::Clip::full(t.start, len);
+                        clip.name = String::new();
+                        draw_peaks(
+                            &painter,
+                            frame,
+                            frame,
+                            &clip,
+                            peaks,
+                            Color32::from_rgba_unmultiplied(200, 225, 255, 160),
+                        );
+                    }
                     painter.rect_stroke(
                         frame,
                         4.0,
@@ -1869,6 +1919,8 @@ impl App {
                     self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
                 }
             }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         } else if dropped.is_empty() {
             self.probes.clear();
         }
@@ -1876,11 +1928,60 @@ impl App {
             return;
         }
         self.probes.clear();
-        let (track, start) = match pointer.filter(|p| area.contains(*p)) {
-            Some(p) => (row_at(p), start_at(p)),
-            None => (None, 0),
-        };
-        self.import_in_background(dropped, track, Some(start));
+        let target = pointer.map_or_else(
+            || daw_gui::DropTarget {
+                track: None,
+                start: 0,
+            },
+            target_at,
+        );
+        self.last_pointer = None;
+        self.import_in_background(dropped, target.track, Some(target.start));
+    }
+
+    /// Decodes a hovered file in the background so its waveform can show in
+    /// the preview frame; the decode also fills the PCM cache for the drop.
+    fn start_hover_peaks(&mut self, path: &std::path::Path, len: u64, rate: u32) {
+        if self.hover_peaks.contains_key(path) {
+            return;
+        }
+        if self.hover_peaks.len() >= 8 {
+            self.hover_peaks.clear();
+        }
+        let template = daw_gui::Peaks::empty(len);
+        self.hover_peaks
+            .insert(path.to_path_buf(), template.clone());
+        let (tx, path, cache) = (
+            self.hover_tx.clone(),
+            path.to_path_buf(),
+            self.editor.pcm_cache(),
+        );
+        std::thread::spawn(move || {
+            let mut sent = 0;
+            let mut last = std::time::Instant::now();
+            let progress_path = path.clone();
+            let result =
+                daw_gui::read_source_cached(&path, rate, cache.as_ref(), &mut |from, ch| {
+                    let Some(left) = ch.first() else { return };
+                    if last.elapsed() < std::time::Duration::from_millis(100) {
+                        return;
+                    }
+                    last = std::time::Instant::now();
+                    let blocks = template.blocks_from(left, from, rate, sent);
+                    if blocks.is_empty() {
+                        return;
+                    }
+                    let first = sent;
+                    sent += blocks.len();
+                    let _ = tx.send((progress_path.clone(), first, blocks));
+                });
+            if let Ok(ch) = result {
+                let all = template.blocks_from(&ch.left, rate, rate, sent);
+                if !all.is_empty() {
+                    let _ = tx.send((path, sent, all));
+                }
+            }
+        });
     }
 
     /// Scroll offset that keeps the zoom anchor still (SPEC-037): the

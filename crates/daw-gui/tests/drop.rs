@@ -234,3 +234,66 @@ fn probe_len_comes_from_the_header_for_mp3_and_wav() {
     assert_eq!(daw_gui::probe_len(&wav, RATE).unwrap(), 2400);
     assert!(daw_gui::probe_len(&sine_mp3(), RATE).unwrap() >= 24_000);
 }
+
+fn target(pointer: Option<(f32, f32)>, audio: &[bool], snap: bool) -> daw_gui::DropTarget {
+    daw_gui::drop_target(pointer, 24.0, 80.0, audio, RATE, 100.0, 120.0, snap)
+}
+
+#[test]
+fn a_drop_on_an_audio_row_goes_to_that_track_under_the_pointer() {
+    let audio = [true, true, true];
+    // Row 1 spans y = 24 + 80 .. 24 + 160.
+    let t = target(Some((130.0, 24.0 + 80.0 + 10.0)), &audio, false);
+    assert_eq!(t.track, Some(1));
+    assert_eq!(t.start, daw_gui::x_to_samples(130.0, RATE, 100.0));
+    let last = target(Some((10.0, 24.0 + 2.0 * 80.0 + 79.0)), &audio, false);
+    assert_eq!(last.track, Some(2));
+}
+
+#[test]
+fn a_drop_snaps_to_the_beat_unless_free() {
+    let audio = [true];
+    let free = target(Some((130.0, 40.0)), &audio, false);
+    let snapped = target(Some((130.0, 40.0)), &audio, true);
+    assert_eq!(snapped.track, Some(0));
+    assert_eq!(
+        snapped.start,
+        daw_gui::snap_to_beat(free.start, RATE, 120.0)
+    );
+}
+
+#[test]
+fn a_drop_below_the_last_track_or_on_the_ruler_makes_a_new_track() {
+    let audio = [true, true];
+    assert_eq!(
+        target(Some((50.0, 24.0 + 2.0 * 80.0 + 1.0)), &audio, false).track,
+        None
+    );
+    assert_eq!(target(Some((50.0, 500.0)), &audio, false).track, None);
+    assert_eq!(target(Some((50.0, 10.0)), &audio, false).track, None);
+    assert_eq!(target(Some((50.0, 24.0)), &audio, false).track, Some(0));
+    assert_eq!(target(Some((50.0, 24.0)), &[], false).track, None);
+}
+
+#[test]
+fn a_drop_on_an_instrument_row_or_without_a_pointer_makes_a_new_track() {
+    let rows = [true, false];
+    assert_eq!(
+        target(Some((50.0, 24.0 + 80.0 + 5.0)), &rows, false).track,
+        None
+    );
+    assert_eq!(
+        target(None, &rows, true),
+        daw_gui::DropTarget {
+            track: None,
+            start: 0
+        }
+    );
+    assert_eq!(target(Some((f32::NAN, 40.0)), &rows, true).track, None);
+}
+
+#[test]
+fn a_negative_x_drops_at_zero() {
+    let t = target(Some((-30.0, 40.0)), &[true], true);
+    assert_eq!((t.track, t.start), (Some(0), 0));
+}

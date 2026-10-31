@@ -3085,6 +3085,49 @@ pub fn drop_start(x: f32, rate: u32, zoom: f32, tempo_bpm: f64, snap: bool) -> u
     }
 }
 
+/// Where a dropped audio file lands (SPEC-050 §2, §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTarget {
+    /// Existing audio track under the pointer; `None` for a new track.
+    pub track: Option<usize>,
+    /// Region start in samples.
+    pub start: u64,
+}
+
+/// Picks the track and start for a file released at (`x`, `y`), measured from
+/// the top-left of the timeline area. A row of an audio track takes the file;
+/// the ruler, the empty area below the last track, an instrument track or no
+/// known pointer (`None`) mean a new track. The preview frame and the drop
+/// call this with the same arguments, so they agree.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn drop_target(
+    pointer: Option<(f32, f32)>,
+    ruler_height: f32,
+    row_height: f32,
+    audio_rows: &[bool],
+    rate: u32,
+    zoom: f32,
+    tempo_bpm: f64,
+    snap: bool,
+) -> DropTarget {
+    let Some((x, y)) = pointer.filter(|(x, y)| x.is_finite() && y.is_finite()) else {
+        return DropTarget {
+            track: None,
+            start: 0,
+        };
+    };
+    let row = ((y - ruler_height) / row_height.max(1.0)).floor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let track = (row >= 0.0)
+        .then_some(row as usize)
+        .filter(|&r| audio_rows.get(r).copied().unwrap_or(false));
+    DropTarget {
+        track,
+        start: drop_start(x.max(0.0), rate, zoom, tempo_bpm, snap),
+    }
+}
+
 /// The beat (4/4 grid) nearest to `samples`; halfway rounds up. A bad tempo
 /// falls back to [`DEFAULT_TEMPO`].
 #[must_use]
