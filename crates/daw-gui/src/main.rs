@@ -569,6 +569,10 @@ struct App {
     /// Draw the XQueryPointer / egui pointer debug crosses while a file is
     /// hovered (set `SOUND_PRO_DROP_DEBUG=1`). Read once at startup.
     drop_debug: bool,
+    /// Log window/viewport state and every `ViewportCommand` sent, to diagnose
+    /// broken window controls on Wayland/XWayland (set
+    /// `SOUND_PRO_WINDOW_DEBUG=1`). Read once at startup.
+    window_debug: bool,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -726,6 +730,7 @@ impl App {
             #[cfg(target_os = "linux")]
             x11_cursor: None,
             drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
+            window_debug: std::env::var_os("SOUND_PRO_WINDOW_DEBUG").is_some(),
             player: None,
             last_tempo_map: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
@@ -800,6 +805,14 @@ impl App {
 
     fn play(&mut self) {
         self.player = None;
+        let play_debug = std::env::var_os("SOUND_PRO_PLAY_DEBUG").is_some();
+        if play_debug {
+            eprintln!(
+                "[play-debug] play() from playhead={} (length_samples={})",
+                self.playhead,
+                self.editor.session().length_samples()
+            );
+        }
         let started = self
             .editor
             .playback(self.playhead)
@@ -808,6 +821,12 @@ impl App {
                 (control, engine)
             });
         let Some((control, engine)) = self.report(started, "Играет") else {
+            if play_debug {
+                eprintln!(
+                    "[play-debug] playback() failed; status now: {:?}",
+                    self.status
+                );
+            }
             return;
         };
         self.playhead = control.position();
@@ -816,6 +835,9 @@ impl App {
             let rate = control.sample_rate();
             match daw_app::realtime::start_output_with(engine, rate, &self.audio) {
                 Ok(stream) => {
+                    if play_debug {
+                        eprintln!("[play-debug] start_output_with ok; playing");
+                    }
                     self.player = Some(Player {
                         control,
                         _stream: stream,
@@ -823,7 +845,12 @@ impl App {
                         changed: None,
                     });
                 }
-                Err(e) => self.status = format!("Ошибка звука: {e}"),
+                Err(e) => {
+                    if play_debug {
+                        eprintln!("[play-debug] start_output_with error: {e}");
+                    }
+                    self.status = format!("Ошибка звука: {e}");
+                }
             }
         }
         #[cfg(not(feature = "audio"))]
@@ -2783,11 +2810,19 @@ impl App {
             let x = area.min.x + samples_to_x(samples, rate, self.zoom);
             let label = format!("{:.0}", point.bpm);
             let galley = painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::BLACK);
-            let flag = Rect::from_min_size(
+            let mut flag = Rect::from_min_size(
                 Pos2::new(x - galley.size().x * 0.5 - 4.0, lane.min.y + 2.0),
                 Vec2::new(galley.size().x + 8.0, TEMPO_LANE_HEIGHT - 4.0),
             );
-            painter.rect_filled(flag, 2.0, color);
+            // The first point sits at tick 0, whose flag would otherwise spill
+            // left of the lane and hide behind the track headers (SPEC-054);
+            // clamp it back into view and anchor it in place.
+            if index == 0 {
+                flag = Rect::from_min_size(Pos2::new(lane.min.x, lane.min.y + 2.0), flag.size());
+                painter.rect_filled(flag, 2.0, color.gamma_multiply(0.75));
+            } else {
+                painter.rect_filled(flag, 2.0, color);
+            }
             painter.galley(
                 flag.min + Vec2::new(4.0, (TEMPO_LANE_HEIGHT - 4.0 - galley.size().y) * 0.5),
                 galley,
@@ -2807,6 +2842,23 @@ impl App {
         let mut action = None;
         for (index, flag) in flags {
             let id = ui.id().with(("tempo-point", index));
+            // The first point (tick 0) is a fixed anchor: it keeps the project
+            // tempo and cannot be dragged (SPEC-054).
+            if index == 0 {
+                let response = ui
+                    .interact(flag, id, Sense::click())
+                    .on_hover_text("Первая темпо-точка зафиксирована на тике 0");
+                if response.double_clicked() {
+                    action = Some(TempoAction::Edit(index));
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Изменить BPM").clicked() {
+                        action = Some(TempoAction::Edit(index));
+                        ui.close();
+                    }
+                });
+                continue;
+            }
             let response = ui
                 .interact(flag, id, Sense::click_and_drag())
                 .on_hover_cursor(egui::CursorIcon::Grab);
@@ -2949,10 +3001,15 @@ impl App {
             FontId::proportional(11.0),
             Color32::BLACK,
         );
-        Some(Rect::from_min_size(
-            Pos2::new(x - galley.size().x * 0.5 - 4.0, lane.min.y + 2.0),
-            Vec2::new(galley.size().x + 8.0, TEMPO_LANE_HEIGHT - 4.0),
-        ))
+        let size = Vec2::new(galley.size().x + 8.0, TEMPO_LANE_HEIGHT - 4.0);
+        // The first point (tick 0) is anchored at the lane's left edge so its
+        // flag does not spill behind the track headers.
+        let min = if index == 0 {
+            Pos2::new(lane.min.x, lane.min.y + 2.0)
+        } else {
+            Pos2::new(x - galley.size().x * 0.5 - 4.0, lane.min.y + 2.0)
+        };
+        Some(Rect::from_min_size(min, size))
     }
 
     /// Marker flags on the ruler and their clicks, drags and menus (SPEC-030).
@@ -4164,6 +4221,12 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F11)) {
             let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            if self.window_debug {
+                eprintln!(
+                    "[window-debug] F11: send_viewport_cmd Fullscreen({})",
+                    !full
+                );
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
         }
         if !typing(ctx) {

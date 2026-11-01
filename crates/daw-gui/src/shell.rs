@@ -579,14 +579,29 @@ fn inspector_block(
     ui.add_space(2.0);
 }
 
+/// Emit a diagnostic line to stderr when `SOUND_PRO_WINDOW_DEBUG=1` is set.
+/// Used to trace window-control delivery on Wayland/XWayland, where the
+/// `ViewportCommand`s may never reach winit (SPEC-050 §1).
+fn window_debug(msg: &str) {
+    if std::env::var_os("SOUND_PRO_WINDOW_DEBUG").is_some() {
+        eprintln!("[window-debug] {msg}");
+    }
+}
+
 /// In full screen the system title bar is gone, so the window controls are
 /// drawn in the control bar: minimize, leave full screen, close.
 fn window_buttons(ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
-    if !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+    let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+    if !fullscreen {
+        // System decorations are expected to provide the buttons; log the
+        // state so a broken-WM report can be correlated with decorations.
+        window_debug("window_buttons: not fullscreen, no custom buttons (system title bar)");
         return;
     }
+    window_debug("window_buttons: fullscreen, rendering ✕/🗗/🗕");
     if ui.button("✕").on_hover_text("Закрыть").clicked() {
+        window_debug("send_viewport_cmd: Close");
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     if ui
@@ -594,11 +609,13 @@ fn window_buttons(ui: &mut egui::Ui) {
         .on_hover_text("Выйти из полноэкранного режима (F11)")
         .clicked()
     {
+        window_debug("send_viewport_cmd: Fullscreen(false)");
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
     }
     if ui.button("🗕").on_hover_text("Свернуть").clicked() {
         // Most window managers ignore a minimize request from a full-screen
         // window, so leave full screen first (SPEC-045 §7).
+        window_debug("send_viewport_cmd: Fullscreen(false) then Minimized(true)");
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
@@ -783,8 +800,14 @@ impl App {
         );
         let ctx = ui.ctx().clone();
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if strip.drag_started() {
+            window_debug(&format!(
+                "control_bar strip drag started (fullscreen={fullscreen})"
+            ));
+        }
         if let Some(commands) = window_drag_commands(fullscreen, strip.drag_started()) {
             for command in commands {
+                window_debug(&format!("send_viewport_cmd: {command:?}"));
                 ctx.send_viewport_cmd(command);
             }
         }

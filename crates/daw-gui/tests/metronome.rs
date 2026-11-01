@@ -103,11 +103,11 @@ fn set_tempo_is_clamped_undoable_and_dirty() {
     assert_eq!(editor.session().tempo_bpm, 140.0);
     assert!(editor.is_dirty());
     editor.set_tempo(5.0);
-    assert_eq!(editor.session().tempo_bpm, 20.0);
+    assert_eq!(editor.session().tempo_bpm, 30.0);
     editor.set_tempo(5_000.0);
-    assert_eq!(editor.session().tempo_bpm, 999.0);
+    assert_eq!(editor.session().tempo_bpm, 300.0);
     assert!(editor.undo());
-    assert_eq!(editor.session().tempo_bpm, 20.0);
+    assert_eq!(editor.session().tempo_bpm, 30.0);
     assert!(editor.undo());
     assert!(editor.undo());
     assert_eq!(editor.session().tempo_bpm, 120.0);

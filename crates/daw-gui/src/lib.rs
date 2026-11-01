@@ -25,14 +25,12 @@ use audio_core::{
 pub const DEFAULT_RATE: u32 = 48_000;
 /// Tempo of a new project.
 pub const DEFAULT_TEMPO: f64 = 120.0;
-/// Slowest tempo the window allows (SPEC-026).
-pub const MIN_TEMPO: f64 = 20.0;
-/// Fastest tempo the window allows (SPEC-026).
-pub const MAX_TEMPO: f64 = 999.0;
-/// Slowest BPM a tempo point may take (SPEC-054).
-pub const MIN_TEMPO_POINT_BPM: f64 = 30.0;
-/// Fastest BPM a tempo point may take (SPEC-054).
-pub const MAX_TEMPO_POINT_BPM: f64 = 300.0;
+/// Slowest tempo the window allows. The scalar tempo is the first tempo-map
+/// point, so it shares the tempo-map range (SPEC-054); it was `20.0` before
+/// the map existed.
+pub const MIN_TEMPO: f64 = 30.0;
+/// Fastest tempo the window allows. See [`MIN_TEMPO`].
+pub const MAX_TEMPO: f64 = 300.0;
 /// Frames summarised by one [`Peaks`] entry.
 pub const PEAK_BLOCK: usize = 256;
 
@@ -2916,8 +2914,9 @@ impl Editor {
         }
     }
 
-    /// Sets the tempo, clamped to `20..=999` BPM (SPEC-026). A value that is
-    /// not finite, or the current tempo, changes nothing.
+    /// Sets the tempo, clamped to `30..=300` BPM (SPEC-054; the scalar tempo
+    /// is the first tempo-map point). A value that is not finite, or the
+    /// current tempo, changes nothing.
     pub fn set_tempo(&mut self, tempo_bpm: f64) {
         if !tempo_bpm.is_finite() {
             return;
@@ -2958,7 +2957,7 @@ impl Editor {
     /// Returns the full-list index of the point, or `None` if the inputs are
     /// out of range or the point limit is reached.
     pub fn add_tempo_point(&mut self, position_ticks: u64, bpm: f64) -> Option<usize> {
-        if !bpm.is_finite() || !(MIN_TEMPO_POINT_BPM..=MAX_TEMPO_POINT_BPM).contains(&bpm) {
+        if !bpm.is_finite() || !(MIN_TEMPO..=MAX_TEMPO).contains(&bpm) {
             return None;
         }
         if position_ticks == 0 {
@@ -3039,7 +3038,7 @@ impl Editor {
     /// Sets the BPM of tempo point `index` (full list), clamped to 30–300.
     /// Index 0 routes to [`Self::set_tempo`]. Returns `true` when changed.
     pub fn set_tempo_point_bpm(&mut self, index: usize, bpm: f64) -> bool {
-        if !bpm.is_finite() || !(MIN_TEMPO_POINT_BPM..=MAX_TEMPO_POINT_BPM).contains(&bpm) {
+        if !bpm.is_finite() || !(MIN_TEMPO..=MAX_TEMPO).contains(&bpm) {
             return false;
         }
         if index == 0 {
