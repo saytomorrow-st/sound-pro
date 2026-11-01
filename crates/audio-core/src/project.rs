@@ -20,7 +20,7 @@ use crate::session::{
     MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker,
     Note, Session, SessionError, Track, TrackFormat, TrackKind,
 };
-use crate::transport::TimeSignature;
+use crate::transport::{TempoPoint, TimeSignature};
 
 /// Longest accepted `name`, in bytes.
 pub const MAX_NAME_BYTES: usize = 128;
@@ -414,6 +414,22 @@ fn write_session(out: &mut String, session: &Session) {
     out.push_str(&session.sample_rate.to_string());
     out.push_str(",\n    \"tempo_bpm\": ");
     out.push_str(&format_number(session.tempo_bpm));
+    // Written only when there are additional points, so single-tempo documents
+    // keep their exact text (SPEC-054).
+    if !session.tempo_map.is_empty() {
+        out.push_str(",\n    \"tempo_map\": [");
+        for (index, point) in session.tempo_map.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str("\n      [");
+            out.push_str(&point.position_ticks.to_string());
+            out.push_str(", ");
+            out.push_str(&format_number(point.bpm));
+            out.push(']');
+        }
+        out.push_str("\n    ]");
+    }
     out.push_str(",\n    \"master_gain\": ");
     out.push_str(&format_number(f64::from(session.master_gain)));
     // Written only when set, so older documents keep their exact text.
@@ -717,6 +733,7 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut buses = None;
     let mut markers = None;
     let mut notes = None;
+    let mut tempo_map = None;
     for (key, value) in entries {
         match key.as_str() {
             "notes" => notes = Some(require_string(value)?),
@@ -729,6 +746,7 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
             "master_mute" => master_mute = Some(require_bool(value)?),
             "master_dim" => master_dim = Some(require_bool(value)?),
             "time_signature" => time_signature = Some(time_signature_from_value(value)?),
+            "tempo_map" => tempo_map = Some(tempo_map_from_value(value)?),
             "tracks" => {
                 let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
                 // Reject an over-long session while parsing rather than after
@@ -780,6 +798,8 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         markers: markers.unwrap_or_default(),
         // Optional since SPEC-043.
         notes: notes.unwrap_or_default(),
+        // Optional since SPEC-054; absent means a single point at `tempo_bpm`.
+        tempo_map: tempo_map.unwrap_or_default(),
     })
 }
 
@@ -792,6 +812,23 @@ fn time_signature_from_value(value: &Value) -> Result<TimeSignature, ProjectErro
         numerator: require_u8(numerator)?,
         denominator: require_u8(denominator)?,
     })
+}
+
+fn tempo_map_from_value(value: &Value) -> Result<Vec<TempoPoint>, ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    items
+        .iter()
+        .map(|point| {
+            let pair = point.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+            let [ticks, bpm] = pair else {
+                return Err(ProjectError::Malformed { at: 0 });
+            };
+            Ok(TempoPoint {
+                position_ticks: require_u64(ticks)?,
+                bpm: require_f64(bpm)?,
+            })
+        })
+        .collect()
 }
 
 fn track_from_value(value: &Value) -> Result<Track, ProjectError> {

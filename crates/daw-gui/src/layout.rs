@@ -60,18 +60,14 @@ pub const TICKS_PER_SIXTEENTH: u64 = 240;
 
 /// Position display fields `bar beat sixteenth tick`, each counted from 1
 /// except the tick (from 1 too, `1..=240`). `beats_per_bar` of zero counts
-/// as 4; a bad tempo counts as 120 BPM.
+/// as 4; a bad tempo counts as 120 BPM. Routes through the tempo map.
 #[must_use]
-pub fn lcd_position(samples: u64, rate: u32, tempo_bpm: f64, beats_per_bar: u32) -> [u64; 4] {
+pub fn lcd_position(samples: u64, map: &audio_core::TempoMap, beats_per_bar: u32) -> [u64; 4] {
     let per_bar = u64::from(if beats_per_bar == 0 { 4 } else { beats_per_bar });
-    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
-        tempo_bpm
-    } else {
-        crate::DEFAULT_TEMPO
-    };
     let per_beat = 4 * TICKS_PER_SIXTEENTH;
+    let spb = map.samples_per_beat_at(samples);
     #[allow(clippy::cast_precision_loss)]
-    let beats = samples as f64 / f64::from(rate.max(1)) * tempo / 60.0;
+    let beats = samples as f64 / spb;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let ticks = (beats * per_beat as f64 + 1e-6).floor() as u64;
     let beat = ticks / per_beat;

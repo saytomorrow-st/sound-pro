@@ -41,6 +41,371 @@ impl Tempo {
     }
 }
 
+/// Most tempo points a tempo map may hold (SPEC-054).
+pub const MAX_TEMPO_POINTS: usize = 256;
+
+/// One tempo change on the timeline: from `position_ticks` the tempo is
+/// `bpm` until the next point (stepwise, no ramps — SPEC-054).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TempoPoint {
+    /// Absolute position in ticks (TPQN subdivision) where this tempo begins.
+    pub position_ticks: u64,
+    /// Tempo in beats per minute, valid `30.0..=300.0`.
+    pub bpm: f64,
+}
+
+/// A stepwise tempo map: an ordered list of [`TempoPoint`] whose first entry
+/// is always at tick 0, plus a precomputed cumulative sample position for
+/// each segment so the audio thread can convert ticks ↔ samples with a binary
+/// search and no allocation (SPEC-054).
+///
+/// The map is built on the control thread and never mutated afterwards; it is
+/// `Clone`-free on the audio path because it is passed by reference into
+/// [`Transport`]. A single point reproduces the old single-`tempo_bpm`
+/// behaviour bit-for-bit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TempoMap {
+    /// Ordered tempo points; `points[0].position_ticks == 0`.
+    points: Vec<TempoPoint>,
+    /// Cumulative sample position of each point at a fixed `sample_rate`.
+    /// `segment_samples[i]` is where `points[i]` lands in samples; segment `i`
+    /// runs from `points[i]` to `points[i + 1]` at `points[i].bpm`.
+    segment_samples: Vec<u64>,
+    /// Samples per tick of each segment (constant inside a segment).
+    samples_per_tick: Vec<f64>,
+    /// Samples per beat of each segment (`rate * 60 / bpm`). Kept separately
+    /// from `samples_per_tick` so beat placement stays bit-identical to the
+    /// pre-map metronome, which computed `ceil(k · rate · 60 / tempo)`.
+    samples_per_beat: Vec<f64>,
+    /// Beat position of each point (`position_ticks / TPQN`; may be fractional
+    /// if a point sits between beats).
+    segment_beats: Vec<f64>,
+    /// Sample rate the cumulative positions were computed for.
+    sample_rate: u32,
+}
+
+impl TempoMap {
+    /// Builds a map from an ordered list of points, precomputing cumulative
+    /// sample positions for `sample_rate`. The first point must sit at tick 0.
+    ///
+    /// This is the control-side constructor: it allocates the segment arrays,
+    /// so it must not run on the audio thread. Use [`Transport`] to read a
+    /// pre-built map inside `process`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TempoMapError`] if the list is empty, the first point is not
+    /// at tick 0, a point is out of order, a BPM is out of `30.0..=300.0`, or
+    /// there are more than [`MAX_TEMPO_POINTS`] points.
+    pub fn new(points: Vec<TempoPoint>, sample_rate: u32) -> Result<Self, TempoMapError> {
+        if sample_rate == 0 {
+            return Err(TempoMapError::InvalidSampleRate);
+        }
+        if points.is_empty() {
+            return Err(TempoMapError::Empty);
+        }
+        if points.len() > MAX_TEMPO_POINTS {
+            return Err(TempoMapError::TooManyPoints {
+                max: MAX_TEMPO_POINTS,
+            });
+        }
+        let mut prev_tick = 0_u64;
+        for (index, point) in points.iter().enumerate() {
+            if index == 0 {
+                if point.position_ticks != 0 {
+                    return Err(TempoMapError::FirstPointNotAtZero);
+                }
+            } else if point.position_ticks <= prev_tick {
+                return Err(TempoMapError::Unordered { index });
+            }
+            if !point.bpm.is_finite() || !(30.0..=300.0).contains(&point.bpm) {
+                return Err(TempoMapError::InvalidBpm { index });
+            }
+            prev_tick = point.position_ticks;
+        }
+
+        // Precompute cumulative sample positions and per-segment samples/tick.
+        let mut segment_samples = Vec::with_capacity(points.len());
+        let mut samples_per_tick = Vec::with_capacity(points.len());
+        let mut samples_per_beat = Vec::with_capacity(points.len());
+        let mut segment_beats = Vec::with_capacity(points.len());
+        segment_samples.push(0_u64);
+        for index in 0..points.len() {
+            let bpm = points[index].bpm;
+            let spb = Tempo(bpm).samples_per_beat(sample_rate);
+            let spt = spb / f64::from(TPQN);
+            samples_per_tick.push(spt);
+            samples_per_beat.push(spb);
+            #[allow(clippy::cast_precision_loss)]
+            segment_beats.push(points[index].position_ticks as f64 / f64::from(TPQN));
+            if index + 1 < points.len() {
+                let tick_span = points[index + 1].position_ticks - points[index].position_ticks;
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let span_samples = (tick_span as f64 * spt).round() as u64;
+                let next = segment_samples[index].saturating_add(span_samples);
+                segment_samples.push(next);
+            }
+        }
+
+        Ok(Self {
+            points,
+            segment_samples,
+            samples_per_tick,
+            samples_per_beat,
+            segment_beats,
+            sample_rate,
+        })
+    }
+
+    /// Builds a single-point map at `bpm`, the old single-tempo behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TempoMapError`] if `bpm` is out of range or `sample_rate` is
+    /// zero.
+    pub fn single(bpm: f64, sample_rate: u32) -> Result<Self, TempoMapError> {
+        Self::new(
+            vec![TempoPoint {
+                position_ticks: 0,
+                bpm,
+            }],
+            sample_rate,
+        )
+    }
+
+    /// Builds a single-point map, falling back to 120 BPM and a sample rate
+    /// of 1 for invalid inputs, matching the old scalar helpers' behaviour.
+    /// Used by UI display helpers that previously accepted a raw `tempo_bpm`.
+    ///
+    /// # Panics
+    ///
+    /// Never: `bpm` is clamped into `30.0..=300.0` and `sample_rate` is at
+    /// least 1, both of which [`Self::single`] always accepts.
+    #[must_use]
+    pub fn single_or_default(bpm: f64, sample_rate: u32) -> Self {
+        let bpm = if bpm.is_finite() && (30.0..=300.0).contains(&bpm) {
+            bpm
+        } else {
+            120.0
+        };
+        let rate = sample_rate.max(1);
+        Self::single(bpm, rate).expect("clamped bpm and rate are always valid")
+    }
+
+    /// The ordered tempo points.
+    #[must_use]
+    pub fn points(&self) -> &[TempoPoint] {
+        &self.points
+    }
+
+    /// Number of tempo points.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Whether the map has no points (always `false` for a valid map).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    /// Sample rate the map was built for.
+    #[must_use]
+    pub const fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// BPM of the first point (the project's headline tempo).
+    #[must_use]
+    pub fn initial_bpm(&self) -> f64 {
+        self.points.first().map_or(120.0, |p| p.bpm)
+    }
+
+    /// Converts an absolute sample position to an absolute tick position.
+    ///
+    /// Binary search over the precomputed cumulative sample positions; no
+    /// allocation, realtime-safe.
+    #[must_use]
+    pub fn samples_to_ticks(&self, samples: u64) -> u64 {
+        let segment = self.segment_at(samples);
+        let start_sample = self.segment_samples[segment];
+        let start_tick = self.points[segment].position_ticks;
+        let spt = self.samples_per_tick[segment];
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let delta_ticks = ((samples - start_sample) as f64 / spt).round() as u64;
+        start_tick.saturating_add(delta_ticks)
+    }
+
+    /// Converts an absolute tick position to an absolute sample position.
+    ///
+    /// Binary search over the precomputed cumulative sample positions; no
+    /// allocation, realtime-safe.
+    #[must_use]
+    pub fn ticks_to_samples(&self, ticks: u64) -> u64 {
+        let segment = self.tick_segment(ticks);
+        let start_sample = self.segment_samples[segment];
+        let start_tick = self.points[segment].position_ticks;
+        let spt = self.samples_per_tick[segment];
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let delta_samples = ((ticks - start_tick) as f64 * spt).round() as u64;
+        start_sample.saturating_add(delta_samples)
+    }
+
+    /// Converts an absolute beat index to an absolute sample position,
+    /// rounding up so a fractional beat length lands on the next frame. The
+    /// metronome uses this to keep click placement bit-identical to the
+    /// pre-map `ceil(k · rate · 60 / tempo)` behaviour (SPEC-026); a
+    /// single-point map reproduces that formula exactly.
+    ///
+    /// Binary search over the precomputed beat positions; no allocation,
+    /// realtime-safe.
+    #[must_use]
+    pub fn beat_to_samples_ceil(&self, beat: u64) -> u64 {
+        #[allow(clippy::cast_precision_loss)]
+        let beat_f = beat as f64;
+        let segment = self
+            .segment_beats
+            .partition_point(|&b| b <= beat_f)
+            .saturating_sub(1);
+        let start_sample = self.segment_samples[segment];
+        let start_beat = self.segment_beats[segment];
+        let spb = self.samples_per_beat[segment];
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let delta_samples = ((beat_f - start_beat) * spb).ceil() as u64;
+        start_sample.saturating_add(delta_samples)
+    }
+
+    /// Samples per tick at the given sample position (the tempo in force there).
+    #[must_use]
+    pub fn samples_per_tick_at(&self, samples: u64) -> f64 {
+        self.samples_per_tick[self.segment_at(samples)]
+    }
+
+    /// Samples per beat (quarter note) at the given sample position. This is
+    /// the tempo in force there, so a single-point map returns the old
+    /// `rate * 60 / bpm` exactly.
+    #[must_use]
+    pub fn samples_per_beat_at(&self, samples: u64) -> f64 {
+        self.samples_per_beat[self.segment_at(samples)]
+    }
+
+    /// Converts an absolute sample position to an absolute beat index
+    /// (quarter notes), flooring the fractional part. Realtime-safe, no
+    /// allocation. A single-point map reproduces the old
+    /// `floor(samples * tempo / (rate * 60))` formula exactly.
+    #[must_use]
+    pub fn samples_to_beats(&self, samples: u64) -> u64 {
+        let segment = self.segment_at(samples);
+        let start_sample = self.segment_samples[segment];
+        let start_beat = self.segment_beats[segment];
+        let spb = self.samples_per_beat[segment];
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let delta_beats = (((samples - start_sample) as f64) / spb).floor() as u64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let start_beat_u64 = start_beat.round() as u64;
+        start_beat_u64.saturating_add(delta_beats)
+    }
+
+    /// Converts an absolute beat index to an absolute sample position,
+    /// rounding to the nearest frame. Realtime-safe, no allocation. A
+    /// single-point map reproduces `round(beat * rate * 60 / bpm)` exactly.
+    #[must_use]
+    pub fn beat_to_samples(&self, beat: u64) -> u64 {
+        #[allow(clippy::cast_precision_loss)]
+        let beat_f = beat as f64;
+        let segment = self
+            .segment_beats
+            .partition_point(|&b| b <= beat_f)
+            .saturating_sub(1);
+        let start_sample = self.segment_samples[segment];
+        let start_beat = self.segment_beats[segment];
+        let spb = self.samples_per_beat[segment];
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let delta_samples = ((beat_f - start_beat) * spb).round() as u64;
+        start_sample.saturating_add(delta_samples)
+    }
+
+    /// BPM in force at the given sample position.
+    #[must_use]
+    pub fn bpm_at(&self, samples: u64) -> f64 {
+        self.points[self.segment_at(samples)].bpm
+    }
+
+    /// Index of the segment (tempo point) governing `samples`. Realtime-safe
+    /// binary search, no allocation.
+    fn segment_at(&self, samples: u64) -> usize {
+        // Last segment whose start sample is <= samples.
+        let idx = self
+            .segment_samples
+            .partition_point(|&start| start <= samples);
+        idx.saturating_sub(1)
+    }
+
+    /// Index of the segment (tempo point) governing `ticks`.
+    fn tick_segment(&self, ticks: u64) -> usize {
+        self.points
+            .partition_point(|p| p.position_ticks <= ticks)
+            .saturating_sub(1)
+    }
+}
+
+/// Why a [`TempoMap`] could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TempoMapError {
+    /// `sample_rate` is zero.
+    #[error("sample_rate must be non-zero")]
+    InvalidSampleRate,
+    /// The point list is empty.
+    #[error("tempo map must have at least one point")]
+    Empty,
+    /// The first point is not at tick 0.
+    #[error("first tempo point must be at tick 0")]
+    FirstPointNotAtZero,
+    /// A point is not strictly after its predecessor.
+    #[error("tempo point {index} is not strictly after its predecessor")]
+    Unordered {
+        /// Index of the offending point.
+        index: usize,
+    },
+    /// A BPM is not finite or outside `30.0..=300.0`.
+    #[error("tempo point {index} has a BPM outside 30.0..=300.0")]
+    InvalidBpm {
+        /// Index of the offending point.
+        index: usize,
+    },
+    /// The list is longer than [`MAX_TEMPO_POINTS`].
+    #[error("tempo map has more than {max} points")]
+    TooManyPoints {
+        /// Accepted maximum.
+        max: usize,
+    },
+}
+
 /// Time signature. Only the denominator affects bar length in ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeSignature {
@@ -107,6 +472,9 @@ pub struct Transport {
     position: u64,
     playing: bool,
     click: bool,
+    /// Optional tempo map; when set it governs tick↔sample conversion instead
+    /// of the single `tempo` (SPEC-054).
+    tempo_map: Option<TempoMap>,
 }
 
 impl Transport {
@@ -125,6 +493,7 @@ impl Transport {
             position: 0,
             playing: false,
             click: false,
+            tempo_map: None,
         }
     }
 
@@ -138,6 +507,21 @@ impl Transport {
     #[must_use]
     pub const fn tempo(&self) -> Tempo {
         self.tempo
+    }
+
+    /// The active tempo map, if one was set.
+    #[must_use]
+    pub const fn tempo_map(&self) -> Option<&TempoMap> {
+        self.tempo_map.as_ref()
+    }
+
+    /// Sets the tempo map for tick↔sample conversion (control-side only).
+    ///
+    /// Called before the transport is handed to the audio thread (or between
+    /// quanta on the control side). The map's arrays are already sized, so
+    /// moving it in allocates nothing on the audio path.
+    pub fn set_tempo_map(&mut self, map: TempoMap) {
+        self.tempo_map = Some(map);
     }
 
     /// Current time signature.
@@ -196,15 +580,20 @@ impl Transport {
     #[must_use]
     pub fn bar_position_at(&self, samples: u64) -> BarPosition {
         let ticks_per_bar = self.signature.ticks_per_bar();
-        let samples_per_tick = self.tempo.samples_per_tick(self.sample_rate);
-        // Ticks are derived from samples, never accumulated, so dragging the
-        // playhead back and forth is exact.
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let total_ticks = ((samples as f64) / samples_per_tick).round().max(0.0) as u64;
+        let total_ticks = if let Some(map) = &self.tempo_map {
+            map.samples_to_ticks(samples)
+        } else {
+            let samples_per_tick = self.tempo.samples_per_tick(self.sample_rate);
+            // Ticks are derived from samples, never accumulated, so dragging the
+            // playhead back and forth is exact.
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let total_ticks = ((samples as f64) / samples_per_tick).round().max(0.0) as u64;
+            total_ticks
+        };
         let bar = total_ticks / ticks_per_bar;
         let in_bar = total_ticks % ticks_per_bar;
         let ticks_per_beat = u64::from(TPQN) * 4 / u64::from(self.signature.denominator);
@@ -226,24 +615,42 @@ impl Transport {
     ///
     /// Returns `Some(true)` for a downbeat, `Some(false)` for other beats.
     /// Beat `n` (absolute, zero-based) lands at sample `ceil(n * samples_per_beat)`.
+    /// With a tempo map, beat `n` lands at `map.ticks_to_samples(n * TPQN)`.
     pub fn click_for_quantum(&self, start: u64, frames: usize) -> Option<bool> {
         if !self.click || !self.playing || frames == 0 {
             return None;
         }
-        let spp = self.tempo.samples_per_beat(self.sample_rate);
         let end = start.saturating_add(frames as u64);
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let first_beat = (start as f64 / spp).ceil() as u64;
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let beat_sample = (first_beat as f64 * spp).ceil() as u64;
+        let first_beat = if let Some(map) = &self.tempo_map {
+            let beat = map.samples_to_ticks(start) / u64::from(TPQN);
+            // First beat boundary at or after `start`.
+            if map.ticks_to_samples(beat * u64::from(TPQN)) < start {
+                beat + 1
+            } else {
+                beat
+            }
+        } else {
+            let spp = self.tempo.samples_per_beat(self.sample_rate);
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let first = (start as f64 / spp).ceil() as u64;
+            first
+        };
+        let beat_sample = if let Some(map) = &self.tempo_map {
+            map.ticks_to_samples(first_beat * u64::from(TPQN))
+        } else {
+            let spp = self.tempo.samples_per_beat(self.sample_rate);
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let sample = (first_beat as f64 * spp).ceil() as u64;
+            sample
+        };
         if beat_sample < end {
             let in_bar = first_beat % u64::from(self.signature.numerator);
             Some(in_bar == 0)
@@ -318,5 +725,125 @@ mod tests {
         assert_eq!(t.position(), 1234);
         t.apply(TransportCommand::SetTempo(Tempo(0.0)));
         assert!((t.tempo().0 - 120.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn tempo_map_single_point_matches_old_behaviour() {
+        // A one-point map at 120 BPM must reproduce the single-tempo math.
+        let map = TempoMap::single(120.0, 48_000).unwrap();
+        let t = Tempo(120.0);
+        for samples in [0_u64, 1, 24_000, 24_001, 96_000, 960_000] {
+            assert_eq!(map.samples_to_ticks(samples), {
+                let spt = t.samples_per_tick(48_000);
+                ((samples as f64) / spt).round() as u64
+            });
+        }
+        // tick 3840 == one bar == 96 000 samples.
+        assert_eq!(map.ticks_to_samples(3840), 96_000);
+    }
+
+    #[test]
+    fn tempo_map_conversion_round_trips() {
+        let map = TempoMap::new(
+            vec![
+                TempoPoint {
+                    position_ticks: 0,
+                    bpm: 120.0,
+                },
+                TempoPoint {
+                    position_ticks: 3840,
+                    bpm: 60.0,
+                },
+                TempoPoint {
+                    position_ticks: 7680,
+                    bpm: 180.0,
+                },
+            ],
+            48_000,
+        )
+        .unwrap();
+        for ticks in [0_u64, 1, 1920, 3840, 3841, 7680, 9600, 11520] {
+            let samples = map.ticks_to_samples(ticks);
+            assert_eq!(map.samples_to_ticks(samples), ticks, "tick {ticks}");
+        }
+    }
+
+    #[test]
+    fn tempo_map_is_stepwise() {
+        // 120 BPM for bar 0 (3840 ticks), 60 BPM for bar 1.
+        let map = TempoMap::new(
+            vec![
+                TempoPoint {
+                    position_ticks: 0,
+                    bpm: 120.0,
+                },
+                TempoPoint {
+                    position_ticks: 3840,
+                    bpm: 60.0,
+                },
+            ],
+            48_000,
+        )
+        .unwrap();
+        // Bar 0: 96 000 samples. Bar 1 at 60 BPM: 192 000 samples long.
+        assert_eq!(map.ticks_to_samples(3840), 96_000);
+        assert_eq!(map.ticks_to_samples(7680), 96_000 + 192_000);
+    }
+
+    #[test]
+    fn tempo_map_rejects_invalid_inputs() {
+        assert!(TempoMap::new(vec![], 48_000).is_err());
+        assert!(
+            TempoMap::new(
+                vec![TempoPoint {
+                    position_ticks: 1,
+                    bpm: 120.0
+                }],
+                48_000
+            )
+            .is_err()
+        );
+        assert!(
+            TempoMap::new(
+                vec![
+                    TempoPoint {
+                        position_ticks: 0,
+                        bpm: 120.0
+                    },
+                    TempoPoint {
+                        position_ticks: 0,
+                        bpm: 90.0
+                    },
+                ],
+                48_000
+            )
+            .is_err()
+        );
+        assert!(
+            TempoMap::new(
+                vec![TempoPoint {
+                    position_ticks: 0,
+                    bpm: 20.0
+                }],
+                48_000
+            )
+            .is_err()
+        );
+        assert!(
+            TempoMap::new(
+                vec![TempoPoint {
+                    position_ticks: 0,
+                    bpm: 301.0
+                }],
+                48_000
+            )
+            .is_err()
+        );
+        assert!(TempoMap::single(120.0, 0).is_err());
     }
 }

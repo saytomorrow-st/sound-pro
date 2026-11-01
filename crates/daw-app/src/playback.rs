@@ -14,8 +14,9 @@ use std::f64::consts::TAU;
 
 use audio_core::AudioBuffer;
 use audio_core::Graph;
+use audio_core::TempoMap;
 use audio_core::{CommandConsumer, CommandQueue};
-use audio_core::{Renderer, Transport, TransportCommand};
+use audio_core::{Renderer, TPQN, Transport, TransportCommand};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -85,6 +86,13 @@ pub struct PlaybackControl {
     /// so they are freed here, never on the audio thread (SPEC-035).
     graphs: Producer<Graph>,
     retired: Consumer<Graph>,
+    /// New tempo maps for the audio thread's metronome (SPEC-054). Swapped
+    /// through a single-slot ring, like graphs, so nothing allocates or
+    /// locks on the audio path.
+    tempo_maps: Producer<TempoMap>,
+    /// Replaced tempo maps handed back from the audio thread, so they are
+    /// freed here, never on the audio thread (SPEC-035).
+    retired_tempo: Consumer<TempoMap>,
     channels: usize,
     block: usize,
 }
@@ -160,6 +168,11 @@ impl PlaybackControl {
 
     /// Sets the click tempo in BPM and the beats per bar. A tempo that is
     /// not finite and positive, or zero beats, is ignored.
+    ///
+    /// This also replaces the metronome's tempo map with a single-point map
+    /// at `tempo_bpm`, so the map stays the single source of beat placement
+    /// (SPEC-054). A multi-point map can then be pushed with
+    /// [`Self::set_tempo_map`] to override it.
     pub fn set_meter(&mut self, tempo_bpm: f64, beats_per_bar: u32) {
         let tempo = tempo_bpm as f32;
         if !tempo.is_finite() || tempo <= 0.0 || beats_per_bar == 0 {
@@ -168,6 +181,19 @@ impl PlaybackControl {
         self.shared
             .meter
             .store(pack_meter(tempo, beats_per_bar), Ordering::Relaxed);
+        if let Ok(map) = TempoMap::single(f64::from(tempo), self.sample_rate) {
+            self.set_tempo_map(map);
+        }
+    }
+
+    /// Replaces the tempo map the metronome uses for beat placement
+    /// (SPEC-054). The map is precomputed off the audio path; here it is
+    /// moved through a single-slot ring, so the audio thread never allocates
+    /// or blocks. When a map is already waiting it is dropped (the caller
+    /// may push again on the next frame). A map with a single point is the
+    /// same as the single-tempo `set_meter` path, so it is still accepted.
+    pub fn set_tempo_map(&mut self, map: TempoMap) {
+        let _ = self.tempo_maps.push(map);
     }
 
     /// Last position published by the audio thread.
@@ -218,6 +244,9 @@ impl PlaybackControl {
         while let Ok(graph) = self.retired.pop() {
             drop(graph);
         }
+        while let Ok(map) = self.retired_tempo.pop() {
+            drop(map);
+        }
     }
 
     fn send(&mut self, command: TransportCommand) -> bool {
@@ -242,6 +271,10 @@ pub struct PlaybackEngine {
     applied: u64,
     graphs: Consumer<Graph>,
     retired: Producer<Graph>,
+    tempo_maps: Consumer<TempoMap>,
+    retired_tempo: Producer<TempoMap>,
+    /// Current tempo map for metronome beat placement (SPEC-054).
+    tempo_map: TempoMap,
     meters: Option<crate::meters::Meters>,
 }
 
@@ -283,6 +316,10 @@ pub fn playback(
     let channels = renderer.channels();
     let (graphs, incoming) = RingBuffer::new(1);
     let (outgoing, retired) = RingBuffer::new(2);
+    let (tempo_maps, incoming_tempo) = RingBuffer::new(1);
+    let (outgoing_tempo, retired_tempo) = RingBuffer::new(2);
+    let initial_map = TempoMap::single(f64::from(DEFAULT_METER.0), sample_rate)
+        .expect("default tempo map is valid");
     shared.position.store(start, Ordering::Relaxed);
     shared.meter.store(
         pack_meter(DEFAULT_METER.0, DEFAULT_METER.1),
@@ -296,6 +333,8 @@ pub fn playback(
             end,
             graphs,
             retired,
+            tempo_maps,
+            retired_tempo,
             channels,
             block,
         },
@@ -311,6 +350,9 @@ pub fn playback(
             applied: 0,
             graphs: incoming,
             retired: outgoing,
+            tempo_maps: incoming_tempo,
+            retired_tempo: outgoing_tempo,
+            tempo_map: initial_map,
             meters: None,
         },
     )
@@ -339,6 +381,7 @@ impl PlaybackEngine {
         let metronome = self.shared.metronome.load(Ordering::Relaxed);
         let meter = unpack_meter(self.shared.meter.load(Ordering::Relaxed));
         self.swap_graph();
+        self.swap_tempo_map();
         let frames = out.len() / channels;
         let mut offset = 0usize;
         while offset < frames {
@@ -424,20 +467,32 @@ impl PlaybackEngine {
         }
     }
 
+    /// Takes a waiting tempo map for the metronome (SPEC-054). The replaced
+    /// map is handed back through a ring so it is freed on the control
+    /// thread, never on the audio thread; when the return ring is full the
+    /// swap waits for the next buffer.
+    fn swap_tempo_map(&mut self) {
+        if self.retired_tempo.is_full() {
+            return;
+        }
+        if let Ok(mut map) = self.tempo_maps.pop() {
+            std::mem::swap(&mut self.tempo_map, &mut map);
+            let _ = self.retired_tempo.push(map);
+        }
+    }
+
     /// Mixes the metronome into `dst`, whose first frame is at `from`.
-    /// Beat `k` starts on frame `ceil(k · rate · 60 / tempo)`.
+    /// Beat `k` starts on frame `map.beat_to_samples_ceil(k)` (SPEC-054),
+    /// preserving the ceil beat placement of the pre-map metronome so a lone
+    /// tempo point stays bit-identical (SPEC-026).
     fn add_click(&mut self, dst: &mut [f32], channels: usize, from: u64, meter: (f64, u64)) {
-        let (tempo, beats) = meter;
+        let (_tempo, beats) = meter;
+        let map = &self.tempo_map;
         let rate = f64::from(self.sample_rate);
-        let beat = rate * 60.0 / tempo;
         let length = (rate * CLICK_SECONDS).round() as usize;
-        let starts = |k: u64| (k as f64 * beat).ceil() as u64;
+        let starts = |k: u64| map.beat_to_samples_ceil(k);
         // First beat starting at or after `from`.
-        let mut k = if from == 0 {
-            0
-        } else {
-            ((from - 1) as f64 / beat).floor() as u64 + 1
-        };
+        let mut k = map.samples_to_ticks(from) / u64::from(TPQN);
         while k > 0 && starts(k - 1) >= from {
             k -= 1;
         }

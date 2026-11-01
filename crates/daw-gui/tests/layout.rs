@@ -39,30 +39,36 @@ fn opening_clip_shows_editor_even_when_mixer_open() {
 
 #[test]
 fn lcd_starts_at_one() {
-    assert_eq!(lcd_position(0, RATE, 120.0, 4), [1, 1, 1, 1]);
+    let m = audio_core::TempoMap::single_or_default(120.0, RATE);
+    assert_eq!(lcd_position(0, &m, 4), [1, 1, 1, 1]);
 }
 
 #[test]
 fn lcd_counts_beats_sixteenths_and_ticks() {
     // 120 BPM: one beat = 0.5 s = 24000 samples, a sixteenth = 6000.
-    assert_eq!(lcd_position(24_000, RATE, 120.0, 4), [1, 2, 1, 1]);
-    assert_eq!(lcd_position(6_000, RATE, 120.0, 4), [1, 1, 2, 1]);
-    assert_eq!(lcd_position(6_025, RATE, 120.0, 4), [1, 1, 2, 2]);
-    assert_eq!(lcd_position(4 * 24_000, RATE, 120.0, 4), [2, 1, 1, 1]);
-    assert_eq!(lcd_position(5_999, RATE, 120.0, 4), [1, 1, 1, 240]);
+    let m = audio_core::TempoMap::single_or_default(120.0, RATE);
+    assert_eq!(lcd_position(24_000, &m, 4), [1, 2, 1, 1]);
+    assert_eq!(lcd_position(6_000, &m, 4), [1, 1, 2, 1]);
+    assert_eq!(lcd_position(6_025, &m, 4), [1, 1, 2, 2]);
+    assert_eq!(lcd_position(4 * 24_000, &m, 4), [2, 1, 1, 1]);
+    assert_eq!(lcd_position(5_999, &m, 4), [1, 1, 1, 240]);
 }
 
 #[test]
 fn lcd_follows_time_signature() {
-    assert_eq!(lcd_position(3 * 24_000, RATE, 120.0, 3), [2, 1, 1, 1]);
-    assert_eq!(lcd_position(3 * 24_000, RATE, 120.0, 0), [1, 4, 1, 1]);
+    let m = audio_core::TempoMap::single_or_default(120.0, RATE);
+    assert_eq!(lcd_position(3 * 24_000, &m, 3), [2, 1, 1, 1]);
+    assert_eq!(lcd_position(3 * 24_000, &m, 0), [1, 4, 1, 1]);
 }
 
 #[test]
 fn lcd_survives_bad_input() {
-    assert_eq!(lcd_position(24_000, RATE, f64::NAN, 4), [1, 2, 1, 1]);
-    assert_eq!(lcd_position(24_000, RATE, 0.0, 4), [1, 2, 1, 1]);
-    assert_eq!(lcd_position(0, 0, 120.0, 4), [1, 1, 1, 1]);
+    let nan = audio_core::TempoMap::single_or_default(f64::NAN, RATE);
+    assert_eq!(lcd_position(24_000, &nan, 4), [1, 2, 1, 1]);
+    let zero = audio_core::TempoMap::single_or_default(0.0, RATE);
+    assert_eq!(lcd_position(24_000, &zero, 4), [1, 2, 1, 1]);
+    let rate0 = audio_core::TempoMap::single_or_default(120.0, 0);
+    assert_eq!(lcd_position(0, &rate0, 4), [1, 1, 1, 1]);
 }
 
 #[test]

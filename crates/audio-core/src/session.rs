@@ -8,7 +8,7 @@ use std::fmt;
 
 use crate::fx::{Effect, EffectParam, MAX_EFFECTS_PER_TRACK};
 use crate::project::MAX_NAME_BYTES;
-use crate::transport::TimeSignature;
+use crate::transport::{MAX_TEMPO_POINTS, TempoPoint, TimeSignature};
 
 /// Most tracks a session may hold.
 pub const MAX_TRACKS: usize = 32;
@@ -51,6 +51,9 @@ pub enum SessionError {
     InvalidSampleRate,
     /// `tempo_bpm` is not finite or not positive.
     InvalidTempo,
+    /// A tempo map point is invalid: out of order, bad BPM, or too many
+    /// points (SPEC-054).
+    InvalidTempoMap,
     /// A session, track or clip name is longer than [`MAX_NAME_BYTES`].
     NameTooLong,
     /// Track or project notes are longer than [`MAX_NOTES_BYTES`].
@@ -202,6 +205,7 @@ impl fmt::Display for SessionError {
         match self {
             Self::InvalidSampleRate => write!(f, "sample rate must be non-zero"),
             Self::InvalidTempo => write!(f, "tempo must be finite and positive"),
+            Self::InvalidTempoMap => write!(f, "tempo map is invalid"),
             Self::NameTooLong => write!(f, "name longer than {MAX_NAME_BYTES} bytes"),
             Self::NotesTooLong => write!(f, "notes longer than {MAX_NOTES_BYTES} bytes"),
             Self::TooManyTracks { max } => write!(f, "more than {max} tracks"),
@@ -948,6 +952,10 @@ pub struct Session {
     pub sample_rate: u32,
     /// Tempo in beats per minute.
     pub tempo_bpm: f64,
+    /// Additional tempo points after tick 0 (SPEC-054). The first point is
+    /// always `tempo_bpm` at tick 0, so an empty list reproduces the old
+    /// single-tempo behaviour exactly. Points are ordered by `position_ticks`.
+    pub tempo_map: Vec<TempoPoint>,
     /// Linear master gain, `0.0..=1.0`, applied to the whole mix.
     pub master_gain: f32,
     /// Master mute, the M button of Stereo Out (SPEC-044 §1).
@@ -1007,6 +1015,7 @@ impl Session {
             buses: Vec::new(),
             markers: Vec::new(),
             notes: String::new(),
+            tempo_map: Vec::new(),
         }
     }
 
@@ -1025,6 +1034,26 @@ impl Session {
             .map(Track::length_samples)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Builds the full [`TempoMap`] for `sample_rate`, with `tempo_bpm` as the
+    /// first point at tick 0 followed by the additional `tempo_map` points.
+    /// Control-side only: it allocates the segment arrays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::TempoMapError`] if the combined points are invalid.
+    pub fn build_tempo_map(
+        &self,
+        sample_rate: u32,
+    ) -> Result<crate::TempoMap, crate::TempoMapError> {
+        let mut points = Vec::with_capacity(self.tempo_map.len() + 1);
+        points.push(TempoPoint {
+            position_ticks: 0,
+            bpm: self.tempo_bpm,
+        });
+        points.extend_from_slice(&self.tempo_map);
+        crate::TempoMap::new(points, sample_rate)
     }
 
     /// Length of one track, `0` for an out-of-range index.
@@ -1080,6 +1109,7 @@ impl Session {
         if !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
             return Err(SessionError::InvalidTempo);
         }
+        self.validate_tempo_map()?;
         if !valid_gain(self.master_gain) {
             return Err(SessionError::InvalidMasterGain);
         }
@@ -1116,6 +1146,26 @@ impl Session {
             validate_effects(&track.effects, track_index)?;
             validate_automation(&track.automation, &track.effects, track_index)?;
             validate_sends(&track.sends, self.buses.len(), track_index)?;
+        }
+        Ok(())
+    }
+
+    /// SPEC-054 checks for the tempo map: points after the first are ordered,
+    /// have `position_ticks > 0`, a BPM in `30.0..=300.0`, and the list is not
+    /// longer than [`MAX_TEMPO_POINTS`].
+    fn validate_tempo_map(&self) -> Result<(), SessionError> {
+        if self.tempo_map.len() > MAX_TEMPO_POINTS {
+            return Err(SessionError::InvalidTempoMap);
+        }
+        let mut prev_tick = 0_u64;
+        for point in &self.tempo_map {
+            if point.position_ticks == 0 || point.position_ticks <= prev_tick {
+                return Err(SessionError::InvalidTempoMap);
+            }
+            if !point.bpm.is_finite() || !(30.0..=300.0).contains(&point.bpm) {
+                return Err(SessionError::InvalidTempoMap);
+            }
+            prev_tick = point.position_ticks;
         }
         Ok(())
     }

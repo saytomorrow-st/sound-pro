@@ -207,7 +207,8 @@ fn the_drop_start_follows_the_pointer_and_snaps_to_the_beat() {
     let free = daw_gui::drop_start(130.0, RATE, zoom, 120.0, false);
     assert_eq!(free, daw_gui::x_to_samples(130.0, RATE, zoom));
     let snapped = daw_gui::drop_start(130.0, RATE, zoom, 120.0, true);
-    assert_eq!(snapped, daw_gui::snap_to_beat(free, RATE, 120.0));
+    let m = audio_core::TempoMap::single_or_default(120.0, RATE);
+    assert_eq!(snapped, daw_gui::snap_to_beat(free, &m));
     assert_eq!(snapped % u64::from(RATE / 2), 0, "a beat at 120 BPM");
     assert_eq!(daw_gui::drop_start(-5.0, RATE, zoom, 120.0, true), 0);
 }

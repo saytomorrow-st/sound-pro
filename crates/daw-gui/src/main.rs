@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use audio_core::{
     AutoPoint, Effect, EffectKind, EffectParam, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note,
-    TRACK_COLORS, TrackFormat, TrackKind,
+    TRACK_COLORS, TempoMap, TrackFormat, TrackKind,
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
@@ -32,6 +32,10 @@ use eframe::egui::{
 
 const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 24.0;
+/// Height of the tempo lane between the ruler and the first track (SPEC-054).
+const TEMPO_LANE_HEIGHT: f32 = 24.0;
+/// Combined height of the ruler and the tempo lane; track rows start below it.
+const TIMELINE_HEADER: f32 = RULER_HEIGHT + TEMPO_LANE_HEIGHT;
 /// Distance in pixels from a clip boundary where the Fade tool makes a
 /// crossfade instead of a fade (SPEC-043 §2).
 const XFADE_GRAB: f32 = 6.0;
@@ -537,6 +541,9 @@ struct App {
     /// Playhead in samples while stopped; the player's position while playing.
     playhead: u64,
     player: Option<Player>,
+    /// Last tempo map pushed to the metronome, to avoid rebuilding it every
+    /// frame while the tempo is unchanged (SPEC-054).
+    last_tempo_map: Option<TempoMap>,
     imports: Imports,
     /// Mix-export progress and options (SPEC-052).
     export_tx: std::sync::mpsc::Sender<ExportMsg>,
@@ -620,6 +627,10 @@ struct App {
     marker_drag: Option<(usize, u64)>,
     /// Marker whose name is being edited and the text typed so far (SPEC-030).
     marker_rename: Option<(usize, String)>,
+    /// Tempo point being dragged and where it would land (SPEC-054).
+    tempo_drag: Option<(usize, u64)>,
+    /// Tempo point whose BPM is being edited and the text typed (SPEC-054).
+    tempo_edit: Option<(usize, String)>,
     /// Sound devices and buffer size (SPEC-033).
     audio: AudioSettings,
     /// Where `audio` is saved; `None` when no config folder is known.
@@ -641,6 +652,14 @@ enum MarkerAction {
     Seek(u64),
     Move(usize, u64),
     Rename(usize),
+    Delete(usize),
+}
+
+/// What the user asked to do with a tempo point (SPEC-054).
+enum TempoAction {
+    Add(u64, f64),
+    Move(usize, u64),
+    Edit(usize),
     Delete(usize),
 }
 
@@ -708,6 +727,7 @@ impl App {
             x11_cursor: None,
             drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
             player: None,
+            last_tempo_map: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
             drawn_zoom: 100.0,
@@ -739,6 +759,8 @@ impl App {
             cycle_drag: None,
             marker_drag: None,
             marker_rename: None,
+            tempo_drag: None,
+            tempo_edit: None,
             audio: AudioSettings::default(),
             audio_path: daw_app::audio_settings::default_path(),
             audio_open: false,
@@ -1168,7 +1190,7 @@ impl App {
         let rate = self.editor.session().sample_rate;
         let px_per_sample = self.zoom / rate as f32;
         for g in &self.imports.ghosts {
-            let top = area.min.y + RULER_HEIGHT + g.row as f32 * TRACK_HEIGHT;
+            let top = area.min.y + TIMELINE_HEADER + g.row as f32 * TRACK_HEIGHT;
             let left = area.min.x + g.start as f32 * px_per_sample;
             let w = (g.clip.length_samples as f32 * px_per_sample).max(2.0);
             let rect =
@@ -1250,6 +1272,24 @@ impl App {
         if let Some(player) = self.player.as_mut() {
             player.control.set_metronome(on);
             player.control.set_meter(tempo, beats);
+            if let Ok(map) = session.build_tempo_map(session.sample_rate)
+                && self.last_tempo_map.as_ref() != Some(&map)
+            {
+                player.control.set_tempo_map(map.clone());
+                self.last_tempo_map = Some(map);
+            }
+        }
+    }
+
+    /// Current tempo map, rebuilt from the session when it changed. UI-only:
+    /// the audio path receives its own copy via [`Self::sync_metronome`].
+    fn tempo_map(&self) -> audio_core::TempoMap {
+        let session = self.editor.session();
+        match session.build_tempo_map(session.sample_rate) {
+            Ok(map) => map,
+            Err(_) => self.last_tempo_map.clone().unwrap_or_else(|| {
+                audio_core::TempoMap::single_or_default(session.tempo_bpm, session.sample_rate)
+            }),
         }
     }
 
@@ -1280,6 +1320,7 @@ impl App {
     fn reset_playback(&mut self) {
         self.player = None;
         self.playhead = 0;
+        self.last_tempo_map = None;
     }
 
     /// Tempo and time signature fields of the transport bar (SPEC-026).
@@ -1633,7 +1674,7 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn track_headers(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(RULER_HEIGHT);
+        ui.add_space(TIMELINE_HEADER);
         let count = self.editor.session().tracks.len();
         let mut delete = None;
         let mut action = None;
@@ -2018,7 +2059,7 @@ impl App {
         let to_target = |local: (f32, f32)| {
             daw_gui::drop_target(
                 Some(local),
-                RULER_HEIGHT,
+                TIMELINE_HEADER,
                 TRACK_HEIGHT,
                 &audio_rows,
                 rate,
@@ -2077,14 +2118,14 @@ impl App {
             self.drop_tracker.hover(target);
             let band = match target.and_then(|t| t.track) {
                 Some(t) => {
-                    let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
+                    let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
                     Rect::from_min_size(
                         Pos2::new(area.min.x, top),
                         Vec2::new(area.width(), TRACK_HEIGHT),
                     )
                 }
                 None => {
-                    let top = area.min.y + RULER_HEIGHT + tracks as f32 * TRACK_HEIGHT;
+                    let top = area.min.y + TIMELINE_HEADER + tracks as f32 * TRACK_HEIGHT;
                     Rect::from_min_max(Pos2::new(area.min.x, top), area.max)
                 }
             };
@@ -2303,13 +2344,14 @@ impl App {
         let session_seconds = self.editor.session().length_samples() as f64 / rate;
         let width = ((session_seconds as f32 + 10.0) * self.zoom).max(ui.available_width());
         let tracks = self.editor.session().tracks.len();
-        let height = (RULER_HEIGHT + TRACK_HEIGHT * tracks as f32).max(ui.available_height() - 4.0);
+        let height =
+            (TIMELINE_HEADER + TRACK_HEIGHT * tracks as f32).max(ui.available_height() - 4.0);
 
         let (area, response) =
             ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
         self.drawn_zoom = self.zoom;
         if let Some(t) = self.reveal_track.take() {
-            let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
+            let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
             let left = area.min.x + samples_to_x(self.playhead, rate as u32, self.zoom);
             ui.scroll_to_rect(
                 Rect::from_min_size(Pos2::new(left, top), Vec2::new(1.0, TRACK_HEIGHT)),
@@ -2322,10 +2364,17 @@ impl App {
         painter.rect_filled(area, 0.0, Color32::from_gray(24));
         self.handle_drop(ui, area, tracks);
 
-        // Ruler: one line per beat, labels on bar starts (SPEC-026).
-        let beat_seconds = 60.0 / self.editor.session().tempo_bpm;
+        // Ruler: one line per beat, labels on bar starts (SPEC-026). Beat and
+        // bar positions follow the tempo map, so gridlines shift with each
+        // tempo point (SPEC-054).
+        let map = self.tempo_map();
+        let rate_u32 = self.editor.session().sample_rate;
         let per_bar = usize::from(self.editor.session().time_signature.numerator.max(1));
-        let beat_px = beat_seconds as f32 * self.zoom;
+        // Step (in bars) between labelled gridlines, from the zoomed bar width.
+        let beat_px = {
+            let bpm = map.initial_bpm().max(1.0);
+            (60.0 / bpm) as f32 * self.zoom
+        };
         let bar_px = beat_px * per_bar as f32;
         let bar_step = if bar_px < 40.0 {
             ((40.0 / bar_px).ceil() as usize).max(1)
@@ -2334,23 +2383,41 @@ impl App {
         };
         let ruler = Rect::from_min_size(area.min, Vec2::new(width, RULER_HEIGHT));
         painter.rect_filled(ruler, 0.0, Color32::from_gray(40));
-        let beats = (width / beat_px.max(0.01)).ceil() as usize;
-        for beat in 0..=beats.min(100_000) {
-            let x = area.min.x + beat as f32 * beat_px;
-            let bar = beat / per_bar;
-            if beat % per_bar == 0 && bar % bar_step == 0 {
-                painter.line_segment(
-                    [Pos2::new(x, area.min.y), Pos2::new(x, area.max.y)],
-                    Stroke::new(1.0_f32, Color32::from_gray(60)),
-                );
-                painter.text(
-                    Pos2::new(x + 3.0, area.min.y + 4.0),
-                    Align2::LEFT_TOP,
-                    (bar + 1).to_string(),
-                    FontId::monospace(11.0),
-                    Color32::from_gray(200),
-                );
-            } else if beat_px >= 8.0 && bar_step == 1 {
+        let total_samples = self.editor.session().length_samples();
+        // Iterate bars; a bar's sample position comes from the tempo map so
+        // changes propagate to the ruler (SPEC-054).
+        let max_bar = map
+            .samples_to_beats(total_samples)
+            .div_ceil(per_bar as u64)
+            .min(100_000);
+        for bar in 0..=max_bar {
+            if bar % bar_step as u64 != 0 {
+                continue;
+            }
+            let beat = bar * per_bar as u64;
+            let sample = map.beat_to_samples(beat).min(total_samples);
+            let x = area.min.x + samples_to_x(sample, rate_u32, self.zoom);
+            painter.line_segment(
+                [Pos2::new(x, area.min.y), Pos2::new(x, area.max.y)],
+                Stroke::new(1.0_f32, Color32::from_gray(60)),
+            );
+            painter.text(
+                Pos2::new(x + 3.0, area.min.y + 4.0),
+                Align2::LEFT_TOP,
+                (bar + 1).to_string(),
+                FontId::monospace(11.0),
+                Color32::from_gray(200),
+            );
+        }
+        // Intermediate beat lines when zoomed in enough (SPEC-026).
+        if beat_px >= 8.0 && bar_step == 1 {
+            let max_beat = map.samples_to_beats(total_samples).min(100_000);
+            for beat in 0..=max_beat {
+                if beat % per_bar as u64 == 0 {
+                    continue;
+                }
+                let sample = map.beat_to_samples(beat).min(total_samples);
+                let x = area.min.x + samples_to_x(sample, rate_u32, self.zoom);
                 painter.line_segment(
                     [Pos2::new(x, ruler.max.y), Pos2::new(x, area.max.y)],
                     Stroke::new(1.0_f32, Color32::from_gray(34)),
@@ -2358,7 +2425,6 @@ impl App {
             }
         }
 
-        let rate_u32 = self.editor.session().sample_rate;
         if let Some((from, to)) = self.editor.cycle() {
             let x0 = area.min.x + samples_to_x(from, rate_u32, self.zoom);
             let x1 = area.min.x + samples_to_x(to, rate_u32, self.zoom);
@@ -2386,6 +2452,7 @@ impl App {
         }
 
         let on_flag = self.markers(ui, area, ruler);
+        let on_tempo = self.tempo_lane(ui, area, ruler);
 
         let px_per_sample = self.zoom / rate as f32;
         let mut clicked = None;
@@ -2393,7 +2460,7 @@ impl App {
         let mut rects = Vec::new();
         let pointer = response.interact_pointer_pos();
         for (t, track) in self.editor.session().tracks.iter().enumerate() {
-            let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
+            let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
             painter.line_segment(
                 [
                     Pos2::new(area.min.x, top + TRACK_HEIGHT),
@@ -2531,7 +2598,7 @@ impl App {
         }
 
         let auto_row = self.auto.filter(|&t| t < tracks).map(|t| {
-            let top = area.min.y + RULER_HEIGHT + t as f32 * TRACK_HEIGHT;
+            let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
             Rect::from_min_max(
                 Pos2::new(area.min.x, top),
                 Pos2::new(area.max.x, top + TRACK_HEIGHT),
@@ -2556,6 +2623,12 @@ impl App {
                 || (pressed
                     && auto_row
                         .is_some_and(|row| ui.input(press_pos).is_some_and(|p| row.contains(p)))));
+        // Presses in the tempo lane are its own, not clips/tracks (SPEC-054).
+        let tempo_owned = !ruler_owned
+            && !lane_owned
+            && self.drag.is_none()
+            && self.auto_drag.is_none()
+            && on_tempo;
 
         self.draw_ghosts(&painter, area);
         self.draw_take(&painter, area);
@@ -2572,7 +2645,7 @@ impl App {
             if let (Some(t), Some(row)) = (self.auto, auto_row) {
                 self.edit_lane(ui, &response, area, row, t);
             }
-        } else if response.clicked() || response.secondary_clicked() {
+        } else if !tempo_owned && (response.clicked() || response.secondary_clicked()) {
             // SPEC-047 §1: Shift or Ctrl adds or removes a region; a right
             // click on a selected region keeps the group for its menu.
             let toggle = ui.input(|i| i.modifiers.shift || i.modifiers.command);
@@ -2588,7 +2661,7 @@ impl App {
                         self.editor.select_clip(None, false);
                     }
                     if let Some(p) = pointer {
-                        let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
+                        let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
                         if row >= 0.0 && (row as usize) < tracks {
                             self.editor.select_track(row as usize, false, false);
                         }
@@ -2599,22 +2672,22 @@ impl App {
 
         if let Some(at) = open_piano {
             self.open_clip_editor(at);
-        } else if response.double_clicked() && !lane_owned && !ruler_owned {
+        } else if response.double_clicked() && !lane_owned && !ruler_owned && !tempo_owned {
             // SPEC-049 §6: a double click on an empty spot of an instrument
             // track makes a MIDI region there.
             if let Some(p) = pointer {
-                let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
+                let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
                 if row >= 0.0 {
                     let x = x_to_samples((p.x - area.min.x).max(0.0), rate_u32, self.zoom);
                     self.new_region_on(row as usize, x);
                 }
             }
         }
-        if !lane_owned && !ruler_owned {
+        if !lane_owned && !ruler_owned && !tempo_owned {
             self.region_menu(&response);
         }
 
-        if !lane_owned && !ruler_owned {
+        if !lane_owned && !ruler_owned && !tempo_owned {
             self.drag_clips(ui, &response, area, &rects);
         }
 
@@ -2660,7 +2733,7 @@ impl App {
         let left = area.min.x + samples_to_x(recorder.start, project, self.zoom);
         let seconds = samples.len() as f32 / rate as f32;
         for row in rows {
-            let top = area.min.y + RULER_HEIGHT + row as f32 * TRACK_HEIGHT;
+            let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
             let rect = Rect::from_min_size(
                 Pos2::new(left, top + 3.0),
                 Vec2::new((seconds * self.zoom).max(2.0), TRACK_HEIGHT - 6.0),
@@ -2673,11 +2746,221 @@ impl App {
     #[allow(clippy::unused_self)]
     const fn draw_take(&self, _painter: &egui::Painter, _area: Rect) {}
 
+    /// The tempo lane between the ruler and the first track (SPEC-054). Each
+    /// tempo point is a flag at its tick position; double-clicking the lane
+    /// adds a point, dragging a flag moves it, the context menu deletes it or
+    /// edits its BPM. Returns whether the current press started on the lane.
+    #[allow(clippy::too_many_lines)]
+    fn tempo_lane(&mut self, ui: &egui::Ui, area: Rect, ruler: Rect) -> bool {
+        let lane = Rect::from_min_size(
+            Pos2::new(area.min.x, ruler.max.y),
+            Vec2::new(area.width(), TEMPO_LANE_HEIGHT),
+        );
+        let painter = ui.painter_at(area);
+        painter.rect_filled(lane, 0.0, Color32::from_gray(30));
+        painter.line_segment(
+            [lane.left_bottom(), lane.right_bottom()],
+            Stroke::new(1.0_f32, Color32::from_gray(45)),
+        );
+
+        let rate = self.editor.session().sample_rate;
+        let map = self.tempo_map();
+        let free = ui.input(|i| i.modifiers.shift) || !self.snap;
+        let color = Color32::from_rgb(90, 220, 140);
+
+        let count = self.editor.tempo_point_count();
+        let mut flags = Vec::new();
+        for index in 0..count {
+            let Some(point) = self.editor.tempo_point(index) else {
+                continue;
+            };
+            // While dragging, show the flag where it would land.
+            let ticks = match self.tempo_drag {
+                Some((dragged, to)) if dragged == index => to,
+                _ => point.position_ticks,
+            };
+            let samples = map.ticks_to_samples(ticks);
+            let x = area.min.x + samples_to_x(samples, rate, self.zoom);
+            let label = format!("{:.0}", point.bpm);
+            let galley = painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::BLACK);
+            let flag = Rect::from_min_size(
+                Pos2::new(x - galley.size().x * 0.5 - 4.0, lane.min.y + 2.0),
+                Vec2::new(galley.size().x + 8.0, TEMPO_LANE_HEIGHT - 4.0),
+            );
+            painter.rect_filled(flag, 2.0, color);
+            painter.galley(
+                flag.min + Vec2::new(4.0, (TEMPO_LANE_HEIGHT - 4.0 - galley.size().y) * 0.5),
+                galley,
+                Color32::BLACK,
+            );
+            painter.line_segment(
+                [Pos2::new(x, lane.min.y), Pos2::new(x, lane.max.y)],
+                Stroke::new(1.0_f32, color.gamma_multiply(0.6)),
+            );
+            flags.push((index, flag));
+        }
+
+        let origin = ui.input(press_pos);
+        let on_point = self.tempo_drag.is_some()
+            || origin.is_some_and(|p| flags.iter().any(|(_, flag)| flag.contains(p)));
+
+        let mut action = None;
+        for (index, flag) in flags {
+            let id = ui.id().with(("tempo-point", index));
+            let response = ui
+                .interact(flag, id, Sense::click_and_drag())
+                .on_hover_cursor(egui::CursorIcon::Grab);
+            if response.dragged()
+                && let Some(p) = ui.input(|i| i.pointer.latest_pos())
+            {
+                let samples = x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom);
+                let to = if free {
+                    map.samples_to_ticks(samples).max(1)
+                } else {
+                    map.samples_to_ticks(snap_to_beat(samples, &map)).max(1)
+                };
+                self.tempo_drag = Some((index, to));
+            }
+            if response.drag_stopped()
+                && let Some((dragged, to)) = self.tempo_drag.take()
+            {
+                action = Some(TempoAction::Move(dragged, to));
+            }
+            if response.double_clicked() {
+                action = Some(TempoAction::Edit(index));
+            }
+            response.context_menu(|ui| {
+                if ui.button("Изменить BPM").clicked() {
+                    action = Some(TempoAction::Edit(index));
+                    ui.close();
+                }
+                if ui.button("Удалить").clicked() {
+                    action = Some(TempoAction::Delete(index));
+                    ui.close();
+                }
+            });
+        }
+
+        // A double-click on the empty lane adds a point at that position.
+        if !on_point
+            && let Some(p) = ui.input(press_pos).filter(|p| lane.contains(*p))
+            && ui.input(|i| {
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary)
+            })
+        {
+            let samples = x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom);
+            let ticks = if free {
+                map.samples_to_ticks(samples).max(1)
+            } else {
+                map.samples_to_ticks(snap_to_beat(samples, &map)).max(1)
+            };
+            let bpm = map.bpm_at(samples);
+            action = Some(TempoAction::Add(ticks, bpm));
+        }
+
+        match action {
+            Some(TempoAction::Add(ticks, bpm)) => {
+                self.status = match self.editor.add_tempo_point(ticks, bpm) {
+                    Some(_) => "Темпо-точка добавлена".into(),
+                    None => "Не удалось добавить темпо-точку".into(),
+                };
+            }
+            Some(TempoAction::Move(index, to)) => {
+                self.status = if self.editor.move_tempo_point(index, to) {
+                    "Темпо-точка перенесена".into()
+                } else {
+                    "Не удалось перенести темпо-точку".into()
+                };
+            }
+            Some(TempoAction::Delete(index)) => {
+                self.status = if self.editor.remove_tempo_point(index) {
+                    "Темпо-точка удалена".into()
+                } else {
+                    "Нельзя удалить первую точку".into()
+                };
+            }
+            Some(TempoAction::Edit(index)) => {
+                if let Some(point) = self.editor.tempo_point(index) {
+                    self.tempo_edit = Some((index, format!("{:.0}", point.bpm)));
+                }
+            }
+            None => {}
+        }
+
+        self.tempo_edit_field(ui, lane);
+
+        on_point
+            || (self.tempo_edit.is_some() && origin.is_some_and(|p| lane.contains(p)))
+            || origin.is_some_and(|p| lane.contains(p))
+    }
+
+    /// Inline BPM text field over the tempo point being edited (SPEC-054).
+    fn tempo_edit_field(&mut self, ui: &egui::Ui, lane: Rect) {
+        let mut done = None;
+        let Some((index, _)) = self.tempo_edit else {
+            return;
+        };
+        let flag = self.tempo_point_flag(ui, lane, index).unwrap_or(lane);
+        egui::Area::new(ui.id().with("tempo_edit"))
+            .fixed_pos(flag.min)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                let Some((_, text)) = self.tempo_edit.as_mut() else {
+                    return;
+                };
+                let field = ui.add(egui::TextEdit::singleline(text).desired_width(70.0));
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    done = Some(false);
+                } else if field.lost_focus() {
+                    done = Some(true);
+                }
+            });
+        match done {
+            Some(true) => {
+                if let Some((index, text)) = self.tempo_edit.take() {
+                    let bpm = text.trim().parse::<f64>().ok();
+                    self.status = match bpm {
+                        Some(bpm) if self.editor.set_tempo_point_bpm(index, bpm) => {
+                            "BPM обновлён".into()
+                        }
+                        Some(_) => "BPM вне диапазона 30–300".into(),
+                        None => "Неверное число".into(),
+                    };
+                }
+            }
+            Some(false) => self.tempo_edit = None,
+            None => {}
+        }
+    }
+
+    /// The flag rect for tempo point `index`, or `None` when out of range.
+    fn tempo_point_flag(&self, ui: &egui::Ui, lane: Rect, index: usize) -> Option<Rect> {
+        let point = self.editor.tempo_point(index)?;
+        let map = self.tempo_map();
+        let rate = self.editor.session().sample_rate;
+        let samples = map.ticks_to_samples(point.position_ticks);
+        let x = lane.min.x + samples_to_x(samples, rate, self.zoom);
+        let galley = ui.painter().layout_no_wrap(
+            format!("{:.0}", point.bpm),
+            FontId::proportional(11.0),
+            Color32::BLACK,
+        );
+        Some(Rect::from_min_size(
+            Pos2::new(x - galley.size().x * 0.5 - 4.0, lane.min.y + 2.0),
+            Vec2::new(galley.size().x + 8.0, TEMPO_LANE_HEIGHT - 4.0),
+        ))
+    }
+
     /// Marker flags on the ruler and their clicks, drags and menus (SPEC-030).
     /// Returns whether the current press started on a flag.
     fn markers(&mut self, ui: &egui::Ui, area: Rect, ruler: Rect) -> bool {
         let session = self.editor.session();
-        let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+        let rate = session.sample_rate;
+        let map = self.tempo_map();
         let free = ui.input(|i| i.modifiers.shift) || !self.snap;
         let painter = ui.painter_at(area);
         let color = Color32::from_rgb(120, 200, 255);
@@ -2724,7 +3007,7 @@ impl App {
                 let to = if free {
                     samples
                 } else {
-                    snap_to_beat(samples, rate, tempo)
+                    snap_to_beat(samples, &map)
                 };
                 self.marker_drag = Some((index, to));
             }
@@ -2836,16 +3119,17 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn ruler_input(&mut self, ui: &egui::Ui, response: &egui::Response, area: Rect) {
         let session = self.editor.session();
-        let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+        let rate = session.sample_rate;
         let per_bar = u32::from(session.time_signature.numerator);
         let free = ui.input(|i| i.modifiers.shift) || !self.snap;
         let zoom = self.zoom;
+        let map = self.tempo_map();
         let raw = |x: f32| x_to_samples(x - area.min.x, rate, zoom);
         let at = |x: f32| {
             if free {
                 raw(x)
             } else {
-                snap_to_beat(raw(x), rate, tempo)
+                snap_to_beat(raw(x), &map)
             }
         };
         let Some(origin) = ui.input(press_pos) else {
@@ -2894,14 +3178,14 @@ impl App {
                         - i64::try_from(from).unwrap_or(i64::MAX);
                     let (mut a, _) = timeline::move_cycle(start, end, delta);
                     if !free {
-                        a = snap_to_beat(a, rate, tempo);
+                        a = snap_to_beat(a, &map);
                     }
                     let len = end - start;
                     self.editor.set_cycle(a, a + len).is_ok()
                 }
                 RulerDrag::Resize(hit) => {
                     let (start, end) = self.editor.cycle().unwrap_or((0, 0));
-                    let min = timeline::bar_samples(rate, tempo, per_bar) / 16;
+                    let min = timeline::bar_samples(&map, per_bar) / 16;
                     let (a, b) = timeline::resize_cycle(start, end, hit, at(p.x), min);
                     self.editor.set_cycle(a, b).is_ok()
                 }
@@ -2916,8 +3200,8 @@ impl App {
             if was_cycle && let Some((from, to)) = self.editor.cycle() {
                 self.status = format!(
                     "Цикл: такт {} – {}",
-                    bars_in(from, rate, tempo, per_bar),
-                    bars_in(to, rate, tempo, per_bar)
+                    bars_in(from, &map, per_bar),
+                    bars_in(to, &map, per_bar)
                 );
             }
         }
@@ -2926,11 +3210,8 @@ impl App {
     /// Moves the playhead one bar back or forward (⏪/⏩, SPEC-040).
     pub(crate) fn step_bar(&mut self, forward: bool) {
         let session = self.editor.session();
-        let bar = timeline::bar_samples(
-            session.sample_rate,
-            session.tempo_bpm,
-            u32::from(session.time_signature.numerator),
-        );
+        let map = self.tempo_map();
+        let bar = timeline::bar_samples(&map, u32::from(session.time_signature.numerator));
         let at = self
             .player
             .as_ref()
@@ -3037,18 +3318,14 @@ impl App {
         track: usize,
     ) {
         let rate = self.editor.session().sample_rate;
-        let tempo = self.editor.session().tempo_bpm;
+        let map = self.tempo_map();
         let lane = self.auto_lane;
         let snap = self.snap && !ui.input(|i| i.modifiers.shift);
         let zoom = self.zoom;
         let to_point = |p: Pos2| {
             let time = x_to_samples((p.x - area.min.x).max(0.0), rate, zoom);
             AutoPoint {
-                time: if snap {
-                    snap_to_beat(time, rate, tempo)
-                } else {
-                    time
-                },
+                time: if snap { snap_to_beat(time, &map) } else { time },
                 value: y_to_value(lane, p.y, row),
             }
         };
@@ -3145,11 +3422,11 @@ impl App {
         }
 
         let rate = self.editor.session().sample_rate;
-        let tempo = self.editor.session().tempo_bpm;
+        let map = self.tempo_map();
         let snap = self.snap && !ui.input(|i| i.modifiers.shift);
         let fit = |samples: u64| {
             if snap {
-                snap_to_beat(samples, rate, tempo)
+                snap_to_beat(samples, &map)
             } else {
                 samples
             }
@@ -3234,7 +3511,7 @@ impl App {
             DragMode::Move => {
                 let start = fit((at as i64 - drag.grab).max(0) as u64);
                 let tracks = self.editor.session().tracks.len();
-                let row = ((p.y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT).floor();
+                let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
                 let to = if row < 0.0 {
                     0
                 } else {
@@ -3298,7 +3575,7 @@ impl App {
         let rate = self.editor.session().sample_rate;
         let tracks = self.editor.session().tracks.len();
         let row = |y: f32| {
-            ((y - area.min.y - RULER_HEIGHT) / TRACK_HEIGHT)
+            ((y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT)
                 .floor()
                 .max(0.0) as usize
         };
@@ -3456,7 +3733,8 @@ impl App {
     )]
     fn piano_grid(&mut self, ui: &mut egui::Ui, t: usize, c: usize) {
         let session = self.editor.session();
-        let step = sixteenth_samples(session.sample_rate, session.tempo_bpm);
+        let map = self.tempo_map();
+        let step = sixteenth_samples(&map);
         let clip = &session.tracks[t].clips[c];
         let content = clip.source_length;
         let notes = clip.notes.clone().unwrap_or_default();

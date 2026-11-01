@@ -419,6 +419,78 @@ fn a_hand_written_file_parses() {
 }
 
 #[test]
+fn tempo_map_round_trips_and_omits_the_key_when_single() {
+    // A session with extra tempo points round-trips losslessly.
+    let mut session = audio_core::Session::new("tempo", SR, 120.0);
+    session.tempo_map = vec![
+        audio_core::TempoPoint {
+            position_ticks: 3840,
+            bpm: 90.0,
+        },
+        audio_core::TempoPoint {
+            position_ticks: 7680,
+            bpm: 150.0,
+        },
+    ];
+    session.validate().unwrap();
+    let project = Project {
+        name: "tempo".to_owned(),
+        sample_rate: SR,
+        tempo_bpm: 120.0,
+        params: Vec::new(),
+        session,
+    };
+    let text = project.to_json();
+    assert!(
+        text.contains("\"tempo_map\""),
+        "multi-point map must be written"
+    );
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session.tempo_map.len(), 2);
+    assert_eq!(
+        back.session.tempo_map, project.session.tempo_map,
+        "tempo map must survive a round-trip"
+    );
+
+    // A single-point session writes no `tempo_map` key at all, so old
+    // documents keep their exact text.
+    let single = Project {
+        session: audio_core::Session::new("tempo", SR, 120.0),
+        ..project
+    };
+    let single_text = single.to_json();
+    assert!(
+        !single_text.contains("\"tempo_map\""),
+        "single-point session must not write a tempo_map key"
+    );
+}
+
+#[test]
+fn old_format_without_tempo_map_reads_as_one_point() {
+    // A pre-SPEC-054 document has no `tempo_map` key; it loads as a single
+    // point at `tempo_bpm` (empty extra-points list).
+    let text = r#"
+        {
+          "name": "old",
+          "sample_rate": 48000,
+          "tempo_bpm": 128.5,
+          "params": [],
+          "session": {
+            "name": "old",
+            "sample_rate": 48000,
+            "tempo_bpm": 128.5,
+            "tracks": []
+          }
+        }
+    "#;
+    let project = Project::from_json(text).unwrap();
+    assert!(project.session.tempo_map.is_empty());
+    let map = project.session.build_tempo_map(48_000).unwrap();
+    assert_eq!(map.len(), 1);
+    assert!((map.initial_bpm() - 128.5).abs() < 1e-9);
+}
+
+#[test]
 fn awkward_floats_survive_the_text_format_exactly() {
     // `Display` falls back to an exponent for these; the writer must not.
     let graphemes = [

@@ -25,9 +25,11 @@ fn a_narrow_cycle_keeps_both_edges_reachable() {
 
 #[test]
 fn bar_length_follows_tempo_and_meter() {
-    assert_eq!(bar_samples(48_000, 120.0, 4), 96_000);
-    assert_eq!(bar_samples(48_000, 120.0, 3), 72_000);
-    assert_eq!(bar_samples(48_000, f64::NAN, 0), 96_000);
+    let map = audio_core::TempoMap::single_or_default(120.0, 48_000);
+    assert_eq!(bar_samples(&map, 4), 96_000);
+    assert_eq!(bar_samples(&map, 3), 72_000);
+    let nan = audio_core::TempoMap::single_or_default(f64::NAN, 48_000);
+    assert_eq!(bar_samples(&nan, 0), 96_000);
 }
 
 #[test]

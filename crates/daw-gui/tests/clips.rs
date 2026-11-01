@@ -218,14 +218,15 @@ fn trimming_the_end_keeps_the_left_edge() {
 #[test]
 fn snapping_picks_the_nearest_beat() {
     // 120 BPM at 48 kHz: one beat is 24000 samples.
-    assert_eq!(snap_to_beat(0, RATE, 120.0), 0);
-    assert_eq!(snap_to_beat(11_999, RATE, 120.0), 0);
-    assert_eq!(snap_to_beat(12_000, RATE, 120.0), 24_000);
-    assert_eq!(snap_to_beat(30_000, RATE, 120.0), 24_000);
-    assert_eq!(snap_to_beat(100_000, RATE, 120.0), 96_000);
-    assert_eq!(snap_to_beat(30_000, RATE, 60.0), 48_000);
-    assert_eq!(snap_to_beat(30_000, RATE, f64::NAN), 24_000);
-    assert_eq!(snap_to_beat(30_000, RATE, -5.0), 24_000);
+    let m = |bpm| audio_core::TempoMap::single_or_default(bpm, RATE);
+    assert_eq!(snap_to_beat(0, &m(120.0)), 0);
+    assert_eq!(snap_to_beat(11_999, &m(120.0)), 0);
+    assert_eq!(snap_to_beat(12_000, &m(120.0)), 24_000);
+    assert_eq!(snap_to_beat(30_000, &m(120.0)), 24_000);
+    assert_eq!(snap_to_beat(100_000, &m(120.0)), 96_000);
+    assert_eq!(snap_to_beat(30_000, &m(60.0)), 48_000);
+    assert_eq!(snap_to_beat(30_000, &m(f64::NAN)), 24_000);
+    assert_eq!(snap_to_beat(30_000, &m(-5.0)), 24_000);
 }
 
 #[test]

@@ -913,10 +913,12 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let session = self.editor.session();
                     let rate = session.sample_rate;
+                    let map = session.build_tempo_map(rate).unwrap_or_else(|_| {
+                        audio_core::TempoMap::single_or_default(session.tempo_bpm, rate)
+                    });
                     let [bar, beat, div, tick] = lcd_position(
                         self.playhead,
-                        rate,
-                        session.tempo_bpm,
+                        &map,
                         u32::from(session.time_signature.numerator),
                     );
                     let position = format!("{bar:>3} {beat} {div} {tick:>3}");
@@ -1163,10 +1165,13 @@ impl App {
             });
             ui.end_row();
             let session = self.editor.session();
-            let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
+            let rate = session.sample_rate;
+            let map = session.build_tempo_map(rate).unwrap_or_else(|_| {
+                audio_core::TempoMap::single_or_default(session.tempo_bpm, rate)
+            });
             let per_bar = u32::from(session.time_signature.numerator);
             row_label(ui, "Позиция");
-            ui.label(daw_gui::bars_in(region.start_samples, rate, tempo, per_bar));
+            ui.label(daw_gui::bars_in(region.start_samples, &map, per_bar));
             ui.end_row();
             row_label(ui, "Длина");
             ui.label(format!(
