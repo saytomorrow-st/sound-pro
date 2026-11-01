@@ -18,7 +18,7 @@ use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
     AutoPoint, Automation, Bus, BusSend, Clip, EffectLane, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
     MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker,
-    Note, Session, SessionError, Track, TrackFormat, TrackKind,
+    Note, Session, SessionError, Track, TrackFolder, TrackFormat, TrackKind,
 };
 use crate::transport::{TempoPoint, TimeSignature};
 
@@ -416,20 +416,7 @@ fn write_session(out: &mut String, session: &Session) {
     out.push_str(&format_number(session.tempo_bpm));
     // Written only when there are additional points, so single-tempo documents
     // keep their exact text (SPEC-054).
-    if !session.tempo_map.is_empty() {
-        out.push_str(",\n    \"tempo_map\": [");
-        for (index, point) in session.tempo_map.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
-            }
-            out.push_str("\n      [");
-            out.push_str(&point.position_ticks.to_string());
-            out.push_str(", ");
-            out.push_str(&format_number(point.bpm));
-            out.push(']');
-        }
-        out.push_str("\n    ]");
-    }
+    write_tempo_map(out, session);
     out.push_str(",\n    \"master_gain\": ");
     out.push_str(&format_number(f64::from(session.master_gain)));
     // Written only when set, so older documents keep their exact text.
@@ -514,9 +501,35 @@ fn write_session(out: &mut String, session: &Session) {
     if !session.markers.is_empty() {
         write_markers(out, &session.markers);
     }
+    // Written only when present, so older documents keep their exact text
+    // (SPEC-055).
+    if !session.folders.is_empty() {
+        write_folders(out, &session.folders, &session.folder_children);
+    }
     // Written only when present (SPEC-043).
     write_text_notes(out, "    ", &session.notes);
     out.push_str("\n  }");
+}
+
+/// Appends the session's `"tempo_map"` array (SPEC-054). Written only when
+/// there are additional points, so single-tempo documents keep their exact
+/// text.
+fn write_tempo_map(out: &mut String, session: &Session) {
+    if session.tempo_map.is_empty() {
+        return;
+    }
+    out.push_str(",\n    \"tempo_map\": [");
+    for (index, point) in session.tempo_map.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n      [");
+        out.push_str(&point.position_ticks.to_string());
+        out.push_str(", ");
+        out.push_str(&format_number(point.bpm));
+        out.push(']');
+    }
+    out.push_str("\n    ]");
 }
 
 /// Appends a track's `"sends"` array (SPEC-028).
@@ -574,6 +587,89 @@ fn write_buses(out: &mut String, buses: &[Bus]) {
         out.push_str("\n      }");
     }
     out.push_str("\n    ]");
+}
+
+/// Appends the session's `"folders"` array (SPEC-055).
+fn write_folders(out: &mut String, folders: &[TrackFolder], children: &[Vec<usize>]) {
+    out.push_str(",\n    \"folders\": [");
+    for (index, folder) in folders.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n      {\"name\": ");
+        write_string(out, &folder.name);
+        out.push_str(", \"children\": [");
+        for (child_index, child) in children[index].iter().enumerate() {
+            if child_index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&child.to_string());
+        }
+        out.push(']');
+        if folder.collapsed {
+            out.push_str(", \"collapsed\": true");
+        }
+        if let Some(color) = folder.color {
+            out.push_str(", \"color\": ");
+            out.push_str(&color.to_string());
+        }
+        out.push('}');
+    }
+    out.push_str("\n    ]");
+}
+
+fn folders_from_value(value: &Value) -> Result<(Vec<TrackFolder>, Vec<Vec<usize>>), ProjectError> {
+    let items = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+    if items.len() > MAX_TRACKS {
+        return Err(ProjectError::Session(SessionError::TooManyTracks {
+            max: MAX_TRACKS,
+        }));
+    }
+    let mut folders = Vec::with_capacity(items.len());
+    let mut children = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::Object(entries) = item else {
+            return Err(ProjectError::Malformed { at: 0 });
+        };
+        let mut name = None;
+        let mut child_indices = None;
+        let mut collapsed = None;
+        let mut color = None;
+        for (key, value) in entries {
+            match key.as_str() {
+                "name" => name = Some(require_string(value)?),
+                "children" => {
+                    let list = value.as_array().ok_or(ProjectError::Malformed { at: 0 })?;
+                    let mut indices = Vec::with_capacity(list.len());
+                    for entry in list {
+                        let idx = require_u64(entry)?;
+                        let idx =
+                            usize::try_from(idx).map_err(|_| ProjectError::Malformed { at: 0 })?;
+                        indices.push(idx);
+                    }
+                    child_indices = Some(indices);
+                }
+                "collapsed" => collapsed = Some(require_bool(value)?),
+                "color" => color = Some(require_u8(value)?),
+                other => {
+                    return Err(ProjectError::UnknownField {
+                        field: other.to_owned(),
+                    });
+                }
+            }
+        }
+        folders.push(TrackFolder {
+            name: name.ok_or(ProjectError::MissingField {
+                field: "session.folders[].name",
+            })?,
+            color,
+            collapsed: collapsed.unwrap_or(false),
+        });
+        children.push(child_indices.ok_or(ProjectError::MissingField {
+            field: "session.folders[].children",
+        })?);
+    }
+    Ok((folders, children))
 }
 
 /// Appends the session's `"markers"` array (SPEC-030).
@@ -734,11 +830,18 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
     let mut markers = None;
     let mut notes = None;
     let mut tempo_map = None;
+    let mut folders = None;
+    let mut folder_children = None;
     for (key, value) in entries {
         match key.as_str() {
             "notes" => notes = Some(require_string(value)?),
             "buses" => buses = Some(buses_from_value(value)?),
             "markers" => markers = Some(markers_from_value(value)?),
+            "folders" => {
+                let (folders_val, children_val) = folders_from_value(value)?;
+                folders = Some(folders_val);
+                folder_children = Some(children_val);
+            }
             "name" => name = Some(require_string(value)?),
             "sample_rate" => sample_rate = Some(require_u32(value)?),
             "tempo_bpm" => tempo_bpm = Some(require_f64(value)?),
@@ -800,6 +903,9 @@ fn session_from_value(value: &Value) -> Result<Session, ProjectError> {
         notes: notes.unwrap_or_default(),
         // Optional since SPEC-054; absent means a single point at `tempo_bpm`.
         tempo_map: tempo_map.unwrap_or_default(),
+        // Optional since SPEC-055; absent means no track folders.
+        folders: folders.unwrap_or_default(),
+        folder_children: folder_children.unwrap_or_default(),
     })
 }
 

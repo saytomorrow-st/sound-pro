@@ -10,12 +10,15 @@
 
 pub mod layout;
 pub mod timeline;
+pub mod track_rows;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track, TrackFormat, TrackKind};
+use audio_core::session::{
+    AutoPoint, Clip, Lane, Note, Session, Track, TrackFolder, TrackFormat, TrackKind,
+};
 use audio_core::{
     Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, MAX_TEMPO_POINTS,
     Marker, Project, ProjectError, SessionError, TempoPoint,
@@ -33,6 +36,15 @@ pub const MIN_TEMPO: f64 = 30.0;
 pub const MAX_TEMPO: f64 = 300.0;
 /// Frames summarised by one [`Peaks`] entry.
 pub const PEAK_BLOCK: usize = 256;
+
+/// What happens to a folder's children when the folder is deleted (SPEC-055).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteFolder {
+    /// Keep the children, moving them back to the top level.
+    KeepChildren,
+    /// Delete the children along with the folder.
+    DeleteChildren,
+}
 
 /// Errors from editor actions. The project is unchanged when one is returned.
 #[derive(Debug, thiserror::Error)]
@@ -149,6 +161,16 @@ pub enum EditorError {
     /// Another marker already sits at that position (SPEC-030).
     #[error("a marker is already there")]
     MarkerExists,
+    /// The folder index does not exist (SPEC-055).
+    #[error("no such folder")]
+    NoFolder,
+    /// A track is already inside a folder, or the folder operation would put
+    /// a folder inside a folder (SPEC-055).
+    #[error("track is already in a folder")]
+    TrackInFolder,
+    /// The folder has no children, or the track list is empty (SPEC-055).
+    #[error("the folder is empty")]
+    EmptyFolder,
     /// Loading clip files for the mixdown failed.
     #[error(transparent)]
     Load(#[from] daw_app::LoadError),
@@ -1652,12 +1674,31 @@ impl Editor {
         to: u64,
         additive: bool,
     ) -> usize {
+        let mut indices = Vec::new();
+        for t in tracks {
+            indices.push(t);
+        }
+        self.select_clips_in_any(&indices, from, to, additive)
+    }
+
+    /// Selects every clip on the given tracks that overlaps samples
+    /// `from..to`. The rubber band may cover a non-contiguous set of visible
+    /// tracks once folders hide children (SPEC-055 §4), so this accepts an
+    /// explicit index list rather than a range.
+    pub fn select_clips_in_any(
+        &mut self,
+        tracks: &[usize],
+        from: u64,
+        to: u64,
+        additive: bool,
+    ) -> usize {
         let (from, to) = (from.min(to), from.max(to));
         let mut hits = Vec::new();
-        for (t, track) in self.project.session.tracks.iter().enumerate() {
-            if !tracks.contains(&t) {
+        for &t in tracks {
+            if t >= self.project.session.tracks.len() {
                 continue;
             }
+            let track = &self.project.session.tracks[t];
             for (c, clip) in track.clips.iter().enumerate() {
                 let end = clip.start_samples.saturating_add(clip.length_samples);
                 if clip.start_samples < to.max(from + 1) && end > from {
@@ -2805,6 +2846,17 @@ impl Editor {
         let mut session = self.project.session.clone();
         let moved = session.tracks.remove(from);
         session.tracks.insert(to, moved);
+        remap_folder_children(&mut session.folder_children, |c| {
+            if c == from {
+                to
+            } else if from < to && from < c && c <= to {
+                c - 1
+            } else if to < from && to <= c && c < from {
+                c + 1
+            } else {
+                c
+            }
+        });
         self.commit_track(session, to)?;
         for a in &mut self.armed {
             *a = if *a == from {
@@ -2841,6 +2893,9 @@ impl Editor {
             copy.name.clone_from(&session.tracks[track].name);
         }
         session.tracks.insert(track + 1, copy);
+        remap_folder_children(&mut session.folder_children, |c| {
+            if c > track { c + 1 } else { c }
+        });
         self.commit_track(session, track + 1)?;
         for a in &mut self.armed {
             if *a > track {
@@ -2856,6 +2911,16 @@ impl Editor {
         if track < self.project.session.tracks.len() {
             self.record();
             self.project.session.tracks.remove(track);
+            // Remove the track from its folder (if any) and shift the other
+            // child indices (SPEC-055).
+            for children in &mut self.project.session.folder_children {
+                children.retain(|&c| c != track);
+                for c in children {
+                    if *c > track {
+                        *c -= 1;
+                    }
+                }
+            }
             self.armed.retain(|&a| a != track);
             for a in &mut self.armed {
                 if *a > track {
@@ -2868,6 +2933,294 @@ impl Editor {
             self.more_clips.clear();
             self.dirty = true;
         }
+    }
+
+    /// Creates a track folder holding `tracks` (SPEC-055 §3). Children keep
+    /// their session order; the folder is inserted at the top level. Returns
+    /// the new folder's index.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::EmptyFolder`] when `tracks` is empty,
+    /// [`EditorError::NoClip`] when an index is out of range,
+    /// [`EditorError::TrackInFolder`] when a track is already in a folder.
+    pub fn create_folder(&mut self, tracks: &[usize]) -> Result<usize, EditorError> {
+        if tracks.is_empty() {
+            return Err(EditorError::EmptyFolder);
+        }
+        let count = self.project.session.tracks.len();
+        let mut sorted: Vec<usize> = tracks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut seen = vec![false; count];
+        for children in &self.project.session.folder_children {
+            for &c in children {
+                seen[c] = true;
+            }
+        }
+        for &t in &sorted {
+            if t >= count {
+                return Err(EditorError::NoClip);
+            }
+            if seen[t] {
+                return Err(EditorError::TrackInFolder);
+            }
+            seen[t] = true;
+        }
+        let number = (1..)
+            .find(|n| {
+                !self
+                    .project
+                    .session
+                    .folders
+                    .iter()
+                    .any(|f| f.name == format!("Папка {n}"))
+            })
+            .unwrap_or(1);
+        let mut session = self.project.session.clone();
+        session
+            .folders
+            .push(TrackFolder::new(&format!("Папка {number}")));
+        session.folder_children.push(sorted);
+        self.commit_session(session)?;
+        Ok(self.project.session.folders.len() - 1)
+    }
+
+    /// Creates an empty folder at the top level and returns its index
+    /// (SPEC-055 §3).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::Session`] when the session is full.
+    pub fn create_empty_folder(&mut self) -> Result<usize, EditorError> {
+        let number = (1..)
+            .find(|n| {
+                !self
+                    .project
+                    .session
+                    .folders
+                    .iter()
+                    .any(|f| f.name == format!("Папка {n}"))
+            })
+            .unwrap_or(1);
+        let mut session = self.project.session.clone();
+        session
+            .folders
+            .push(TrackFolder::new(&format!("Папка {number}")));
+        session.folder_children.push(Vec::new());
+        self.commit_session(session)?;
+        Ok(self.project.session.folders.len() - 1)
+    }
+
+    /// Deletes a folder; its children either stay on the top level or are
+    /// deleted with it (SPEC-055 §3).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoFolder`] for a bad index.
+    pub fn delete_folder(&mut self, folder: usize, mode: DeleteFolder) -> Result<(), EditorError> {
+        if folder >= self.project.session.folders.len() {
+            return Err(EditorError::NoFolder);
+        }
+        let mut session = self.project.session.clone();
+        let children = session.folder_children[folder].clone();
+        match mode {
+            DeleteFolder::KeepChildren => {
+                session.folders.remove(folder);
+                session.folder_children.remove(folder);
+            }
+            DeleteFolder::DeleteChildren => {
+                // Delete child tracks (highest index first) and reindex all
+                // remaining folder child lists.
+                for &child in children.iter().rev() {
+                    session.tracks.remove(child);
+                }
+                for list in &mut session.folder_children {
+                    list.retain(|&c| !children.contains(&c));
+                }
+                session.folders.remove(folder);
+                session.folder_children.remove(folder);
+                for list in &mut session.folder_children {
+                    for c in list {
+                        *c -= children.iter().filter(|&&child| child < *c).count();
+                    }
+                }
+            }
+        }
+        self.commit_session(session)?;
+        self.selected_track = None;
+        Ok(())
+    }
+
+    /// Renames a folder (SPEC-055 §3).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoFolder`], [`EditorError::EmptyName`] or
+    /// [`EditorError::Session`] for a too long name.
+    pub fn rename_folder(&mut self, folder: usize, name: &str) -> Result<(), EditorError> {
+        let name = name.trim();
+        let current = &self
+            .project
+            .session
+            .folders
+            .get(folder)
+            .ok_or(EditorError::NoFolder)?
+            .name;
+        if name.is_empty() {
+            return Err(EditorError::EmptyName);
+        }
+        if current == name {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        name.clone_into(&mut session.folders[folder].name);
+        self.commit_session(session)
+    }
+
+    /// Sets or clears a folder's colour (SPEC-055 §3).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoFolder`], [`EditorError::Session`] for a colour
+    /// outside the palette.
+    pub fn set_folder_color(
+        &mut self,
+        folder: usize,
+        color: Option<u8>,
+    ) -> Result<(), EditorError> {
+        let current = self
+            .project
+            .session
+            .folders
+            .get(folder)
+            .ok_or(EditorError::NoFolder)?
+            .color;
+        if current == color {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        session.folders[folder].color = color;
+        self.commit_session(session)
+    }
+
+    /// Collapses or expands a folder; display-only, never touches data or
+    /// sound (SPEC-055 §3).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoFolder`].
+    pub fn toggle_folder(&mut self, folder: usize) -> Result<(), EditorError> {
+        if folder >= self.project.session.folders.len() {
+            return Err(EditorError::NoFolder);
+        }
+        let mut session = self.project.session.clone();
+        session.folders[folder].collapsed = !session.folders[folder].collapsed;
+        self.commit_session(session)
+    }
+
+    /// Moves a folder together with all its children to track position `to`
+    /// (SPEC-055 §3). The children are gathered into one contiguous block that
+    /// starts at `to`, in their original relative order; every other track
+    /// shifts to make room. Child indices in every folder are recomputed, so
+    /// the move is a single undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoFolder`] for a bad folder index.
+    pub fn move_folder(&mut self, folder: usize, to: usize) -> Result<(), EditorError> {
+        if folder >= self.project.session.folders.len() {
+            return Err(EditorError::NoFolder);
+        }
+        let old_count = self.project.session.tracks.len();
+        let mut children = self.project.session.folder_children[folder].clone();
+        children.sort_unstable();
+        // Split the tracks into children (in order) and the rest.
+        let mut child_tracks = Vec::with_capacity(children.len());
+        let mut others = Vec::with_capacity(old_count - children.len());
+        let mut old_to_new = vec![0usize; old_count];
+        let mut non_child_pos = 0usize;
+        for (i, track) in self.project.session.tracks.iter().enumerate() {
+            if children.contains(&i) {
+                // A child's final position is `insert_at + its order`.
+                child_tracks.push(track.clone());
+            } else {
+                others.push(track.clone());
+                old_to_new[i] = non_child_pos;
+                non_child_pos += 1;
+            }
+        }
+        let insert_at = to.min(others.len());
+        // Non-children after the insertion point shift by the child count.
+        for (i, _track) in self.project.session.tracks.iter().enumerate() {
+            if children.contains(&i) {
+                let order = children.iter().position(|&c| c == i).unwrap();
+                old_to_new[i] = insert_at + order;
+            } else if old_to_new[i] >= insert_at {
+                old_to_new[i] += children.len();
+            }
+        }
+        let mut session = self.project.session.clone();
+        let mut new_tracks = others;
+        new_tracks.splice(insert_at..insert_at, child_tracks);
+        session.tracks = new_tracks;
+        remap_folder_children(&mut session.folder_children, |c| old_to_new[c]);
+        // Keep the same selected track (following the physical move).
+        let selected = self.selected_track.and_then(|t| old_to_new.get(t).copied());
+        self.commit_session(session)?;
+        self.selected_track = selected;
+        self.selected_clip = None;
+        Ok(())
+    }
+
+    /// Adds `tracks` to `folder` (SPEC-055 §3).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoFolder`], [`EditorError::NoClip`] for a bad track
+    /// index, [`EditorError::TrackInFolder`] when a track is already inside
+    /// a folder.
+    pub fn add_tracks_to_folder(
+        &mut self,
+        folder: usize,
+        tracks: &[usize],
+    ) -> Result<(), EditorError> {
+        if folder >= self.project.session.folders.len() {
+            return Err(EditorError::NoFolder);
+        }
+        let count = self.project.session.tracks.len();
+        let mut seen = vec![false; count];
+        for children in &self.project.session.folder_children {
+            for &c in children {
+                seen[c] = true;
+            }
+        }
+        for &t in tracks {
+            if t >= count {
+                return Err(EditorError::NoClip);
+            }
+            if seen[t] {
+                return Err(EditorError::TrackInFolder);
+            }
+            seen[t] = true;
+        }
+        let mut session = self.project.session.clone();
+        session.folder_children[folder].extend_from_slice(tracks);
+        session.folder_children[folder].sort_unstable();
+        self.commit_session(session)
+    }
+
+    /// Removes `tracks` from whichever folder holds them (SPEC-055 §3).
+    /// Tracks that are not in a folder are ignored.
+    pub fn remove_tracks_from_folder(&mut self, tracks: &[usize]) -> Result<(), EditorError> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        for list in &mut session.folder_children {
+            list.retain(|c| !tracks.contains(c));
+        }
+        self.commit_session(session)
     }
 
     /// Mutable access to one track's mixer settings; marks the project
@@ -3262,6 +3615,17 @@ fn insert_note(notes: &mut Vec<Note>, note: Note) -> usize {
     let index = notes.partition_point(|n| (n.start, n.pitch) <= (note.start, note.pitch));
     notes.insert(index, note);
     index
+}
+
+/// Remaps every folder child index through `f` (SPEC-055). Used when a track
+/// moves, is duplicated or is deleted so the child lists keep addressing the
+/// right [`Track`]s.
+fn remap_folder_children(children: &mut [Vec<usize>], f: impl Fn(usize) -> usize) {
+    for list in children {
+        for child in list {
+            *child = f(*child);
+        }
+    }
 }
 
 /// A track's effect chain, provided `index` is inside it.

@@ -198,6 +198,12 @@ pub enum SessionError {
         /// many.
         marker: usize,
     },
+    /// A track folder is invalid: its child list is out of range, repeats a
+    /// track, or a track appears in more than one folder (SPEC-055).
+    FolderChild {
+        /// Index of the offending folder.
+        folder: usize,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -258,6 +264,7 @@ impl fmt::Display for SessionError {
             }
             Self::InvalidColor { track } => write!(f, "track {track}: colour is invalid"),
             Self::InvalidMarker { marker } => write!(f, "marker {marker} is invalid"),
+            Self::FolderChild { folder } => write!(f, "folder {folder}: child track is invalid"),
             Self::InvalidFade { track, clip } => {
                 write!(
                     f,
@@ -970,6 +977,14 @@ pub struct Session {
     pub buses: Vec<Bus>,
     /// Named positions on the timeline, sorted by position (SPEC-030).
     pub markers: Vec<Marker>,
+    /// Organizational track folders (Track Stacks, SPEC-055). Folders are
+    /// purely organizational: they hold no audio state and never affect
+    /// routing, gain or the render. Parallel to [`Self::folder_children`].
+    pub folders: Vec<TrackFolder>,
+    /// Children of each folder, in display order: `folder_children[i]` lists
+    /// the indices of the tracks inside `folders[i]`. Every index addresses
+    /// [`Self::tracks`], and each track appears in at most one folder.
+    pub folder_children: Vec<Vec<usize>>,
     /// Free text from the inspector's project notes tab (SPEC-043).
     pub notes: String,
 }
@@ -981,6 +996,32 @@ pub struct Marker {
     pub name: String,
     /// Position in project samples.
     pub position: u64,
+}
+
+/// An organizational group of tracks (Track Stack, SPEC-055). It holds no
+/// audio state: no gain, pan, mute, effects or sends, and it never affects
+/// routing. Collapsing is a display-only flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackFolder {
+    /// Display name.
+    pub name: String,
+    /// Palette index below [`TRACK_COLORS`]; `None` is the default colour.
+    pub color: Option<u8>,
+    /// Whether the folder is collapsed in the track headers. Display only:
+    /// collapsing never changes a child's sound or state (SPEC-055 §1).
+    pub collapsed: bool,
+}
+
+impl TrackFolder {
+    /// A new, expanded folder with no colour.
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            color: None,
+            collapsed: false,
+        }
+    }
 }
 
 /// Gain of the master dim: −20 dB (SPEC-044 §1).
@@ -1014,6 +1055,8 @@ impl Session {
             tracks: Vec::new(),
             buses: Vec::new(),
             markers: Vec::new(),
+            folders: Vec::new(),
+            folder_children: Vec::new(),
             notes: String::new(),
             tempo_map: Vec::new(),
         }
@@ -1121,6 +1164,7 @@ impl Session {
         }
         self.validate_buses()?;
         self.validate_markers()?;
+        self.validate_folders()?;
         for (track_index, track) in self.tracks.iter().enumerate() {
             if track.name.len() > MAX_NAME_BYTES {
                 return Err(SessionError::NameTooLong);
@@ -1181,6 +1225,35 @@ impl Session {
             let ordered = index == 0 || self.markers[index - 1].position < marker.position;
             if marker.name.len() > MAX_NAME_BYTES || !ordered {
                 return Err(SessionError::InvalidMarker { marker: index });
+            }
+        }
+        Ok(())
+    }
+
+    /// SPEC-055 checks for the folder list: folder names, colours, and the
+    /// child lists (in range, no repeats, no track in two folders).
+    fn validate_folders(&self) -> Result<(), SessionError> {
+        if self.folders.len() != self.folder_children.len() {
+            return Err(SessionError::FolderChild {
+                folder: self.folders.len().min(self.folder_children.len()),
+            });
+        }
+        let mut seen = vec![false; self.tracks.len()];
+        for (folder, children) in self.folder_children.iter().enumerate() {
+            if self.folders[folder].name.len() > MAX_NAME_BYTES {
+                return Err(SessionError::NameTooLong);
+            }
+            if self.folders[folder]
+                .color
+                .is_some_and(|color| color >= TRACK_COLORS)
+            {
+                return Err(SessionError::InvalidColor { track: folder });
+            }
+            for &child in children {
+                if child >= self.tracks.len() || seen[child] {
+                    return Err(SessionError::FolderChild { folder });
+                }
+                seen[child] = true;
             }
         }
         Ok(())
