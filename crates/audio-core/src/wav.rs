@@ -191,6 +191,15 @@ fn read_from_reader<R: Read + Seek>(
                 buf.channel_mut(ch)[frame] = Sample::from(sample?) / 32768.0;
             }
         }
+        (SampleFormat::Int, 24) => {
+            for (i, sample) in reader.samples::<i32>().enumerate() {
+                let frame = i / channels;
+                let ch = i % channels;
+                #[allow(clippy::cast_precision_loss, reason = "24-bit PCM is quantised")]
+                let value = sample? as f32 / 8_388_608.0;
+                buf.channel_mut(ch)[frame] = value;
+            }
+        }
         other => {
             return Err(WavError::Unsupported {
                 channels: spec.channels,
@@ -229,6 +238,82 @@ pub fn write_mono_slice<P: AsRef<Path>>(
     )?;
     for &s in samples {
         writer.write_sample(s)?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Bit depth of a PCM WAV written by [`write_wav_pcm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitDepth {
+    /// 16-bit signed integer PCM.
+    I16,
+    /// 24-bit signed integer PCM.
+    I24,
+}
+
+impl BitDepth {
+    /// Number of bits per sample.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        match self {
+            Self::I16 => 16,
+            Self::I24 => 24,
+        }
+    }
+
+    /// Full-scale magnitude: the largest positive integer value representable.
+    #[must_use]
+    pub const fn full_scale(self) -> i32 {
+        match self {
+            Self::I16 => 32_767,
+            Self::I24 => 8_388_607,
+        }
+    }
+}
+
+/// Writes planar float samples as an interleaved integer-PCM WAV.
+///
+/// Samples are clamped to `[-1, 1]`, scaled by the full-scale magnitude of
+/// `bits` and rounded to the nearest integer. The symmetric conversion uses
+/// `1/2^(bits-1)` per the convention used everywhere else in this crate (see
+/// [`read_from_reader`]): a float of `1.0` becomes `32767` at 16 bits and
+/// `8388607` at 24 bits.
+///
+/// `samples` holds `channels × frames` values in interleaved order (all
+/// channels of frame 0, then frame 1, ...).
+///
+/// # Errors
+///
+/// Propagates any I/O or encoder error.
+pub fn write_wav_pcm<P: AsRef<Path>>(
+    path: P,
+    sample_rate: u32,
+    channels: u16,
+    bits: BitDepth,
+    samples: &[Sample],
+) -> Result<(), WavError> {
+    let mut writer = WavWriter::create(
+        path,
+        HoundSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: bits.bits(),
+            sample_format: SampleFormat::Int,
+        },
+    )?;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "full scale is an integer constant"
+    )]
+    let scale = bits.full_scale() as f32;
+    for &s in samples {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "clamped to the integer range"
+        )]
+        let v = (s.clamp(-1.0, 1.0) * scale).round() as i32;
+        writer.write_sample(v)?;
     }
     writer.finalize()?;
     Ok(())
@@ -673,5 +758,45 @@ mod tests {
                 channels: 2
             }
         ));
+    }
+
+    #[test]
+    fn write_wav_pcm_24bit_roundtrips() {
+        let dir = TempDir::new("pcm24");
+        let base = dir.path("pcm24.wav");
+        // Interleaved stereo: full-scale +1 and -1, mid value, and silence.
+        let samples = [1.0_f32, -1.0_f32, 0.5_f32, -0.25_f32, 0.0_f32, 0.0_f32];
+        write_wav_pcm(&base, 48_000, 2, BitDepth::I24, &samples).unwrap();
+
+        let mut reader = hound::WavReader::open(&base).unwrap();
+        assert_eq!(reader.spec().bits_per_sample, 24);
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.spec().sample_rate, 48_000);
+
+        let scale = 8_388_608.0_f32;
+        #[allow(clippy::cast_precision_loss, reason = "24-bit PCM is quantised")]
+        let got: Vec<f32> = reader
+            .samples::<i32>()
+            .map(|s| s.unwrap() as f32 / scale)
+            .collect();
+        // Symmetric write, asymmetric read: +1 -> 8388607 -> 0.99999988.
+        let expect = [8_388_607.0 / scale, -1.0, 0.5, -0.25, 0.0, 0.0];
+        for (g, e) in got.iter().zip(expect.iter()) {
+            assert!((g - e).abs() < 1e-6, "got {g}, expected {e}");
+        }
+    }
+
+    #[test]
+    fn write_wav_pcm_clamps_and_quantises_16bit() {
+        let dir = TempDir::new("pcm16");
+        let base = dir.path("pcm16.wav");
+        // Values outside [-1, 1] must clamp; 0.5 * 32767 = 16383.5 rounds to
+        // 16384, which reads back as exactly 0.5 at 16 bits.
+        write_wav_pcm(&base, 44_100, 1, BitDepth::I16, &[1.5_f32, 0.5_f32]).unwrap();
+
+        let mut reader = hound::WavReader::open(&base).unwrap();
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        let got: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(got, vec![32_767, 16_384]);
     }
 }

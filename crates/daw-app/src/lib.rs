@@ -25,7 +25,7 @@ use audio_core::render::Renderer;
 use audio_core::schedule::Schedule;
 use audio_core::synth::{Envelope, Synth};
 use audio_core::transport::{DEFAULT_SAMPLE_RATE, Transport, TransportCommand};
-use audio_core::wav::{Recorder, WavSpec, write_mono_slice};
+use audio_core::wav::{BitDepth, Recorder, WavSpec, write_mono_slice, write_wav_pcm};
 
 pub mod audio_file;
 pub mod audio_settings;
@@ -810,18 +810,8 @@ pub fn render_session(job: SessionJob) -> Result<SessionReport, Box<dyn std::err
             std::fs::create_dir_all(parent)?;
         }
     }
-    let frames = job.frames.unwrap_or_else(|| job.session.length_samples());
-    let session_frames = job.session.length_samples();
-    let tracks = job.session.tracks.len();
-    let sample_rate = job.sample_rate;
-    let block_frames = job.block_frames;
     let output = job.output.clone();
-    let graph = build_session_graph(job)?;
-    let mut transport = Transport::new(sample_rate);
-    transport.apply(TransportCommand::Play);
-    let renderer = Renderer::new(graph, transport, 1024);
-    let mut offline = OfflineRenderer::new(renderer, block_frames);
-    let mix = offline.bounce(frames)?;
+    let (mix, frames, session_frames, tracks, sample_rate) = render_mix(job)?;
     audio_core::wav::write_wav_mono(
         &output,
         audio_core::wav::WavSpec {
@@ -835,6 +825,131 @@ pub fn render_session(job: SessionJob) -> Result<SessionReport, Box<dyn std::err
         session_frames,
         tracks,
     })
+}
+
+/// Options for [`render_export`]: the bit depth, target sample rate and an
+/// optional peak normalisation of the master mix.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportSpec {
+    /// Bit depth of the written WAV (16 or 24 bit integer PCM).
+    pub bit_depth: BitDepth,
+    /// Target sample rate; the master mix is resampled onto it after render.
+    pub sample_rate: u32,
+    /// Optional peak normalisation: the target peak in dBFS (`None` keeps the
+    /// mix as rendered).
+    pub normalize: Option<f32>,
+}
+
+impl Default for ExportSpec {
+    fn default() -> Self {
+        Self {
+            bit_depth: BitDepth::I16,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            normalize: None,
+        }
+    }
+}
+
+/// Renders `job` to an integer-PCM stereo WAV with the bit depth, sample rate
+/// and normalisation chosen by `spec`.
+///
+/// The session is rendered on its own rate exactly as [`render_session`]
+/// does (same graph, buses, sends and master chain), then the stereo master
+/// mix is resampled onto `spec.sample_rate`, optionally normalised to a target
+/// peak, and written with [`audio_core::wav::write_wav_pcm`]. A zero-peak mix
+/// (silence) is written unchanged so normalisation never divides by zero.
+///
+/// # Errors
+///
+/// As [`render_session`], plus a zero `spec.sample_rate`.
+pub fn render_export(
+    job: SessionJob,
+    spec: ExportSpec,
+) -> Result<SessionReport, Box<dyn std::error::Error>> {
+    if spec.sample_rate == 0 {
+        return Err(Box::new(audio_core::resample::ResampleError::ZeroRate));
+    }
+    if let Some(parent) = job.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let output = job.output.clone();
+    let (mix, _frames, session_frames, tracks, from_rate) = render_mix(job)?;
+
+    // Resample each channel of the master mix onto the target rate.
+    let to_rate = spec.sample_rate;
+    let resampled = if mix.frames() == 0 {
+        AudioBuffer::new(2, 1)
+    } else {
+        let mut left = audio_core::resample::resample(mix.channel(0), from_rate, to_rate)?;
+        let mut right = audio_core::resample::resample(mix.channel(1), from_rate, to_rate)?;
+        let frames = left.len().max(right.len()).max(1);
+        left.resize(frames, 0.0);
+        right.resize(frames, 0.0);
+        let mut buf = AudioBuffer::new(2, frames);
+        buf.channel_mut(0).copy_from_slice(&left);
+        buf.channel_mut(1).copy_from_slice(&right);
+        buf
+    };
+    let frames = resampled.frames() as u64;
+
+    // Optional peak normalisation across both channels.
+    let mut resampled = resampled;
+    if let Some(target_db) = spec.normalize {
+        let target = 10.0_f32.powf(target_db / 20.0);
+        let mut peak = 0.0_f32;
+        for ch in 0..resampled.channels() {
+            for &s in resampled.channel(ch) {
+                peak = peak.max(s.abs());
+            }
+        }
+        if peak > 0.0 {
+            let gain = target / peak;
+            for ch in 0..resampled.channels() {
+                for s in resampled.channel_mut(ch) {
+                    *s *= gain;
+                }
+            }
+        }
+    }
+
+    // Interleave and write as integer PCM.
+    let channels = resampled.channels() as u16;
+    let mut interleaved = Vec::with_capacity(resampled.frames() * channels as usize);
+    for frame in 0..resampled.frames() {
+        for ch in 0..channels as usize {
+            interleaved.push(resampled.channel(ch)[frame]);
+        }
+    }
+    write_wav_pcm(&output, to_rate, channels, spec.bit_depth, &interleaved)?;
+
+    Ok(SessionReport {
+        frames,
+        session_frames,
+        tracks,
+    })
+}
+
+/// The master mix of [`render_mix`] together with the render metadata.
+type RenderMix = (AudioBuffer, u64, u64, usize, u32);
+
+/// Renders `job` to a stereo `AudioBuffer` and reports the frame counts and
+/// track count, plus the sample rate it was rendered at. Shared by
+/// [`render_session`] and [`render_export`].
+fn render_mix(job: SessionJob) -> Result<RenderMix, Box<dyn std::error::Error>> {
+    let frames = job.frames.unwrap_or_else(|| job.session.length_samples());
+    let session_frames = job.session.length_samples();
+    let tracks = job.session.tracks.len();
+    let sample_rate = job.sample_rate;
+    let block_frames = job.block_frames;
+    let graph = build_session_graph(job)?;
+    let mut transport = Transport::new(sample_rate);
+    transport.apply(TransportCommand::Play);
+    let renderer = Renderer::new(graph, transport, 1024);
+    let mut offline = OfflineRenderer::new(renderer, block_frames);
+    let mix = offline.bounce(frames)?;
+    Ok((mix, frames, session_frames, tracks, sample_rate))
 }
 
 /// A two-track session built in memory for `daw render-session`: a 440 Hz

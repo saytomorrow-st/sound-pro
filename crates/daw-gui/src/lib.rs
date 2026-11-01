@@ -796,6 +796,38 @@ impl Editor {
         daw_app::render_session(job).map_err(|e| EditorError::Render(e.to_string()))
     }
 
+    /// Mixes the project down to a stereo WAV at `out` using `spec` for the
+    /// bit depth, target sample rate and optional peak normalisation
+    /// (SPEC-052).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::Empty`] for a project with no audio, load or render
+    /// errors otherwise.
+    pub fn export_with(
+        &self,
+        out: &Path,
+        spec: &daw_app::ExportSpec,
+    ) -> Result<daw_app::SessionReport, EditorError> {
+        let job = self.prepare_export(out)?;
+        daw_app::render_export(job, *spec).map_err(|e| EditorError::Render(e.to_string()))
+    }
+
+    /// Builds the render job for a mix export to `out` without rendering it,
+    /// so the caller can run [`daw_app::render_export`] off the UI thread
+    /// (SPEC-052).
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::Empty`] for a project with no audio, load errors
+    /// otherwise.
+    pub fn prepare_export(&self, out: &Path) -> Result<daw_app::SessionJob, EditorError> {
+        if self.project.session.length_samples() == 0 {
+            return Err(EditorError::Empty);
+        }
+        self.load(out.to_path_buf())
+    }
+
     /// Loads the session for rendering from the decoded files and rendered
     /// notes this editor already holds (SPEC-035).
     fn load(&self, output: PathBuf) -> Result<daw_app::SessionJob, EditorError> {
