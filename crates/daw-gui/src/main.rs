@@ -1058,7 +1058,7 @@ impl App {
             .filter(|p| daw_app::audio_file::is_audio_file(p))
             .collect();
         if paths.is_empty() {
-            self.status = "Можно добавлять только WAV и MP3".into();
+            self.status = "Можно добавлять только WAV, MP3, FLAC и OGG".into();
             return;
         }
         if self.imports.pending == 0 {
@@ -1401,7 +1401,12 @@ impl App {
 
     fn import_dialog(&mut self) {
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("WAV, MP3", &["wav", "WAV", "mp3", "MP3"])
+            .add_filter(
+                "WAV, MP3, FLAC, OGG",
+                &[
+                    "wav", "WAV", "mp3", "MP3", "flac", "FLAC", "ogg", "OGG", "oga", "OGA",
+                ],
+            )
             .pick_files()
         else {
             return;

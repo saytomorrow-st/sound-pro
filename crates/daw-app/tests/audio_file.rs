@@ -1,4 +1,5 @@
-//! Acceptance tests for reading WAV and MP3 clip files (SPEC-032).
+//! Acceptance tests for reading WAV, MP3, FLAC and OGG Vorbis clip files
+//! (SPEC-032, SPEC-053).
 
 use std::path::{Path, PathBuf};
 
@@ -8,12 +9,31 @@ fn sine_mp3() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sine.mp3")
 }
 
+fn sine_flac() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sine.flac")
+}
+
+fn sine24_flac() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sine24.flac")
+}
+
+fn sine_stereo_flac() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sine_stereo.flac")
+}
+
+fn sine_ogg() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sine.ogg")
+}
+
 #[test]
 fn audio_files_are_recognised_by_extension() {
     assert!(is_audio_file(Path::new("a.wav")));
     assert!(is_audio_file(Path::new("b.MP3")));
     assert!(is_audio_file(Path::new("dir/c.Mp3")));
-    assert!(!is_audio_file(Path::new("song.flac")));
+    assert!(is_audio_file(Path::new("song.flac")));
+    assert!(is_audio_file(Path::new("song.FLAC")));
+    assert!(is_audio_file(Path::new("song.ogg")));
+    assert!(is_audio_file(Path::new("song.Oga")));
     assert!(!is_audio_file(Path::new("notes.txt")));
     assert!(!is_audio_file(Path::new("noext")));
 }
@@ -49,7 +69,10 @@ fn a_broken_mp3_is_an_error_not_a_panic() {
     let result = read_audio(&path);
     let _ = std::fs::remove_file(&path);
     assert!(
-        matches!(result, Err(AudioFileError::Mp3(_) | AudioFileError::Empty)),
+        matches!(
+            result,
+            Err(AudioFileError::Decode(_) | AudioFileError::Empty)
+        ),
         "{result:?}"
     );
 }
@@ -107,4 +130,91 @@ fn a_broken_file_has_no_probed_length() {
     assert!(daw_app::audio_file::probe_len_at(&wav, 48_000).is_err());
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&wav);
+}
+
+#[test]
+fn a_flac_decodes_to_a_short_tone() {
+    let (spec, buffer) = read_audio(&sine_flac()).unwrap();
+    assert_eq!(spec.sample_rate, 44_100);
+    assert_eq!(spec.channels, 1);
+    // 0.15 s at 44.1 kHz.
+    let frames = buffer.frames();
+    assert!(frames.abs_diff(6_615) <= 64, "{frames}");
+    let peak = buffer
+        .channel(0)
+        .iter()
+        .fold(0.0f32, |m, &s| m.max(s.abs()));
+    assert!((0.1..=0.15).contains(&peak), "peak {peak}");
+}
+
+#[test]
+fn a_24_bit_flac_decodes_with_its_rate() {
+    let (spec, buffer) = read_audio(&sine24_flac()).unwrap();
+    assert_eq!(spec.sample_rate, 44_100);
+    assert_eq!(spec.channels, 1);
+    // 0.1 s at 44.1 kHz.
+    assert!(buffer.frames().abs_diff(4_410) <= 64, "{}", buffer.frames());
+}
+
+#[test]
+fn a_stereo_flac_keeps_two_channels() {
+    let (spec, buffer) = read_audio(&sine_stereo_flac()).unwrap();
+    assert_eq!(spec.sample_rate, 44_100);
+    assert_eq!(spec.channels, 2);
+    assert_eq!(buffer.channels(), 2);
+    assert!(buffer.frames().abs_diff(6_615) <= 64, "{}", buffer.frames());
+}
+
+#[test]
+fn an_ogg_vorbis_decodes_to_a_short_tone() {
+    let (spec, buffer) = read_audio(&sine_ogg()).unwrap();
+    assert_eq!(spec.sample_rate, 44_100);
+    assert_eq!(spec.channels, 1);
+    // Vorbis pads the end to a block boundary, so allow a little slack.
+    let frames = buffer.frames();
+    assert!(frames.abs_diff(6_615) <= 1_024, "{frames}");
+    let peak = buffer
+        .channel(0)
+        .iter()
+        .fold(0.0f32, |m, &s| m.max(s.abs()));
+    assert!((0.1..=0.15).contains(&peak), "peak {peak}");
+}
+
+#[test]
+fn flac_and_ogg_resample_to_the_project_rate() {
+    for path in [sine_flac(), sine_ogg()] {
+        let at_44k = read_mono_at(&path, 44_100).unwrap();
+        let at_22k = read_mono_at(&path, 22_050).unwrap();
+        let expected = at_44k.len() / 2;
+        assert!(at_22k.len().abs_diff(expected) <= 2, "{}", at_22k.len());
+    }
+}
+
+#[test]
+fn broken_flac_and_ogg_are_errors_not_panics() {
+    for ext in ["flac", "ogg", "oga"] {
+        let path = std::env::temp_dir().join(format!("daw-broken-{}.{ext}", std::process::id()));
+        std::fs::write(&path, b"this is not a real compressed audio file").unwrap();
+        let result = read_audio(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(
+                result,
+                Err(AudioFileError::Decode(_) | AudioFileError::Empty)
+            ),
+            "{ext}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn flac_and_ogg_probe_a_length() {
+    for path in [sine_flac(), sine_ogg()] {
+        let probed = daw_app::audio_file::probe_len_at(&path, 44_100).unwrap();
+        let decoded = read_mono_at(&path, 44_100).unwrap().len() as u64;
+        assert!(
+            probed.abs_diff(decoded) <= 44_100_u64 / 20,
+            "probed {probed}, decoded {decoded}"
+        );
+    }
 }
