@@ -64,6 +64,73 @@ pub enum RealtimeError {
     },
 }
 
+/// Why an ALSA output device failed to open on Linux, for user-facing
+/// diagnostics (SPEC-016). Pure data with no filesystem or device access, so
+/// it is always compiled and unit-testable without the `realtime` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlsaFailure {
+    /// `libasound.so.2` (the ALSA library) is missing from the host.
+    MissingLibasound,
+    /// ALSA is present but no output device can be enumerated.
+    NoDevice,
+    /// A device exists but the PipeWire ALSA bridge plugin
+    /// (`libasound_module_pcm_pipewire.so`) is missing, so the `default` PCM
+    /// cannot be opened.
+    MissingPipewirePlugin,
+    /// A device exists and the bridge is present, yet opening still failed.
+    Other,
+}
+
+impl AlsaFailure {
+    /// A plain-language Russian explanation and fix, for the status bar and
+    /// `[play-debug]` log.
+    #[must_use]
+    pub fn russian_message(self) -> &'static str {
+        match self {
+            AlsaFailure::MissingLibasound => {
+                "В системе нет ALSA (libasound.so.2). Установите: Fedora: sudo dnf install \
+                 alsa-lib; Ubuntu/Debian: sudo apt install libasound2; Arch: sudo pacman -S alsa-lib"
+            }
+            AlsaFailure::NoDevice => {
+                "Не найдено ни одного устройства вывода звука. Подключите устройство или \
+                 включите звуковой сервер (PipeWire/PulseAudio) и попробуйте снова."
+            }
+            AlsaFailure::MissingPipewirePlugin => {
+                "В системе нет pipewire-alsa (мост ALSA→PipeWire). Установите: \
+                 Fedora: sudo dnf install pipewire-alsa; Ubuntu/Debian: sudo apt install \
+                 pipewire-alsa; Arch: sudo pacman -S pipewire-alsa"
+            }
+            AlsaFailure::Other => {
+                "Не удалось открыть устройство вывода. Проверьте настройки звука и \
+                 попробуйте снова."
+            }
+        }
+    }
+}
+
+/// Classifies why ALSA playback failed from three host facts, in priority order:
+/// the presence of the ALSA library, the presence of any output device, and the
+/// presence of the PipeWire ALSA bridge plugin.
+///
+/// Pure: takes booleans so callers (and tests) supply mocked filesystem/device
+/// results instead of touching the host.
+#[must_use]
+pub fn classify_alsa_failure(
+    has_libasound: bool,
+    has_device: bool,
+    has_pipewire_plugin: bool,
+) -> AlsaFailure {
+    if !has_libasound {
+        AlsaFailure::MissingLibasound
+    } else if !has_device {
+        AlsaFailure::NoDevice
+    } else if !has_pipewire_plugin {
+        AlsaFailure::MissingPipewirePlugin
+    } else {
+        AlsaFailure::Other
+    }
+}
+
 /// One F32 output configuration advertised by a device.
 ///
 /// Mirrors the fields of `cpal::SupportedStreamConfigRange` that selection needs,
@@ -566,20 +633,96 @@ mod device {
         engine: PlaybackEngine,
         sample_rate: u32,
     ) -> Result<RealtimeHandle, RealtimeError> {
-        start_output_with(engine, sample_rate, &AudioSettings::default())
+        start_output_with(engine, sample_rate, &AudioSettings::default()).map_err(|boxed| boxed.0)
     }
 
     /// [`start_output`] on the device and buffer chosen in `settings`
     /// (SPEC-033). A device that is gone falls back to the default.
     ///
+    /// Unlike [`start_output`], the engine is returned on error so the caller
+    /// can keep the transport rolling on a silent clock when no usable output
+    /// device exists. The engine is `None` only in the pathological case where
+    /// a probe stream opened successfully but the real stream then failed; in
+    /// that rare case the engine has already been handed to the realtime
+    /// callback and cannot be recovered without cloning or locking (both
+    /// forbidden on the audio path).
+    ///
     /// # Errors
     ///
-    /// As [`start_output`].
+    /// The [`RealtimeError`] is paired with the still-owned [`PlaybackEngine`]
+    /// (when recoverable) so it can be reused, for example by
+    /// [`PlaybackEngine::advance_silent`].
     pub fn start_output_with(
         mut engine: PlaybackEngine,
         sample_rate: u32,
         settings: &AudioSettings,
-    ) -> Result<RealtimeHandle, RealtimeError> {
+    ) -> Result<RealtimeHandle, Box<(RealtimeError, Option<PlaybackEngine>)>> {
+        // Preflight: resolve the device and stream config without touching the
+        // engine. Any failure here returns the engine so the caller can fall
+        // back to a silent transport.
+        let (device, stream_config, channels) = match resolve_output(sample_rate, settings) {
+            Ok(v) => v,
+            Err(e) => return Err(Box::new((e, Some(engine)))),
+        };
+
+        // Probe the device *before* moving the engine into the realtime
+        // callback. Opening (and starting) a no-op stream exercises the exact
+        // failure that a missing PipeWire ALSA plugin causes on Fedora — the
+        // dlopen happens inside `build_output_stream`/`play` — while the engine
+        // is still owned here. The probe is dropped immediately.
+        let probe = match device.build_output_stream(
+            &stream_config,
+            move |_data: &mut [f32], _| {},
+            |_err| {},
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => return Err(Box::new((RealtimeError::Stream(e), Some(engine)))),
+        };
+        if let Err(e) = probe.play() {
+            return Err(Box::new((RealtimeError::Play(e), Some(engine))));
+        }
+        drop(probe);
+
+        // The probe succeeded, so the same device/config will open here. Move
+        // the engine into the real callback. A failure at this point is
+        // pathological (the identical open just succeeded) and the engine is
+        // unrecoverable without cloning or locking, so it is reported as `None`.
+        let stats = Arc::new(RealtimeStats::default());
+        let cb_stats = Arc::clone(&stats);
+        let err_stats = Arc::clone(&stats);
+        let stream = match device.build_output_stream(
+            &stream_config,
+            move |data: &mut [f32], _| {
+                engine.fill(data, channels);
+                cb_stats
+                    .rendered_frames
+                    .fetch_add((data.len() / channels.max(1)) as u64, Ordering::Relaxed);
+            },
+            move |_err| {
+                err_stats.stream_errors.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => return Err(Box::new((RealtimeError::Stream(e), None))),
+        };
+        if let Err(e) = stream.play() {
+            return Err(Box::new((RealtimeError::Play(e), None)));
+        }
+        Ok(RealtimeHandle {
+            stream: Some(stream),
+            stats,
+        })
+    }
+
+    /// Resolves the output device and stream configuration for `sample_rate`
+    /// without touching the engine. Pure selection plus CPAL enumeration; runs
+    /// once, before the stream starts.
+    fn resolve_output(
+        sample_rate: u32,
+        settings: &AudioSettings,
+    ) -> Result<(cpal::Device, StreamConfig, usize), RealtimeError> {
         let device = pick_output(settings)?;
         let configs = device_configs(&device)?;
         let chosen = choose_exact_config(&configs, sample_rate)?;
@@ -598,27 +741,63 @@ mod device {
             .into();
         stream_config.buffer_size = buffer;
         let channels = usize::from(stream_config.channels);
-        let stats = Arc::new(RealtimeStats::default());
-        let cb_stats = Arc::clone(&stats);
-        let err_stats = Arc::clone(&stats);
-        let stream = device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _| {
-                engine.fill(data, channels);
-                cb_stats
-                    .rendered_frames
-                    .fetch_add((data.len() / channels.max(1)) as u64, Ordering::Relaxed);
-            },
-            move |_err| {
-                err_stats.stream_errors.fetch_add(1, Ordering::Relaxed);
-            },
-            None,
-        )?;
-        stream.play()?;
-        Ok(RealtimeHandle {
-            stream: Some(stream),
-            stats,
-        })
+        Ok((device, stream_config, channels))
+    }
+
+    /// Candidate locations of `libasound.so.2` on common Linux layouts.
+    #[cfg(target_os = "linux")]
+    const LIBASOUND_PATHS: &[&str] = &[
+        "/usr/lib64/libasound.so.2",
+        "/usr/lib/x86_64-linux-gnu/libasound.so.2",
+        "/usr/lib/aarch64-linux-gnu/libasound.so.2",
+        "/usr/lib/libasound.so.2",
+    ];
+
+    /// Candidate locations of the PipeWire ALSA bridge plugin.
+    #[cfg(target_os = "linux")]
+    const PIPEWIRE_PLUGIN_PATHS: &[&str] = &[
+        "/usr/lib64/alsa-lib/libasound_module_pcm_pipewire.so",
+        "/usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pipewire.so",
+        "/usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_pcm_pipewire.so",
+        "/usr/lib/alsa-lib/libasound_module_pcm_pipewire.so",
+    ];
+
+    /// Determines why ALSA playback failed on this Linux host and returns a
+    /// plain-language Russian explanation (mirrored to `[play-debug]` by the
+    /// caller). Returns `None` on non-Linux, where ALSA does not apply.
+    ///
+    /// Distinguishes three cases: no `libasound.so.2`, no output device, and a
+    /// missing PipeWire ALSA bridge plugin. The transport keeps rolling on a
+    /// silent clock regardless, so this only shapes the user-facing message.
+    pub fn diagnose_alsa_failure() -> Option<String> {
+        diagnose_alsa_failure_impl()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn diagnose_alsa_failure_impl() -> Option<String> {
+        let has_libasound = any_path_exists(LIBASOUND_PATHS);
+        let has_pipewire_plugin = any_path_exists(PIPEWIRE_PLUGIN_PATHS);
+        let has_device = cpal::default_host().default_output_device().is_some()
+            || cpal::default_host()
+                .output_devices()
+                .map(|mut devices| devices.next().is_some())
+                .unwrap_or(false);
+        Some(
+            super::classify_alsa_failure(has_libasound, has_device, has_pipewire_plugin)
+                .russian_message()
+                .to_owned(),
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn diagnose_alsa_failure_impl() -> Option<String> {
+        None
+    }
+
+    /// Whether any of `paths` exists on the host filesystem.
+    #[cfg(target_os = "linux")]
+    fn any_path_exists(paths: &[&str]) -> bool {
+        paths.iter().any(|path| std::path::Path::new(path).exists())
     }
 
     /// Opens the default microphone and feeds a capture pair (SPEC-020).
@@ -707,8 +886,8 @@ mod device {
 
 #[cfg(feature = "realtime")]
 pub use device::{
-    input_device_names, output_device_names, play_default, start_input, start_input_with,
-    start_output, start_output_with,
+    diagnose_alsa_failure, input_device_names, output_device_names, play_default, start_input,
+    start_input_with, start_output, start_output_with,
 };
 
 #[cfg(test)]
@@ -874,5 +1053,56 @@ mod tests {
         let mut s = QuantumSplitter::new(1024, 1024);
         assert_eq!(s.next_len(), 1024);
         assert_eq!(s.next_len(), 0);
+    }
+
+    #[test]
+    fn classify_missing_libasound_wins_over_everything() {
+        // No library: the most fundamental failure, regardless of device/plugin.
+        assert_eq!(
+            classify_alsa_failure(false, false, false),
+            AlsaFailure::MissingLibasound
+        );
+        assert_eq!(
+            classify_alsa_failure(false, true, true),
+            AlsaFailure::MissingLibasound
+        );
+    }
+
+    #[test]
+    fn classify_no_device_reported_when_library_present() {
+        assert_eq!(
+            classify_alsa_failure(true, false, false),
+            AlsaFailure::NoDevice
+        );
+        assert_eq!(
+            classify_alsa_failure(true, false, true),
+            AlsaFailure::NoDevice
+        );
+    }
+
+    #[test]
+    fn classify_missing_pipewire_plugin_when_device_present() {
+        assert_eq!(
+            classify_alsa_failure(true, true, false),
+            AlsaFailure::MissingPipewirePlugin
+        );
+    }
+
+    #[test]
+    fn classify_other_when_all_present() {
+        assert_eq!(classify_alsa_failure(true, true, true), AlsaFailure::Other);
+    }
+
+    #[test]
+    fn classify_messages_cover_all_cases_and_are_static() {
+        for case in [
+            AlsaFailure::MissingLibasound,
+            AlsaFailure::NoDevice,
+            AlsaFailure::MissingPipewirePlugin,
+            AlsaFailure::Other,
+        ] {
+            let msg = case.russian_message();
+            assert!(!msg.is_empty());
+        }
     }
 }
