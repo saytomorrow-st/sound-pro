@@ -501,7 +501,8 @@ pub enum LoadError {
         /// Underlying error.
         source: audio_core::WavError,
     },
-    /// A clip's MP3 file could not be decoded (SPEC-032).
+    /// A clip's compressed file (MP3, FLAC or OGG Vorbis) could not be
+    /// decoded (SPEC-032, SPEC-053).
     #[error("{path}: {message}")]
     Decode {
         /// Resolved file path.
@@ -731,7 +732,7 @@ fn audio_file_error(path: &std::path::Path, e: audio_file::AudioFileError) -> Lo
     match e {
         audio_file::AudioFileError::Wav(source) => wav_error(source),
         audio_file::AudioFileError::Empty => wav_error(audio_core::WavError::Empty),
-        audio_file::AudioFileError::Mp3(message) => LoadError::Decode {
+        audio_file::AudioFileError::Decode(message) => LoadError::Decode {
             path: path.to_path_buf(),
             message,
         },

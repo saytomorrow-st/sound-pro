@@ -1,5 +1,6 @@
-//! Reading audio files for clips: WAV through `audio_core::wav`, MP3 through
-//! `symphonia` (SPEC-032). Never called on the audio path.
+//! Reading audio files for clips: WAV through `audio_core::wav`, MP3, FLAC and
+//! OGG Vorbis through `symphonia` (SPEC-032, SPEC-053). Never called on the
+//! audio path.
 
 use std::path::Path;
 
@@ -14,7 +15,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 /// Extensions the importer accepts, lower case.
-pub const AUDIO_EXTENSIONS: [&str; 2] = ["wav", "mp3"];
+pub const AUDIO_EXTENSIONS: [&str; 5] = ["wav", "mp3", "flac", "ogg", "oga"];
 
 /// Why an audio file could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -22,9 +23,10 @@ pub enum AudioFileError {
     /// The WAV reader failed.
     #[error(transparent)]
     Wav(#[from] audio_core::WavError),
-    /// The MP3 file could not be opened or decoded.
-    #[error("cannot decode mp3: {0}")]
-    Mp3(String),
+    /// A compressed file (MP3, FLAC or OGG Vorbis) could not be opened or
+    /// decoded.
+    #[error("cannot decode {0}")]
+    Decode(String),
     /// The file decoded to zero frames.
     #[error("the file has no audio")]
     Empty,
@@ -42,7 +44,16 @@ fn extension(path: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-/// Reads `path` as planar `f32`: MP3 by extension, everything else as WAV.
+/// True for a path that symphonia decodes: MP3, FLAC or OGG Vorbis.
+fn is_compressed(path: &Path) -> bool {
+    matches!(
+        extension(path).as_deref(),
+        Some("mp3" | "flac" | "ogg" | "oga")
+    )
+}
+
+/// Reads `path` as planar `f32`: compressed formats (MP3, FLAC, OGG Vorbis)
+/// by extension, everything else as WAV.
 ///
 /// # Errors
 ///
@@ -51,13 +62,13 @@ pub fn read_audio(path: &Path) -> Result<(WavSpec, AudioBuffer), AudioFileError>
     read_audio_progress(path, &mut |_, _| {})
 }
 
-/// Called while an MP3 decodes with its sample rate and the channels
-/// decoded so far, after every packet.
+/// Called while a compressed file decodes with its sample rate and the
+/// channels decoded so far, after every packet.
 pub type Progress<'a> = &'a mut dyn FnMut(u32, &[Vec<f32>]);
 
-/// [`read_audio`] that reports a decoding MP3's content as it grows, so a
-/// waveform can be drawn before the file is finished. WAV files are read in
-/// one go and report nothing.
+/// [`read_audio`] that reports a decoding compressed file's content as it
+/// grows, so a waveform can be drawn before the file is finished. WAV files
+/// are read in one go and report nothing.
 ///
 /// # Errors
 ///
@@ -66,9 +77,13 @@ pub fn read_audio_progress(
     path: &Path,
     progress: Progress<'_>,
 ) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
-    if extension(path).as_deref() == Some("mp3") {
-        let file = std::fs::File::open(path).map_err(|e| AudioFileError::Mp3(e.to_string()))?;
-        decode_mp3(Box::new(file), progress)
+    if is_compressed(path) {
+        let file = std::fs::File::open(path).map_err(|e| AudioFileError::Decode(e.to_string()))?;
+        decode_with_symphonia(
+            Box::new(file),
+            extension(path).unwrap_or_default(),
+            progress,
+        )
     } else {
         match audio_core::wav::read_wav_mono(path) {
             Err(audio_core::WavError::Empty) => Err(AudioFileError::Empty),
@@ -286,15 +301,16 @@ fn resample_split(
 }
 
 /// Length of `path` at `rate` in frames, read from the header without
-/// decoding the audio (SPEC-050 §2). MP3 files without a frame count in the
-/// header are measured by walking their packets, still without decoding.
+/// decoding the audio (SPEC-050 §2). Compressed files without a frame count
+/// in the header are measured by walking their packets, still without
+/// decoding.
 ///
 /// # Errors
 ///
 /// See [`AudioFileError`]; a file with no audio is [`AudioFileError::Empty`].
 pub fn probe_len_at(path: &Path, rate: u32) -> Result<u64, AudioFileError> {
-    let (frames, from) = if extension(path).as_deref() == Some("mp3") {
-        probe_mp3(path)?
+    let (frames, from) = if is_compressed(path) {
+        probe_symphonia(path)?
     } else {
         let reader = hound::WavReader::open(path).map_err(audio_core::WavError::from)?;
         (u64::from(reader.duration()), reader.spec().sample_rate)
@@ -305,12 +321,14 @@ pub fn probe_len_at(path: &Path, rate: u32) -> Result<u64, AudioFileError> {
     Ok((u128::from(frames) * u128::from(rate)).div_ceil(u128::from(from)) as u64)
 }
 
-fn probe_mp3(path: &Path) -> Result<(u64, u32), AudioFileError> {
-    let mp3 = |e: &dyn std::fmt::Display| AudioFileError::Mp3(e.to_string());
-    let file = std::fs::File::open(path).map_err(|e| mp3(&e))?;
+fn probe_symphonia(path: &Path) -> Result<(u64, u32), AudioFileError> {
+    let decode = |e: &dyn std::fmt::Display| AudioFileError::Decode(e.to_string());
+    let file = std::fs::File::open(path).map_err(|e| decode(&e))?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
-    hint.with_extension("mp3");
+    if let Some(ext) = extension(path) {
+        hint.with_extension(&ext);
+    }
     let mut format = symphonia::default::get_probe()
         .format(
             &hint,
@@ -318,13 +336,13 @@ fn probe_mp3(path: &Path) -> Result<(u64, u32), AudioFileError> {
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|e| mp3(&e))?
+        .map_err(|e| decode(&e))?
         .format;
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| AudioFileError::Mp3("no audio track".into()))?;
+        .ok_or_else(|| AudioFileError::Decode("no audio track".into()))?;
     let rate = track.codec_params.sample_rate.unwrap_or(0);
     if let Some(frames) = track.codec_params.n_frames {
         return Ok((frames, rate));
@@ -338,7 +356,7 @@ fn probe_mp3(path: &Path) -> Result<(u64, u32), AudioFileError> {
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
-            Err(e) => return Err(mp3(&e)),
+            Err(e) => return Err(decode(&e)),
         }
     }
     Ok((frames, rate))
@@ -348,20 +366,25 @@ fn probe_mp3(path: &Path) -> Result<(u64, u32), AudioFileError> {
 ///
 /// # Errors
 ///
-/// [`AudioFileError::Mp3`] for undecodable data, [`AudioFileError::Empty`]
+/// [`AudioFileError::Decode`] for undecodable data, [`AudioFileError::Empty`]
 /// when it holds no audio.
 pub fn decode_mp3_bytes(bytes: &'static [u8]) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
-    decode_mp3(Box::new(std::io::Cursor::new(bytes)), &mut |_, _| {})
+    decode_with_symphonia(
+        Box::new(std::io::Cursor::new(bytes)),
+        "mp3".to_owned(),
+        &mut |_, _| {},
+    )
 }
 
-fn decode_mp3(
+fn decode_with_symphonia(
     source: Box<dyn symphonia::core::io::MediaSource>,
+    extension: String,
     progress: Progress<'_>,
 ) -> Result<(WavSpec, AudioBuffer), AudioFileError> {
-    let mp3 = |e: &dyn std::fmt::Display| AudioFileError::Mp3(e.to_string());
+    let decode = |e: &dyn std::fmt::Display| AudioFileError::Decode(e.to_string());
     let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
-    hint.with_extension("mp3");
+    hint.with_extension(&extension);
     let probed = symphonia::default::get_probe()
         .format(
             &hint,
@@ -369,17 +392,17 @@ fn decode_mp3(
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|e| mp3(&e))?;
+        .map_err(|e| decode(&e))?;
     let mut format = probed.format;
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| AudioFileError::Mp3("no audio track".into()))?;
+        .ok_or_else(|| AudioFileError::Decode("no audio track".into()))?;
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| mp3(&e))?;
+        .map_err(|e| decode(&e))?;
 
     let mut rate = track.codec_params.sample_rate.unwrap_or(0);
     let mut channels: Vec<Vec<f32>> = Vec::new();
@@ -391,7 +414,7 @@ fn decode_mp3(
                 break;
             }
             Err(SymphoniaError::ResetRequired) => break,
-            Err(e) => return Err(mp3(&e)),
+            Err(e) => return Err(decode(&e)),
         };
         if packet.track_id() != track_id {
             continue;
@@ -400,7 +423,7 @@ fn decode_mp3(
             Ok(decoded) => decoded,
             // A damaged frame is skipped, like any player does.
             Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(e) => return Err(mp3(&e)),
+            Err(e) => return Err(decode(&e)),
         };
         let spec = *decoded.spec();
         rate = spec.rate;

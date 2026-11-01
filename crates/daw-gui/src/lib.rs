@@ -67,7 +67,7 @@ pub enum EditorError {
         /// Decoder error.
         source: audio_core::WavError,
     },
-    /// The MP3 file could not be decoded (SPEC-032).
+    /// A compressed file (MP3, FLAC or OGG Vorbis) could not be decoded.
     #[error("{path}: {message}")]
     Decode {
         /// File path.
@@ -3438,7 +3438,7 @@ fn file_error(path: &Path, e: daw_app::audio_file::AudioFileError) -> EditorErro
             path: path.to_path_buf(),
             source,
         },
-        AudioFileError::Mp3(message) => EditorError::Decode {
+        AudioFileError::Decode(message) => EditorError::Decode {
             path: path.to_path_buf(),
             message,
         },
