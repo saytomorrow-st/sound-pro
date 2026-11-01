@@ -944,8 +944,10 @@ fn render_mix(job: SessionJob) -> Result<RenderMix, Box<dyn std::error::Error>> 
     let tracks = job.session.tracks.len();
     let sample_rate = job.sample_rate;
     let block_frames = job.block_frames;
+    let tempo_map = job.session.build_tempo_map(sample_rate)?;
     let graph = build_session_graph(job)?;
     let mut transport = Transport::new(sample_rate);
+    transport.set_tempo_map(tempo_map);
     transport.apply(TransportCommand::Play);
     let renderer = Renderer::new(graph, transport, 1024);
     let mut offline = OfflineRenderer::new(renderer, block_frames);

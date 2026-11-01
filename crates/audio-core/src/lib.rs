@@ -57,7 +57,10 @@ pub use session::{
     valid_time_signature,
 };
 pub use synth::{Envelope, MAX_VOICES, Synth, SynthError, Voice, note_to_hz, render_notes};
-pub use transport::{BarPosition, Tempo, TimeSignature, Transport, TransportCommand};
+pub use transport::{
+    BarPosition, MAX_TEMPO_POINTS, TPQN, Tempo, TempoMap, TempoMapError, TempoPoint, TimeSignature,
+    Transport, TransportCommand,
+};
 pub use wav::{Recorder, WavError, WavSpec, read_wav_mono, write_wav_mono};
 
 /// Abstraction over "who drives the clock".

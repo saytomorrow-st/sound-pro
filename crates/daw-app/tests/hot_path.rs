@@ -9,7 +9,9 @@ use audio_core::graph::NodeProcessor;
 use audio_core::params::{ParamHandle, ParamId, ParamSpec};
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 use audio_core::session::{Clip, Session, Track as SessionTrack};
-use audio_core::{Graph, MidiEvent, MidiMessage, Renderer, Transport, TransportCommand};
+use audio_core::{
+    Graph, MidiEvent, MidiMessage, Renderer, TempoMap, TempoPoint, Transport, TransportCommand,
+};
 use daw_app::capture::capture;
 use daw_app::nodes::{ClipSource, MidiPlayer, MonoClip, Strip, Tone};
 use daw_app::{SessionJob, TrackSource, build_session_graph};
@@ -129,6 +131,36 @@ fn sources() -> Vec<Box<dyn ClipSource + Send>> {
         Box::new(MonoClip::sine(220.0, RATE, 10_000)),
         Box::new(MonoClip::sine(330.0, RATE, 10_000)),
     ]
+}
+
+#[test]
+fn rendering_with_a_tempo_map_does_not_allocate() {
+    // A multi-point tempo map is built (and thus allocated) on the control
+    // side, then handed to the transport; the render itself must not allocate
+    // even while it converts samples↔ticks across segments (SPEC-054).
+    let map = TempoMap::new(
+        vec![
+            TempoPoint {
+                position_ticks: 0,
+                bpm: 120.0,
+            },
+            TempoPoint {
+                position_ticks: 3840,
+                bpm: 90.0,
+            },
+            TempoPoint {
+                position_ticks: 7680,
+                bpm: 150.0,
+            },
+        ],
+        RATE,
+    )
+    .unwrap();
+    let mut renderer = renderer_for(graph_with(Tone::new(440.0, param("level"))));
+    renderer.transport_mut().set_tempo_map(map);
+    let mut mix = AudioBuffer::new(1, BLOCK);
+    let count = allocations_of(|| run_quanta(&mut renderer, &mut mix, QUANTA));
+    assert_eq!(count, 0, "tempo-map render allocated {count} times");
 }
 
 #[test]

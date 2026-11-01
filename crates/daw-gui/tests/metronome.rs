@@ -188,13 +188,11 @@ fn export_never_contains_the_click() {
 #[test]
 fn bars_in_counts_the_beats_of_the_bar() {
     // 120 BPM at 48 kHz: one beat is 24 000 frames.
-    assert_eq!(bars_in(0, RATE, 120.0, 3), "1.1");
-    assert_eq!(bars_in(24_000 * 2, RATE, 120.0, 3), "1.3");
-    assert_eq!(bars_in(24_000 * 3, RATE, 120.0, 3), "2.1");
-    assert_eq!(bars_in(24_000 * 6, RATE, 120.0, 7), "1.7");
-    assert_eq!(bars_in(24_000 * 4, RATE, 120.0, 0), "2.1");
-    assert_eq!(
-        bars(24_000 * 4, RATE, 120.0),
-        bars_in(24_000 * 4, RATE, 120.0, 4)
-    );
+    let m = audio_core::TempoMap::single_or_default(120.0, RATE);
+    assert_eq!(bars_in(0, &m, 3), "1.1");
+    assert_eq!(bars_in(24_000 * 2, &m, 3), "1.3");
+    assert_eq!(bars_in(24_000 * 3, &m, 3), "2.1");
+    assert_eq!(bars_in(24_000 * 6, &m, 7), "1.7");
+    assert_eq!(bars_in(24_000 * 4, &m, 0), "2.1");
+    assert_eq!(bars(24_000 * 4, &m), bars_in(24_000 * 4, &m, 4));
 }

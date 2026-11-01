@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use audio_core::session::{AutoPoint, Clip, Lane, Note, Session, Track, TrackFormat, TrackKind};
 use audio_core::{
-    Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, Marker, Project,
-    ProjectError, SessionError,
+    Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, MAX_TEMPO_POINTS,
+    Marker, Project, ProjectError, SessionError, TempoPoint,
 };
 
 /// Sample rate of a new project.
@@ -29,6 +29,10 @@ pub const DEFAULT_TEMPO: f64 = 120.0;
 pub const MIN_TEMPO: f64 = 20.0;
 /// Fastest tempo the window allows (SPEC-026).
 pub const MAX_TEMPO: f64 = 999.0;
+/// Slowest BPM a tempo point may take (SPEC-054).
+pub const MIN_TEMPO_POINT_BPM: f64 = 30.0;
+/// Fastest BPM a tempo point may take (SPEC-054).
+pub const MAX_TEMPO_POINT_BPM: f64 = 300.0;
 /// Frames summarised by one [`Peaks`] entry.
 pub const PEAK_BLOCK: usize = 256;
 
@@ -1288,9 +1292,12 @@ impl Editor {
             return Err(EditorError::InvalidNote);
         }
         let session = &self.project.session;
-        let step = (sixteenth_samples(session.sample_rate, session.tempo_bpm) * 16
-            / u64::from(division))
-        .max(1);
+        let map = session
+            .build_tempo_map(session.sample_rate)
+            .unwrap_or_else(|_| {
+                audio_core::TempoMap::single_or_default(session.tempo_bpm, session.sample_rate)
+            });
+        let step = (sixteenth_samples(&map) * 16 / u64::from(division)).max(1);
         let c = self.clip_ref(track, clip)?;
         let origin = i128::from(c.start_samples) - i128::from(c.offset_samples);
         let last = c.source_length.saturating_sub(1);
@@ -1914,7 +1921,12 @@ impl Editor {
             return 0;
         }
         let beats = u64::from(session.time_signature.numerator.max(1));
-        let bar = sixteenth_samples(session.sample_rate, session.tempo_bpm) * 4 * beats;
+        let map = session
+            .build_tempo_map(session.sample_rate)
+            .unwrap_or_else(|_| {
+                audio_core::TempoMap::single_or_default(session.tempo_bpm, session.sample_rate)
+            });
+        let bar = sixteenth_samples(&map) * 4 * beats;
         playhead - playhead % bar
     }
 
@@ -1928,7 +1940,12 @@ impl Editor {
         }
         let session = &self.project.session;
         let beats = u64::from(session.time_signature.numerator.max(1));
-        let bar = sixteenth_samples(session.sample_rate, session.tempo_bpm) * 4 * beats;
+        let map = session
+            .build_tempo_map(session.sample_rate)
+            .unwrap_or_else(|_| {
+                audio_core::TempoMap::single_or_default(session.tempo_bpm, session.sample_rate)
+            });
+        let bar = sixteenth_samples(&map) * 4 * beats;
         (self.new_clip_start(playhead), bar * 4)
     }
 
@@ -2914,6 +2931,147 @@ impl Editor {
         self.dirty = true;
     }
 
+    /// Number of tempo points, including the implied first point at tick 0
+    /// (SPEC-054).
+    #[must_use]
+    pub fn tempo_point_count(&self) -> usize {
+        self.project.session.tempo_map.len() + 1
+    }
+
+    /// Tempo point `index` in the full ordered list, where index 0 is the
+    /// implied first point (`tempo_bpm` at tick 0). Returns `None` when out of
+    /// range.
+    #[must_use]
+    pub fn tempo_point(&self, index: usize) -> Option<TempoPoint> {
+        if index == 0 {
+            return Some(TempoPoint {
+                position_ticks: 0,
+                bpm: self.project.session.tempo_bpm,
+            });
+        }
+        self.project.session.tempo_map.get(index - 1).copied()
+    }
+
+    /// Adds a tempo point at `position_ticks` (in ticks) with `bpm`, or
+    /// updates the first point when `position_ticks == 0`. Points are kept
+    /// ordered by position; a point at an existing position replaces it.
+    /// Returns the full-list index of the point, or `None` if the inputs are
+    /// out of range or the point limit is reached.
+    pub fn add_tempo_point(&mut self, position_ticks: u64, bpm: f64) -> Option<usize> {
+        if !bpm.is_finite() || !(MIN_TEMPO_POINT_BPM..=MAX_TEMPO_POINT_BPM).contains(&bpm) {
+            return None;
+        }
+        if position_ticks == 0 {
+            self.set_tempo(bpm);
+            return Some(0);
+        }
+        if self.project.session.tempo_map.len() >= MAX_TEMPO_POINTS - 1 {
+            return None;
+        }
+        self.record();
+        let map = &mut self.project.session.tempo_map;
+        if let Some(existing) = map.iter().position(|p| p.position_ticks == position_ticks) {
+            map[existing].bpm = bpm;
+            self.dirty = true;
+            return Some(existing + 1);
+        }
+        let point = TempoPoint {
+            position_ticks,
+            bpm,
+        };
+        let idx = map.partition_point(|p| p.position_ticks < position_ticks);
+        map.insert(idx, point);
+        self.dirty = true;
+        Some(idx + 1)
+    }
+
+    /// Moves tempo point `index` (full list) to `position_ticks`, reordering
+    /// as needed. The first point cannot move. Returns `true` when it moved.
+    pub fn move_tempo_point(&mut self, index: usize, position_ticks: u64) -> bool {
+        if index == 0 || index > self.project.session.tempo_map.len() || position_ticks == 0 {
+            return false;
+        }
+        let map = &self.project.session.tempo_map;
+        if map[index - 1].position_ticks == position_ticks {
+            return false;
+        }
+        // A collision collapses into one point (the surviving one keeps its
+        // BPM), so positions stay unique.
+        if let Some(other) = map.iter().position(|p| p.position_ticks == position_ticks)
+            && other != index - 1
+        {
+            // Drop one of the two colliding points, then set the position.
+            let keep = index - 1;
+            let drop = other;
+            self.record();
+            self.project.session.tempo_map.remove(drop);
+            let keep = if drop < keep { keep - 1 } else { keep };
+            self.project.session.tempo_map[keep].position_ticks = position_ticks;
+            self.project
+                .session
+                .tempo_map
+                .sort_by_key(|p| p.position_ticks);
+            self.dirty = true;
+            return true;
+        }
+        self.record();
+        self.project.session.tempo_map[index - 1].position_ticks = position_ticks;
+        self.project
+            .session
+            .tempo_map
+            .sort_by_key(|p| p.position_ticks);
+        self.dirty = true;
+        true
+    }
+
+    /// Removes tempo point `index` (full list). The first point cannot be
+    /// removed. Returns `true` when a point was removed.
+    pub fn remove_tempo_point(&mut self, index: usize) -> bool {
+        if index == 0 || index > self.project.session.tempo_map.len() {
+            return false;
+        }
+        self.record();
+        self.project.session.tempo_map.remove(index - 1);
+        self.dirty = true;
+        true
+    }
+
+    /// Sets the BPM of tempo point `index` (full list), clamped to 30–300.
+    /// Index 0 routes to [`Self::set_tempo`]. Returns `true` when changed.
+    pub fn set_tempo_point_bpm(&mut self, index: usize, bpm: f64) -> bool {
+        if !bpm.is_finite() || !(MIN_TEMPO_POINT_BPM..=MAX_TEMPO_POINT_BPM).contains(&bpm) {
+            return false;
+        }
+        if index == 0 {
+            let old = self.project.session.tempo_bpm;
+            self.set_tempo(bpm);
+            return self.project.session.tempo_bpm.to_bits() != old.to_bits();
+        }
+        let Some(&point) = self.project.session.tempo_map.get(index - 1) else {
+            return false;
+        };
+        if point.bpm.to_bits() == bpm.to_bits() {
+            return false;
+        }
+        self.record();
+        self.project.session.tempo_map[index - 1].bpm = bpm;
+        self.dirty = true;
+        true
+    }
+
+    /// Builds the full tempo map from the session (SPEC-054). Control-side
+    /// only; the result is moved to the audio thread, never built there.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::audio_core::TempoMapError`] if the combined points are invalid.
+    pub fn tempo_map(
+        &self,
+        sample_rate: u32,
+    ) -> Result<audio_core::TempoMap, audio_core::TempoMapError> {
+        self.project.session.build_tempo_map(sample_rate)
+    }
+
     /// Sets the time signature (SPEC-026).
     ///
     /// # Errors
@@ -3190,7 +3348,8 @@ pub fn x_to_samples(x: f32, rate: u32, zoom: f32) -> u64 {
 pub fn drop_start(x: f32, rate: u32, zoom: f32, tempo_bpm: f64, snap: bool) -> u64 {
     let samples = x_to_samples(x, rate, zoom);
     if snap {
-        snap_to_beat(samples, rate, tempo_bpm)
+        let map = audio_core::TempoMap::single_or_default(tempo_bpm, rate);
+        snap_to_beat(samples, &map)
     } else {
         samples
     }
@@ -3303,15 +3462,11 @@ impl DropTracker {
 }
 
 /// The beat (4/4 grid) nearest to `samples`; halfway rounds up. A bad tempo
-/// falls back to [`DEFAULT_TEMPO`].
+/// falls back to [`DEFAULT_TEMPO`]. Routes through the tempo map so a
+/// multi-point map snaps against its own grid.
 #[must_use]
-pub fn snap_to_beat(samples: u64, rate: u32, tempo_bpm: f64) -> u64 {
-    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
-        tempo_bpm
-    } else {
-        DEFAULT_TEMPO
-    };
-    let beat = f64::from(rate.max(1)) * 60.0 / tempo;
+pub fn snap_to_beat(samples: u64, map: &audio_core::TempoMap) -> u64 {
+    let beat = map.samples_per_beat_at(samples);
     #[allow(clippy::cast_precision_loss)]
     let beats = (samples as f64 / beat + 0.5).floor();
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -3320,16 +3475,11 @@ pub fn snap_to_beat(samples: u64, rate: u32, tempo_bpm: f64) -> u64 {
 }
 
 /// Length of a 1/16 note (a quarter beat) in samples, at least 1; the
-/// piano roll grid (SPEC-021). A bad tempo falls back to [`DEFAULT_TEMPO`].
+/// piano roll grid (SPEC-021). Routes through the tempo map.
 #[must_use]
-pub fn sixteenth_samples(rate: u32, tempo_bpm: f64) -> u64 {
-    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
-        tempo_bpm
-    } else {
-        DEFAULT_TEMPO
-    };
+pub fn sixteenth_samples(map: &audio_core::TempoMap) -> u64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let step = (f64::from(rate) * 15.0 / tempo).round() as u64;
+    let step = (map.samples_per_beat_at(0) / 4.0).round() as u64;
     step.max(1)
 }
 
@@ -3348,24 +3498,16 @@ pub fn clock(samples: u64, rate: u32) -> String {
 
 /// Musical position `bar.beat` in 4/4, both counted from 1.
 #[must_use]
-pub fn bars(samples: u64, rate: u32, tempo_bpm: f64) -> String {
-    bars_in(samples, rate, tempo_bpm, 4)
+pub fn bars(samples: u64, map: &audio_core::TempoMap) -> String {
+    bars_in(samples, map, 4)
 }
 
 /// Like [`bars`], with `beats_per_bar` beats in a bar (SPEC-026); zero
 /// counts as 4.
 #[must_use]
-pub fn bars_in(samples: u64, rate: u32, tempo_bpm: f64, beats_per_bar: u32) -> String {
+pub fn bars_in(samples: u64, map: &audio_core::TempoMap, beats_per_bar: u32) -> String {
     let per_bar = u64::from(if beats_per_bar == 0 { 4 } else { beats_per_bar });
-    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
-        tempo_bpm
-    } else {
-        DEFAULT_TEMPO
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let beats = samples as f64 / f64::from(rate.max(1)) * tempo / 60.0;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let beat = (beats + 1e-9).floor() as u64;
+    let beat = map.samples_to_beats(samples);
     format!("{}.{}", beat / per_bar + 1, beat % per_bar + 1)
 }
 

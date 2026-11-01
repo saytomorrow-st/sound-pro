@@ -45,16 +45,13 @@ pub fn cycle_hit(x: f32, cycle: Option<(f32, f32)>) -> CycleHit {
 }
 
 /// Length of one bar in samples; bad inputs fall back to 120 BPM in 4/4.
+/// Routes through the tempo map so multi-point maps report the bar length at
+/// the start of the map.
 #[must_use]
-pub fn bar_samples(rate: u32, tempo_bpm: f64, beats_per_bar: u32) -> u64 {
-    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
-        tempo_bpm
-    } else {
-        120.0
-    };
+pub fn bar_samples(map: &audio_core::TempoMap, beats_per_bar: u32) -> u64 {
     let beats = if beats_per_bar == 0 { 4 } else { beats_per_bar };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let len = (f64::from(rate.max(1)) * 60.0 / tempo * f64::from(beats)).round() as u64;
+    let len = (map.samples_per_beat_at(0) * f64::from(beats)).round() as u64;
     len.max(1)
 }
 

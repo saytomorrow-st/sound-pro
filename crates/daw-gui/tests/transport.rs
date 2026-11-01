@@ -132,11 +132,12 @@ fn the_clock_shows_minutes_seconds_and_milliseconds() {
 #[test]
 fn bars_count_from_one_in_four_four() {
     // 120 BPM: one beat is half a second, one bar two seconds.
-    assert_eq!(bars(0, RATE, 120.0), "1.1");
-    assert_eq!(bars(24_000, RATE, 120.0), "1.2");
-    assert_eq!(bars(23_999, RATE, 120.0), "1.1");
-    assert_eq!(bars(96_000, RATE, 120.0), "2.1");
-    assert_eq!(bars(96_000 + 72_000, RATE, 120.0), "2.4");
+    let map = audio_core::TempoMap::single_or_default(120.0, RATE);
+    assert_eq!(bars(0, &map), "1.1");
+    assert_eq!(bars(24_000, &map), "1.2");
+    assert_eq!(bars(23_999, &map), "1.1");
+    assert_eq!(bars(96_000, &map), "2.1");
+    assert_eq!(bars(96_000 + 72_000, &map), "2.4");
 }
 
 /// Regression: a MIDI track must not silence playback (it rendered fine on

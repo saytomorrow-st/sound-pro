@@ -256,10 +256,8 @@ fn a_drop_snaps_to_the_beat_unless_free() {
     let free = target(Some((130.0, 40.0)), &audio, false);
     let snapped = target(Some((130.0, 40.0)), &audio, true);
     assert_eq!(snapped.track, Some(0));
-    assert_eq!(
-        snapped.start,
-        daw_gui::snap_to_beat(free.start, RATE, 120.0)
-    );
+    let m = audio_core::TempoMap::single_or_default(120.0, RATE);
+    assert_eq!(snapped.start, daw_gui::snap_to_beat(free.start, &m));
 }
 
 #[test]
