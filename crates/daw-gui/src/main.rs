@@ -413,6 +413,12 @@ const REFRESH_DELAY: std::time::Duration = std::time::Duration::from_millis(120)
 /// start, and the channels at the project rate (SPEC-050 §5).
 type HoverBlocks = (PathBuf, usize, Vec<(f32, f32)>);
 
+// X11 cursor position in physical pixels, read via XQueryPointer. A type alias
+// keeps the non-Linux drop-debug fallbacks (which always produce `None`) from
+// tripping clippy::type_complexity on the Windows/macOS cfg branch.
+#[cfg(not(target_os = "linux"))]
+type CursorWinPx = Option<(i16, i16)>;
+
 type Decoded = (
     PathBuf,
     Option<usize>,
@@ -2006,8 +2012,8 @@ impl App {
                 });
                 #[cfg(not(target_os = "linux"))]
                 let (xq_win, xq_root, xq_mask): (
-                    Option<(i16, i16)>,
-                    Option<(i16, i16)>,
+                    CursorWinPx,
+                    CursorWinPx,
                     Option<u16>,
                 ) = (None, None, None);
                 eprintln!(
@@ -2055,7 +2061,7 @@ impl App {
             #[cfg(target_os = "linux")]
             let (xq_win, xq_root) = xquery.map_or((None, None), |q| (Some(q.win), Some(q.root)));
             #[cfg(not(target_os = "linux"))]
-            let (xq_win, xq_root): (Option<(i16, i16)>, Option<(i16, i16)>) = (None, None);
+            let (xq_win, xq_root): (CursorWinPx, CursorWinPx) = (None, None);
             eprintln!(
                 "DROP-DEBUG drop source={pointer_source} xquery_win={xq_win:?} xquery_root={xq_root:?} \
                  ppp={ppp} os_points={os_points:?} egui={pointer:?} effective={effective_pointer:?} \
@@ -4456,10 +4462,10 @@ fn press_pos(input: &egui::InputState) -> Option<Pos2> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "linux")]
         if self.x11_cursor.is_none() {
-            self.x11_cursor = x11_cursor::X11Cursor::from_frame(frame);
+            self.x11_cursor = x11_cursor::X11Cursor::from_frame(_frame);
         }
         if !self.themed {
             shell::apply_theme(ctx);
