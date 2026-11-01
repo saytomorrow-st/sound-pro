@@ -1894,17 +1894,21 @@ impl App {
         #[cfg(not(target_os = "linux"))]
         let os_points: Option<(f32, f32)> = None;
         let os_pointer = os_points.map(|(x, y)| Pos2::new(x, y));
-        // The ghost follows egui's pointer: the vendored winit turns every
-        // `XdndPosition` into `CursorMoved`, so `latest_pos` stays live during
-        // the drag. The drop below keeps the proven PR #62 path.
-        let (hover_pointer, hover_source) = match (pointer, os_pointer) {
+        // One pointer source for both the ghost and the drop. The vendored
+        // winit turns every `XdndPosition` into `CursorMoved`, so egui's
+        // `latest_pos` stays live during an external drag on both X11 and
+        // Wayland sources. XQueryPointer (`win_x`/`win_y`) can freeze while a
+        // Wayland client (Nautilus) drives the drag, so it is only a fallback
+        // when egui reports no pointer. Using one source guarantees the ghost
+        // sits exactly where the region will land.
+        let (effective_pointer, pointer_source) = match (pointer, os_pointer) {
             (Some(p), _) => (Some(p), "egui/xdnd"),
             (None, Some(p)) => (Some(p), "xquery"),
             (None, None) => (None, "none"),
         };
         if hovering {
             let painter = ui.painter_at(area);
-            let target = hover_pointer.map(target_at);
+            let target = effective_pointer.map(target_at);
             self.drop_tracker.hover(target);
             let band = match target.and_then(|t| t.track) {
                 Some(t) => {
@@ -1999,8 +2003,8 @@ impl App {
                     Option<u16>,
                 ) = (None, None, None);
                 eprintln!(
-                    "DROP-DEBUG hover source={hover_source} egui={pointer:?} xquery_win={xq_win:?} \
-                     xquery_root={xq_root:?} mask={xq_mask:?} ppp={ppp} effective={hover_pointer:?} \
+                    "DROP-DEBUG hover source={pointer_source} egui={pointer:?} xquery_win={xq_win:?} \
+                     xquery_root={xq_root:?} mask={xq_mask:?} ppp={ppp} effective={effective_pointer:?} \
                      area_min=({:.1},{:.1}) start={:?} track={:?}",
                     area.min.x,
                     area.min.y,
@@ -2027,11 +2031,13 @@ impl App {
             return;
         }
         self.probes.clear();
-        // The live OS cursor wins over the stale hover preview. On non-X11 or
-        // when the query fails, fall back to the last preview (`DropTracker`).
-        let target = match os_pointer {
+        // The ghost and the drop share one pointer source (`effective_pointer`)
+        // and one conversion (`target_at`), so the region lands exactly where
+        // the ghost was drawn. The last hover target wins over the drop-frame
+        // position so a final-frame pointer glitch cannot move the drop.
+        let target = match effective_pointer {
             Some(p) => {
-                // Live OS cursor wins over the stale hover preview.
+                // Same live source the ghost used; drop right under it.
                 self.drop_tracker.cancel();
                 target_at(p)
             }
@@ -2042,16 +2048,11 @@ impl App {
             let (xq_win, xq_root) = xquery.map_or((None, None), |q| (Some(q.win), Some(q.root)));
             #[cfg(not(target_os = "linux"))]
             let (xq_win, xq_root): (Option<(i16, i16)>, Option<(i16, i16)>) = (None, None);
-            let source = if os_pointer.is_some() {
-                "xquery"
-            } else {
-                "tracker"
-            };
             eprintln!(
-                "DROP-DEBUG drop source={source} xquery_win={xq_win:?} xquery_root={xq_root:?} \
-                 ppp={ppp} os_points={os_points:?} egui={pointer:?} area_min=({:.1},{:.1}) \
-                 ruler_h={RULER_HEIGHT} row_h={TRACK_HEIGHT} tracks={tracks} target.track={:?} \
-                 target.start={} ghost_at_egui={:?}",
+                "DROP-DEBUG drop source={pointer_source} xquery_win={xq_win:?} xquery_root={xq_root:?} \
+                 ppp={ppp} os_points={os_points:?} egui={pointer:?} effective={effective_pointer:?} \
+                 area_min=({:.1},{:.1}) ruler_h={RULER_HEIGHT} row_h={TRACK_HEIGHT} tracks={tracks} \
+                 target.track={:?} target.start={} ghost_at_egui={:?}",
                 area.min.x,
                 area.min.y,
                 target.track,

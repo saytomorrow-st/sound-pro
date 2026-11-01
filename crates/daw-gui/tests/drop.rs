@@ -600,6 +600,24 @@ fn the_owner_drop_numbers_map_to_the_expected_row() {
     assert_eq!(below.track, None);
 }
 
+// The owner's full live drop, end to end (PR #63 spec): ppp=2, area.min
+// (440.5,118), ruler 24, row 72, scroll (-3,-3). XQueryPointer win=(1158,389)
+// -> os_points (579,194.5) -> local (138.5,76.5) -> track 0, start snapped to
+// the beat: 138.5 / 100 * 48000 = 66480 -> 3 beats * 24000 = 72000.
+#[test]
+fn the_owner_full_drop_maps_to_track_zero_and_start_72000() {
+    let audio = [true, true];
+    let (scale, area) = (2.0, (440.5_f32, 118.0_f32));
+    let win = (1158.0_f32, 389.0_f32);
+    let points = (win.0 / scale, win.1 / scale);
+    assert_eq!(points, (579.0, 194.5));
+    let local = (points.0 - area.0, points.1 - area.1);
+    assert_eq!(local, (138.5, 76.5));
+    let t = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    assert_eq!(t.track, Some(0));
+    assert_eq!(t.start, 72_000);
+}
+
 // The native conversion is scale- and window-size-independent: the owner's
 // cursor, reported window-relative, maps to the same timeline point whether
 // the window is small or large (only the origin and scale factor matter).
