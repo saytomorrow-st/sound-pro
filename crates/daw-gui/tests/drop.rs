@@ -646,3 +646,33 @@ fn the_client_window_coords_have_no_title_bar_offset() {
     );
     assert_eq!(t.track, Some(1), "client coords drop onto track 1");
 }
+
+// The vendored winit turns `XdndPosition` (root px) into `CursorMoved` by
+// subtracting the client window origin in root (`TranslateCoordinates`). With
+// the owner's numbers (root=(1158,453), client origin=(0,64)) that equals the
+// XQueryPointer `win` value the drop uses, so the ghost (egui pointer) and the
+// drop (XQueryPointer) resolve to the same track and start.
+#[test]
+fn the_xdnd_ghost_and_the_xquery_drop_agree_on_the_owner_numbers() {
+    let audio = [true, true];
+    let (scale, area) = (2.0, (440.5_f32, 118.0_f32));
+    let ghost = daw_gui::native_pointer_to_timeline((1158.0, 453.0), (0.0, 64.0), scale, area);
+    let drop = daw_gui::native_pointer_to_timeline((1158.0, 389.0), (0.0, 0.0), scale, area);
+    assert_eq!(ghost, drop);
+    let at = |p| daw_gui::drop_target(Some(p), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    let (g, d) = (at(ghost), at(drop));
+    assert_eq!((g.track, g.start), (d.track, d.start));
+    assert_eq!(d.track, Some(0));
+}
+
+// A pointer moving below the last track turns the ghost into the "new track"
+// band, and the drop at that point also makes a new track.
+#[test]
+fn an_xdnd_pointer_below_the_last_track_makes_a_new_track() {
+    let audio = [true, true];
+    let (scale, area) = (2.0, (440.5_f32, 118.0_f32));
+    // Root y = 64 (title) + 2 * (118 + 24 + 72 * 2 + 10) px.
+    let local = daw_gui::native_pointer_to_timeline((1158.0, 656.0), (0.0, 64.0), scale, area);
+    let t = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    assert_eq!(t.track, None);
+}

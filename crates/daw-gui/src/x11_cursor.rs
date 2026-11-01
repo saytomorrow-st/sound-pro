@@ -38,21 +38,8 @@ pub struct CursorPos {
     pub root: (i16, i16),
     /// Whether the pointer and the window are on the same screen.
     pub same_screen: bool,
-    /// The current button/modifier mask from `QueryPointer`. A file drag holds
-    /// a mouse button, so a non-zero button mask means the drag is still in
-    /// flight (used to tell a drag-in-progress from a cancelled drag, since
-    /// egui only reports the hovered files once at drag enter).
+    /// The current button/modifier mask from `QueryPointer` (diagnostics).
     pub mask: u16,
-}
-
-impl CursorPos {
-    /// Whether any mouse button (1-5) is held, i.e. a file drag is still
-    /// active. Used to detect when an XDND drag was cancelled without a drop.
-    #[must_use]
-    pub fn any_button_down(&self) -> bool {
-        const BUTTONS: u16 = 0x1f00;
-        self.mask & BUTTONS != 0
-    }
 }
 
 impl X11Cursor {
@@ -84,34 +71,5 @@ impl X11Cursor {
             same_screen: reply.same_screen,
             mask: u16::from(reply.mask),
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::CursorPos;
-
-    fn pos(mask: u16) -> CursorPos {
-        CursorPos {
-            win: (0, 0),
-            root: (0, 0),
-            same_screen: true,
-            mask,
-        }
-    }
-
-    // A file drag is carried by a held mouse button. The button mask from
-    // QueryPointer is the only reliable signal that a drag is still in flight,
-    // because egui only reports `hovered_files` once at drag enter.
-    #[test]
-    fn any_button_down_detects_a_drag_in_flight() {
-        assert!(pos(0x0100).any_button_down()); // Button1
-        assert!(pos(0x0400).any_button_down()); // Button3
-        assert!(pos(0x1000).any_button_down()); // Button5
-        assert!(pos(0x1f00).any_button_down()); // all buttons
-        assert!(!pos(0x0000).any_button_down()); // no button: drag cancelled
-        // Modifier keys alone (Shift=0x0001, etc.) must not count as a drag.
-        assert!(!pos(0x0001).any_button_down());
-        assert!(!pos(0x00ff).any_button_down());
     }
 }
