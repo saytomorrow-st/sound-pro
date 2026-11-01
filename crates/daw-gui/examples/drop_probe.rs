@@ -19,16 +19,29 @@
 
 // Diagnostic only: XQueryPointer goes through `x11-dl`'s raw function pointer,
 // which is inherently `unsafe`. This example is not part of the product.
-#![allow(unsafe_code)]
+// The entire diagnostic is X11-only; on other platforms it compiles to a stub
+// so the Windows/macOS build never pulls in X11 (x11-dl is Linux-only).
+#![cfg_attr(target_os = "linux", allow(unsafe_code))]
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("drop-probe: только Linux/X11");
+}
+
+#[cfg(target_os = "linux")]
 use std::ptr::NonNull;
 
+#[cfg(target_os = "linux")]
 use eframe::Frame;
+#[cfg(target_os = "linux")]
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Stroke};
+#[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+#[cfg(target_os = "linux")]
 use x11_dl::xlib::Display;
 
 /// A labelled drop zone whose marker is computed from one position source.
+#[cfg(target_os = "linux")]
 struct Panel {
     title: &'static str,
     color: Color32,
@@ -36,6 +49,7 @@ struct Panel {
     pos: Option<Pos2>,
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -50,6 +64,7 @@ fn main() -> eframe::Result {
     )
 }
 
+#[cfg(target_os = "linux")]
 struct DropProbe {
     xlib: Option<Xlib>,
     /// Cached (display, window) extracted from the raw window handle.
@@ -60,16 +75,19 @@ struct DropProbe {
     native_ppp: f32,
 }
 
+#[cfg(target_os = "linux")]
 struct Xlib {
     lib: x11_dl::xlib::Xlib,
 }
 
+#[cfg(target_os = "linux")]
 impl Xlib {
     fn load() -> Option<Self> {
         x11_dl::xlib::Xlib::open().ok().map(|lib| Self { lib })
     }
 }
 
+#[cfg(target_os = "linux")]
 impl DropProbe {
     fn new(_cc: &eframe::CreationContext) -> Self {
         Self {
@@ -179,6 +197,7 @@ impl DropProbe {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl eframe::App for DropProbe {
     fn update(&mut self, ctx: &egui::Context, frame: &mut Frame) {
         if self.x11_target.is_none() {
@@ -244,6 +263,7 @@ impl eframe::App for DropProbe {
 }
 
 /// Extract the X11 (Display, Window) from the raw window handle, if on X11.
+#[cfg(target_os = "linux")]
 fn x11_target(frame: &Frame) -> Option<(NonNull<Display>, u64)> {
     let display = match frame.display_handle().ok()?.as_raw() {
         RawDisplayHandle::Xlib(h) => h.display?,

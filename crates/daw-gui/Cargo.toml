@@ -28,7 +28,10 @@ x11rb = "0.13"
 
 # Diagnostic example (run `cargo run -p daw-gui --example drop-probe`):
 # compares candidate cursor-position sources during an XDND drag.
-[dev-dependencies]
+# Diagnostic example (run `cargo run -p daw-gui --example drop-probe`):
+# compares candidate cursor-position sources during an XDND drag. X11-only, so
+# it lives under the Linux target to keep the Windows build free of X11.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 x11-dl = "2.21"
 
 [features]
