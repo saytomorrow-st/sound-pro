@@ -13,21 +13,7 @@
 //! query the same window eframe owns.
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use x11rb::connection::Connection;
 use x11rb::protocol::xproto::ConnectionExt;
-
-/// Converts a root (screen) pointer position to a client-area position by
-/// subtracting the client window's own origin in root coords. A WM frame or
-/// title bar above the client window is part of `origin_root`, so it is
-/// excluded — this is the correction for the constant title-bar offset that
-/// previously pushed drops below the track the user aimed at.
-#[must_use]
-pub fn root_to_client(root: (i16, i16), origin_root: (i16, i16)) -> (f32, f32) {
-    (
-        f32::from(root.0) - f32::from(origin_root.0),
-        f32::from(root.1) - f32::from(origin_root.1),
-    )
-}
 
 /// A lazily-opened X11 connection used to read the cursor at drop time.
 ///
@@ -40,17 +26,16 @@ pub struct X11Cursor {
     window: x11rb::protocol::xproto::Window,
 }
 
-/// The cursor position in two coordinate spaces, for the debug cross overlay.
+/// Everything [`X11Cursor::query`] learns in one shot, for the drop logic and
+/// the debug overlay.
 #[derive(Debug, Clone, Copy)]
 pub struct CursorPos {
-    /// Window-relative physical pixels, measured from the client area's
-    /// top-left (what egui's `latest_pos` uses).
-    pub client: (f32, f32),
+    /// Window-relative physical pixels, measured from the client window's
+    /// top-left. This is the value that (divided by `pixels_per_point`) maps
+    /// to egui points and is what the drop target wants.
+    pub win: (i16, i16),
     /// Root-window (screen) physical pixels.
     pub root: (i16, i16),
-    /// The client window's (0,0) in root pixels (its top-left on screen,
-    /// below any title bar).
-    pub origin_root: (i16, i16),
     /// Whether the pointer and the window are on the same screen.
     pub same_screen: bool,
     /// The current button/modifier mask from `QueryPointer`. A file drag holds
@@ -82,59 +67,34 @@ impl X11Cursor {
         })
     }
 
-    /// The client-area cursor position (physical px) plus the button mask,
-    /// or `None` if the query failed or the pointer is on another screen.
-    ///
-    /// This is computed from the *root* pointer position minus the client
-    /// window's own origin, obtained with `translate_coordinates` so the X
-    /// window tree (WM reparenting, title bars) is walked correctly. Relying
-    /// on `QueryPointer`'s `win_x`/`win_y` alone was wrong: under a decorated
-    /// frame those are measured from the frame window's origin, which includes
-    /// the title bar, so they ran a constant title-bar height below egui's
-    /// client-area pointer.
+    /// Full query result (window/root coords, same-screen, button mask) for
+    /// cancel detection and the `SOUND_PRO_DROP_DEBUG` overlay.
     #[must_use]
     pub fn position_debug(&self) -> Option<CursorPos> {
         self.query()
     }
 
-    /// Query the pointer in root coords and the window origin, then combine
-    /// them into a client-area-relative position. `same_screen == false` means
-    /// the pointer is on another screen.
+    /// Open a fresh connection and query the pointer.
     fn query(&self) -> Option<CursorPos> {
-        let (conn, screen_num) = x11rb::connect(None).ok()?;
-        let root = conn.setup().roots.get(screen_num)?.root;
-        // Pointer position on the screen. Querying the root window makes
-        // `root_x`/`root_y` true screen coordinates, independent of which
-        // window (frame or client) owns the pointer.
-        let ptr = conn.query_pointer(root).ok()?.reply().ok()?;
-        // The client window's (0,0) in root coords. translate_coordinates
-        // walks the window tree, so a WM frame / title bar above the client
-        // window is reflected in `dst_y`.
-        let origin = conn
-            .translate_coordinates(self.window, root, 0, 0)
-            .ok()?
-            .reply()
-            .ok()?;
-        let client = root_to_client((ptr.root_x, ptr.root_y), (origin.dst_x, origin.dst_y));
+        let (conn, _screen) = x11rb::connect(None).ok()?;
+        let reply = conn.query_pointer(self.window).ok()?.reply().ok()?;
         Some(CursorPos {
-            client,
-            root: (ptr.root_x, ptr.root_y),
-            origin_root: (origin.dst_x, origin.dst_y),
-            same_screen: ptr.same_screen && origin.same_screen,
-            mask: u16::from(ptr.mask),
+            win: (reply.win_x, reply.win_y),
+            root: (reply.root_x, reply.root_y),
+            same_screen: reply.same_screen,
+            mask: u16::from(reply.mask),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorPos, root_to_client};
+    use super::CursorPos;
 
     fn pos(mask: u16) -> CursorPos {
         CursorPos {
-            client: (0.0, 0.0),
+            win: (0, 0),
             root: (0, 0),
-            origin_root: (0, 0),
             same_screen: true,
             mask,
         }
@@ -153,26 +113,5 @@ mod tests {
         // Modifier keys alone (Shift=0x0001, etc.) must not count as a drag.
         assert!(!pos(0x0001).any_button_down());
         assert!(!pos(0x00ff).any_button_down());
-    }
-
-    // The owner's live bug: XQueryPointer's window coords included the title
-    // bar, so a cursor over track 1 (egui y=271) read 32pt lower (303) and
-    // landed below the tracks. Converting from root coords minus the client
-    // window's origin removes that title-bar offset.
-    #[test]
-    fn root_to_client_removes_the_title_bar_offset() {
-        // Title bar is 64px at 2x scale = 32 points; the client window origin
-        // sits 64px below the screen top.
-        let origin_root = (100_i16, 64_i16);
-        // Cursor at screen y=606px: 64px title bar + 542px into the client.
-        let root = (1000_i16, 606_i16);
-        let client = root_to_client(root, origin_root);
-        assert_eq!(client, (900.0, 542.0));
-    }
-
-    #[test]
-    fn root_to_client_is_identity_for_an_undecorated_window() {
-        let client = root_to_client((300_i16, 200_i16), (0_i16, 0_i16));
-        assert_eq!(client, (300.0, 200.0));
     }
 }

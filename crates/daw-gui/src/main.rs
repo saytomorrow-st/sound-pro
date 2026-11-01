@@ -538,6 +538,10 @@ struct App {
     /// latch keeps the hover preview + repaint alive until the drop or a
     /// detected cancel (pointer button released with no drop).
     file_drag_active: bool,
+    /// The file paths latched at drag enter. `hovered_files` is drained every
+    /// frame, so the ghost preview (waveform + region) re-reads the paths from
+    /// here instead of the now-empty event list.
+    file_drag_paths: Vec<PathBuf>,
     /// OS cursor query used at drop time (X11 only): winit drops
     /// `XdndPosition` during an external drag, so egui's pointer is stale.
     #[cfg(target_os = "linux")]
@@ -679,6 +683,7 @@ impl App {
             hover_rx,
             drop_tracker: daw_gui::DropTracker::default(),
             file_drag_active: false,
+            file_drag_paths: Vec::new(),
             #[cfg(target_os = "linux")]
             x11_cursor: None,
             drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
@@ -1852,18 +1857,18 @@ impl App {
                 i.modifiers.shift,
             )
         });
-        let hovering = {
-            // egui reports `hovered_files` only on the first frame of an
-            // external drag and drains it each frame afterwards, so latch the
-            // drag state and clear it only on drop or a detected cancel.
-            if !hovered.is_empty() {
-                self.file_drag_active = true;
-            }
-            if !dropped.is_empty() {
-                self.file_drag_active = false;
-            }
-            self.file_drag_active
-        };
+        // Latch the drag state and the file list: egui reports `hovered_files`
+        // only on the first frame of an external drag and drains it each frame
+        // afterwards. The latch keeps the ghost + repaint alive, and the
+        // latched paths keep the waveform probing working, until the drop or a
+        // detected cancel (button released with no drop).
+        if !hovered.is_empty() {
+            self.file_drag_active = true;
+            self.file_drag_paths = hovered.clone();
+        }
+        if !dropped.is_empty() {
+            self.file_drag_active = false;
+        }
         let session = self.editor.session();
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
         let audio_rows: Vec<bool> = session
@@ -1892,34 +1897,35 @@ impl App {
         // `latest_pos` freezes. Read the OS cursor directly (X11 `QueryPointer`)
         // and convert physical px to egui points with the real pixels-per-point
         // (which folds in `native_pixels_per_point` AND the UI zoom factor).
-        // The same query also returns the button mask, used to detect a drag
-        // that was cancelled (button released) without ever being dropped.
+        // The same query returns the button mask, used to detect a drag that
+        // was cancelled (button released) without ever being dropped.
         #[cfg(target_os = "linux")]
         let (os_points, buttons_down): (Option<(f32, f32)>, Option<bool>) =
             self.x11_cursor.as_ref().map_or((None, None), |cursor| {
-                let pos = cursor.position_debug().filter(|p| p.same_screen);
+                let debug = cursor.position_debug();
                 let ppp = ui.ctx().pixels_per_point();
                 let ppp = if ppp.is_finite() && ppp > 0.0 {
                     ppp
                 } else {
                     1.0
                 };
-                let points = pos.map(|p| (p.client.0 / ppp, p.client.1 / ppp));
-                let held = pos.map(|p| p.any_button_down());
+                let points = debug.map(|p| (f32::from(p.win.0) / ppp, f32::from(p.win.1) / ppp));
+                let held = debug.map(|p| p.any_button_down());
                 (points, held)
             });
         #[cfg(not(target_os = "linux"))]
         let (os_points, buttons_down): (Option<(f32, f32)>, Option<bool>) = (None, None);
         // A drag that is still latched but whose button was released without a
         // drop was cancelled; clear the latch so the ghost does not linger.
-        if hovering && dropped.is_empty() && buttons_down == Some(false) {
+        if self.file_drag_active && dropped.is_empty() && buttons_down == Some(false) {
             self.file_drag_active = false;
+            self.file_drag_paths.clear();
         }
-        // Prefer the live OS cursor over egui's frozen pointer for both the
-        // hover preview and the drop itself.
-        let effective_pointer = os_points.map(|(x, y)| Pos2::new(x, y)).or(pointer);
-        // Recompute `hovering` after a possible cancel so the ghost does not
-        // paint this frame.
+        // The live OS cursor wins over egui's frozen pointer for the hover
+        // preview and the drop. During an active drag we must NOT fall back to
+        // egui's stale pointer (which reflects the last real event, i.e. where
+        // Nautilus was), so the ghost and the drop share one source of truth.
+        let effective_pointer = os_points.map(|(x, y)| Pos2::new(x, y));
         let hovering = self.file_drag_active;
         if hovering {
             let painter = ui.painter_at(area);
@@ -1938,8 +1944,10 @@ impl App {
                 }
             };
             // The first audio file's length comes from its header, read once
-            // per hover (SPEC-050 §2).
-            let first = hovered
+            // per hover (SPEC-050 §2). Re-read from the latched list so the
+            // waveform keeps drawing after `hovered_files` is drained.
+            let first = self
+                .file_drag_paths
                 .iter()
                 .find(|p| daw_app::audio_file::is_audio_file(p))
                 .cloned();
@@ -1984,6 +1992,15 @@ impl App {
                         StrokeKind::Inside,
                     );
                     self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
+                    if self.drop_debug {
+                        eprintln!(
+                            "DROP-DEBUG hover ghost_rect=[({x0:.1},{:.1})..({x1:.1},{:.1})] start={} track={:?}",
+                            band.min.y + 2.0,
+                            band.min.y + TRACK_HEIGHT - 2.0,
+                            t.start,
+                            t.track,
+                        );
+                    }
                 }
                 (Some(Err(e)), _) => self.status = format!("Ошибка: {e}"),
                 _ => {
@@ -1995,10 +2012,31 @@ impl App {
                     self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
                 }
             }
-            // Repaint as fast as possible while dragging so the hover preview
-            // tracks the OS cursor (egui receives no motion events during XDND).
-            ui.ctx().request_repaint();
+            // Repaint at ~60 Hz while dragging so the ghost tracks the OS
+            // cursor even though egui receives no motion events during XDND.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
             if self.drop_debug {
+                #[cfg(target_os = "linux")]
+                if let Some(dbg) = self.x11_cursor.as_ref().and_then(|c| c.position_debug()) {
+                    eprintln!(
+                        "DROP-DEBUG hover xquery win=({},{}) root=({},{}) same_screen={} mask={:#06x} \
+                         ppp={} effective={:?} egui={:?} area_min=({:.1},{:.1}) start={} track={:?}",
+                        dbg.win.0,
+                        dbg.win.1,
+                        dbg.root.0,
+                        dbg.root.1,
+                        dbg.same_screen,
+                        dbg.mask,
+                        ui.ctx().pixels_per_point(),
+                        effective_pointer,
+                        pointer,
+                        area.min.x,
+                        area.min.y,
+                        target.map_or(0, |t| t.start),
+                        target.and_then(|t| t.track),
+                    );
+                }
                 let painter = ui.ctx().layer_painter(egui::LayerId::new(
                     egui::Order::Foreground,
                     egui::Id::new("drop-debug-cross"),
@@ -2014,83 +2052,16 @@ impl App {
             }
         } else if dropped.is_empty() {
             self.probes.clear();
+            self.file_drag_paths.clear();
             self.drop_tracker.cancel();
         }
         if dropped.is_empty() {
             return;
         }
         self.probes.clear();
-        // The live OS cursor (already converted to window points above) wins
-        // over the stale hover preview. On non-X11 or when the query fails,
-        // fall back to the last preview (`DropTracker`).
-        if self.drop_debug {
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(dbg) = self.x11_cursor.as_ref().and_then(|c| c.position_debug()) {
-                    eprintln!(
-                        "DROP-DEBUG xquery client=({:.1},{:.1}) root=({},{}) origin_root=({},{}) same_screen={} \
-                         ppp={} os_points={:?} egui_pointer={:?} area_min=({:.1},{:.1})",
-                        dbg.client.0,
-                        dbg.client.1,
-                        dbg.root.0,
-                        dbg.root.1,
-                        dbg.origin_root.0,
-                        dbg.origin_root.1,
-                        dbg.same_screen,
-                        ui.ctx().pixels_per_point(),
-                        os_points,
-                        pointer,
-                        area.min.x,
-                        area.min.y,
-                    );
-                } else {
-                    eprintln!(
-                        "DROP-DEBUG xquery=UNAVAILABLE egui_pointer={:?} area_min=({:.1},{:.1})",
-                        pointer, area.min.x, area.min.y,
-                    );
-                }
-            }
-            // Comprehensive DROP-DEBUG: layout + per-row hit-test (temporary).
-            {
-                let clip = ui.clip_rect();
-                let scroll_off = Vec2::new(clip.min.x - area.min.x, clip.min.y - area.min.y);
-                eprintln!(
-                    "DROP-DEBUG layout: area=[({:.1},{:.1})..({:.1},{:.1})] clip=[({:.1},{:.1})..({:.1},{:.1})] \
-                     scroll_offset=({:.1},{:.1}) ruler_h={} row_h={} tracks={} audio_rows={:?}",
-                    area.min.x,
-                    area.min.y,
-                    area.max.x,
-                    area.max.y,
-                    clip.min.x,
-                    clip.min.y,
-                    clip.max.x,
-                    clip.max.y,
-                    scroll_off.x,
-                    scroll_off.y,
-                    RULER_HEIGHT,
-                    TRACK_HEIGHT,
-                    tracks,
-                    audio_rows,
-                );
-                let p = effective_pointer;
-                eprintln!("DROP-DEBUG pointer: effective={:?}", p);
-                for (r, &is_audio) in audio_rows.iter().enumerate() {
-                    let top = area.min.y + RULER_HEIGHT + r as f32 * TRACK_HEIGHT;
-                    let bottom = top + TRACK_HEIGHT;
-                    let hit = p.is_some_and(|p| p.y >= top && p.y < bottom);
-                    eprintln!(
-                        "DROP-DEBUG row[{r}]: y=[{top:.1}..{bottom:.1}) kind={} pointer_inside={hit}",
-                        if is_audio { "audio" } else { "instrument" },
-                    );
-                }
-                let below_top = area.min.y + RULER_HEIGHT + tracks as f32 * TRACK_HEIGHT;
-                let below = p.is_some_and(|p| p.y >= below_top && p.y < area.max.y);
-                eprintln!(
-                    "DROP-DEBUG below-last: y=[{below_top:.1}..{:.1}) pointer_inside={below}",
-                    area.max.y
-                );
-            }
-        }
+        self.file_drag_paths.clear();
+        // The live OS cursor wins over the stale hover preview. On non-X11 or
+        // when the query fails, fall back to the last preview (`DropTracker`).
         let target = match effective_pointer {
             Some(p) if os_points.is_some() => {
                 // Live OS cursor wins over the stale hover preview.
@@ -2100,10 +2071,25 @@ impl App {
             _ => self.drop_tracker.release(pointer.map(target_at)),
         };
         if self.drop_debug {
-            eprintln!(
-                "DROP-DEBUG target: track={:?} start={}",
-                target.track, target.start
-            );
+            #[cfg(target_os = "linux")]
+            if let Some(dbg) = self.x11_cursor.as_ref().and_then(|c| c.position_debug()) {
+                eprintln!(
+                    "DROP-DEBUG drop xquery win=({},{}) root=({},{}) same_screen={} ppp={} \
+                     os_points={:?} egui={:?} area_min=({:.1},{:.1}) target.track={:?} target.start={}",
+                    dbg.win.0,
+                    dbg.win.1,
+                    dbg.root.0,
+                    dbg.root.1,
+                    dbg.same_screen,
+                    ui.ctx().pixels_per_point(),
+                    os_points,
+                    pointer,
+                    area.min.x,
+                    area.min.y,
+                    target.track,
+                    target.start,
+                );
+            }
         }
         self.import_in_background(dropped, target.track, Some(target.start));
     }

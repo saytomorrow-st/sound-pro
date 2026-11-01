@@ -436,28 +436,23 @@ fn a_scaled_drop_onto_an_existing_track_with_regions_stays_on_it() {
 #[test]
 fn the_ghost_preview_and_the_drop_agree_on_track_and_start() {
     // The ghost preview and the final drop must both go through the same
-    // conversion (`native_pointer_to_timeline`) and the same `drop_target`, so
-    // the region lands exactly where the ghost was drawn. This reproduces the
-    // owner's live numbers: ppp = 2, timeline origin (area.min) = (303, 118),
-    // cursor at window point (884, 332) over an existing track.
+    // conversion (window-relative `XQueryPointer` px / ppp - area.min) and the
+    // same `drop_target`, so the region lands exactly where the ghost was
+    // drawn. This reproduces the owner's *working* live numbers: ppp = 2,
+    // timeline origin (area.min) = (440.5, 118), XQueryPointer win=(1158,389)
+    // -> points (579, 194.5) -> local y = 76.5 -> row 0 (track 0).
     let audio = [true, true];
     let scale = 2.0;
-    let origin = (303.0, 118.0);
-    // The OS cursor in *physical* px, as XQueryPointer reports it, converted
-    // back to window points via ppp = 2. y = 224 puts the cursor over row 1
-    // (ruler 24 + row 0 of 72 + 10 into row 1).
-    let win = (884.0, 224.0);
-    let native = (win.0 * scale, win.1 * scale);
+    let origin = (440.5_f32, 118.0_f32);
+    // XQueryPointer reports *window-relative* physical px; only ppp divides it
+    // into egui points.
+    let win = (1158.0_f32, 389.0_f32);
+    let points = (win.0 / scale, win.1 / scale);
+    let local = (points.0 - origin.0, points.1 - origin.1);
     // Both the preview frame and the drop frame run this identical conversion
     // and target computation (they share one code path in `handle_drop`).
-    let preview = {
-        let local = daw_gui::native_pointer_to_timeline(native, (0.0, 0.0), scale, origin);
-        daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true)
-    };
-    let drop = {
-        let local = daw_gui::native_pointer_to_timeline(native, (0.0, 0.0), scale, origin);
-        daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true)
-    };
+    let preview = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    let drop = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
     assert_eq!(
         preview.track, drop.track,
         "ghost and drop must pick one track"
@@ -466,12 +461,12 @@ fn the_ghost_preview_and_the_drop_agree_on_track_and_start() {
         preview.start, drop.start,
         "ghost and drop must share one start"
     );
-    // y = 224 - 118 = 106 into the timeline: ruler (24) + row 0 (72) + 10 into
-    // row 1.
+    // local y = 194.5 - 118 = 76.5; row 0 spans y=24..96, so the cursor is over
+    // the first existing track.
     assert_eq!(
         drop.track,
-        Some(1),
-        "cursor is over the second existing track"
+        Some(0),
+        "cursor is over the first existing track"
     );
 }
 
@@ -568,32 +563,32 @@ fn a_drop_on_an_existing_audio_track_does_not_add_a_track() {
     assert_eq!(editor.session().tracks[0].clips[1].start_samples, t.start);
 }
 
-// Regression for the live X11 test (PR #62): the owner's exact drop numbers.
-// ppp=2 (200% HiDPI), area_min=(303,118), cursor window-native (1768,664).
-// The conversion must map the native cursor to the timeline point (581,214)
-// and pick the right row using the *real* TRACK_HEIGHT=72 / RULER_HEIGHT=24.
+// Regression for the live X11 test (PR #62, the *working* iteration 2): the
+// owner's exact drop numbers. ppp=2 (200% HiDPI), area_min=(440.5,118),
+// XQueryPointer win=(1158,389) -> points (579,194.5) -> local (138.5,76.5) ->
+// row 0 (track 0). TRACK_HEIGHT=72 / RULER_HEIGHT=24.
 #[test]
 fn the_owner_drop_numbers_map_to_the_expected_row() {
-    // Step 1: native window px -> egui points (divide by ppp).
+    // Step 1: window-relative native px -> egui points (divide by ppp).
     let points = (
-        1768.0_f32 / 2.0, // 884.0
-        664.0_f32 / 2.0,  // 332.0
+        1158.0_f32 / 2.0, // 579.0
+        389.0_f32 / 2.0,  // 194.5
     );
-    assert_eq!(points, (884.0, 332.0));
+    assert_eq!(points, (579.0, 194.5));
     // Step 2: egui points -> timeline-relative (subtract area.min).
-    let local = (points.0 - 303.0, points.1 - 118.0);
-    assert_eq!(local, (581.0, 214.0));
+    let local = (points.0 - 440.5, points.1 - 118.0);
+    assert_eq!(local, (138.5, 76.5));
 
-    // With two audio tracks (rows 0 and 1 span y=24..168 relative to the
-    // timeline top), y=214 is *below* the last track, so it is a new track.
+    // With two audio tracks (rows 0 and 1 span y=24..96 and y=96..168
+    // relative to the timeline top), y=76.5 is over row 0, so track 0.
     let audio = [true, true];
     let t = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, false);
-    assert_eq!(t.track, None, "y=214 is below the two 72pt tracks");
+    assert_eq!(t.track, Some(0), "y=76.5 is over the first 72pt track");
 
-    // A cursor genuinely over row 1 (y = 24 + 72 + 10 = 106 relative) must
-    // land on track 1, never create a new track.
-    let on_track = daw_gui::drop_target(
-        Some((581.0, 106.0)),
+    // A cursor genuinely below the last track (y = 24 + 72*2 + 10 = 178
+    // relative) must create a new track.
+    let below = daw_gui::drop_target(
+        Some((138.5, 178.0)),
         24.0,
         72.0,
         &audio,
@@ -602,7 +597,7 @@ fn the_owner_drop_numbers_map_to_the_expected_row() {
         120.0,
         false,
     );
-    assert_eq!(on_track.track, Some(1));
+    assert_eq!(below.track, None);
 }
 
 // The native conversion is scale- and window-size-independent: the owner's
@@ -611,9 +606,10 @@ fn the_owner_drop_numbers_map_to_the_expected_row() {
 #[test]
 fn the_owner_drop_is_independent_of_window_size() {
     let scale = 2.0;
-    let origin = (303.0, 118.0);
-    // Cursor 581pt right and 214pt down from the timeline origin, in native px.
-    let cursor_native = (origin.0 + 581.0, origin.1 + 214.0);
+    let origin = (440.5_f32, 118.0_f32);
+    // Cursor 138.5pt right and 76.5pt down from the timeline origin, in
+    // native px.
+    let cursor_native = (origin.0 + 138.5, origin.1 + 76.5);
     for _size in [(1920.0, 1080.0), (800.0, 600.0), (2560.0, 1440.0)] {
         let local = daw_gui::native_pointer_to_timeline(
             (cursor_native.0 * scale, cursor_native.1 * scale),
@@ -621,30 +617,25 @@ fn the_owner_drop_is_independent_of_window_size() {
             scale,
             origin,
         );
-        assert_eq!(local, (581.0, 214.0));
+        assert_eq!(local, (138.5, 76.5));
     }
 }
 
-// The owner's live X11 bug (PR #62): XQueryPointer reported window coords
-// measured from the *frame* (including a 32pt title bar), so a cursor near
-// the bottom of a track read 32pt too low and fell below the tracks, landing
-// on a new track instead. Converting from root coords minus the client origin
-// removes that offset, so the drop lands on the track the user aimed at.
+// The working behaviour (iteration 2): XQueryPointer's `win_x`/`win_y` are
+// measured from the *client* window (what winit owns via raw_window_handle),
+// NOT from the WM frame. There is no title-bar offset to subtract, so a
+// cursor over a track lands on that track directly from `win_y`.
 #[test]
-fn a_title_bar_offset_does_not_push_the_drop_below_the_tracks() {
+fn the_client_window_coords_have_no_title_bar_offset() {
     // Two tracks, ruler 24pt, row height 72pt, area top at y=118. Track 1
-    // therefore spans y=214..286 in window points.
+    // spans y=214..286 in window points. A cursor 15pt above track 1's bottom
+    // edge (egui y=271) reads the same value from `win_y`.
     let audio = [true, true];
     let area_min_y = 118.0_f32;
-    let title_bar_pt = 32.0_f32;
-    // The cursor is over track 1, 15pt above its bottom edge (egui y=271).
     let cursor_window_y = 271.0_f32;
-
-    // Buggy path: XQueryPointer's frame-relative value includes the title bar,
-    // so the same cursor reads 32pt lower (303), which is below track 1.
-    let frame_relative_y = cursor_window_y + title_bar_pt - area_min_y;
-    let wrong = daw_gui::drop_target(
-        Some((0.0, frame_relative_y)),
+    let local_y = cursor_window_y - area_min_y;
+    let t = daw_gui::drop_target(
+        Some((0.0, local_y)),
         24.0,
         72.0,
         &audio,
@@ -653,20 +644,5 @@ fn a_title_bar_offset_does_not_push_the_drop_below_the_tracks() {
         120.0,
         false,
     );
-    assert_eq!(wrong.track, None, "frame coords include the title bar");
-
-    // Fixed path: root minus the client origin (title bar removed) recovers
-    // the true client y, which is over track 1.
-    let client_y = cursor_window_y - area_min_y;
-    let fixed = daw_gui::drop_target(
-        Some((0.0, client_y)),
-        24.0,
-        72.0,
-        &audio,
-        RATE,
-        100.0,
-        120.0,
-        false,
-    );
-    assert_eq!(fixed.track, Some(1), "client coords drop onto track 1");
+    assert_eq!(t.track, Some(1), "client coords drop onto track 1");
 }
