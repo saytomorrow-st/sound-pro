@@ -434,6 +434,13 @@ enum ImportMsg {
     Done(Decoded),
 }
 
+/// The result of a background mix export (SPEC-052): the destination path,
+/// the sample rate it was written at, and either the render report or the
+/// error that stopped it.
+enum ExportMsg {
+    Done(PathBuf, u32, Result<daw_app::SessionReport, EditorError>),
+}
+
 /// A region shown while its file still decodes (SPEC-050 §7): its length
 /// comes from the header, its waveform fills in as the decoder advances.
 struct Ghost {
@@ -531,6 +538,15 @@ struct App {
     playhead: u64,
     player: Option<Player>,
     imports: Imports,
+    /// Mix-export progress and options (SPEC-052).
+    export_tx: std::sync::mpsc::Sender<ExportMsg>,
+    export_rx: std::sync::mpsc::Receiver<ExportMsg>,
+    export_open: bool,
+    export_bits: audio_core::wav::BitDepth,
+    export_rate: u32,
+    export_normalize: bool,
+    export_target_db: f32,
+    export_pending: bool,
     /// File lengths read from headers while files hover (SPEC-050 §2).
     probes: HashMap<PathBuf, Result<u64, String>>,
     /// Waveforms of hovered files, filling in as they decode.
@@ -657,6 +673,7 @@ fn buffer_label(frames: u32, rate: u32) -> String {
 impl App {
     fn new(start: Option<PathBuf>) -> Self {
         let (hover_tx, hover_rx) = std::sync::mpsc::channel();
+        let (export_tx, export_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             editor: Editor::new(),
             #[cfg(feature = "audio")]
@@ -674,6 +691,14 @@ impl App {
                     total: 0,
                 }
             },
+            export_tx,
+            export_rx,
+            export_open: false,
+            export_bits: audio_core::wav::BitDepth::I16,
+            export_rate: 48_000,
+            export_normalize: false,
+            export_target_db: -1.0,
+            export_pending: false,
             probes: HashMap::new(),
             hover_peaks: HashMap::new(),
             hover_tx,
@@ -1385,7 +1410,92 @@ impl App {
         self.import_in_background(paths, track, None);
     }
 
+    /// Opens the mix-export options window (SPEC-052). The project's sample
+    /// rate is the initial target rate.
     fn export_dialog(&mut self) {
+        self.export_rate = self.editor.session().sample_rate;
+        self.export_open = true;
+    }
+
+    /// The mix-export window: bit depth, target sample rate, optional peak
+    /// normalisation, and the button that starts the background render.
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if !self.export_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Экспорт сведения")
+            .id(egui::Id::new("export"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(360.0)
+            .show(ctx, |ui| self.export_ui(ui));
+        if !open {
+            self.export_open = false;
+        }
+    }
+
+    fn export_ui(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("export-grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Разрядность");
+                egui::ComboBox::from_id_salt("export-bits")
+                    .selected_text(self.export_bits.bits().to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.export_bits,
+                            audio_core::wav::BitDepth::I16,
+                            "16 бит",
+                        );
+                        ui.selectable_value(
+                            &mut self.export_bits,
+                            audio_core::wav::BitDepth::I24,
+                            "24 бит",
+                        );
+                    });
+                ui.end_row();
+                ui.label("Частота");
+                egui::ComboBox::from_id_salt("export-rate")
+                    .selected_text(format!("{} Гц", self.export_rate))
+                    .show_ui(ui, |ui| {
+                        for &rate in &[44_100, 48_000, 88_200, 96_000] {
+                            ui.selectable_value(&mut self.export_rate, rate, format!("{rate} Гц"));
+                        }
+                    });
+                ui.end_row();
+                ui.label("Нормализация");
+                ui.checkbox(&mut self.export_normalize, "пик до заданного dBFS");
+                ui.end_row();
+            });
+        if self.export_normalize {
+            ui.horizontal(|ui| {
+                ui.label("Пик (dBFS)");
+                ui.add(egui::DragValue::new(&mut self.export_target_db).range(-60.0..=0.0));
+            });
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let enabled = !self.export_pending;
+            if ui
+                .add_enabled(enabled, egui::Button::new("Экспорт…"))
+                .clicked()
+            {
+                self.start_export();
+            }
+            if self.export_pending {
+                ui.spinner();
+                ui.label("Экспорт…");
+            }
+        });
+        ui.small("Экспорт идёт в фоне; можно продолжать работать.");
+    }
+
+    /// Asks for a destination and starts the export on a background thread so
+    /// the UI stays responsive (SPEC-052).
+    fn start_export(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("WAV", &["wav"])
             .set_file_name("mixdown.wav")
@@ -1393,11 +1503,47 @@ impl App {
         else {
             return;
         };
-        let result = self.editor.export(&path);
-        if let Some(report) = self.report(result, "") {
-            #[allow(clippy::cast_precision_loss)]
-            let seconds = report.frames as f64 / f64::from(self.editor.session().sample_rate);
-            self.status = format!("Сведение записано: {} ({seconds:.2} с)", path.display());
+        let spec = daw_app::ExportSpec {
+            bit_depth: self.export_bits,
+            sample_rate: self.export_rate,
+            normalize: self.export_normalize.then_some(self.export_target_db),
+        };
+        let tx = self.export_tx.clone();
+        // Build the job here (it reads decoded files), then render off the
+        // UI thread so the window stays responsive.
+        let job = match self.editor.prepare_export(&path) {
+            Ok(job) => job,
+            Err(e) => {
+                self.status = format!("Ошибка экспорта: {e}");
+                return;
+            }
+        };
+        self.export_pending = true;
+        self.status = "Экспорт…".into();
+        let rate = spec.sample_rate;
+        std::thread::spawn(move || {
+            let result =
+                daw_app::render_export(job, spec).map_err(|e| EditorError::Render(e.to_string()));
+            let _ = tx.send(ExportMsg::Done(path, rate, result));
+        });
+    }
+
+    /// Collects a finished export and reports its result.
+    fn poll_export(&mut self) {
+        if !self.export_pending {
+            return;
+        }
+        while let Ok(msg) = self.export_rx.try_recv() {
+            let ExportMsg::Done(path, rate, result) = msg;
+            self.export_pending = false;
+            match result {
+                Ok(report) => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let seconds = report.frames as f64 / f64::from(rate);
+                    self.status = format!("Сведение записано: {} ({seconds:.2} с)", path.display());
+                }
+                Err(e) => self.status = format!("Ошибка экспорта: {e}"),
+            }
         }
     }
 
@@ -4476,6 +4622,7 @@ impl eframe::App for App {
         self.poll_meters(ctx);
         self.poll_recorder(ctx);
         self.poll_imports(ctx);
+        self.poll_export();
         // Everything done during one mouse press is one undo step.
         if ctx.input(|i| i.pointer.any_down()) {
             self.editor.begin_group();
@@ -4559,6 +4706,7 @@ impl eframe::App for App {
         self.audio_window(ctx);
         self.about_window(ctx);
         self.new_track_window(ctx);
+        self.export_window(ctx);
 
         if self.confirm_quit {
             egui::Window::new("Несохранённые изменения")
