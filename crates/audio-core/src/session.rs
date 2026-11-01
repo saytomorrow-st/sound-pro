@@ -831,7 +831,7 @@ pub struct BusSend {
 }
 
 /// A shared effects return: tracks send to it, it adds its processed sum to
-/// the master (SPEC-028).
+/// the master (SPEC-028). Buses may also send to one another (SPEC-051).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bus {
     /// Display name.
@@ -840,17 +840,39 @@ pub struct Bus {
     pub gain: f32,
     /// Effects applied to the summed sends, in order.
     pub effects: Vec<Effect>,
+    /// Silent bus return when `true` (SPEC-051); its sends to other buses
+    /// still flow.
+    pub mute: bool,
+    /// When any bus is soloed, only soloed, unmuted buses return to the
+    /// master (SPEC-051); solo never breaks a bus's outgoing sends.
+    pub solo: bool,
+    /// Post-fader sends to other buses, indexed into [`Session::buses`]
+    /// (SPEC-051).
+    pub sends: Vec<BusSend>,
 }
 
 impl Bus {
-    /// Bus at unity gain with no effects.
+    /// Bus at unity gain with no effects, sends, or mute/solo.
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_owned(),
             gain: 1.0,
             effects: Vec::new(),
+            mute: false,
+            solo: false,
+            sends: Vec::new(),
         }
+    }
+
+    /// Send level to `bus`, `0.0` when this bus does not send there
+    /// (SPEC-051).
+    #[must_use]
+    pub fn send_level(&self, bus: usize) -> f32 {
+        self.sends
+            .iter()
+            .find(|send| send.bus == bus)
+            .map_or(0.0, |send| send.level)
     }
 }
 
@@ -1021,6 +1043,18 @@ impl Session {
         !t.mute && (t.solo || !self.tracks.iter().any(|other| other.solo))
     }
 
+    /// Whether `bus` returns to the master: not muted, and either nothing is
+    /// soloed or it is. Mute beats solo; an out-of-range index is `false`
+    /// (SPEC-051). A bus's outgoing sends are not gated here, so solo never
+    /// breaks a send chain.
+    #[must_use]
+    pub fn is_bus_audible(&self, bus: usize) -> bool {
+        let Some(b) = self.buses.get(bus) else {
+            return false;
+        };
+        !b.mute && (b.solo || !self.buses.iter().any(|other| other.solo))
+    }
+
     /// Checks every invariant the renderer relies on.
     ///
     /// The constructor for the model is the caller's literal, so this is the
@@ -1102,7 +1136,8 @@ impl Session {
         Ok(())
     }
 
-    /// SPEC-028 checks for the bus list.
+    /// SPEC-028/SPEC-051 checks for the bus list: per-bus effects and gain,
+    /// plus each bus's sends (no self-reference, no repeats, no cycles).
     fn validate_buses(&self) -> Result<(), SessionError> {
         if self.buses.len() > MAX_BUSES {
             return Err(SessionError::InvalidBus { bus: MAX_BUSES });
@@ -1112,6 +1147,25 @@ impl Session {
                 && bus.effects.iter().all(|effect| effect.kind.is_valid());
             if bus.name.len() > MAX_NAME_BYTES || !valid_gain(bus.gain) || !effects_ok {
                 return Err(SessionError::InvalidBus { bus: bus_index });
+            }
+            validate_bus_sends(&bus.sends, self.buses.len(), bus_index)?;
+        }
+        self.validate_bus_cycles()
+    }
+
+    /// Rejects a directed cycle over the buses' sends (SPEC-051).
+    fn validate_bus_cycles(&self) -> Result<(), SessionError> {
+        // Three states: unvisited, on the current DFS stack, done. A back edge
+        // to an on-stack bus is a cycle. With at most MAX_BUSES buses this is
+        // trivially cheap and runs once at validate time, never on the audio
+        // path.
+        let mut state = vec![0u8; self.buses.len()];
+        for start in 0..self.buses.len() {
+            if state[start] != 0 {
+                continue;
+            }
+            if let Err((bus, send)) = visit_bus(self, start, &mut state) {
+                return Err(SessionError::InvalidSend { track: bus, send });
             }
         }
         Ok(())
@@ -1132,6 +1186,48 @@ fn validate_sends(sends: &[BusSend], buses: usize, track: usize) -> Result<(), S
             return Err(SessionError::InvalidSend { track, send: index });
         }
     }
+    Ok(())
+}
+
+/// SPEC-051 checks for one bus's sends: same rules as a track's sends plus a
+/// ban on the bus sending to itself. `bus_index` is reported as `track`.
+fn validate_bus_sends(
+    sends: &[BusSend],
+    buses: usize,
+    bus_index: usize,
+) -> Result<(), SessionError> {
+    if sends.len() > MAX_BUSES {
+        return Err(SessionError::InvalidSend {
+            track: bus_index,
+            send: MAX_BUSES,
+        });
+    }
+    for (index, send) in sends.iter().enumerate() {
+        let repeated = sends[..index].iter().any(|other| other.bus == send.bus);
+        if send.bus == bus_index || send.bus >= buses || repeated || !valid_gain(send.level) {
+            return Err(SessionError::InvalidSend {
+                track: bus_index,
+                send: index,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Depth-first walk of `session`'s bus-send graph starting at `bus`. Returns
+/// the offending bus index and send index for the first back edge found, if
+/// any (SPEC-051).
+fn visit_bus(session: &Session, bus: usize, state: &mut [u8]) -> Result<(), (usize, usize)> {
+    state[bus] = 1;
+    for (send_index, send) in session.buses[bus].sends.iter().enumerate() {
+        let target = send.bus;
+        match state[target] {
+            0 => visit_bus(session, target, state)?,
+            1 => return Err((bus, send_index)),
+            _ => {}
+        }
+    }
+    state[bus] = 2;
     Ok(())
 }
 
@@ -1557,5 +1653,96 @@ mod tests {
         // Bypass does not excuse an invalid value.
         s.tracks[0].effects[1].bypass = true;
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn bus_send_level_and_defaults_are_neutral() {
+        let b = Bus::new("fx");
+        assert_eq!(b.gain, 1.0);
+        assert!(!b.mute);
+        assert!(!b.solo);
+        assert_eq!(b.sends, []);
+        assert_eq!(b.send_level(0), 0.0);
+        let mut b = Bus::new("fx");
+        b.sends.push(BusSend { bus: 1, level: 0.5 });
+        assert_eq!(b.send_level(1), 0.5);
+        assert_eq!(b.send_level(0), 0.0);
+    }
+
+    #[test]
+    fn bus_solo_and_mute_decide_audibility() {
+        let mut s = Session::new("s", 48_000, 120.0);
+        s.buses = (0..3).map(|_| Bus::new("b")).collect();
+        assert!((0..3).all(|i| s.is_bus_audible(i)));
+        assert!(!s.is_bus_audible(3));
+        s.buses[1].solo = true;
+        assert_eq!(
+            (0..3).map(|i| s.is_bus_audible(i)).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        s.buses[2].solo = true;
+        assert_eq!(
+            (0..3).map(|i| s.is_bus_audible(i)).collect::<Vec<_>>(),
+            [false, true, true]
+        );
+        s.buses[2].solo = false;
+        s.buses[1].mute = true;
+        assert!((0..3).all(|i| !s.is_bus_audible(i)), "mute beats solo");
+    }
+
+    #[test]
+    fn a_bus_cannot_send_to_itself() {
+        let mut s = Session::new("s", 48_000, 120.0);
+        s.buses = (0..2).map(|_| Bus::new("b")).collect();
+        s.buses[0].sends.push(BusSend { bus: 0, level: 1.0 });
+        assert_eq!(
+            s.validate(),
+            Err(SessionError::InvalidSend { track: 0, send: 0 })
+        );
+    }
+
+    #[test]
+    fn bus_sends_must_be_in_range_and_unique() {
+        let mut s = Session::new("s", 48_000, 120.0);
+        s.buses = (0..2).map(|_| Bus::new("b")).collect();
+        s.buses[0].sends.push(BusSend { bus: 2, level: 1.0 });
+        assert_eq!(
+            s.validate(),
+            Err(SessionError::InvalidSend { track: 0, send: 0 })
+        );
+        let mut s = Session::new("s", 48_000, 120.0);
+        s.buses = (0..2).map(|_| Bus::new("b")).collect();
+        s.buses[0].sends = vec![
+            BusSend { bus: 1, level: 1.0 },
+            BusSend { bus: 1, level: 1.0 },
+        ];
+        assert_eq!(
+            s.validate(),
+            Err(SessionError::InvalidSend { track: 0, send: 1 })
+        );
+    }
+
+    #[test]
+    fn bus_cycles_are_rejected() {
+        let mut s = Session::new("s", 48_000, 120.0);
+        s.buses = (0..3).map(|_| Bus::new("b")).collect();
+        // 0 -> 1 -> 2 -> 0.
+        s.buses[0].sends.push(BusSend { bus: 1, level: 1.0 });
+        s.buses[1].sends.push(BusSend { bus: 2, level: 1.0 });
+        s.buses[2].sends.push(BusSend { bus: 0, level: 1.0 });
+        assert!(matches!(
+            s.validate(),
+            Err(SessionError::InvalidSend { .. })
+        ));
+    }
+
+    #[test]
+    fn acyclic_bus_sends_pass() {
+        let mut s = Session::new("s", 48_000, 120.0);
+        s.buses = (0..3).map(|_| Bus::new("b")).collect();
+        // 0 -> 1 -> 2 (a chain, no cycle).
+        s.buses[0].sends.push(BusSend { bus: 1, level: 1.0 });
+        s.buses[1].sends.push(BusSend { bus: 2, level: 1.0 });
+        assert_eq!(s.validate(), Ok(()));
     }
 }

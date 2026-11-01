@@ -1795,6 +1795,49 @@ impl App {
                     if ui.add(button).clicked() {
                         self.fx = Some(FxTarget::Bus(index));
                     }
+                    // SPEC-051: bus->bus sends, listed with a per-send level
+                    // slider plus a picker to add a new destination.
+                    strip_caption(ui, "Sends");
+                    let buses = self.editor.session().buses.clone();
+                    for (target, b) in buses.iter().enumerate() {
+                        if target == index {
+                            continue;
+                        }
+                        let mut level = bus.send_level(target);
+                        let label = RichText::new(&b.name).size(9.0);
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                Vec2::new(ui.available_width() - 32.0, 16.0),
+                                egui::Slider::new(&mut level, 0.0..=1.0)
+                                    .show_value(false)
+                                    .text(label),
+                            );
+                            if level != bus.send_level(target) {
+                                let _ = self.editor.set_bus_send(index, target, level);
+                            }
+                        });
+                    }
+                    // Picker for a new bus->bus send destination.
+                    egui::ComboBox::from_id_salt(("bus-send-dst", index))
+                        .width(ui.available_width())
+                        .selected_text("+ шина")
+                        .show_ui(ui, |ui| {
+                            for (target, b) in buses.iter().enumerate() {
+                                if target == index {
+                                    continue;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        bus.send_level(target) > 0.0,
+                                        RichText::new(&b.name).size(10.0),
+                                    )
+                                    .clicked()
+                                    && bus.send_level(target) == 0.0
+                                {
+                                    let _ = self.editor.set_bus_send(index, target, 0.5);
+                                }
+                            }
+                        });
                 });
                 let used = ui.cursor().top() - top;
                 let rest = strip_rest(match_height, used, 130.0 + 70.0);
@@ -1811,6 +1854,22 @@ impl App {
                             let _ = self.editor.set_bus_gain(index, gain);
                         }
                         level_labels(ui, gain, &mut meter);
+                        // SPEC-051: mute/solo on the bus return only.
+                        let (mut mute, mut solo) = (bus.mute, bus.solo);
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let m = pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
+                                .on_hover_text("Без звука шины");
+                            let s = pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
+                                .on_hover_text("Соло шины");
+                            if m.changed() {
+                                let _ = self.editor.set_bus_mute(index, mute);
+                            }
+                            if s.changed() {
+                                let _ = self.editor.set_bus_solo(index, solo);
+                            }
+                        });
                     },
                 );
             });

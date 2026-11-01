@@ -788,6 +788,96 @@ fn bus_effects_shape_only_the_sent_part() {
     assert_ne!(wet.channel(0), dry.channel(0));
 }
 
+/// A track sends to bus 0, bus 0 sends to bus 1; the dry signal plus both
+/// scaled returns sum in order (SPEC-051).
+#[test]
+fn a_bus_send_flows_into_the_next_bus_in_order() {
+    let mut scratch = Scratch::new("busbus");
+    let source = ramp(300);
+    let mut bus0 = audio_core::Bus::new("A");
+    bus0.gain = 0.5;
+    bus0.sends.push(audio_core::BusSend { bus: 1, level: 0.5 });
+    let mut bus1 = audio_core::Bus::new("B");
+    bus1.gain = 0.5;
+    // Track sends at level 1.0 to bus 0; bus 1 has no direct track sends.
+    let out = render_bused(
+        &mut scratch,
+        vec![(sending(1.0), source.clone())],
+        vec![bus0, bus1],
+        1.0,
+    );
+    // dry s + bus0 return s*1.0*0.5 + bus1 return s*1.0*0.5*0.5*0.5
+    let expected: Vec<f32> = source
+        .iter()
+        .map(|s| s + s * 0.5 + s * 0.5 * 0.5 * 0.5)
+        .collect();
+    for (got, want) in out.channel(0).iter().zip(&expected) {
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    }
+}
+
+/// A muted bus still sends onward, but its own return is silent (SPEC-051).
+#[test]
+fn a_muted_bus_sends_but_does_not_return() {
+    let mut scratch = Scratch::new("busmute-send");
+    let source = ramp(300);
+    let mut bus0 = audio_core::Bus::new("A");
+    bus0.gain = 0.5;
+    bus0.mute = true;
+    bus0.sends.push(audio_core::BusSend { bus: 1, level: 1.0 });
+    let bus1 = audio_core::Bus::new("B");
+    let out = render_bused(
+        &mut scratch,
+        vec![(sending(1.0), source.clone())],
+        vec![bus0, bus1],
+        1.0,
+    );
+    // dry s + (bus0 return silenced) + bus1 return s*1.0*0.5*1.0*1.0
+    let expected: Vec<f32> = source.iter().map(|s| s + s * 0.5).collect();
+    for (got, want) in out.channel(0).iter().zip(&expected) {
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    }
+}
+
+/// Solo on one bus gates only the master returns, never the sends (SPEC-051).
+#[test]
+fn a_soloed_bus_returns_but_other_returns_are_gated() {
+    let mut scratch = Scratch::new("bussolo");
+    let source = ramp(300);
+    let mut bus0 = audio_core::Bus::new("A");
+    bus0.gain = 0.5;
+    bus0.sends.push(audio_core::BusSend { bus: 1, level: 1.0 });
+    let mut bus1 = audio_core::Bus::new("B");
+    bus1.gain = 0.5;
+    bus1.solo = true;
+    let out = render_bused(
+        &mut scratch,
+        vec![(sending(1.0), source.clone())],
+        vec![bus0, bus1],
+        1.0,
+    );
+    // dry s + bus0 return (gated) + bus1 return s*1.0*0.5*1.0*0.5. The bus0 ->
+    // bus1 send flows even though bus0 is not soloed.
+    let expected: Vec<f32> = source.iter().map(|s| s + s * 0.25).collect();
+    for (got, want) in out.channel(0).iter().zip(&expected) {
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    }
+}
+
+/// A bus sending to itself is rejected by validation, so no render happens.
+#[test]
+fn a_bus_self_send_is_rejected() {
+    let mut session = Session::new("s", RATE, 120.0);
+    session.buses = vec![audio_core::Bus::new("A")];
+    session.buses[0]
+        .sends
+        .push(audio_core::BusSend { bus: 0, level: 1.0 });
+    assert!(matches!(
+        session.validate(),
+        Err(audio_core::SessionError::InvalidSend { .. })
+    ));
+}
+
 /// Renders one track holding `clips`, each over its own constant source.
 fn render_track(scratch: &mut Scratch, clips: Vec<(Clip, f32)>) -> Vec<f32> {
     let mut track = SessionTrack::new("t");
