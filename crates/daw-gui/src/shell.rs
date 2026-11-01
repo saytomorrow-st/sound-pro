@@ -590,10 +590,14 @@ fn window_debug(msg: &str) {
 
 /// In full screen the system title bar is gone, so the window controls are
 /// drawn in the control bar: minimize, leave full screen, close.
-fn window_buttons(ui: &mut egui::Ui) {
+///
+/// `fullscreen` is the caller's local flag (see [`super::App::fullscreen`]);
+/// the buttons update it in place when they leave full screen so the control
+/// bar reflects the change at once, even on XWayland where
+/// `ViewportInfo::fullscreen` never reports the transition.
+fn window_buttons(ui: &mut egui::Ui, fullscreen: &mut bool) {
     let ctx = ui.ctx().clone();
-    let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-    if !fullscreen {
+    if !*fullscreen {
         // System decorations are expected to provide the buttons; log the
         // state so a broken-WM report can be correlated with decorations.
         window_debug("window_buttons: not fullscreen, no custom buttons (system title bar)");
@@ -609,12 +613,14 @@ fn window_buttons(ui: &mut egui::Ui) {
         .on_hover_text("Выйти из полноэкранного режима (F11)")
         .clicked()
     {
+        *fullscreen = false;
         window_debug("send_viewport_cmd: Fullscreen(false)");
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
     }
     if ui.button("🗕").on_hover_text("Свернуть").clicked() {
         // Most window managers ignore a minimize request from a full-screen
         // window, so leave full screen first (SPEC-045 §7).
+        *fullscreen = false;
         window_debug("send_viewport_cmd: Fullscreen(false) then Minimized(true)");
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -799,7 +805,7 @@ impl App {
             Sense::click_and_drag(),
         );
         let ctx = ui.ctx().clone();
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let fullscreen = self.fullscreen;
         if strip.drag_started() {
             window_debug(&format!(
                 "control_bar strip drag started (fullscreen={fullscreen})"
@@ -850,7 +856,7 @@ impl App {
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                window_buttons(ui);
+                window_buttons(ui, &mut self.fullscreen);
                 ui.toggle_value(&mut self.layout.browser, "🗁")
                     .on_hover_text("Браузер файлов (F)");
                 placeholder(ui, "📝");
@@ -2048,7 +2054,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_rest, window_drag_commands};
+    use super::{strip_rest, window_buttons, window_drag_commands};
 
     #[test]
     fn matched_strips_fill_the_neighbour_height() {
@@ -2070,5 +2076,31 @@ mod tests {
         );
         assert_eq!(window_drag_commands(false, true), None);
         assert_eq!(window_drag_commands(true, false), None);
+    }
+
+    /// The window buttons must honour the caller's local `fullscreen` flag —
+    /// never `ViewportInfo::fullscreen`, which is unreliable on XWayland
+    /// (regression for SPEC-050 §1: buttons vanished in fullscreen). With no
+    /// clicks, `window_buttons` leaves the flag untouched; it must not reach
+    /// out to the viewport for the decision.
+    #[test]
+    fn window_buttons_read_the_caller_fullscreen_flag() {
+        let ctx = eframe::egui::Context::default();
+        // Not fullscreen: early return, flag stays false.
+        let mut fullscreen = false;
+        let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                window_buttons(ui, &mut fullscreen);
+            });
+        });
+        assert!(!fullscreen);
+        // Fullscreen, no clicks: flag stays true (buttons shown, no mutation).
+        let mut fullscreen = true;
+        let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                window_buttons(ui, &mut fullscreen);
+            });
+        });
+        assert!(fullscreen);
     }
 }

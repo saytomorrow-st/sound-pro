@@ -39,42 +39,36 @@ jobs:
             v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
           fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
-      - name: ALSA headers + runtime + plugins
+      - name: ALSA headers + runtime
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           # libasound2-dev: ALSA headers for the realtime (cpal) build.
-          # libasound2-plugins: pipewire/pulse plugins that AppImage bundles so
-          # sound works over PipeWire/PulseAudio without host packages.
-          # libpipewire-0.3-0: plugin runtime the AppImage bundles.
-          sudo apt-get install -y libasound2-dev libasound2-plugins libpipewire-0.3-0 libfuse2
+          # The AppImage does NOT bundle ALSA; the host's ALSA + PipeWire
+          # plugin is used, so no plugin/pipewire packages are needed here.
+          sudo apt-get install -y libasound2-dev libfuse2
       - name: Build
         run: cargo build --release --locked -p daw-gui --features audio
       - name: AppImage
         if: runner.os == 'Linux'
         run: packaging/linux/build-appimage.sh target/release/sound-pro "$VERSION" dist
-      - name: Verify AppImage is self-contained
+      - name: Verify AppImage
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # Unpack the AppImage (no FUSE needed) and confirm the audio runtime
-          # is bundled and resolves. The script already fails the build if a
-          # non-glibc library is unresolved; this step surfaces the evidence
-          # in the CI log.
+          # Unpack the AppImage (no FUSE needed) and confirm the binary is
+          # present and does not bundle ALSA (audio uses the host's
+          # ALSA/PipeWire). The binary links against libasound at build time
+          # and must resolve it from the host at run time.
           img=$(ls dist/Sound-Pro-*.AppImage)
           "$img" --appimage-extract >/dev/null 2>&1 || true
-          echo "== bundled libasound + ALSA plugins =="
-          find squashfs-root/usr/lib \( -name 'libasound*' -o -name 'libasound_module*' \) | sort
-          echo "== ldd of the binary against the bundled lib dir =="
-          LD_LIBRARY_PATH=squashfs-root/usr/lib ldd squashfs-root/usr/bin/sound-pro || true
-          echo "== unresolved non-glibc libraries (must be empty) =="
-          missing=$(LD_LIBRARY_PATH=squashfs-root/usr/lib ldd squashfs-root/usr/bin/sound-pro \
-            | grep 'not found' || true)
-          if [ -n "$missing" ]; then
-            echo "::error::AppImage has unresolved libraries: $missing"
+          echo "== AppImage contents (usr/lib should NOT contain ALSA) =="
+          find squashfs-root -maxdepth 3 -type f | sort
+          if find squashfs-root/usr -name 'libasound*' | grep -q .; then
+            echo "::error::AppImage unexpectedly bundles ALSA; audio must use the host ALSA/PipeWire"
             exit 1
           fi
-          echo "(none)"
+          echo "(no bundled ALSA: audio uses the host ALSA/PipeWire)"
       - name: Zip
         if: runner.os == 'Windows'
         shell: pwsh

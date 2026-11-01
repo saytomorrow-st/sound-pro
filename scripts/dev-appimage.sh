@@ -2,10 +2,10 @@
 # Obtains a dev AppImage of Sound Pro and drops it into the user's Downloads
 # folder, so intermediate results of every PR can be tried out.
 #
-# Default behaviour: download the prebuilt, self-contained (with sound)
-# AppImage from GitHub Releases. This needs only `gh`/`curl` — no Rust
-# toolchain and no ALSA headers, so it works on a machine without sudo and
-# without alsa-lib-devel (e.g. Fedora with `FEATURES=none` today).
+# Default behaviour: download the prebuilt AppImage from GitHub Releases. This
+# needs only `gh`/`curl` — no Rust toolchain and no ALSA headers, so it works
+# on a machine without sudo and without alsa-lib-devel (e.g. Fedora with
+# `FEATURES=none` today).
 #
 # With `--build`: build the AppImage locally from source. This is the path
 # AGENTS.md documents for CI-less development; it needs a Rust toolchain, and

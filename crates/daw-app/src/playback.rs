@@ -367,6 +367,38 @@ impl PlaybackEngine {
         self
     }
 
+    /// Advances the transport by `frames` without rendering audio, for a
+    /// silent fallback when no output device is available. Pending transport
+    /// commands are applied and the position is clamped to `end`, stopping at
+    /// the end exactly as [`Self::fill`] does. No audio is produced, so this
+    /// runs on the control thread (not the audio callback) and may therefore
+    /// allocate and lock.
+    pub fn advance_silent(&mut self, frames: u64) {
+        while let Some(command) = self.commands.pop_next() {
+            self.renderer.transport_mut().apply(command);
+            self.applied += 1;
+        }
+        if self.renderer.transport().is_playing() {
+            let position = self.renderer.transport().position();
+            let left = self.end.saturating_sub(position);
+            if left == 0 {
+                self.renderer.transport_mut().apply(TransportCommand::Stop);
+            } else {
+                let n = usize::try_from(frames.min(left)).unwrap_or(usize::MAX);
+                self.renderer.transport_mut().advance(n);
+            }
+        }
+        let transport = self.renderer.transport();
+        self.shared
+            .position
+            .store(transport.position(), Ordering::Relaxed);
+        if self.applied >= self.shared.sent.load(Ordering::Acquire) {
+            self.shared
+                .playing
+                .store(transport.is_playing(), Ordering::Relaxed);
+        }
+    }
+
     /// Fills an interleaved device buffer of `channels` channels.
     ///
     /// Realtime-safe: no allocation, locking, I/O or panics. Reaching the end

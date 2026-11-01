@@ -398,10 +398,23 @@ fn typing(ctx: &egui::Context) -> bool {
 }
 
 /// A running playback: the control side and, with sound, the open stream.
+///
+/// When no output device can be opened the transport keeps rolling against a
+/// silent clock ([`Self::silent_engine`]) so the UI stays alive and the
+/// playhead advances, while a clear audio error is shown in the status bar.
 struct Player {
     control: PlaybackControl,
+    /// The open audio stream, when an output device could be opened.
     #[cfg(feature = "audio")]
-    _stream: daw_app::realtime::RealtimeHandle,
+    stream: Option<daw_app::realtime::RealtimeHandle>,
+    /// The engine advanced on the control thread when `stream` is `None`
+    /// (no device): the transport still runs, just without sound.
+    #[cfg(feature = "audio")]
+    silent_engine: Option<daw_app::playback::PlaybackEngine>,
+    /// Wall-clock time of the last silent advance, to scale the playhead by
+    /// elapsed real time (no device callback drives it otherwise).
+    #[cfg(feature = "audio")]
+    silent_clock: Option<std::time::Instant>,
     /// The project as it sounds now; an edit is swapped in while playing
     /// (SPEC-035).
     played: audio_core::session::Session,
@@ -573,6 +586,12 @@ struct App {
     /// broken window controls on Wayland/XWayland (set
     /// `SOUND_PRO_WINDOW_DEBUG=1`). Read once at startup.
     window_debug: bool,
+    /// Whether the window is full screen. Kept locally as the source of truth
+    /// for the control-bar buttons because `ViewportInfo::fullscreen` is
+    /// unreliable on XWayland (it stays `None`/`false` after a fullscreen
+    /// request). Reconciled with the viewport each frame when it reports a
+    /// definite value.
+    fullscreen: bool,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -731,6 +750,7 @@ impl App {
             x11_cursor: None,
             drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
             window_debug: std::env::var_os("SOUND_PRO_WINDOW_DEBUG").is_some(),
+            fullscreen: false,
             player: None,
             last_tempo_map: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
@@ -836,25 +856,43 @@ impl App {
             match daw_app::realtime::start_output_with(engine, rate, &self.audio) {
                 Ok(stream) => {
                     if play_debug {
-                        eprintln!("[play-debug] start_output_with ok; playing");
+                        eprintln!("[play-debug] start_output_with ok; playing with sound");
                     }
                     self.player = Some(Player {
                         control,
-                        _stream: stream,
+                        stream: Some(stream),
+                        silent_engine: None,
+                        silent_clock: None,
                         played: self.editor.session().clone(),
                         changed: None,
                     });
                 }
                 Err(e) => {
+                    // No usable output device: keep the transport rolling on a
+                    // silent clock so the playhead advances and the UI stays
+                    // alive, and tell the user plainly what is wrong.
                     if play_debug {
-                        eprintln!("[play-debug] start_output_with error: {e}");
+                        eprintln!(
+                            "[play-debug] start_output_with error: {e}; falling back to silent transport"
+                        );
                     }
-                    self.status = format!("Ошибка звука: {e}");
+                    self.status = format!("Нет звука (устройство вывода недоступно): {e}");
+                    self.player = Some(Player {
+                        control,
+                        stream: None,
+                        silent_engine: Some(engine),
+                        silent_clock: Some(std::time::Instant::now()),
+                        played: self.editor.session().clone(),
+                        changed: None,
+                    });
                 }
             }
         }
         #[cfg(not(feature = "audio"))]
         {
+            if play_debug {
+                eprintln!("[play-debug] built without audio feature; no device, no sound");
+            }
             drop((control, engine));
             self.status = "Звук выключен в этой сборке (соберите с --features audio)".into();
         }
@@ -1007,9 +1045,21 @@ impl App {
 
     /// Follows the audio thread; drops a player that reached the end.
     fn poll_player(&mut self, ctx: &egui::Context) {
-        let Some(player) = self.player.as_ref() else {
+        let Some(player) = self.player.as_mut() else {
             return;
         };
+        #[cfg(feature = "audio")]
+        if let Some(engine) = player.silent_engine.as_mut() {
+            // No device callback: advance the transport against the wall clock
+            // by the frames elapsed since the previous poll.
+            let now = std::time::Instant::now();
+            let elapsed = player
+                .silent_clock
+                .map_or(0.0, |last| now.duration_since(last).as_secs_f64());
+            player.silent_clock = Some(now);
+            let frames = (elapsed * f64::from(player.control.sample_rate())) as u64;
+            engine.advance_silent(frames);
+        }
         self.playhead = player.control.position();
         if player.control.is_playing() {
             ctx.request_repaint();
@@ -4220,14 +4270,17 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F11)) {
-            let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(self.fullscreen));
+            let next = !full;
+            // Update the local flag immediately: on XWayland the viewport may
+            // not report the change, and the control-bar buttons depend on it.
+            self.fullscreen = next;
             if self.window_debug {
                 eprintln!(
-                    "[window-debug] F11: send_viewport_cmd Fullscreen({})",
-                    !full
+                    "[window-debug] F11: send_viewport_cmd Fullscreen({next}) (local fullscreen now {next})"
                 );
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(next));
         }
         if !typing(ctx) {
             let (space, home, record, cycle, click) = ctx.input_mut(|i| {
@@ -4962,6 +5015,14 @@ impl eframe::App for App {
         if !self.themed {
             shell::apply_theme(ctx);
             self.themed = true;
+        }
+        // Reconcile the local fullscreen flag with the viewport when it reports
+        // a definite value. On XWayland `ViewportInfo::fullscreen` can lag or
+        // stay `None`, so F11/button toggles still update `self.fullscreen`
+        // directly in `shortcuts`; this only back-fills the truth when the WM
+        // does report it.
+        if let Some(fs) = ctx.input(|i| i.viewport().fullscreen) {
+            self.fullscreen = fs;
         }
         self.screenshot(ctx);
         self.poll_player(ctx);
