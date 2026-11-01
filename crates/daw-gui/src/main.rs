@@ -21,9 +21,10 @@ use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
 use daw_gui::layout::{Bottom, Layout, MeterState};
 use daw_gui::timeline::{self, CycleHit};
+use daw_gui::track_rows::{self, Row};
 use daw_gui::{
-    Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x, sixteenth_samples,
-    snap_to_beat, x_to_samples,
+    DeleteFolder, Editor, EditorError, MAX_TEMPO, MIN_TEMPO, bars_in, clock, samples_to_x,
+    sixteenth_samples, snap_to_beat, x_to_samples,
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke,
@@ -508,17 +509,25 @@ enum RegionAction {
     Join,
 }
 
-/// Track header command chosen in this frame (SPEC-029).
-#[derive(Clone, Copy)]
+/// Track header command chosen in this frame (SPEC-029, SPEC-055).
+#[derive(Clone)]
 enum TrackAction {
     Rename(usize),
     Color(usize, Option<u8>),
     Move(usize, usize),
     Duplicate(usize),
     New(TrackKind),
+    GatherFolder(Vec<usize>),
+    NewFolder,
+    RenameFolder(usize),
+    FolderColor(usize, Option<u8>),
+    ToggleFolder(usize),
+    MoveFolder(usize, usize),
+    UngroupFolder(usize),
+    DeleteFolder(usize),
 }
 
-/// «New track» items of the track-header menus (SPEC-050 §4).
+/// «New track» items of the track-header menus (SPEC-050 §4, SPEC-055 §4).
 fn new_track_items(ui: &mut egui::Ui, action: &mut Option<TrackAction>) {
     if ui.button("Новая дорожка…").clicked() {
         *action = Some(TrackAction::New(TrackKind::Audio));
@@ -526,6 +535,10 @@ fn new_track_items(ui: &mut egui::Ui, action: &mut Option<TrackAction>) {
     }
     if ui.button("Новая MIDI-дорожка").clicked() {
         *action = Some(TrackAction::New(TrackKind::Instrument));
+        ui.close();
+    }
+    if ui.button("Новая папка").clicked() {
+        *action = Some(TrackAction::NewFolder);
         ui.close();
     }
 }
@@ -544,6 +557,12 @@ fn track_color(color: Option<u8>, index: usize) -> Color32 {
         Color32::from_rgb(226, 96, 176),
     ];
     PALETTE[usize::from(daw_gui::layout::display_color(color, index)) % PALETTE.len()]
+}
+
+/// Display colour of a folder header (SPEC-055); folders without their own
+/// colour take one from the palette by folder index.
+fn folder_color(color: Option<u8>, index: usize) -> Color32 {
+    track_color(color, index)
 }
 
 struct App {
@@ -640,6 +659,10 @@ struct App {
     selected_send: Option<usize>,
     /// Track whose name is being edited and the text typed so far (SPEC-029).
     rename: Option<(usize, String)>,
+    /// Folder whose name is being edited and the text typed so far (SPEC-055).
+    folder_rename: Option<(usize, String)>,
+    /// Folder awaiting a confirm-delete dialog (SPEC-055 §4).
+    delete_folder: Option<usize>,
     /// Track whose automation lane is shown (SPEC-023).
     auto: Option<usize>,
     auto_lane: Lane,
@@ -779,6 +802,8 @@ impl App {
             buses_open: false,
             selected_send: None,
             rename: None,
+            folder_rename: None,
+            delete_folder: None,
             auto: None,
             auto_lane: Lane::Gain,
             auto_drag: None,
@@ -1300,7 +1325,11 @@ impl App {
         let rate = self.editor.session().sample_rate;
         let px_per_sample = self.zoom / rate as f32;
         for g in &self.imports.ghosts {
-            let top = area.min.y + TIMELINE_HEADER + g.row as f32 * TRACK_HEIGHT;
+            // `g.row` is a track index; a folder above shifts its visual row.
+            let Some(row) = track_rows::row_of_track(self.editor.session(), g.row) else {
+                continue;
+            };
+            let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
             let left = area.min.x + g.start as f32 * px_per_sample;
             let w = (g.clip.length_samples as f32 * px_per_sample).max(2.0);
             let rect =
@@ -1786,10 +1815,20 @@ impl App {
     fn track_headers(&mut self, ui: &mut egui::Ui) {
         ui.add_space(TIMELINE_HEADER);
         let count = self.editor.session().tracks.len();
+        // Owned layout snapshot, so the loop can mutate the editor freely.
+        let rows = track_rows::visible_rows(self.editor.session());
+        let foldered: Vec<bool> = (0..count)
+            .map(|t| track_rows::folder_of_track(self.editor.session(), t).is_some())
+            .collect();
         let mut delete = None;
         let mut action = None;
-        for index in 0..count {
+        for row in rows {
+            let Row::Track(index) = row else {
+                self.folder_header(ui, row, &mut action);
+                continue;
+            };
             let selected = self.editor.is_track_selected(index);
+            let in_folder = foldered.get(index).copied().unwrap_or(false);
             let frame = egui::Frame::new()
                 .fill(if selected {
                     Color32::from_rgb(48, 56, 72)
@@ -1804,6 +1843,7 @@ impl App {
                     frame.show(ui, |ui| {
                         ui.set_height(TRACK_HEIGHT - 8.0);
                         ui.set_width(ui.available_width());
+                        ui.add_space(if in_folder { 16.0 } else { 0.0 });
                         let track = &self.editor.session().tracks[index];
                         let (mut mute, mut solo) = (track.mute, track.solo);
                         let track_monitor = track.input_monitor;
@@ -2048,6 +2088,17 @@ impl App {
                     action = Some(TrackAction::Duplicate(index));
                     ui.close();
                 }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.editor.selected_tracks().len() > 1,
+                        egui::Button::new("Собрать в папку"),
+                    )
+                    .clicked()
+                {
+                    action = Some(TrackAction::GatherFolder(self.editor.selected_tracks()));
+                    ui.close();
+                }
                 if ui.button("Удалить").clicked() {
                     delete = Some(index);
                     ui.close();
@@ -2056,7 +2107,7 @@ impl App {
                 new_track_items(ui, &mut action);
             });
         }
-        if let Some(action) = action {
+        if let Some(action) = action.take() {
             self.track_action(action);
         }
         if let Some(index) = delete {
@@ -2079,9 +2130,168 @@ impl App {
         let rest = ui.available_rect_before_wrap();
         let empty = ui.interact(rest, ui.id().with("headers_empty"), Sense::click());
         empty.context_menu(|ui| new_track_items(ui, &mut action));
-        if let Some(action) = action {
+        if let Some(action) = action.take() {
             self.track_action(action);
         }
+    }
+
+    /// Draws one folder header row (SPEC-055 §4): a collapse arrow, the name,
+    /// a colour swatch and the child count, plus the folder context menu.
+    fn folder_header(&mut self, ui: &mut egui::Ui, row: Row, action: &mut Option<TrackAction>) {
+        let Row::Folder(folder) = row else {
+            return;
+        };
+        let session = self.editor.session();
+        let Some(f) = session.folders.get(folder) else {
+            return;
+        };
+        let collapsed = f.collapsed;
+        let name = f.name.clone();
+        let color = f.color;
+        let child_count = session.folder_children.get(folder).map_or(0, Vec::len);
+        let selected = self.editor.selected_tracks().iter().any(|&t| {
+            session
+                .folder_children
+                .get(folder)
+                .is_some_and(|c| c.contains(&t))
+        });
+        let frame = egui::Frame::new()
+            .fill(if selected {
+                Color32::from_rgb(48, 56, 72)
+            } else {
+                Color32::from_gray(30)
+            })
+            .inner_margin(4.0);
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
+                frame.show(ui, |ui| {
+                    ui.set_height(TRACK_HEIGHT - 8.0);
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(if collapsed { "▸" } else { "▾" }).strong(),
+                                )
+                                .sense(Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            *action = Some(TrackAction::ToggleFolder(folder));
+                        }
+                        let icon = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover()).0;
+                        let c = folder_color(color, folder);
+                        ui.painter().rect_filled(icon, 4.0, c.gamma_multiply(0.35));
+                        ui.painter().rect_stroke(
+                            icon,
+                            4.0,
+                            egui::Stroke::new(1.0_f32, c),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            icon.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "▤",
+                            egui::FontId::proportional(13.0),
+                            c,
+                        );
+                        if let Some((fidx, text)) =
+                            self.folder_rename.as_mut().filter(|(f, _)| *f == folder)
+                        {
+                            let edit =
+                                ui.add(egui::TextEdit::singleline(text).desired_width(120.0));
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.folder_rename = None;
+                            } else if edit.lost_focus() {
+                                *action = Some(TrackAction::RenameFolder(*fidx));
+                            } else {
+                                edit.request_focus();
+                            }
+                        } else if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{name}  · {child_count}"))
+                                        .strong(),
+                                )
+                                .truncate()
+                                .sense(Sense::click()),
+                            )
+                            .on_hover_text(format!("{name}\nДвойной щелчок — переименовать"))
+                            .double_clicked()
+                        {
+                            self.folder_rename = Some((folder, name.clone()));
+                        }
+                    });
+                });
+            })
+            .response;
+        ui.painter().rect_filled(
+            Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height())),
+            0.0,
+            folder_color(color, folder),
+        );
+        response.context_menu(|ui| {
+            if ui.button("Переименовать").clicked() {
+                self.folder_rename = Some((folder, name.clone()));
+                ui.close();
+            }
+            ui.menu_button("Цвет", |ui| {
+                for c in 0..TRACK_COLORS {
+                    let swatch = egui::RichText::new("■■■■").color(folder_color(Some(c), 0));
+                    if ui.button(swatch).clicked() {
+                        *action = Some(TrackAction::FolderColor(folder, Some(c)));
+                        ui.close();
+                    }
+                }
+                if ui.button("Без цвета").clicked() {
+                    *action = Some(TrackAction::FolderColor(folder, None));
+                    ui.close();
+                }
+            });
+            if ui
+                .button(if collapsed {
+                    "Развернуть"
+                } else {
+                    "Свернуть"
+                })
+                .clicked()
+            {
+                *action = Some(TrackAction::ToggleFolder(folder));
+                ui.close();
+            }
+            let first = self
+                .editor
+                .session()
+                .folder_children
+                .get(folder)
+                .and_then(|c| c.iter().min().copied());
+            if ui
+                .add_enabled(first.is_some_and(|f| f > 0), egui::Button::new("Выше"))
+                .clicked()
+            {
+                *action = Some(TrackAction::MoveFolder(folder, first.unwrap_or(0) - 1));
+                ui.close();
+            }
+            if ui.button("Ниже").clicked() {
+                *action = Some(TrackAction::MoveFolder(
+                    folder,
+                    first
+                        .unwrap_or(self.editor.session().tracks.len())
+                        .saturating_add(1),
+                ));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Разобрать папку").clicked() {
+                *action = Some(TrackAction::UngroupFolder(folder));
+                ui.close();
+            }
+            if ui.button("Удалить").clicked() {
+                *action = Some(TrackAction::DeleteFolder(folder));
+                ui.close();
+            }
+        });
     }
 
     fn track_action(&mut self, action: TrackAction) {
@@ -2122,6 +2332,38 @@ impl App {
                     .duplicate_track(track)
                     .map(|_| "Дорожка продублирована")
             }
+            TrackAction::GatherFolder(tracks) => {
+                self.editor.create_folder(&tracks).map(|_| "Папка создана")
+            }
+            TrackAction::NewFolder => self.editor.create_empty_folder().map(|_| "Папка создана"),
+            TrackAction::RenameFolder(folder) => {
+                let Some((_, text)) = self.folder_rename.take() else {
+                    return;
+                };
+                self.editor
+                    .rename_folder(folder, &text)
+                    .map(|()| "Папка переименована")
+            }
+            TrackAction::FolderColor(folder, color) => self
+                .editor
+                .set_folder_color(folder, color)
+                .map(|()| "Цвет изменён"),
+            TrackAction::ToggleFolder(folder) => self
+                .editor
+                .toggle_folder(folder)
+                .map(|()| "Папка свёрнута/развёрнута"),
+            TrackAction::MoveFolder(folder, to) => self
+                .editor
+                .move_folder(folder, to)
+                .map(|()| "Папка перемещена"),
+            TrackAction::UngroupFolder(folder) => self
+                .editor
+                .delete_folder(folder, DeleteFolder::KeepChildren)
+                .map(|()| "Папка разобрана"),
+            TrackAction::DeleteFolder(folder) => {
+                self.delete_folder = Some(folder);
+                return;
+            }
         };
         self.status = match result {
             Ok(text) => text.into(),
@@ -2158,11 +2400,18 @@ impl App {
         // cancel (egui 0.33 clones it each frame, it is not drained).
         let hovering = !hovered.is_empty();
         let session = self.editor.session();
+        let visible = track_rows::row_count(session);
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
-        let audio_rows: Vec<bool> = session
-            .tracks
+        // `drop_target` indexes by visual row; folder headers take no file, so
+        // they read `false`, and each track reports whether it is audio.
+        let audio_rows: Vec<bool> = track_rows::visible_rows(session)
             .iter()
-            .map(|t| t.kind == audio_core::session::TrackKind::Audio)
+            .map(|row| match row {
+                track_rows::Row::Folder(_) => false,
+                track_rows::Row::Track(t) => {
+                    session.tracks[*t].kind == audio_core::session::TrackKind::Audio
+                }
+            })
             .collect();
         let snap = self.snap && !free;
         let zoom = self.zoom;
@@ -2235,7 +2484,7 @@ impl App {
                     )
                 }
                 None => {
-                    let top = area.min.y + TIMELINE_HEADER + tracks as f32 * TRACK_HEIGHT;
+                    let top = area.min.y + TIMELINE_HEADER + visible as f32 * TRACK_HEIGHT;
                     Rect::from_min_max(Pos2::new(area.min.x, top), area.max)
                 }
             };
@@ -2379,7 +2628,12 @@ impl App {
                 }),
             );
         }
-        self.import_in_background(dropped, target.track, Some(target.start));
+        // `target.track` is a visual row; recover the actual track index (a
+        // folder header row is never a drop target, so `track_at_row` holds).
+        let drop_track = target
+            .track
+            .and_then(|row| track_rows::track_at_row(self.editor.session(), row));
+        self.import_in_background(dropped, drop_track, Some(target.start));
     }
 
     /// Decodes a hovered file in the background so its waveform can show in
@@ -2454,19 +2708,24 @@ impl App {
         let session_seconds = self.editor.session().length_samples() as f64 / rate;
         let width = ((session_seconds as f32 + 10.0) * self.zoom).max(ui.available_width());
         let tracks = self.editor.session().tracks.len();
+        // The track area is as tall as the number of visible rows: every
+        // unfolded track plus one folder header per folder (SPEC-055 §4).
+        let visible = track_rows::row_count(self.editor.session());
         let height =
-            (TIMELINE_HEADER + TRACK_HEIGHT * tracks as f32).max(ui.available_height() - 4.0);
+            (TIMELINE_HEADER + TRACK_HEIGHT * visible as f32).max(ui.available_height() - 4.0);
 
         let (area, response) =
             ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
         self.drawn_zoom = self.zoom;
         if let Some(t) = self.reveal_track.take() {
-            let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
-            let left = area.min.x + samples_to_x(self.playhead, rate as u32, self.zoom);
-            ui.scroll_to_rect(
-                Rect::from_min_size(Pos2::new(left, top), Vec2::new(1.0, TRACK_HEIGHT)),
-                None,
-            );
+            if let Some(row) = track_rows::row_of_track(self.editor.session(), t) {
+                let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
+                let left = area.min.x + samples_to_x(self.playhead, rate as u32, self.zoom);
+                ui.scroll_to_rect(
+                    Rect::from_min_size(Pos2::new(left, top), Vec2::new(1.0, TRACK_HEIGHT)),
+                    None,
+                );
+            }
         }
         let view = ui.clip_rect();
         self.timeline_view = ((view.min.x - area.min.x).max(0.0), view.width());
@@ -2570,7 +2829,12 @@ impl App {
         let mut rects = Vec::new();
         let pointer = response.interact_pointer_pos();
         for (t, track) in self.editor.session().tracks.iter().enumerate() {
-            let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
+            // Collapsed folders hide their children; only draw visible tracks
+            // (SPEC-055 §4). The row offset is the track's visual row.
+            let Some(row) = track_rows::row_of_track(self.editor.session(), t) else {
+                continue;
+            };
+            let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
             painter.line_segment(
                 [
                     Pos2::new(area.min.x, top + TRACK_HEIGHT),
@@ -2707,13 +2971,17 @@ impl App {
             }
         }
 
-        let auto_row = self.auto.filter(|&t| t < tracks).map(|t| {
-            let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
-            Rect::from_min_max(
-                Pos2::new(area.min.x, top),
-                Pos2::new(area.max.x, top + TRACK_HEIGHT),
-            )
-        });
+        let auto_row = self
+            .auto
+            .filter(|&t| t < tracks)
+            .and_then(|t| track_rows::row_of_track(self.editor.session(), t))
+            .map(|r| {
+                let top = area.min.y + TIMELINE_HEADER + r as f32 * TRACK_HEIGHT;
+                Rect::from_min_max(
+                    Pos2::new(area.min.x, top),
+                    Pos2::new(area.max.x, top + TRACK_HEIGHT),
+                )
+            });
         if let (Some(t), Some(row)) = (self.auto.filter(|&t| t < tracks), auto_row) {
             self.draw_lane(&painter, area, row, t);
         }
@@ -2772,8 +3040,12 @@ impl App {
                     }
                     if let Some(p) = pointer {
                         let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
-                        if row >= 0.0 && (row as usize) < tracks {
-                            self.editor.select_track(row as usize, false, false);
+                        if row >= 0.0 {
+                            if let Some(track) =
+                                track_rows::track_at_row(self.editor.session(), row as usize)
+                            {
+                                self.editor.select_track(track, false, false);
+                            }
                         }
                     }
                 }
@@ -2789,7 +3061,11 @@ impl App {
                 let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
                 if row >= 0.0 {
                     let x = x_to_samples((p.x - area.min.x).max(0.0), rate_u32, self.zoom);
-                    self.new_region_on(row as usize, x);
+                    if let Some(track) =
+                        track_rows::track_at_row(self.editor.session(), row as usize)
+                    {
+                        self.new_region_on(track, x);
+                    }
                 }
             }
         }
@@ -2842,7 +3118,12 @@ impl App {
         }
         let left = area.min.x + samples_to_x(recorder.start, project, self.zoom);
         let seconds = samples.len() as f32 / rate as f32;
-        for row in rows {
+        for track in rows {
+            // `track` is a track index; a folder above shifts its visual row,
+            // and a collapsed folder hides it entirely (SPEC-055 §4).
+            let Some(row) = track_rows::row_of_track(self.editor.session(), track) else {
+                continue;
+            };
             let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
             let rect = Rect::from_min_size(
                 Pos2::new(left, top + 3.0),
@@ -3652,10 +3933,14 @@ impl App {
                 let start = fit((at as i64 - drag.grab).max(0) as u64);
                 let tracks = self.editor.session().tracks.len();
                 let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
+                // A visual row may be a folder header; dragging onto it keeps
+                // the clip on its current track (SPEC-055 §4).
                 let to = if row < 0.0 {
                     0
                 } else {
-                    (row as usize).min(tracks.saturating_sub(1))
+                    track_rows::track_at_row(self.editor.session(), row as usize)
+                        .unwrap_or(drag.track)
+                        .min(tracks.saturating_sub(1))
                 };
                 if self.editor.selected_clips().len() > 1 {
                     // SPEC-047 §4: the grabbed clip leads the whole group.
@@ -3720,19 +4005,21 @@ impl App {
                 .max(0.0) as usize
         };
         let (top, bottom) = (row(origin.y.min(p.y)), row(origin.y.max(p.y)));
-        let rows = if top < tracks {
-            top..=bottom.min(tracks - 1)
-        } else {
-            // An empty range: the band is below the last track.
-            #[allow(clippy::reversed_empty_ranges, reason = "selects nothing on purpose")]
-            let none = 1..=0;
-            none
-        };
+        // Rubber band selects every visible track whose visual row lies in the
+        // band; collapsed children are hidden and skipped (SPEC-055 §4).
+        let mut rows = Vec::new();
+        for t in 0..tracks {
+            if let Some(r) = track_rows::row_of_track(self.editor.session(), t) {
+                if (top..=bottom).contains(&r) {
+                    rows.push(t);
+                }
+            }
+        }
         let from = x_to_samples((origin.x - area.min.x).max(0.0), rate, self.zoom);
         let to = x_to_samples((p.x - area.min.x).max(0.0), rate, self.zoom);
         let done = response.drag_stopped() || !ui.input(|i| i.pointer.primary_down());
         if !additive || done {
-            let count = self.editor.select_clips_in(rows, from, to, additive);
+            let count = self.editor.select_clips_in_any(&rows, from, to, additive);
             if done {
                 self.band = None;
                 self.status = format!(
@@ -5147,6 +5434,45 @@ impl eframe::App for App {
         self.about_window(ctx);
         self.new_track_window(ctx);
         self.export_window(ctx);
+
+        if let Some(folder) = self.delete_folder {
+            let name = self
+                .editor
+                .session()
+                .folders
+                .get(folder)
+                .map_or_else(|| "папка".to_owned(), |f| f.name.clone());
+            let mut open = true;
+            egui::Window::new("Удалить папку")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(format!("Удалить папку «{name}» вместе с дорожками?"));
+                    ui.horizontal(|ui| {
+                        // Safe default: keep the children on the top level.
+                        if ui.button("Оставить дорожки").clicked() {
+                            let _ = self
+                                .editor
+                                .delete_folder(folder, DeleteFolder::KeepChildren);
+                            self.delete_folder = None;
+                        }
+                        if ui.button("Удалить дорожки").clicked() {
+                            let _ = self
+                                .editor
+                                .delete_folder(folder, DeleteFolder::DeleteChildren);
+                            self.delete_folder = None;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            self.delete_folder = None;
+                        }
+                    });
+                });
+            if !open {
+                self.delete_folder = None;
+            }
+        }
 
         if self.confirm_quit {
             egui::Window::new("Несохранённые изменения")
