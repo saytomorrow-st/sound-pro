@@ -404,9 +404,10 @@ fn typing(ctx: &egui::Context) -> bool {
 /// playhead advances, while a clear audio error is shown in the status bar.
 struct Player {
     control: PlaybackControl,
-    /// The open audio stream, when an output device could be opened.
+    /// The open audio stream, when an output device could be opened. Held only
+    /// so its `Drop` stops the stream when playback ends or is replaced.
     #[cfg(feature = "audio")]
-    stream: Option<daw_app::realtime::RealtimeHandle>,
+    _stream: Option<daw_app::realtime::RealtimeHandle>,
     /// The engine advanced on the control thread when `stream` is `None`
     /// (no device): the transport still runs, just without sound.
     #[cfg(feature = "audio")]
@@ -860,31 +861,63 @@ impl App {
                     }
                     self.player = Some(Player {
                         control,
-                        stream: Some(stream),
+                        _stream: Some(stream),
                         silent_engine: None,
                         silent_clock: None,
                         played: self.editor.session().clone(),
                         changed: None,
                     });
                 }
-                Err(e) => {
+                Err(boxed) => {
+                    let (e, engine) = *boxed;
                     // No usable output device: keep the transport rolling on a
                     // silent clock so the playhead advances and the UI stays
                     // alive, and tell the user plainly what is wrong.
                     if play_debug {
                         eprintln!(
-                            "[play-debug] start_output_with error: {e}; falling back to silent transport"
+                            "[play-debug] start_output_with error: {e}; engine recoverable: {}",
+                            engine.is_some()
                         );
                     }
-                    self.status = format!("Нет звука (устройство вывода недоступно): {e}");
-                    self.player = Some(Player {
-                        control,
-                        stream: None,
-                        silent_engine: Some(engine),
-                        silent_clock: Some(std::time::Instant::now()),
-                        played: self.editor.session().clone(),
-                        changed: None,
+                    // On Linux, diagnose *why* (missing libasound / no device /
+                    // missing pipewire-alsa) and show a Russian explanation with
+                    // an install hint. Elsewhere, fall back to the raw error.
+                    #[cfg(target_os = "linux")]
+                    let message = daw_app::realtime::diagnose_alsa_failure().unwrap_or_else(|| {
+                        format!("Нет звука (устройство вывода недоступно): {e}")
                     });
+                    #[cfg(not(target_os = "linux"))]
+                    let message = format!("Нет звука (устройство вывода недоступно): {e}");
+
+                    if play_debug {
+                        eprintln!("[play-debug] audio diagnostics: {message}");
+                    }
+                    self.status = message;
+                    match engine {
+                        Some(engine) => {
+                            self.player = Some(Player {
+                                control,
+                                _stream: None,
+                                silent_engine: Some(engine),
+                                silent_clock: Some(std::time::Instant::now()),
+                                played: self.editor.session().clone(),
+                                changed: None,
+                            });
+                        }
+                        None => {
+                            // Pathological: the probe succeeded but the real
+                            // stream failed, consuming the engine. Stop rather
+                            // than leave a stalled "playing" state.
+                            if play_debug {
+                                eprintln!(
+                                    "[play-debug] engine unrecoverable after probe; stopping"
+                                );
+                            }
+                            let mut control = control;
+                            control.stop();
+                            self.player = None;
+                        }
+                    }
                 }
             }
         }
