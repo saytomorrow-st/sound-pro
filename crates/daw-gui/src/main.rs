@@ -7,6 +7,8 @@
 
 mod audio_editor;
 mod shell;
+#[cfg(target_os = "linux")]
+mod x11_cursor;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -283,6 +285,23 @@ fn draw_crossfade_x(painter: &egui::Painter, body: Rect) {
     painter.line_segment([body.left_top(), body.right_bottom()], line);
 }
 
+/// A bright crosshair plus a label at `p`, used by the drop debug overlay to
+/// show where the OS cursor and egui's pointer each think the cursor is.
+fn draw_cross(painter: &egui::Painter, p: egui::Pos2, color: Color32, label: &str) {
+    let r = 12.0;
+    let stroke = Stroke::new(2.0_f32, color);
+    painter.line_segment([Pos2::new(p.x - r, p.y), Pos2::new(p.x + r, p.y)], stroke);
+    painter.line_segment([Pos2::new(p.x, p.y - r), Pos2::new(p.x, p.y + r)], stroke);
+    painter.circle_stroke(p, r, stroke);
+    painter.text(
+        Pos2::new(p.x + r + 3.0, p.y + r + 3.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(14.0),
+        color,
+    );
+}
+
 fn rgb_detail(colors: &daw_gui::layout::RegionColors) -> Color32 {
     let [r, g, b] = colors.detail;
     Color32::from_rgb(r, g, b)
@@ -393,6 +412,12 @@ const REFRESH_DELAY: std::time::Duration = std::time::Duration::from_millis(120)
 /// A file decoded on a background thread (SPEC-035): path, target track,
 /// start, and the channels at the project rate (SPEC-050 §5).
 type HoverBlocks = (PathBuf, usize, Vec<(f32, f32)>);
+
+// X11 cursor position in physical pixels, read via XQueryPointer. A type alias
+// keeps the non-Linux drop-debug fallbacks (which always produce `None`) from
+// tripping clippy::type_complexity on the Windows/macOS cfg branch.
+#[cfg(not(target_os = "linux"))]
+type CursorWinPx = Option<(i16, i16)>;
 
 type Decoded = (
     PathBuf,
@@ -514,6 +539,13 @@ struct App {
     hover_rx: std::sync::mpsc::Receiver<HoverBlocks>,
     /// Last pointer position over the window; a drop no longer has one.
     drop_tracker: daw_gui::DropTracker,
+    /// OS cursor query used at drop time (X11 only): winit drops
+    /// `XdndPosition` during an external drag, so egui's pointer is stale.
+    #[cfg(target_os = "linux")]
+    x11_cursor: Option<x11_cursor::X11Cursor>,
+    /// Draw the XQueryPointer / egui pointer debug crosses while a file is
+    /// hovered (set `SOUND_PRO_DROP_DEBUG=1`). Read once at startup.
+    drop_debug: bool,
     status: String,
     /// Timeline zoom in pixels per second.
     zoom: f32,
@@ -647,6 +679,9 @@ impl App {
             hover_tx,
             hover_rx,
             drop_tracker: daw_gui::DropTracker::default(),
+            #[cfg(target_os = "linux")]
+            x11_cursor: None,
+            drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
             player: None,
             status: "Готово. Файл → Импорт WAV…, чтобы добавить звук.".into(),
             zoom: 100.0,
@@ -1817,7 +1852,9 @@ impl App {
                 i.modifiers.shift,
             )
         });
-        let hovering = !hovered.is_empty() || ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        // egui keeps `raw.hovered_files` until winit reports the drop or the
+        // cancel (egui 0.33 clones it each frame, it is not drained).
+        let hovering = !hovered.is_empty();
         let session = self.editor.session();
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
         let audio_rows: Vec<bool> = session
@@ -1827,9 +1864,9 @@ impl App {
             .collect();
         let snap = self.snap && !free;
         let zoom = self.zoom;
-        let target_at = |p: Pos2| {
+        let to_target = |local: (f32, f32)| {
             daw_gui::drop_target(
-                Some((p.x - area.min.x, p.y - area.min.y)),
+                Some(local),
                 RULER_HEIGHT,
                 TRACK_HEIGHT,
                 &audio_rows,
@@ -1839,9 +1876,53 @@ impl App {
                 snap,
             )
         };
+        // `p` is window-local in egui points; `drop_target` wants the position
+        // measured from the timeline's top-left corner.
+        let target_at = |p: Pos2| to_target((p.x - area.min.x, p.y - area.min.y));
+        // OS cursor from X11 `QueryPointer` (`win_x`/`win_y`, physical px ->
+        // egui points). It is correct at drop time (owner-verified in PR #62),
+        // but it can stay frozen while a Wayland client drives the drag.
+        #[cfg(target_os = "linux")]
+        let xquery = self
+            .x11_cursor
+            .as_ref()
+            .and_then(x11_cursor::X11Cursor::position_debug);
+        let ppp = ui.ctx().pixels_per_point();
+        let ppp = if ppp.is_finite() && ppp > 0.0 {
+            ppp
+        } else {
+            1.0
+        };
+        #[cfg(target_os = "linux")]
+        let os_points: Option<(f32, f32)> = xquery
+            .filter(|p| p.same_screen)
+            .map(|p| (f32::from(p.win.0) / ppp, f32::from(p.win.1) / ppp));
+        #[cfg(not(target_os = "linux"))]
+        let os_points: Option<(f32, f32)> = None;
+        let os_pointer = os_points.map(|(x, y)| Pos2::new(x, y));
+        // One pointer source for both the ghost and the drop. The vendored
+        // winit turns every `XdndPosition` into `CursorMoved`, so egui's
+        // `latest_pos` stays live during an external drag on both X11 and
+        // Wayland sources. XQueryPointer (`win_x`/`win_y`) can freeze while a
+        // Wayland client (Nautilus) drives the drag, so it is only a fallback
+        // when egui reports no pointer. Using one source guarantees the ghost
+        // sits exactly where the region will land.
+        let (effective_pointer, pointer_source) = match (pointer, os_pointer) {
+            (Some(p), _) => (Some(p), "egui/xdnd"),
+            (None, Some(p)) => (Some(p), "xquery"),
+            (None, None) => (None, "none"),
+        };
         if hovering {
-            let painter = ui.painter_at(area);
-            let target = pointer.map(target_at);
+            // The ghost is drawn on a foreground layer so it paints over the
+            // clips/regions, which are drawn later on the timeline painter.
+            let painter = ui
+                .ctx()
+                .layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("drop-ghost"),
+                ))
+                .with_clip_rect(area);
+            let target = effective_pointer.map(target_at);
             self.drop_tracker.hover(target);
             let band = match target.and_then(|t| t.track) {
                 Some(t) => {
@@ -1903,6 +1984,15 @@ impl App {
                         StrokeKind::Inside,
                     );
                     self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
+                    if self.drop_debug {
+                        eprintln!(
+                            "DROP-DEBUG hover ghost_rect=[({x0:.1},{:.1})..({x1:.1},{:.1})] start={} track={:?}",
+                            band.min.y + 2.0,
+                            band.min.y + TRACK_HEIGHT - 2.0,
+                            t.start,
+                            t.track,
+                        );
+                    }
                 }
                 (Some(Err(e)), _) => self.status = format!("Ошибка: {e}"),
                 _ => {
@@ -1914,8 +2004,39 @@ impl App {
                     self.status = "Отпустите файл: на дорожку или ниже — новая дорожка".into();
                 }
             }
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
+            ui.ctx().request_repaint();
+            if self.drop_debug {
+                #[cfg(target_os = "linux")]
+                let (xq_win, xq_root, xq_mask) = xquery.map_or((None, None, None), |q| {
+                    (Some(q.win), Some(q.root), Some(q.mask))
+                });
+                #[cfg(not(target_os = "linux"))]
+                let (xq_win, xq_root, xq_mask): (
+                    CursorWinPx,
+                    CursorWinPx,
+                    Option<u16>,
+                ) = (None, None, None);
+                eprintln!(
+                    "DROP-DEBUG hover source={pointer_source} egui={pointer:?} xquery_win={xq_win:?} \
+                     xquery_root={xq_root:?} mask={xq_mask:?} ppp={ppp} effective={effective_pointer:?} \
+                     area_min=({:.1},{:.1}) start={:?} track={:?}",
+                    area.min.x,
+                    area.min.y,
+                    target.map(|t| t.start),
+                    target.and_then(|t| t.track),
+                );
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("drop-debug-cross"),
+                ));
+                // Red: X11 QueryPointer; green: egui pointer (fed by XDND).
+                if let Some(p) = os_pointer {
+                    draw_cross(&painter, p, Color32::RED, "xq");
+                }
+                if let Some(p) = pointer {
+                    draw_cross(&painter, p, Color32::GREEN, "eg");
+                }
+            }
         } else if dropped.is_empty() {
             self.probes.clear();
             self.drop_tracker.cancel();
@@ -1924,7 +2045,38 @@ impl App {
             return;
         }
         self.probes.clear();
-        let target = self.drop_tracker.release(pointer.map(target_at));
+        // The ghost and the drop share one pointer source (`effective_pointer`)
+        // and one conversion (`target_at`), so the region lands exactly where
+        // the ghost was drawn. The last hover target wins over the drop-frame
+        // position so a final-frame pointer glitch cannot move the drop.
+        let target = match effective_pointer {
+            Some(p) => {
+                // Same live source the ghost used; drop right under it.
+                self.drop_tracker.cancel();
+                target_at(p)
+            }
+            _ => self.drop_tracker.release(pointer.map(target_at)),
+        };
+        if self.drop_debug {
+            #[cfg(target_os = "linux")]
+            let (xq_win, xq_root) = xquery.map_or((None, None), |q| (Some(q.win), Some(q.root)));
+            #[cfg(not(target_os = "linux"))]
+            let (xq_win, xq_root): (CursorWinPx, CursorWinPx) = (None, None);
+            eprintln!(
+                "DROP-DEBUG drop source={pointer_source} xquery_win={xq_win:?} xquery_root={xq_root:?} \
+                 ppp={ppp} os_points={os_points:?} egui={pointer:?} effective={effective_pointer:?} \
+                 area_min=({:.1},{:.1}) ruler_h={RULER_HEIGHT} row_h={TRACK_HEIGHT} tracks={tracks} \
+                 target.track={:?} target.start={} ghost_at_egui={:?}",
+                area.min.x,
+                area.min.y,
+                target.track,
+                target.start,
+                pointer.map(|p| {
+                    let t = target_at(p);
+                    (t.track, t.start)
+                }),
+            );
+        }
         self.import_in_background(dropped, target.track, Some(target.start));
     }
 
@@ -4311,6 +4463,10 @@ fn press_pos(input: &egui::InputState) -> Option<Pos2> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "linux")]
+        if self.x11_cursor.is_none() {
+            self.x11_cursor = x11_cursor::X11Cursor::from_frame(_frame);
+        }
         if !self.themed {
             shell::apply_theme(ctx);
             self.themed = true;

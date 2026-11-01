@@ -18,6 +18,21 @@ daw-app = { path = "../daw-app" }
 thiserror = { workspace = true }
 eframe = { version = "0.33", default-features = false, features = ["glow", "x11", "default_fonts"] }
 rfd = "0.17"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Safe X11 bindings used to read the OS cursor at drop time: winit discards
+# XdndPosition during an external XDND drag, so egui's pointer position is
+# stale/None and the drop otherwise lands off-target (SPEC-050 §2).
+x11rb = "0.13"
+
+# Diagnostic example (run `cargo run -p daw-gui --example drop-probe`):
+# compares candidate cursor-position sources during an XDND drag.
+# Diagnostic example (run `cargo run -p daw-gui --example drop-probe`):
+# compares candidate cursor-position sources during an XDND drag. X11-only, so
+# it lives under the Linux target to keep the Windows build free of X11.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11-dl = "2.21"
 
 [features]
 # Live sound through the default output device (needs ALSA headers on Linux).

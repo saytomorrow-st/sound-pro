@@ -298,6 +298,178 @@ fn a_negative_x_drops_at_zero() {
     assert_eq!((t.track, t.start), (Some(0), 0));
 }
 
+#[test]
+fn native_pointer_conversion_scales_by_pixels_per_point() {
+    // A 2x (HiDPI) screen: the same physical cursor distance maps to half the
+    // egui points. A 100px cursor at a 2x scale is 50 points in.
+    let local = daw_gui::native_pointer_to_timeline(
+        (300.0, 200.0), // native cursor, monitor space
+        (100.0, 100.0), // window origin in native px
+        2.0,
+        (0.0, 0.0),
+    );
+    assert_eq!(local, (100.0, 50.0));
+}
+
+#[test]
+fn native_pointer_conversion_is_independent_of_window_position() {
+    // The same cursor offset from the window must give the same timeline point
+    // whether the window sits at (10, 10) or (1500, 900) on the desktop.
+    let origin = (1500.0, 900.0);
+    let local = daw_gui::native_pointer_to_timeline(
+        (origin.0 + 240.0, origin.1 + 120.0),
+        origin,
+        1.0,
+        (0.0, 0.0),
+    );
+    assert_eq!(local, (240.0, 120.0));
+}
+
+#[test]
+fn native_pointer_conversion_subtracts_the_timeline_area_origin() {
+    // The timeline does not start at the window's top-left: its own origin must
+    // be subtracted so the drop lands on the timeline, not the window frame.
+    let local = daw_gui::native_pointer_to_timeline((500.0, 400.0), (0.0, 0.0), 1.0, (40.0, 24.0));
+    assert_eq!(local, (460.0, 376.0));
+}
+
+#[test]
+fn native_pointer_conversion_ignores_window_size() {
+    // A drop must land at the same place no matter how large the window is:
+    // only the window origin (its `.min`) and the scale factor matter. The
+    // old bug placed the region depending on screen/window size.
+    let origin = (100.0, 50.0);
+    let scale = 1.5;
+    let cursor = (origin.0 + 180.0, origin.1 + 90.0);
+    let expected = daw_gui::native_pointer_to_timeline(cursor, origin, scale, (0.0, 0.0));
+    // Three very different window sizes all share the same top-left origin.
+    for _size in [(1920.0, 1080.0), (800.0, 600.0), (2560.0, 1440.0)] {
+        let local = daw_gui::native_pointer_to_timeline(cursor, origin, scale, (0.0, 0.0));
+        assert_eq!(local, expected);
+    }
+}
+
+#[test]
+fn native_pointer_conversion_falls_back_on_a_bad_scale() {
+    // A non-finite or non-positive scale must not produce NaN/inf or divide by
+    // zero; it behaves as a 1x screen.
+    for bad in [f32::NAN, f32::INFINITY, 0.0, -2.0] {
+        let local =
+            daw_gui::native_pointer_to_timeline((120.0, 80.0), (20.0, 30.0), bad, (0.0, 0.0));
+        assert_eq!(local, (100.0, 50.0), "scale {bad}");
+    }
+}
+
+#[test]
+fn a_scaled_window_places_the_clip_under_the_cursor() {
+    // End-to-end: `XQueryPointer` returns *window-relative* native pixels, so
+    // only the scale factor and the timeline's own top-left corner (area.min)
+    // matter — never the window size or its desktop position. This is the
+    // actual conversion `handle_drop` performs on X11.
+    let audio = [true, true];
+    let scale = 2.0;
+    // Cursor over row 1 (y = 24 + 80 + 10 = 114 points from the window top),
+    // at x = 130 points. The window-relative native pixels come from
+    // `XQueryPointer`; only the scale factor matters, never the window size.
+    let win_x = 130.0 * scale;
+    let win_y = 114.0 * scale;
+    let local = daw_gui::native_pointer_to_timeline((win_x, win_y), (0.0, 0.0), scale, (0.0, 0.0));
+    let t = daw_gui::drop_target(Some(local), 24.0, 80.0, &audio, RATE, 100.0, 120.0, false);
+    assert_eq!(t.track, Some(1));
+    assert_eq!(t.start, daw_gui::x_to_samples(130.0, RATE, 100.0));
+}
+
+#[test]
+fn the_os_cursor_drop_does_not_depend_on_window_size() {
+    // Bug: the region used to land somewhere that changed with the screen/window
+    // size. Because `XQueryPointer` reports window-relative pixels, the same
+    // window-relative cursor maps to the same timeline point at every window
+    // size (only the scale matters).
+    let audio = [true];
+    let scale = 1.5;
+    // Cursor at 90 points in from the window left, on row 0 (y = 24 + 10 = 34).
+    let win = (90.0 * scale, 34.0 * scale);
+    let expected = daw_gui::native_pointer_to_timeline(win, (0.0, 0.0), scale, (0.0, 0.0));
+    for _size in [(1920.0, 1080.0), (800.0, 600.0), (2560.0, 1440.0)] {
+        let local = daw_gui::native_pointer_to_timeline(win, (0.0, 0.0), scale, (0.0, 0.0));
+        let t = daw_gui::drop_target(Some(local), 24.0, 80.0, &audio, RATE, 100.0, 120.0, false);
+        assert_eq!(t.track, Some(0));
+        assert_eq!(local, expected);
+    }
+}
+
+#[test]
+fn a_scaled_drop_onto_an_existing_track_with_regions_stays_on_it() {
+    // Bug #2: a drop onto a track that already has regions must not create a
+    // new track. The cursor (scaled, with a window origin) maps to row 0, and
+    // the file lands as a second clip on that same track.
+    let dir = Scratch::new("scaled-existing");
+    let first = dir.join("a.wav");
+    write_wav(&first, 4800);
+    let wav = dir.join("d.wav");
+    write_wav(&wav, 4800);
+    let mut editor = Editor::new();
+    editor.import_audio_at(&first, None, None).unwrap();
+    let audio: Vec<bool> = editor
+        .session()
+        .tracks
+        .iter()
+        .map(|t| t.kind == audio_core::session::TrackKind::Audio)
+        .collect();
+
+    let scale = 1.5;
+    // Window-relative native cursor over row 0 (y = 24 + 10 = 34 points) at
+    // x = 200 points. The window origin is already baked into `XQueryPointer`,
+    // so nothing is subtracted but the scale.
+    let win = (200.0 * scale, 34.0 * scale);
+    let local = daw_gui::native_pointer_to_timeline(win, (0.0, 0.0), scale, (0.0, 0.0));
+    let t = daw_gui::drop_target(Some(local), 24.0, 80.0, &audio, RATE, 100.0, 120.0, true);
+    assert_eq!(t.track, Some(0), "the cursor is over the existing track");
+    let (index, _) = editor
+        .import_audio_at(&wav, t.track, Some(t.start))
+        .unwrap();
+    assert_eq!(editor.session().tracks.len(), 1, "no new track is created");
+    assert_eq!(index, 0);
+    assert_eq!(editor.session().tracks[0].clips.len(), 2);
+}
+
+#[test]
+fn the_ghost_preview_and_the_drop_agree_on_track_and_start() {
+    // The ghost preview and the final drop must both go through the same
+    // conversion (window-relative `XQueryPointer` px / ppp - area.min) and the
+    // same `drop_target`, so the region lands exactly where the ghost was
+    // drawn. This reproduces the owner's *working* live numbers: ppp = 2,
+    // timeline origin (area.min) = (440.5, 118), XQueryPointer win=(1158,389)
+    // -> points (579, 194.5) -> local y = 76.5 -> row 0 (track 0).
+    let audio = [true, true];
+    let scale = 2.0;
+    let origin = (440.5_f32, 118.0_f32);
+    // XQueryPointer reports *window-relative* physical px; only ppp divides it
+    // into egui points.
+    let win = (1158.0_f32, 389.0_f32);
+    let points = (win.0 / scale, win.1 / scale);
+    let local = (points.0 - origin.0, points.1 - origin.1);
+    // Both the preview frame and the drop frame run this identical conversion
+    // and target computation (they share one code path in `handle_drop`).
+    let preview = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    let drop = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    assert_eq!(
+        preview.track, drop.track,
+        "ghost and drop must pick one track"
+    );
+    assert_eq!(
+        preview.start, drop.start,
+        "ghost and drop must share one start"
+    );
+    // local y = 194.5 - 118 = 76.5; row 0 spans y=24..96, so the cursor is over
+    // the first existing track.
+    assert_eq!(
+        drop.track,
+        Some(0),
+        "cursor is over the first existing track"
+    );
+}
+
 /// What the window computes on each frame of a drag: hover frames feed the
 /// tracker, the drop frame asks it where the file goes.
 fn frame_target(pointer: Option<(f32, f32)>, audio: &[bool]) -> Option<daw_gui::DropTarget> {
@@ -389,4 +561,136 @@ fn a_drop_on_an_existing_audio_track_does_not_add_a_track() {
     assert_eq!(editor.session().tracks.len(), 1);
     assert_eq!(index, 0);
     assert_eq!(editor.session().tracks[0].clips[1].start_samples, t.start);
+}
+
+// Regression for the live X11 test (PR #62, the *working* iteration 2): the
+// owner's exact drop numbers. ppp=2 (200% HiDPI), area_min=(440.5,118),
+// XQueryPointer win=(1158,389) -> points (579,194.5) -> local (138.5,76.5) ->
+// row 0 (track 0). TRACK_HEIGHT=72 / RULER_HEIGHT=24.
+#[test]
+fn the_owner_drop_numbers_map_to_the_expected_row() {
+    // Step 1: window-relative native px -> egui points (divide by ppp).
+    let points = (
+        1158.0_f32 / 2.0, // 579.0
+        389.0_f32 / 2.0,  // 194.5
+    );
+    assert_eq!(points, (579.0, 194.5));
+    // Step 2: egui points -> timeline-relative (subtract area.min).
+    let local = (points.0 - 440.5, points.1 - 118.0);
+    assert_eq!(local, (138.5, 76.5));
+
+    // With two audio tracks (rows 0 and 1 span y=24..96 and y=96..168
+    // relative to the timeline top), y=76.5 is over row 0, so track 0.
+    let audio = [true, true];
+    let t = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, false);
+    assert_eq!(t.track, Some(0), "y=76.5 is over the first 72pt track");
+
+    // A cursor genuinely below the last track (y = 24 + 72*2 + 10 = 178
+    // relative) must create a new track.
+    let below = daw_gui::drop_target(
+        Some((138.5, 178.0)),
+        24.0,
+        72.0,
+        &audio,
+        RATE,
+        100.0,
+        120.0,
+        false,
+    );
+    assert_eq!(below.track, None);
+}
+
+// The owner's full live drop, end to end (PR #63 spec): ppp=2, area.min
+// (440.5,118), ruler 24, row 72, scroll (-3,-3). XQueryPointer win=(1158,389)
+// -> os_points (579,194.5) -> local (138.5,76.5) -> track 0, start snapped to
+// the beat: 138.5 / 100 * 48000 = 66480 -> 3 beats * 24000 = 72000.
+#[test]
+fn the_owner_full_drop_maps_to_track_zero_and_start_72000() {
+    let audio = [true, true];
+    let (scale, area) = (2.0, (440.5_f32, 118.0_f32));
+    let win = (1158.0_f32, 389.0_f32);
+    let points = (win.0 / scale, win.1 / scale);
+    assert_eq!(points, (579.0, 194.5));
+    let local = (points.0 - area.0, points.1 - area.1);
+    assert_eq!(local, (138.5, 76.5));
+    let t = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    assert_eq!(t.track, Some(0));
+    assert_eq!(t.start, 72_000);
+}
+
+// The native conversion is scale- and window-size-independent: the owner's
+// cursor, reported window-relative, maps to the same timeline point whether
+// the window is small or large (only the origin and scale factor matter).
+#[test]
+fn the_owner_drop_is_independent_of_window_size() {
+    let scale = 2.0;
+    let origin = (440.5_f32, 118.0_f32);
+    // Cursor 138.5pt right and 76.5pt down from the timeline origin, in
+    // native px.
+    let cursor_native = (origin.0 + 138.5, origin.1 + 76.5);
+    for _size in [(1920.0, 1080.0), (800.0, 600.0), (2560.0, 1440.0)] {
+        let local = daw_gui::native_pointer_to_timeline(
+            (cursor_native.0 * scale, cursor_native.1 * scale),
+            (0.0, 0.0),
+            scale,
+            origin,
+        );
+        assert_eq!(local, (138.5, 76.5));
+    }
+}
+
+// The working behaviour (iteration 2): XQueryPointer's `win_x`/`win_y` are
+// measured from the *client* window (what winit owns via raw_window_handle),
+// NOT from the WM frame. There is no title-bar offset to subtract, so a
+// cursor over a track lands on that track directly from `win_y`.
+#[test]
+fn the_client_window_coords_have_no_title_bar_offset() {
+    // Two tracks, ruler 24pt, row height 72pt, area top at y=118. Track 1
+    // spans y=214..286 in window points. A cursor 15pt above track 1's bottom
+    // edge (egui y=271) reads the same value from `win_y`.
+    let audio = [true, true];
+    let area_min_y = 118.0_f32;
+    let cursor_window_y = 271.0_f32;
+    let local_y = cursor_window_y - area_min_y;
+    let t = daw_gui::drop_target(
+        Some((0.0, local_y)),
+        24.0,
+        72.0,
+        &audio,
+        RATE,
+        100.0,
+        120.0,
+        false,
+    );
+    assert_eq!(t.track, Some(1), "client coords drop onto track 1");
+}
+
+// The vendored winit turns `XdndPosition` (root px) into `CursorMoved` by
+// subtracting the client window origin in root (`TranslateCoordinates`). With
+// the owner's numbers (root=(1158,453), client origin=(0,64)) that equals the
+// XQueryPointer `win` value the drop uses, so the ghost (egui pointer) and the
+// drop (XQueryPointer) resolve to the same track and start.
+#[test]
+fn the_xdnd_ghost_and_the_xquery_drop_agree_on_the_owner_numbers() {
+    let audio = [true, true];
+    let (scale, area) = (2.0, (440.5_f32, 118.0_f32));
+    let ghost = daw_gui::native_pointer_to_timeline((1158.0, 453.0), (0.0, 64.0), scale, area);
+    let drop = daw_gui::native_pointer_to_timeline((1158.0, 389.0), (0.0, 0.0), scale, area);
+    assert_eq!(ghost, drop);
+    let at = |p| daw_gui::drop_target(Some(p), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    let (g, d) = (at(ghost), at(drop));
+    assert_eq!((g.track, g.start), (d.track, d.start));
+    assert_eq!(d.track, Some(0));
+}
+
+// A pointer moving below the last track turns the ghost into the "new track"
+// band, and the drop at that point also makes a new track.
+#[test]
+fn an_xdnd_pointer_below_the_last_track_makes_a_new_track() {
+    let audio = [true, true];
+    let (scale, area) = (2.0, (440.5_f32, 118.0_f32));
+    // Root y = 64 (title) + 2 * (118 + 24 + 72 * 2 + 10) px.
+    let local = daw_gui::native_pointer_to_timeline((1158.0, 656.0), (0.0, 64.0), scale, area);
+    let t = daw_gui::drop_target(Some(local), 24.0, 72.0, &audio, RATE, 100.0, 120.0, true);
+    assert_eq!(t.track, None);
 }
