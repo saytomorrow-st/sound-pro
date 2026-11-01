@@ -520,7 +520,8 @@ fn write_sends(out: &mut String, sends: &[BusSend]) {
 }
 
 /// Appends the session's `"buses"` array (SPEC-028). Bus effects reuse the
-/// track effect format at the same indent.
+/// track effect format at the same indent; SPEC-051 adds `sends`, `mute` and
+/// `solo`, written only when present/`true`.
 fn write_buses(out: &mut String, buses: &[Bus]) {
     out.push_str(",\n    \"buses\": [");
     for (index, bus) in buses.iter().enumerate() {
@@ -533,6 +534,26 @@ fn write_buses(out: &mut String, buses: &[Bus]) {
         out.push_str(&format_number(f64::from(bus.gain)));
         if !bus.effects.is_empty() {
             write_effects(out, &bus.effects);
+        }
+        if !bus.sends.is_empty() {
+            out.push_str(",\n        \"sends\": [");
+            for (send_index, send) in bus.sends.iter().enumerate() {
+                if send_index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("{\"bus\": ");
+                out.push_str(&send.bus.to_string());
+                out.push_str(", \"level\": ");
+                out.push_str(&format_number(f64::from(send.level)));
+                out.push('}');
+            }
+            out.push(']');
+        }
+        if bus.mute {
+            out.push_str(",\n        \"mute\": true");
+        }
+        if bus.solo {
+            out.push_str(",\n        \"solo\": true");
         }
         out.push_str("\n      }");
     }
@@ -648,11 +669,17 @@ fn buses_from_value(value: &Value) -> Result<Vec<Bus>, ProjectError> {
             let mut name = None;
             let mut gain = None;
             let mut effects = None;
+            let mut sends = None;
+            let mut mute = None;
+            let mut solo = None;
             for (key, value) in entries {
                 match key.as_str() {
                     "name" => name = Some(require_string(value)?),
                     "gain" => gain = Some(require_f32(value)?),
                     "effects" => effects = Some(effects_from_value(value)?),
+                    "sends" => sends = Some(sends_from_value(value)?),
+                    "mute" => mute = Some(require_bool(value)?),
+                    "solo" => solo = Some(require_bool(value)?),
                     other => {
                         return Err(ProjectError::UnknownField {
                             field: other.to_owned(),
@@ -666,6 +693,9 @@ fn buses_from_value(value: &Value) -> Result<Vec<Bus>, ProjectError> {
                 })?,
                 gain: gain.unwrap_or(1.0),
                 effects: effects.unwrap_or_default(),
+                mute: mute.unwrap_or(false),
+                solo: solo.unwrap_or(false),
+                sends: sends.unwrap_or_default(),
             })
         })
         .collect()

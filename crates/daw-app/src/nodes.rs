@@ -863,26 +863,77 @@ impl Track {
 }
 
 /// One bus at render time: summed sends, its effects per channel, its gain
-/// (SPEC-028).
+/// (SPEC-028) and its sends/mute/solo (SPEC-051).
 struct BusChannel {
     gain: f32,
+    /// Whether the bus returns to the master (SPEC-051): not muted, and either
+    /// nothing is soloed or it is. Does not gate its outgoing sends.
+    audible: bool,
+    /// Post-fader sends to other buses, indexed into [`Mixer::buses`].
+    sends: Vec<audio_core::BusSend>,
     effects: Vec<(audio_core::EffectProcessor, audio_core::EffectProcessor)>,
     left: Vec<f32>,
     right: Vec<f32>,
+    out_left: Vec<f32>,
+    out_right: Vec<f32>,
 }
 
-/// The whole mix of a session that has buses (SPEC-028): every track, its
-/// post-fader sends, the buses' effects and the master gain, in one node.
+/// Topological order of bus indices by their sends (SPEC-051), computed once
+/// at build time. A send `a -> b` places `a` before `b`. Cycles are already
+/// rejected by [`audio_core::Session::validate`], so this never fails; if one
+/// slipped through, it falls back to index order to stay panic-free.
+fn topo_sort_buses(buses: &[BusChannel]) -> Vec<usize> {
+    let n = buses.len();
+    let mut indegree = vec![0usize; n];
+    for bus in buses {
+        for send in &bus.sends {
+            if send.bus < n {
+                indegree[send.bus] += 1;
+            }
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    let mut ready: Vec<usize> = (0..n).filter(|&i| indegree[i] == 0).collect();
+    while let Some(bus) = ready.pop() {
+        order.push(bus);
+        for send in &buses[bus].sends {
+            if send.bus < n {
+                indegree[send.bus] -= 1;
+                if indegree[send.bus] == 0 {
+                    ready.push(send.bus);
+                }
+            }
+        }
+    }
+    if order.len() != n {
+        // Defensive: a cycle slipped through validation. Preserve index order.
+        return (0..n).collect();
+    }
+    order
+}
+
+/// The whole mix of a session that has buses (SPEC-028, SPEC-051): every
+/// track, its post-fader sends, the buses' effects, the buses' sends to one
+/// another and the master gain, in one node.
 ///
 /// Tracks are built without the master; it is applied once to the sum of
-/// the dry tracks and the bus returns. All buffers are reserved for
-/// `max_frames` at build time; `process` never allocates.
+/// the dry tracks and the bus returns. Buses are processed in a topological
+/// order computed at build time, so a bus's sends are always mixed before the
+/// receiving bus is processed. All buffers are reserved for `max_frames` at
+/// build time; `process` never allocates.
 pub struct Mixer {
     tracks: Vec<(Track, Vec<audio_core::BusSend>)>,
     buses: Vec<BusChannel>,
+    /// Topological order of bus indices (SPEC-051); every send points to a bus
+    /// that appears later in this list.
+    bus_order: Vec<usize>,
     master: f32,
     left: Vec<f32>,
     right: Vec<f32>,
+    /// Reusable scratch, sized to `max_frames`, for carrying one bus's output
+    /// into a downstream bus without aliasing or allocating.
+    scratch_left: Vec<f32>,
+    scratch_right: Vec<f32>,
 }
 
 impl Mixer {
@@ -896,10 +947,13 @@ impl Mixer {
         sample_rate: u32,
         max_frames: usize,
     ) -> Self {
-        let buses = buses
+        let any_solo = buses.iter().any(|bus| bus.solo);
+        let channels: Vec<BusChannel> = buses
             .iter()
             .map(|bus| BusChannel {
                 gain: bus.gain,
+                audible: !bus.mute && (bus.solo || !any_solo),
+                sends: bus.sends.clone(),
                 effects: bus
                     .effects
                     .iter()
@@ -912,14 +966,19 @@ impl Mixer {
                     .collect(),
                 left: vec![0.0; max_frames],
                 right: vec![0.0; max_frames],
+                out_left: vec![0.0; max_frames],
+                out_right: vec![0.0; max_frames],
             })
             .collect();
         Self {
+            bus_order: topo_sort_buses(&channels),
             tracks,
-            buses,
+            buses: channels,
             master,
             left: vec![0.0; max_frames],
             right: vec![0.0; max_frames],
+            scratch_left: vec![0.0; max_frames],
+            scratch_right: vec![0.0; max_frames],
         }
     }
 
@@ -958,6 +1017,8 @@ impl NodeProcessor for Mixer {
         for bus in &mut self.buses {
             bus.left[..frames].fill(0.0);
             bus.right[..frames].fill(0.0);
+            bus.out_left[..frames].fill(0.0);
+            bus.out_right[..frames].fill(0.0);
         }
         let left = &mut self.left[..frames];
         let right = &mut self.right[..frames];
@@ -990,22 +1051,85 @@ impl NodeProcessor for Mixer {
                 }
             }
         }
-        for bus in &mut self.buses {
-            let (bus_left, bus_right) = (&mut bus.left[..frames], &mut bus.right[..frames]);
-            for (left_fx, right_fx) in &mut bus.effects {
-                left_fx.process(bus_left);
-                right_fx.process(bus_right);
-            }
-            for (dst, src) in out_left.iter_mut().zip(bus_left.iter()) {
-                *dst += src * bus.gain;
-            }
-            if stereo {
-                for (dst, src) in out_right.iter_mut().zip(bus_right.iter()) {
-                    *dst += src * bus.gain;
+        // Buses in topological order (SPEC-051): each bus's send contributions
+        // are already in its input buffers before its effects run.
+        let bus_order = &self.bus_order;
+        for &idx in bus_order {
+            // Effects + gain produce the bus's post-fader output.
+            {
+                let bus = &mut self.buses[idx];
+                for (left_fx, right_fx) in &mut bus.effects {
+                    left_fx.process(&mut bus.left[..frames]);
+                    right_fx.process(&mut bus.right[..frames]);
                 }
-            } else {
-                for (dst, src) in out_left.iter_mut().zip(bus_right.iter()) {
-                    *dst += src * bus.gain;
+                for (dst, src) in bus.out_left[..frames]
+                    .iter_mut()
+                    .zip(bus.left[..frames].iter())
+                {
+                    *dst = src * bus.gain;
+                }
+                for (dst, src) in bus.out_right[..frames]
+                    .iter_mut()
+                    .zip(bus.right[..frames].iter())
+                {
+                    *dst = src * bus.gain;
+                }
+            }
+            // Return to master only when audible; outgoing sends always flow.
+            if self.buses[idx].audible {
+                for (dst, src) in out_left
+                    .iter_mut()
+                    .zip(self.buses[idx].out_left[..frames].iter())
+                {
+                    *dst += src;
+                }
+                if stereo {
+                    for (dst, src) in out_right
+                        .iter_mut()
+                        .zip(self.buses[idx].out_right[..frames].iter())
+                    {
+                        *dst += src;
+                    }
+                } else {
+                    for (dst, src) in out_left
+                        .iter_mut()
+                        .zip(self.buses[idx].out_right[..frames].iter())
+                    {
+                        *dst += src;
+                    }
+                }
+            }
+            // Feed this bus's output into downstream buses (SPEC-051). Copy
+            // the output to scratch first so we can write to another bus
+            // without aliasing or allocating.
+            let sends: [audio_core::BusSend; audio_core::MAX_BUSES] = {
+                let mut buf = [audio_core::BusSend { bus: 0, level: 0.0 }; audio_core::MAX_BUSES];
+                for (i, send) in self.buses[idx].sends.iter().enumerate() {
+                    buf[i] = *send;
+                }
+                buf
+            };
+            let send_count = self.buses[idx].sends.len();
+            self.scratch_left[..frames].copy_from_slice(&self.buses[idx].out_left[..frames]);
+            self.scratch_right[..frames].copy_from_slice(&self.buses[idx].out_right[..frames]);
+            for send in sends.iter().take(send_count) {
+                if send.level == 0.0 {
+                    continue;
+                }
+                let Some(target) = self.buses.get_mut(send.bus) else {
+                    continue;
+                };
+                for (dst, src) in target.left[..frames]
+                    .iter_mut()
+                    .zip(self.scratch_left[..frames].iter())
+                {
+                    *dst += src * send.level;
+                }
+                for (dst, src) in target.right[..frames]
+                    .iter_mut()
+                    .zip(self.scratch_right[..frames].iter())
+                {
+                    *dst += src * send.level;
                 }
             }
         }

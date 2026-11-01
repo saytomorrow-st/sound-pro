@@ -2346,6 +2346,16 @@ impl Editor {
                 }
             }
         }
+        // SPEC-051: bus sends also target buses, so they must be cleaned up
+        // and re-indexed the same way track sends are.
+        for sender in &mut session.buses {
+            sender.sends.retain(|send| send.bus != bus);
+            for send in &mut sender.sends {
+                if send.bus > bus {
+                    send.bus -= 1;
+                }
+            }
+        }
         self.commit_session(session)
     }
 
@@ -2363,6 +2373,75 @@ impl Editor {
             return Ok(());
         }
         *slot = gain;
+        self.commit_session(session)
+    }
+
+    /// Sets the level of bus `bus`'s send to bus `target`; `0` removes the
+    /// send (SPEC-051). A self-send or a send that would form a cycle is
+    /// rejected by validation, leaving `self` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for a bad bus or target index,
+    /// [`EditorError::Session`] for a level outside `0..=1`, a self-send, or
+    /// a cycle; `self` is unchanged.
+    pub fn set_bus_send(
+        &mut self,
+        bus: usize,
+        target: usize,
+        level: f32,
+    ) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        if bus >= session.buses.len() || target >= session.buses.len() {
+            return Err(EditorError::NoBus);
+        }
+        let sends = &mut session.buses[bus].sends;
+        let current = sends.iter().position(|send| send.bus == target);
+        match current {
+            Some(index) if level == 0.0 => {
+                sends.remove(index);
+            }
+            Some(index) => {
+                if sends[index].level.to_bits() == level.to_bits() {
+                    return Ok(());
+                }
+                sends[index].level = level;
+            }
+            None if level == 0.0 => return Ok(()),
+            None => sends.push(BusSend { bus: target, level }),
+        }
+        self.commit_session(session)
+    }
+
+    /// Toggles a bus's mute (SPEC-051). Setting the current value records no
+    /// undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for a bad index; `self` is unchanged.
+    pub fn set_bus_mute(&mut self, bus: usize, mute: bool) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let slot = &mut session.buses.get_mut(bus).ok_or(EditorError::NoBus)?.mute;
+        if *slot == mute {
+            return Ok(());
+        }
+        *slot = mute;
+        self.commit_session(session)
+    }
+
+    /// Toggles a bus's solo (SPEC-051). Setting the current value records no
+    /// undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoBus`] for a bad index; `self` is unchanged.
+    pub fn set_bus_solo(&mut self, bus: usize, solo: bool) -> Result<(), EditorError> {
+        let mut session = self.project.session.clone();
+        let slot = &mut session.buses.get_mut(bus).ok_or(EditorError::NoBus)?.solo;
+        if *slot == solo {
+            return Ok(());
+        }
+        *slot = solo;
         self.commit_session(session)
     }
 

@@ -1236,6 +1236,78 @@ fn buses_json() -> String {
     Project::with_session(Project::capture("demo", SR, 120.0, &graph), buses_session()).to_json()
 }
 
+/// A session with a bus->bus send (Verb -> Delay) plus mute/solo on buses,
+/// exercising the SPEC-051 keys.
+fn bus_routing_session() -> audio_core::Session {
+    use audio_core::{Bus, BusSend, Effect, EffectKind};
+    let mut session = demo_session();
+    let mut verb = Bus::new("Verb");
+    verb.gain = 0.75;
+    verb.solo = true;
+    verb.sends.push(BusSend { bus: 1, level: 0.5 });
+    let mut delay = Bus::new("Delay");
+    delay.mute = true;
+    delay.effects.push(Effect::new(EffectKind::reverb()));
+    session.buses = vec![verb, delay];
+    session
+}
+
+fn bus_routing_json() -> String {
+    let (graph, _) = demo_graph();
+    Project::with_session(
+        Project::capture("demo", SR, 120.0, &graph),
+        bus_routing_session(),
+    )
+    .to_json()
+}
+
+#[test]
+fn bus_sends_mute_and_solo_survive_the_round_trip() {
+    let text = bus_routing_json();
+    assert!(text.contains("\"sends\""), "{text}");
+    assert!(text.contains("\"mute\": true"), "{text}");
+    assert!(text.contains("\"solo\": true"), "{text}");
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back.session(), &bus_routing_session());
+    assert_eq!(back.session().buses[0].send_level(1), 0.5);
+    assert!(back.session().buses[0].solo);
+    assert!(back.session().buses[1].mute);
+    assert_eq!(back.to_json(), text);
+}
+
+#[test]
+fn bus_mute_and_solo_default_to_false_when_absent() {
+    // Old files (SPEC-028) have no `mute`/`solo` keys on buses; they must read
+    // back with the neutral defaults (SPEC-051 backward compatibility).
+    let back = Project::from_json(&buses_json()).unwrap();
+    assert!(!back.session().buses.iter().any(|b| b.mute || b.solo));
+}
+
+#[test]
+fn a_bus_sending_to_itself_fails_validation() {
+    let mut session = demo_session();
+    use audio_core::{Bus, BusSend};
+    session.buses = vec![Bus::new("a"), Bus::new("b")];
+    session.buses[0].sends.push(BusSend { bus: 0, level: 1.0 });
+    assert_eq!(
+        session.validate().unwrap_err(),
+        audio_core::SessionError::InvalidSend { track: 0, send: 0 }
+    );
+}
+
+#[test]
+fn bus_send_cycles_fail_validation() {
+    let mut session = demo_session();
+    use audio_core::{Bus, BusSend};
+    session.buses = vec![Bus::new("a"), Bus::new("b")];
+    session.buses[0].sends.push(BusSend { bus: 1, level: 1.0 });
+    session.buses[1].sends.push(BusSend { bus: 0, level: 1.0 });
+    assert!(matches!(
+        session.validate().unwrap_err(),
+        audio_core::SessionError::InvalidSend { .. }
+    ));
+}
+
 #[test]
 fn buses_and_sends_survive_the_round_trip() {
     let text = buses_json();
