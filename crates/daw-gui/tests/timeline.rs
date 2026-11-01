@@ -5,6 +5,21 @@ use daw_gui::timeline::{
 };
 
 #[test]
+fn playhead_seek_target_is_never_clamped_to_the_session_length() {
+    // A user click past the last region, or on an empty project, must keep
+    // the playhead where it was placed (SPEC-040). The transport clamps a
+    // running player separately, so the raw target must stay unclamped here.
+    assert_eq!(daw_gui::playhead_seek_target(0), 0);
+    assert_eq!(daw_gui::playhead_seek_target(48_000), 48_000);
+    // Far past a plausible session length.
+    assert_eq!(
+        daw_gui::playhead_seek_target(10 * 60 * 48_000),
+        10 * 60 * 48_000
+    );
+    assert_eq!(daw_gui::playhead_seek_target(u64::MAX), u64::MAX);
+}
+
+#[test]
 fn cycle_hit_finds_edges_body_and_empty() {
     let c = Some((100.0, 300.0));
     assert_eq!(cycle_hit(100.0, c), CycleHit::Start);

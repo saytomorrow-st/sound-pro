@@ -3715,6 +3715,16 @@ fn effects_mut(
         .ok_or(EditorError::NoEffect)
 }
 
+/// The stopped-playhead target for a user seek: the raw sample position,
+/// unclamped. The playhead may sit anywhere on the timeline, including past
+/// the last region or on an empty project (SPEC-040). A running transport
+/// clamps itself to its own end, so this value is only ever stored or
+/// forwarded — never used to index audio.
+#[must_use]
+pub const fn playhead_seek_target(samples: u64) -> u64 {
+    samples
+}
+
 /// Horizontal offset of `samples` at `zoom` pixels per second.
 #[must_use]
 pub fn samples_to_x(samples: u64, rate: u32, zoom: f32) -> f32 {
