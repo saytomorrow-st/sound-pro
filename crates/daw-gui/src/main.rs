@@ -1907,7 +1907,15 @@ impl App {
             (None, None) => (None, "none"),
         };
         if hovering {
-            let painter = ui.painter_at(area);
+            // The ghost is drawn on a foreground layer so it paints over the
+            // clips/regions, which are drawn later on the timeline painter.
+            let painter = ui
+                .ctx()
+                .layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("drop-ghost"),
+                ))
+                .with_clip_rect(area);
             let target = effective_pointer.map(target_at);
             self.drop_tracker.hover(target);
             let band = match target.and_then(|t| t.track) {
