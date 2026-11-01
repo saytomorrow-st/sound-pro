@@ -268,3 +268,73 @@ fn a_collapsed_folder_hides_its_children() {
     assert!(daw_gui::track_rows::is_hidden(&session, 0));
     assert!(!daw_gui::track_rows::is_hidden(&session, 1));
 }
+
+#[test]
+fn selecting_a_folder_highlights_it_and_clears_track_selection() {
+    let mut editor = editor_with(3);
+    let folder = editor.create_folder(&[0, 1]).unwrap();
+    editor.select_track(2, false, false);
+    assert!(editor.is_track_selected(2));
+
+    editor.select_folder(Some(folder));
+    assert!(editor.is_folder_selected(folder));
+    assert!(!editor.is_track_selected(2));
+    assert!(editor.selected_track.is_none());
+}
+
+#[test]
+fn clearing_folder_selection_does_not_reselect_tracks() {
+    let mut editor = editor_with(2);
+    let folder = editor.create_folder(&[0]).unwrap();
+    editor.select_folder(Some(folder));
+    editor.select_folder(None);
+    assert!(!editor.is_folder_selected(folder));
+    assert!(editor.selected_track.is_none());
+}
+
+#[test]
+fn selecting_a_track_clears_folder_selection() {
+    let mut editor = editor_with(3);
+    let folder = editor.create_folder(&[0]).unwrap();
+    editor.select_folder(Some(folder));
+    assert!(editor.is_folder_selected(folder));
+
+    editor.select_track(2, false, false);
+    assert!(!editor.is_folder_selected(folder));
+    assert!(editor.is_track_selected(2));
+}
+
+#[test]
+fn selecting_an_out_of_range_folder_is_ignored() {
+    let mut editor = editor_with(1);
+    editor.create_folder(&[0]).unwrap();
+    editor.select_track(0, false, false);
+    editor.select_folder(Some(7));
+    assert!(editor.selected_folder.is_none());
+    assert!(editor.is_track_selected(0));
+}
+
+#[test]
+fn adding_a_track_to_a_folder_is_one_undo_step() {
+    let mut editor = editor_with(3);
+    let folder = editor.create_empty_folder().unwrap();
+    editor.add_tracks_to_folder(folder, &[1]).unwrap();
+    assert_eq!(editor.session().folder_children[folder], vec![1]);
+    assert!(editor.undo());
+    assert!(editor.session().folder_children[folder].is_empty());
+    assert!(editor.redo());
+    assert_eq!(editor.session().folder_children[folder], vec![1]);
+}
+
+#[test]
+fn adding_a_foldered_track_to_another_folder_is_rejected() {
+    let mut editor = editor_with(3);
+    let a = editor.create_folder(&[0]).unwrap();
+    let b = editor.create_empty_folder().unwrap();
+    assert!(matches!(
+        editor.add_tracks_to_folder(b, &[0]).unwrap_err(),
+        EditorError::TrackInFolder
+    ));
+    assert!(editor.session().folder_children[a].contains(&0));
+    assert!(editor.session().folder_children[b].is_empty());
+}
