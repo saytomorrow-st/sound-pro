@@ -518,6 +518,7 @@ enum TrackAction {
     Duplicate(usize),
     New(TrackKind),
     GatherFolder(Vec<usize>),
+    AddToFolder(usize, usize),
     NewFolder,
     RenameFolder(usize),
     FolderColor(usize, Option<u8>),
@@ -2088,6 +2089,28 @@ impl App {
                     action = Some(TrackAction::Duplicate(index));
                     ui.close();
                 }
+                let already_in_folder =
+                    track_rows::folder_of_track(self.editor.session(), index).is_some();
+                let folder_names: Vec<String> = self
+                    .editor
+                    .session()
+                    .folders
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect();
+                ui.add_enabled_ui(!already_in_folder, |ui| {
+                    ui.menu_button("Добавить в папку…", |ui| {
+                        if folder_names.is_empty() {
+                            ui.weak("Нет папок");
+                        }
+                        for (folder, name) in folder_names.iter().enumerate() {
+                            if ui.button(name).clicked() {
+                                action = Some(TrackAction::AddToFolder(index, folder));
+                                ui.close();
+                            }
+                        }
+                    });
+                });
                 ui.separator();
                 if ui
                     .add_enabled(
@@ -2149,12 +2172,7 @@ impl App {
         let name = f.name.clone();
         let color = f.color;
         let child_count = session.folder_children.get(folder).map_or(0, Vec::len);
-        let selected = self.editor.selected_tracks().iter().any(|&t| {
-            session
-                .folder_children
-                .get(folder)
-                .is_some_and(|c| c.contains(&t))
-        });
+        let selected = self.editor.is_folder_selected(folder);
         let frame = egui::Frame::new()
             .fill(if selected {
                 Color32::from_rgb(48, 56, 72)
@@ -2231,6 +2249,9 @@ impl App {
             0.0,
             folder_color(color, folder),
         );
+        if response.clicked() {
+            self.editor.select_folder(Some(folder));
+        }
         response.context_menu(|ui| {
             if ui.button("Переименовать").clicked() {
                 self.folder_rename = Some((folder, name.clone()));
@@ -2335,6 +2356,10 @@ impl App {
             TrackAction::GatherFolder(tracks) => {
                 self.editor.create_folder(&tracks).map(|_| "Папка создана")
             }
+            TrackAction::AddToFolder(track, folder) => self
+                .editor
+                .add_tracks_to_folder(folder, &[track])
+                .map(|()| "Дорожка добавлена в папку"),
             TrackAction::NewFolder => self.editor.create_empty_folder().map(|_| "Папка создана"),
             TrackAction::RenameFolder(folder) => {
                 let Some((_, text)) = self.folder_rename.take() else {
@@ -3037,6 +3062,15 @@ impl App {
                 None => {
                     if !toggle {
                         self.editor.select_clip(None, false);
+                        // Clicking empty timeline space moves the playhead
+                        // even when there are no clips or tracks (SPEC-040).
+                        if let Some(p) = pointer {
+                            self.seek(x_to_samples(
+                                (p.x - area.min.x).max(0.0),
+                                rate_u32,
+                                self.zoom,
+                            ));
+                        }
                     }
                     if let Some(p) = pointer {
                         let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();

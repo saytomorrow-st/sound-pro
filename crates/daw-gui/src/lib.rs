@@ -315,6 +315,9 @@ pub struct Editor {
     group: Option<bool>,
     /// Selected track, if any.
     pub selected_track: Option<usize>,
+    /// Selected folder (track stack), if any; exclusive with track and clip
+    /// selection (SPEC-055 §4).
+    pub selected_folder: Option<usize>,
     /// Selected clip as `(track, clip)`, if any; the primary one of a
     /// multiple selection (SPEC-047).
     pub selected_clip: Option<(usize, usize)>,
@@ -369,6 +372,7 @@ impl Editor {
             saved: session,
             group: None,
             selected_track: None,
+            selected_folder: None,
             selected_clip: None,
             more_clips: Vec::new(),
             more_tracks: Vec::new(),
@@ -453,6 +457,7 @@ impl Editor {
             redo: Vec::new(),
             group: None,
             selected_track: None,
+            selected_folder: None,
             selected_clip: None,
             more_clips: Vec::new(),
             more_tracks: Vec::new(),
@@ -1623,6 +1628,7 @@ impl Editor {
             self.more_clips.clear();
             self.more_tracks.clear();
             self.selected_clip = at;
+            self.selected_folder = None;
             if let Some((t, _)) = at {
                 self.selected_track = Some(t);
             }
@@ -1844,9 +1850,32 @@ impl Editor {
         self.selected_track == Some(track) || self.more_tracks.binary_search(&track).is_ok()
     }
 
+    /// Whether `folder` is the selected track stack (SPEC-055 §4).
+    #[must_use]
+    pub fn is_folder_selected(&self, folder: usize) -> bool {
+        self.selected_folder == Some(folder)
+    }
+
+    /// Selects a folder (track stack), clearing any track or clip selection;
+    /// `None` clears the folder selection (SPEC-055 §4). Bad indices do
+    /// nothing.
+    pub fn select_folder(&mut self, folder: Option<usize>) {
+        if folder.is_some_and(|f| f >= self.project.session.folders.len()) {
+            return;
+        }
+        self.selected_folder = folder;
+        if folder.is_some() {
+            self.selected_track = None;
+            self.more_tracks.clear();
+            self.selected_clip = None;
+            self.more_clips.clear();
+        }
+    }
+
     /// Selects a track: alone, with Ctrl (`toggle`) added or removed, or with
     /// Shift (`range`) together with every track up to the primary one
-    /// (SPEC-047 §5). Bad indices do nothing.
+    /// (SPEC-047 §5). Bad indices do nothing. A plain (non-toggle) selection
+    /// clears the folder selection.
     pub fn select_track(&mut self, track: usize, toggle: bool, range: bool) {
         if track >= self.project.session.tracks.len() {
             return;
@@ -1881,6 +1910,7 @@ impl Editor {
         }
         self.more_tracks.clear();
         self.selected_track = Some(track);
+        self.selected_folder = None;
     }
 
     /// Copies a clip to the window's clipboard; the project is untouched.
@@ -3049,6 +3079,7 @@ impl Editor {
         }
         self.commit_session(session)?;
         self.selected_track = None;
+        self.selected_folder = None;
         Ok(())
     }
 
@@ -3515,7 +3546,9 @@ impl Editor {
         session.name.clone_from(&self.project.session.name);
         let current = std::mem::replace(&mut self.project.session, session);
         let tracks = &self.project.session.tracks;
+        let folders = &self.project.session.folders;
         self.selected_track = self.selected_track.filter(|&t| t < tracks.len());
+        self.selected_folder = self.selected_folder.filter(|&f| f < folders.len());
         self.selected_clip = self
             .selected_clip
             .filter(|&(t, c)| tracks.get(t).is_some_and(|tr| c < tr.clips.len()));
