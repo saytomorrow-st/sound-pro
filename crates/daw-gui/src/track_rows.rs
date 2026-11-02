@@ -253,15 +253,32 @@ pub fn row_at_y(heights: &[f32], session: &Session, y: f32) -> Option<usize> {
 }
 
 /// The target track for a clip move at vertical offset `y`, clamped to a
-/// valid track (SPEC-058 §2). A folder header row yields `fallback` (the clip
-/// stays on its current track); `y` above the first row resolves to track
-/// `0`, and `y` below the last row resolves to the last track — it never
-/// wraps back to the top.
+/// valid, VISIBLE track (SPEC-058 §2, SPEC-059 §3). A folder header row yields
+/// `fallback` (the clip stays on its current track); `y` above the first row
+/// resolves to the first visible track, and `y` below the last row resolves to
+/// the last visible track — never wrapping to the top, and never landing on a
+/// track hidden inside a collapsed folder.
 #[must_use]
 pub fn clip_drop_track(heights: &[f32], session: &Session, y: f32, fallback: usize) -> usize {
     let last = session.tracks.len().saturating_sub(1);
+    // Visible tracks in visual order: children of a collapsed folder are
+    // hidden and must never be a clip-drop target (SPEC-059 §3).
+    let visible: Vec<usize> = visible_rows(session)
+        .iter()
+        .filter_map(|r| match *r {
+            Row::Track(t) => Some(t),
+            Row::Folder(_) => None,
+        })
+        .collect();
     let Some(row) = row_at_y(heights, session, y) else {
-        return if y < 0.0 { 0 } else { last };
+        // Above the first row or below the last: clamp to the nearest VISIBLE
+        // track, not a raw index that could be a hidden folder child.
+        return match (y < 0.0, visible.first(), visible.last()) {
+            (true, Some(&first), _) => first,
+            (false, _, Some(&end)) => end,
+            // No visible tracks at all: keep the clip where it is.
+            _ => fallback.min(last),
+        };
     };
     track_at_row(session, row).unwrap_or(fallback).min(last)
 }
@@ -739,6 +756,25 @@ mod tests {
         // On a track row -> that track.
         let track2_y = row_y(&heights, &session, 3) + DEFAULT_TRACK_HEIGHT / 2.0;
         assert_eq!(clip_drop_track(&heights, &session, track2_y, 4), 2);
+    }
+
+    #[test]
+    fn clip_drop_track_skips_hidden_tracks_in_collapsed_folders() {
+        let mut session = session_with_two_folders();
+        // Folder B holds track 5. Collapse it: track 5 becomes hidden.
+        session.folders[1].collapsed = true;
+        let heights = vec![DEFAULT_TRACK_HEIGHT; 6];
+        // Visible tracks are now 0, 1, 2, 3, 4 (5 is hidden inside B).
+        // Below the last row clamps to the last VISIBLE track (4), not 5.
+        assert_eq!(clip_drop_track(&heights, &session, 10_000.0, 4), 4);
+        // Above the first row still resolves to the first visible track (0).
+        assert_eq!(clip_drop_track(&heights, &session, -10.0, 4), 0);
+        // Collapse folder A (holds 1 and 3) too: visible are 0, 2, 4.
+        session.folders[0].collapsed = true;
+        // Below the last row -> 4; the pointer over the hidden track's former
+        // slot must never resolve to a hidden track.
+        assert_eq!(clip_drop_track(&heights, &session, 10_000.0, 4), 4);
+        assert_eq!(clip_drop_track(&heights, &session, -10.0, 4), 0);
     }
 
     #[test]
