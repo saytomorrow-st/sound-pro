@@ -628,6 +628,9 @@ struct App {
     /// Active header resize drag, when dragging a track's bottom edge
     /// (SPEC-056 §1).
     height_drag: Option<HeightDrag>,
+    /// Active header drag-reorder (SPEC-057 §1): dragging a track (or the
+    /// current selection) or a folder to a new position.
+    header_drag: Option<HeaderDrag>,
     /// Shown gain reduction, dB, of every insert of every track (SPEC-052).
     track_reduction: Vec<[f32; MAX_EFFECTS_PER_TRACK]>,
     /// Shown level of the master (SPEC-042).
@@ -726,6 +729,15 @@ struct HeightDrag {
     start_heights: Vec<f32>,
 }
 
+/// State of a header drag-reorder (SPEC-057 §1): dragging a track (or the
+/// whole current selection) or a folder to a new position.
+struct HeaderDrag {
+    /// Track indices being dragged, sorted; empty when dragging a folder.
+    tracks: Vec<usize>,
+    /// The folder being dragged, when dragging a folder header.
+    folder: Option<usize>,
+}
+
 /// Device picker: "Системный" plus every listed name. A saved device that
 /// is not plugged in stays visible, marked as missing.
 fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, names: &[String]) {
@@ -801,6 +813,7 @@ impl App {
             track_meters: Vec::new(),
             track_heights: Vec::new(),
             height_drag: None,
+            header_drag: None,
             track_reduction: Vec::new(),
             master_meter: MeterState::default(),
             timeline_view: (0.0, 0.0),
@@ -890,6 +903,128 @@ impl App {
         let h = self.track_heights.remove(from);
         let to = to.min(self.track_heights.len());
         self.track_heights.insert(to, h);
+    }
+
+    /// Reorder `track_heights` to follow a multi-track move, mirroring
+    /// [`Editor::move_tracks`] and [`Editor::move_folder`] index remapping
+    /// (SPEC-057 §1). `tracks` is the moved set (sorted internally), `to` the
+    /// target track position.
+    fn reindex_heights_move_tracks(&mut self, tracks: &[usize], to: usize) {
+        let count = self.track_heights.len();
+        if count == 0 {
+            return;
+        }
+        let mut moved: Vec<usize> = tracks.to_vec();
+        moved.sort_unstable();
+        moved.dedup();
+        moved.retain(|&t| t < count);
+        if moved.is_empty() {
+            return;
+        }
+        // Same old->new mapping as `move_tracks`/`move_folder`.
+        let insert_at = to.min(count - moved.len());
+        let mut old_to_new = vec![0usize; count];
+        let mut non_moved = 0usize;
+        for (t, slot) in old_to_new.iter_mut().enumerate() {
+            if moved.binary_search(&t).is_ok() {
+                continue;
+            }
+            *slot = non_moved;
+            non_moved += 1;
+        }
+        for (order, &t) in moved.iter().enumerate() {
+            old_to_new[t] = insert_at + order;
+        }
+        for (t, slot) in old_to_new.iter_mut().enumerate() {
+            if moved.binary_search(&t).is_err() && *slot >= insert_at {
+                *slot += moved.len();
+            }
+        }
+        let mut new_heights = vec![track_rows::DEFAULT_TRACK_HEIGHT; count];
+        for (t, &n) in old_to_new.iter().enumerate() {
+            new_heights[n] = self.track_heights[t];
+        }
+        self.track_heights = new_heights;
+    }
+
+    /// Resolves a completed header drag at the given pointer `y` (screen
+    /// coordinates), `rows_top` being the screen y of the first header row
+    /// (SPEC-057 §1–§3). Dispatches to a folder drop, a top-level reorder, or
+    /// a folder reorder, each in a single undo step.
+    fn resolve_header_drop(&mut self, pointer_y: f32, rows_top: f32) {
+        let Some(drag) = self.header_drag.take() else {
+            return;
+        };
+        // Snapshot all target data from the immutable session before mutating.
+        let heights = track_rows::row_heights(&self.track_heights, self.editor.session());
+        let offset = pointer_y - rows_top;
+        let ins = track_rows::drop_insertion_row(&heights, offset);
+        let to = track_rows::track_index_at_insertion(self.editor.session(), ins);
+        let rows = track_rows::visible_rows(self.editor.session());
+        let row = track_rows::row_at_y_heights(&heights, offset).and_then(|r| rows.get(r).copied());
+        let target_folder = match row {
+            Some(track_rows::Row::Folder(f)) => Some(f),
+            Some(track_rows::Row::Track(t)) => {
+                track_rows::folder_of_track(self.editor.session(), t)
+            }
+            None => None,
+        };
+
+        if let Some(folder) = drag.folder {
+            // Folder drag: reorder the folder with its children (no nesting).
+            let children = self
+                .editor
+                .session()
+                .folder_children
+                .get(folder)
+                .cloned()
+                .unwrap_or_default();
+            if self.editor.move_folder(folder, to).is_ok() {
+                let mut kids = children;
+                kids.sort_unstable();
+                self.reindex_heights_move_tracks(&kids, to);
+                self.status = "Папка перемещена".into();
+            }
+            return;
+        }
+
+        let tracks = drag.tracks;
+        if tracks.is_empty() {
+            return;
+        }
+        // Drop onto a folder header or a child track row adds to that folder.
+        if let Some(folder) = target_folder {
+            if self.editor.move_tracks_to_folder(folder, &tracks).is_ok() {
+                self.status = "Дорожки добавлены в папку".into();
+            }
+            return;
+        }
+        // Otherwise a top-level reorder; tracks already in a folder leave it.
+        let any_in_folder = tracks
+            .iter()
+            .any(|&t| track_rows::folder_of_track(self.editor.session(), t).is_some());
+        if any_in_folder {
+            self.editor.begin_group();
+            let _ = self.editor.remove_tracks_from_folder(&tracks);
+            let _ = self.editor.move_tracks(&tracks, to);
+            self.editor.end_group();
+        } else {
+            let _ = self.editor.move_tracks(&tracks, to);
+        }
+        self.reindex_heights_move_tracks(&tracks, to);
+        self.status = "Дорожки перемещены".into();
+    }
+
+    /// Draws the horizontal drop-insertion indicator for an in-progress header
+    /// drag (SPEC-057 §1).
+    fn draw_drag_indicator(&self, ui: &egui::Ui, pointer_y: f32, rows_top: f32) {
+        let heights = track_rows::row_heights(&self.track_heights, self.editor.session());
+        let offset = pointer_y - rows_top;
+        let ins = track_rows::drop_insertion_row(&heights, offset);
+        let y = rows_top + track_rows::row_y(&self.track_heights, self.editor.session(), ins);
+        let clip = ui.clip_rect();
+        let stroke = egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 255));
+        ui.painter().hline(clip.min.x..=clip.max.x, y, stroke);
     }
 
     /// The bottom-edge resize handle for a track header (SPEC-056 §1): drag
@@ -1921,9 +2056,12 @@ impl App {
             .collect();
         let mut delete = None;
         let mut action = None;
+        // Screen y of the first header row; used to map the pointer to a drop
+        // insertion position while a header drag is in progress (SPEC-057 §1).
+        let mut rows_top: Option<f32> = None;
         for row in rows {
             let Row::Track(index) = row else {
-                self.folder_header(ui, row, &mut action);
+                self.folder_header(ui, row, &mut action, &mut rows_top);
                 continue;
             };
             let selected = self.editor.is_track_selected(index);
@@ -1939,201 +2077,244 @@ impl App {
             // SPEC-044 §1: the click-sensing scope is registered before
             // its children, so the M/S/R/I buttons inside get their clicks.
             let response = ui
-                .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
-                    frame.show(ui, |ui| {
-                        ui.set_height(h - 8.0);
-                        ui.set_width(ui.available_width());
-                        ui.add_space(if in_folder { 16.0 } else { 0.0 });
-                        let track = &self.editor.session().tracks[index];
-                        let (mut mute, mut solo) = (track.mute, track.solo);
-                        let track_monitor = track.input_monitor;
-                        let track_stereo = track.format == TrackFormat::Stereo;
-                        let (mut gain, mut pan) = (track.gain, track.pan);
-                        let name = track.name.clone();
-                        let audio = track.kind == TrackKind::Audio;
-                        let color = track_color(track.color, index);
-                        ui.horizontal(|ui| {
-                            ui.add_space(6.0);
-                            let (icon, _) =
-                                ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                            ui.painter()
-                                .rect_filled(icon, 4.0, color.gamma_multiply(0.35));
-                            ui.painter().rect_stroke(
-                                icon,
-                                4.0,
-                                egui::Stroke::new(1.0_f32, color),
-                                egui::StrokeKind::Inside,
-                            );
-                            ui.painter().text(
-                                icon.center(),
-                                egui::Align2::CENTER_CENTER,
-                                if audio { "〰" } else { "♪" },
-                                egui::FontId::proportional(13.0),
-                                color,
-                            );
-                            if let Some((_, text)) =
-                                self.rename.as_mut().filter(|(track, _)| *track == index)
-                            {
-                                let edit =
-                                    ui.add(egui::TextEdit::singleline(text).desired_width(110.0));
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                    self.rename = None;
-                                } else if edit.lost_focus() {
-                                    action = Some(TrackAction::Rename(index));
-                                } else {
-                                    edit.request_focus();
-                                }
-                            } else if ui
-                                .add_sized(
-                                    Vec2::new(
-                                        name_width(ui.available_width(), self.auto == Some(index)),
-                                        ui.spacing().interact_size.y,
-                                    ),
-                                    egui::Label::new(egui::RichText::new(&name).strong())
-                                        .truncate()
-                                        .halign(egui::Align::LEFT)
-                                        .sense(Sense::click()),
-                                )
-                                .on_hover_text(format!("{name}\nДвойной щелчок — переименовать"))
-                                .double_clicked()
-                            {
-                                self.rename = Some((index, name.clone()));
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .small_button("✕")
-                                        .on_hover_text("Удалить дорожку")
-                                        .clicked()
-                                    {
-                                        delete = Some(index);
-                                    }
-                                    let effects = self.editor.session().tracks[index].effects.len();
-                                    let label = if effects == 0 {
-                                        "FX".to_owned()
-                                    } else {
-                                        format!("FX {effects}")
-                                    };
-                                    if ui
-                                        .selectable_label(
-                                            self.fx == Some(FxTarget::Track(index)),
-                                            label,
-                                        )
-                                        .on_hover_text("Эффекты дорожки")
-                                        .clicked()
-                                    {
-                                        self.fx = if self.fx == Some(FxTarget::Track(index)) {
-                                            None
-                                        } else {
-                                            Some(FxTarget::Track(index))
-                                        };
-                                    }
-                                    if ui
-                                        .selectable_label(self.auto == Some(index), "A")
-                                        .on_hover_text("Автоматизация")
-                                        .clicked()
-                                    {
-                                        self.auto = if self.auto == Some(index) {
-                                            None
-                                        } else {
-                                            Some(index)
-                                        };
-                                        self.auto_drag = None;
-                                    }
-                                    if self.auto == Some(index) {
-                                        self.lane_picker(ui, index);
-                                    }
-                                },
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add_space(34.0);
-                            ui.spacing_mut().item_spacing.x = 3.0;
-                            let m =
-                                shell::pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
-                                    .on_hover_text("Без звука");
-                            let s =
-                                shell::pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
-                                    .on_hover_text("Соло");
-                            let mut armed = self.editor.is_armed(index);
-                            if shell::pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
-                                .on_hover_text("Запись на эту дорожку")
-                                .changed()
-                            {
-                                self.editor.set_armed(index, armed);
-                            }
-                            let mut monitor = track_monitor;
-                            let i =
-                                shell::pill(ui, &mut monitor, "I", Color32::from_rgb(240, 160, 60))
-                                    .on_hover_text("Мониторинг входа");
-                            if s.changed() || m.changed() || i.changed() {
-                                if let Some(t) = self.editor.track_mut(index) {
-                                    t.mute = mute;
-                                    t.solo = solo;
-                                    t.input_monitor = monitor;
-                                }
-                            }
-                            if audio {
-                                let mut stereo = track_stereo;
-                                if shell::pill(
-                                    ui,
-                                    &mut stereo,
-                                    "◎",
-                                    Color32::from_rgb(120, 200, 140),
-                                )
-                                .on_hover_text("Стерео / моно")
-                                .changed()
+                .scope_builder(
+                    egui::UiBuilder::new().sense(Sense::click_and_drag()),
+                    |ui| {
+                        frame.show(ui, |ui| {
+                            ui.set_height(h - 8.0);
+                            ui.set_width(ui.available_width());
+                            ui.add_space(if in_folder { 16.0 } else { 0.0 });
+                            let track = &self.editor.session().tracks[index];
+                            let (mut mute, mut solo) = (track.mute, track.solo);
+                            let track_monitor = track.input_monitor;
+                            let track_stereo = track.format == TrackFormat::Stereo;
+                            let (mut gain, mut pan) = (track.gain, track.pan);
+                            let name = track.name.clone();
+                            let audio = track.kind == TrackKind::Audio;
+                            let color = track_color(track.color, index);
+                            ui.horizontal(|ui| {
+                                ui.add_space(6.0);
+                                let (icon, _) =
+                                    ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                                ui.painter()
+                                    .rect_filled(icon, 4.0, color.gamma_multiply(0.35));
+                                ui.painter().rect_stroke(
+                                    icon,
+                                    4.0,
+                                    egui::Stroke::new(1.0_f32, color),
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.painter().text(
+                                    icon.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    if audio { "〰" } else { "♪" },
+                                    egui::FontId::proportional(13.0),
+                                    color,
+                                );
+                                if let Some((_, text)) =
+                                    self.rename.as_mut().filter(|(track, _)| *track == index)
                                 {
-                                    let format = if stereo {
-                                        TrackFormat::Stereo
+                                    let edit = ui
+                                        .add(egui::TextEdit::singleline(text).desired_width(110.0));
+                                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                        self.rename = None;
+                                    } else if edit.lost_focus() {
+                                        action = Some(TrackAction::Rename(index));
                                     } else {
-                                        TrackFormat::Mono
-                                    };
-                                    let _ = self.editor.set_track_format(index, format);
+                                        edit.request_focus();
+                                    }
+                                } else if ui
+                                    .add_sized(
+                                        Vec2::new(
+                                            name_width(
+                                                ui.available_width(),
+                                                self.auto == Some(index),
+                                            ),
+                                            ui.spacing().interact_size.y,
+                                        ),
+                                        egui::Label::new(egui::RichText::new(&name).strong())
+                                            .truncate()
+                                            .halign(egui::Align::LEFT)
+                                            .sense(Sense::click()),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{name}\nДвойной щелчок — переименовать"
+                                    ))
+                                    .double_clicked()
+                                {
+                                    self.rename = Some((index, name.clone()));
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("✕")
+                                            .on_hover_text("Удалить дорожку")
+                                            .clicked()
+                                        {
+                                            delete = Some(index);
+                                        }
+                                        let effects =
+                                            self.editor.session().tracks[index].effects.len();
+                                        let label = if effects == 0 {
+                                            "FX".to_owned()
+                                        } else {
+                                            format!("FX {effects}")
+                                        };
+                                        if ui
+                                            .selectable_label(
+                                                self.fx == Some(FxTarget::Track(index)),
+                                                label,
+                                            )
+                                            .on_hover_text("Эффекты дорожки")
+                                            .clicked()
+                                        {
+                                            self.fx = if self.fx == Some(FxTarget::Track(index)) {
+                                                None
+                                            } else {
+                                                Some(FxTarget::Track(index))
+                                            };
+                                        }
+                                        if ui
+                                            .selectable_label(self.auto == Some(index), "A")
+                                            .on_hover_text("Автоматизация")
+                                            .clicked()
+                                        {
+                                            self.auto = if self.auto == Some(index) {
+                                                None
+                                            } else {
+                                                Some(index)
+                                            };
+                                            self.auto_drag = None;
+                                        }
+                                        if self.auto == Some(index) {
+                                            self.lane_picker(ui, index);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(34.0);
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                let m = shell::pill(
+                                    ui,
+                                    &mut mute,
+                                    "M",
+                                    Color32::from_rgb(90, 170, 255),
+                                )
+                                .on_hover_text("Без звука");
+                                let s = shell::pill(
+                                    ui,
+                                    &mut solo,
+                                    "S",
+                                    Color32::from_rgb(240, 200, 60),
+                                )
+                                .on_hover_text("Соло");
+                                let mut armed = self.editor.is_armed(index);
+                                if shell::pill(ui, &mut armed, "R", Color32::from_rgb(230, 60, 60))
+                                    .on_hover_text("Запись на эту дорожку")
+                                    .changed()
+                                {
+                                    self.editor.set_armed(index, armed);
+                                }
+                                let mut monitor = track_monitor;
+                                let i = shell::pill(
+                                    ui,
+                                    &mut monitor,
+                                    "I",
+                                    Color32::from_rgb(240, 160, 60),
+                                )
+                                .on_hover_text("Мониторинг входа");
+                                if s.changed() || m.changed() || i.changed() {
+                                    if let Some(t) = self.editor.track_mut(index) {
+                                        t.mute = mute;
+                                        t.solo = solo;
+                                        t.input_monitor = monitor;
+                                    }
+                                }
+                                if audio {
+                                    let mut stereo = track_stereo;
+                                    if shell::pill(
+                                        ui,
+                                        &mut stereo,
+                                        "◎",
+                                        Color32::from_rgb(120, 200, 140),
+                                    )
+                                    .on_hover_text("Стерео / моно")
+                                    .changed()
+                                    {
+                                        let format = if stereo {
+                                            TrackFormat::Stereo
+                                        } else {
+                                            TrackFormat::Mono
+                                        };
+                                        let _ = self.editor.set_track_format(index, format);
+                                    }
+                                }
+                            });
+                            let automation = &self.editor.session().tracks[index].automation;
+                            let (gain_free, pan_free) =
+                                (automation.gain.is_empty(), automation.pan.is_empty());
+                            let (g, p) = ui
+                                .horizontal(|ui| {
+                                    ui.add_space(30.0);
+                                    ui.spacing_mut().slider_width =
+                                        ((ui.available_width() - 60.0) * 0.6).max(40.0);
+                                    let g = ui
+                                        .add_enabled(
+                                            gain_free,
+                                            egui::Slider::new(&mut gain, 0.0..=1.0)
+                                                .show_value(false),
+                                        )
+                                        .on_hover_text(format!(
+                                            "Громкость {}",
+                                            daw_gui::layout::db_label(gain)
+                                        ));
+                                    ui.spacing_mut().slider_width =
+                                        (ui.available_width() - 8.0).max(30.0);
+                                    let p =
+                                        ui.add_enabled(
+                                            pan_free,
+                                            egui::Slider::new(&mut pan, -1.0..=1.0)
+                                                .show_value(false),
+                                        )
+                                        .on_hover_text(
+                                            format!("Панорама {}", daw_gui::layout::pan_label(pan)),
+                                        );
+                                    (g, p)
+                                })
+                                .inner;
+                            if g.changed() || p.changed() {
+                                if let Some(t) = self.editor.track_mut(index) {
+                                    t.gain = gain;
+                                    t.pan = pan;
                                 }
                             }
                         });
-                        let automation = &self.editor.session().tracks[index].automation;
-                        let (gain_free, pan_free) =
-                            (automation.gain.is_empty(), automation.pan.is_empty());
-                        let (g, p) = ui
-                            .horizontal(|ui| {
-                                ui.add_space(30.0);
-                                ui.spacing_mut().slider_width =
-                                    ((ui.available_width() - 60.0) * 0.6).max(40.0);
-                                let g = ui
-                                    .add_enabled(
-                                        gain_free,
-                                        egui::Slider::new(&mut gain, 0.0..=1.0).show_value(false),
-                                    )
-                                    .on_hover_text(format!(
-                                        "Громкость {}",
-                                        daw_gui::layout::db_label(gain)
-                                    ));
-                                ui.spacing_mut().slider_width =
-                                    (ui.available_width() - 8.0).max(30.0);
-                                let p = ui
-                                    .add_enabled(
-                                        pan_free,
-                                        egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false),
-                                    )
-                                    .on_hover_text(format!(
-                                        "Панорама {}",
-                                        daw_gui::layout::pan_label(pan)
-                                    ));
-                                (g, p)
-                            })
-                            .inner;
-                        if g.changed() || p.changed() {
-                            if let Some(t) = self.editor.track_mut(index) {
-                                t.gain = gain;
-                                t.pan = pan;
-                            }
-                        }
-                    });
-                })
+                    },
+                )
                 .response;
+            if rows_top.is_none() {
+                rows_top = Some(response.rect.min.y);
+            }
+            if response.drag_started() {
+                // Drag the current selection if this track is in it, else just
+                // this track (SPEC-057 §1).
+                let tracks = if self.editor.is_track_selected(index) {
+                    self.editor.selected_tracks()
+                } else {
+                    vec![index]
+                };
+                self.header_drag = Some(HeaderDrag {
+                    tracks,
+                    folder: None,
+                });
+            }
+            if response.drag_stopped() {
+                if let (Some(top), Some(pos)) = (rows_top, response.interact_pointer_pos()) {
+                    self.resolve_header_drop(pos.y, top);
+                }
+            }
             ui.painter().rect_filled(
                 Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height())),
                 0.0,
@@ -2238,6 +2419,17 @@ impl App {
             });
             self.track_resize_handle(ui, response.rect, index);
         }
+        // Draw the drop-insertion indicator while a header drag is active;
+        // clear the drag if the pointer was released without a captured stop.
+        if self.header_drag.is_some() {
+            let pointer_up = !ui.input(|i| i.pointer.any_down());
+            if pointer_up {
+                self.header_drag = None;
+            } else if let (Some(top), Some(pos)) = (rows_top, ui.input(|i| i.pointer.latest_pos()))
+            {
+                self.draw_drag_indicator(ui, pos.y, top);
+            }
+        }
         if let Some(action) = action.take() {
             self.track_action(action);
         }
@@ -2273,13 +2465,19 @@ impl App {
 
     /// Draws one folder header row (SPEC-055 §4): a collapse arrow, the name,
     /// a colour swatch and the child count, plus the folder context menu.
-    fn folder_header(&mut self, ui: &mut egui::Ui, row: Row, action: &mut Option<TrackAction>) {
+    fn folder_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: Row,
+        action: &mut Option<TrackAction>,
+        rows_top: &mut Option<f32>,
+    ) -> egui::Rect {
         let Row::Folder(folder) = row else {
-            return;
+            return ui.available_rect_before_wrap();
         };
         let session = self.editor.session();
         let Some(f) = session.folders.get(folder) else {
-            return;
+            return ui.available_rect_before_wrap();
         };
         let collapsed = f.collapsed;
         let name = f.name.clone();
@@ -2294,76 +2492,96 @@ impl App {
             })
             .inner_margin(4.0);
         let response = ui
-            .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
-                frame.show(ui, |ui| {
-                    ui.set_height(track_rows::FOLDER_ROW_HEIGHT - 8.0);
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new(if collapsed { "▸" } else { "▾" }).strong(),
+            .scope_builder(
+                egui::UiBuilder::new().sense(Sense::click_and_drag()),
+                |ui| {
+                    frame.show(ui, |ui| {
+                        ui.set_height(track_rows::FOLDER_ROW_HEIGHT - 8.0);
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.add_space(6.0);
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(if collapsed { "▸" } else { "▾" })
+                                            .strong(),
+                                    )
+                                    .sense(Sense::click()),
                                 )
-                                .sense(Sense::click()),
-                            )
-                            .clicked()
-                        {
-                            *action = Some(TrackAction::ToggleFolder(folder));
-                        }
-                        let icon = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover()).0;
-                        let c = folder_color(color, folder);
-                        ui.painter().rect_filled(icon, 4.0, c.gamma_multiply(0.35));
-                        ui.painter().rect_stroke(
-                            icon,
-                            4.0,
-                            egui::Stroke::new(1.0_f32, c),
-                            egui::StrokeKind::Inside,
-                        );
-                        ui.painter().text(
-                            icon.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "▤",
-                            egui::FontId::proportional(13.0),
-                            c,
-                        );
-                        if let Some((fidx, text)) =
-                            self.folder_rename.as_mut().filter(|(f, _)| *f == folder)
-                        {
-                            let edit =
-                                ui.add(egui::TextEdit::singleline(text).desired_width(120.0));
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                self.folder_rename = None;
-                            } else if edit.lost_focus() {
-                                *action = Some(TrackAction::RenameFolder(*fidx));
-                            } else {
-                                edit.request_focus();
+                                .clicked()
+                            {
+                                *action = Some(TrackAction::ToggleFolder(folder));
                             }
-                        } else if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!("{name}  · {child_count}"))
-                                        .strong(),
+                            let icon = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover()).0;
+                            let c = folder_color(color, folder);
+                            ui.painter().rect_filled(icon, 4.0, c.gamma_multiply(0.35));
+                            ui.painter().rect_stroke(
+                                icon,
+                                4.0,
+                                egui::Stroke::new(1.0_f32, c),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                icon.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "▤",
+                                egui::FontId::proportional(13.0),
+                                c,
+                            );
+                            if let Some((fidx, text)) =
+                                self.folder_rename.as_mut().filter(|(f, _)| *f == folder)
+                            {
+                                let edit =
+                                    ui.add(egui::TextEdit::singleline(text).desired_width(120.0));
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    self.folder_rename = None;
+                                } else if edit.lost_focus() {
+                                    *action = Some(TrackAction::RenameFolder(*fidx));
+                                } else {
+                                    edit.request_focus();
+                                }
+                            } else if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{name}  · {child_count}"))
+                                            .strong(),
+                                    )
+                                    .truncate()
+                                    .sense(Sense::click()),
                                 )
-                                .truncate()
-                                .sense(Sense::click()),
-                            )
-                            .on_hover_text(format!("{name}\nДвойной щелчок — переименовать"))
-                            .double_clicked()
-                        {
-                            self.folder_rename = Some((folder, name.clone()));
-                        }
+                                .on_hover_text(format!("{name}\nДвойной щелчок — переименовать"))
+                                .double_clicked()
+                            {
+                                self.folder_rename = Some((folder, name.clone()));
+                            }
+                        });
                     });
-                });
-            })
+                },
+            )
             .response;
+        if rows_top.is_none() {
+            *rows_top = Some(response.rect.min.y);
+        }
+        if response.drag_started() {
+            self.header_drag = Some(HeaderDrag {
+                tracks: Vec::new(),
+                folder: Some(folder),
+            });
+        }
+        if response.drag_stopped() {
+            if let (Some(top), Some(pos)) = (*rows_top, response.interact_pointer_pos()) {
+                self.resolve_header_drop(pos.y, top);
+            }
+        }
         ui.painter().rect_filled(
             Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height())),
             0.0,
             folder_color(color, folder),
         );
         if response.clicked() {
-            self.editor.select_folder(Some(folder));
+            // SPEC-057 §4: Ctrl adds/removes, Shift a range, plain click alone.
+            let (toggle, range) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+            self.editor.select_folder(Some(folder), toggle, range);
         }
         response.context_menu(|ui| {
             if ui.button("Переименовать").clicked() {
@@ -2426,6 +2644,7 @@ impl App {
                 ui.close();
             }
         });
+        response.rect
     }
 
     fn track_action(&mut self, action: TrackAction) {

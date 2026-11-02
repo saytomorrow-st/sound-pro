@@ -276,7 +276,7 @@ fn selecting_a_folder_highlights_it_and_clears_track_selection() {
     editor.select_track(2, false, false);
     assert!(editor.is_track_selected(2));
 
-    editor.select_folder(Some(folder));
+    editor.select_folder(Some(folder), false, false);
     assert!(editor.is_folder_selected(folder));
     assert!(!editor.is_track_selected(2));
     assert!(editor.selected_track.is_none());
@@ -286,8 +286,8 @@ fn selecting_a_folder_highlights_it_and_clears_track_selection() {
 fn clearing_folder_selection_does_not_reselect_tracks() {
     let mut editor = editor_with(2);
     let folder = editor.create_folder(&[0]).unwrap();
-    editor.select_folder(Some(folder));
-    editor.select_folder(None);
+    editor.select_folder(Some(folder), false, false);
+    editor.select_folder(None, false, false);
     assert!(!editor.is_folder_selected(folder));
     assert!(editor.selected_track.is_none());
 }
@@ -296,7 +296,7 @@ fn clearing_folder_selection_does_not_reselect_tracks() {
 fn selecting_a_track_clears_folder_selection() {
     let mut editor = editor_with(3);
     let folder = editor.create_folder(&[0]).unwrap();
-    editor.select_folder(Some(folder));
+    editor.select_folder(Some(folder), false, false);
     assert!(editor.is_folder_selected(folder));
 
     editor.select_track(2, false, false);
@@ -309,7 +309,7 @@ fn selecting_an_out_of_range_folder_is_ignored() {
     let mut editor = editor_with(1);
     editor.create_folder(&[0]).unwrap();
     editor.select_track(0, false, false);
-    editor.select_folder(Some(7));
+    editor.select_folder(Some(7), false, false);
     assert!(editor.selected_folder.is_none());
     assert!(editor.is_track_selected(0));
 }

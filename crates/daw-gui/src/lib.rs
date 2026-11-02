@@ -325,6 +325,8 @@ pub struct Editor {
     more_clips: Vec<(usize, usize)>,
     /// Tracks selected besides [`Self::selected_track`] (SPEC-047), sorted.
     more_tracks: Vec<usize>,
+    /// Folders selected besides [`Self::selected_folder`] (SPEC-057), sorted.
+    more_folders: Vec<usize>,
     /// Cycle region `[start, end)` of the window; not saved (SPEC-025).
     cycle: Option<(u64, u64)>,
     /// Whether playback repeats [`Self::cycle`].
@@ -376,6 +378,7 @@ impl Editor {
             selected_clip: None,
             more_clips: Vec::new(),
             more_tracks: Vec::new(),
+            more_folders: Vec::new(),
             cycle: None,
             cycle_enabled: false,
             metronome: false,
@@ -461,6 +464,7 @@ impl Editor {
             selected_clip: None,
             more_clips: Vec::new(),
             more_tracks: Vec::new(),
+            more_folders: Vec::new(),
             cycle: None,
             cycle_enabled: false,
             metronome: self.metronome,
@@ -1629,6 +1633,7 @@ impl Editor {
             self.more_tracks.clear();
             self.selected_clip = at;
             self.selected_folder = None;
+            self.more_folders.clear();
             if let Some((t, _)) = at {
                 self.selected_track = Some(t);
             }
@@ -1853,23 +1858,81 @@ impl Editor {
     /// Whether `folder` is the selected track stack (SPEC-055 §4).
     #[must_use]
     pub fn is_folder_selected(&self, folder: usize) -> bool {
-        self.selected_folder == Some(folder)
+        self.selected_folder == Some(folder) || self.more_folders.binary_search(&folder).is_ok()
+    }
+
+    /// Every selected folder, sorted (SPEC-057 §4).
+    #[must_use]
+    pub fn selected_folders(&self) -> Vec<usize> {
+        let mut all = self.more_folders.clone();
+        if let Some(f) = self.selected_folder {
+            if let Err(i) = all.binary_search(&f) {
+                all.insert(i, f);
+            }
+        }
+        let count = self.project.session.folders.len();
+        all.retain(|&f| f < count);
+        all
     }
 
     /// Selects a folder (track stack), clearing any track or clip selection;
-    /// `None` clears the folder selection (SPEC-055 §4). Bad indices do
-    /// nothing.
-    pub fn select_folder(&mut self, folder: Option<usize>) {
-        if folder.is_some_and(|f| f >= self.project.session.folders.len()) {
+    /// `None` clears the folder selection (SPEC-055 §4). With `toggle` (Ctrl)
+    /// the folder is added to or removed from the selection; with `range`
+    /// (Shift) every folder up to the primary one is selected (SPEC-057 §4).
+    /// Bad indices do nothing.
+    pub fn select_folder(&mut self, folder: Option<usize>, toggle: bool, range: bool) {
+        let Some(folder) = folder else {
+            self.selected_folder = None;
+            self.more_folders.clear();
+            return;
+        };
+        if folder >= self.project.session.folders.len() {
             return;
         }
-        self.selected_folder = folder;
-        if folder.is_some() {
+        if range {
+            if let Some(anchor) = self.selected_folder {
+                for f in anchor.min(folder)..=anchor.max(folder) {
+                    if f != anchor {
+                        if let Err(i) = self.more_folders.binary_search(&f) {
+                            self.more_folders.insert(i, f);
+                        }
+                    }
+                }
+            } else {
+                self.selected_folder = Some(folder);
+            }
             self.selected_track = None;
             self.more_tracks.clear();
             self.selected_clip = None;
             self.more_clips.clear();
+            return;
         }
+        if toggle {
+            if self.selected_folder == Some(folder) {
+                self.selected_folder =
+                    (!self.more_folders.is_empty()).then(|| self.more_folders.remove(0));
+            } else if let Ok(i) = self.more_folders.binary_search(&folder) {
+                self.more_folders.remove(i);
+            } else {
+                if let Some(old) = self.selected_folder {
+                    if let Err(i) = self.more_folders.binary_search(&old) {
+                        self.more_folders.insert(i, old);
+                    }
+                }
+                self.selected_folder = Some(folder);
+            }
+            self.selected_track = None;
+            self.more_tracks.clear();
+            self.selected_clip = None;
+            self.more_clips.clear();
+            return;
+        }
+        self.more_folders.clear();
+        self.selected_folder = Some(folder);
+        self.selected_track = None;
+        self.more_tracks.clear();
+        self.selected_clip = None;
+        self.more_clips.clear();
     }
 
     /// Selects a track: alone, with Ctrl (`toggle`) added or removed, or with
@@ -1911,6 +1974,7 @@ impl Editor {
         self.more_tracks.clear();
         self.selected_track = Some(track);
         self.selected_folder = None;
+        self.more_folders.clear();
     }
 
     /// Copies a clip to the window's clipboard; the project is untouched.
@@ -2904,6 +2968,113 @@ impl Editor {
         Ok(())
     }
 
+    /// Moves a group of tracks so they form one contiguous block at position
+    /// `to`, preserving their relative order (SPEC-057 §1). One undo step;
+    /// folder child indices and armed tracks are remapped. Empty or repeated
+    /// selections are collapsed; bad indices are rejected.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] when an index is out of range.
+    pub fn move_tracks(&mut self, tracks: &[usize], to: usize) -> Result<(), EditorError> {
+        let count = self.project.session.tracks.len();
+        let mut moved: Vec<usize> = tracks.to_vec();
+        moved.sort_unstable();
+        moved.dedup();
+        if moved.is_empty() {
+            return Ok(());
+        }
+        if moved.iter().any(|&t| t >= count) || to > count {
+            return Err(EditorError::NoClip);
+        }
+        let mut session = self.project.session.clone();
+
+        // Remove the selected tracks, in order, collecting them.
+        let mut selected = Vec::with_capacity(moved.len());
+        for (offset, &t) in moved.iter().enumerate() {
+            selected.push(session.tracks.remove(t - offset));
+        }
+
+        // The block lands at `to`, clamped to the now-shorter list.
+        let insert_at = to.min(session.tracks.len());
+        session.tracks.splice(insert_at..insert_at, selected);
+
+        // Recompute every folder child index through the old->new mapping.
+        let mut old_to_new = vec![0usize; count];
+        let mut non_moved = 0usize;
+        for (t, slot) in old_to_new.iter_mut().enumerate() {
+            if moved.binary_search(&t).is_ok() {
+                continue;
+            }
+            *slot = non_moved;
+            non_moved += 1;
+        }
+        for (order, &t) in moved.iter().enumerate() {
+            old_to_new[t] = insert_at + order;
+        }
+        for (t, slot) in old_to_new.iter_mut().enumerate() {
+            if moved.binary_search(&t).is_err() && *slot >= insert_at {
+                *slot += moved.len();
+            }
+        }
+        remap_folder_children(&mut session.folder_children, |c| old_to_new[c]);
+
+        self.commit_session(session)?;
+        self.armed = self
+            .armed
+            .iter()
+            .map(|&a| old_to_new[a])
+            .collect::<Vec<_>>();
+        self.armed.sort_unstable();
+        self.selected_track = self
+            .selected_track
+            .and_then(|t| (t < old_to_new.len()).then(|| old_to_new[t]));
+        self.more_tracks = self
+            .more_tracks
+            .iter()
+            .filter(|&&t| t < old_to_new.len())
+            .map(|&t| old_to_new[t])
+            .collect();
+        self.more_tracks.sort_unstable();
+        self.selected_clip = None;
+        Ok(())
+    }
+
+    /// Moves `tracks` into `folder`, first removing them from any folder they
+    /// already belong to (SPEC-057 §2). One undo step. Bad indices are
+    /// rejected; repeated tracks are collapsed.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoFolder`], [`EditorError::NoClip`] for a bad track
+    /// index.
+    pub fn move_tracks_to_folder(
+        &mut self,
+        folder: usize,
+        tracks: &[usize],
+    ) -> Result<(), EditorError> {
+        if folder >= self.project.session.folders.len() {
+            return Err(EditorError::NoFolder);
+        }
+        let count = self.project.session.tracks.len();
+        let mut sorted: Vec<usize> = tracks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.is_empty() {
+            return Ok(());
+        }
+        if sorted.iter().any(|&t| t >= count) {
+            return Err(EditorError::NoClip);
+        }
+        let mut session = self.project.session.clone();
+        for list in &mut session.folder_children {
+            list.retain(|c| !sorted.contains(c));
+        }
+        session.folder_children[folder].extend_from_slice(&sorted);
+        session.folder_children[folder].sort_unstable();
+        self.commit_session(session)
+    }
+
     /// Inserts a copy of a track right below it and selects the copy
     /// (SPEC-029). Returns the copy's index.
     ///
@@ -3080,6 +3251,7 @@ impl Editor {
         self.commit_session(session)?;
         self.selected_track = None;
         self.selected_folder = None;
+        self.more_folders.clear();
         Ok(())
     }
 
@@ -3549,6 +3721,7 @@ impl Editor {
         let folders = &self.project.session.folders;
         self.selected_track = self.selected_track.filter(|&t| t < tracks.len());
         self.selected_folder = self.selected_folder.filter(|&f| f < folders.len());
+        self.more_folders.retain(|&f| f < folders.len());
         self.selected_clip = self
             .selected_clip
             .filter(|&(t, c)| tracks.get(t).is_some_and(|tr| c < tr.clips.len()));

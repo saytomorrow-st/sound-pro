@@ -208,3 +208,95 @@ pub fn row_at_y_heights(row_heights: &[f32], y: f32) -> Option<usize> {
 pub fn row_at_y(heights: &[f32], session: &Session, y: f32) -> Option<usize> {
     row_at_y_heights(&row_heights(heights, session), y)
 }
+
+/// The insertion row index (in `0..=rows.len()`) for a drop at vertical
+/// offset `y`, for a drag-reorder indicator (SPEC-057 §1). A pointer in the
+/// top half of a row inserts before that row; in the bottom half, after it.
+/// Above the first row returns `0`, below the last returns `rows.len()`.
+#[must_use]
+pub fn drop_insertion_row(row_heights: &[f32], y: f32) -> usize {
+    if !y.is_finite() || y < 0.0 {
+        return 0;
+    }
+    let Some(row) = row_at_y_heights(row_heights, y) else {
+        // Below the last row (or no rows): insert at the end.
+        return row_heights.len();
+    };
+    let mut acc = 0.0;
+    for (i, h) in row_heights.iter().enumerate() {
+        if i == row {
+            let mid = acc + h / 2.0;
+            return if y < mid { row } else { row + 1 };
+        }
+        acc += h;
+    }
+    row_heights.len()
+}
+
+/// The track index where a drop at `insertion_row` lands: the number of track
+/// rows shown strictly above that row (SPEC-057 §1). A folder header row
+/// contributes no track, so dropping just above a folder's first child lands
+/// at the top-level position right before that child.
+#[must_use]
+pub fn track_index_at_insertion(session: &Session, insertion_row: usize) -> usize {
+    visible_rows(session)
+        .iter()
+        .take(insertion_row)
+        .filter(|r| matches!(r, Row::Track(_)))
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_with_folders() -> Session {
+        let mut session = Session::new("s", 48_000, 120.0);
+        for n in 0..4 {
+            session
+                .tracks
+                .push(audio_core::SessionTrack::new(&format!("t{n}")));
+        }
+        session.folders.push(audio_core::TrackFolder::new("F"));
+        session.folder_children.push(vec![0, 2]);
+        session
+    }
+
+    #[test]
+    fn drop_insertion_row_splits_a_row_into_before_and_after() {
+        // Three rows of 10px each.
+        let heights = vec![10.0, 10.0, 10.0];
+        assert_eq!(drop_insertion_row(&heights, -1.0), 0);
+        assert_eq!(drop_insertion_row(&heights, 0.0), 0);
+        assert_eq!(drop_insertion_row(&heights, 4.9), 0);
+        assert_eq!(drop_insertion_row(&heights, 5.0), 1);
+        assert_eq!(drop_insertion_row(&heights, 14.9), 1);
+        assert_eq!(drop_insertion_row(&heights, 15.0), 2);
+        assert_eq!(drop_insertion_row(&heights, 24.9), 2);
+        assert_eq!(drop_insertion_row(&heights, 25.0), 3);
+        assert_eq!(drop_insertion_row(&heights, 30.0), 3);
+        assert_eq!(drop_insertion_row(&heights, 99.0), 3);
+    }
+
+    #[test]
+    fn drop_insertion_row_handles_empty_and_non_finite() {
+        assert_eq!(drop_insertion_row(&[], 0.0), 0);
+        assert_eq!(drop_insertion_row(&[10.0], f32::NAN), 0);
+    }
+
+    #[test]
+    fn track_index_at_insertion_counts_track_rows_above() {
+        let session = session_with_folders();
+        // visible_rows: Folder(0), Track(0), Track(1), Track(2), Track(3).
+        let rows = visible_rows(&session);
+        assert_eq!(rows.len(), 5);
+        // Insertion before the folder header -> no tracks above.
+        assert_eq!(track_index_at_insertion(&session, 0), 0);
+        // Between folder header and track 0 -> one track (0) above.
+        assert_eq!(track_index_at_insertion(&session, 1), 0);
+        // After track 1 -> tracks 0 and 1 above.
+        assert_eq!(track_index_at_insertion(&session, 3), 2);
+        // At the very end -> all four tracks above.
+        assert_eq!(track_index_at_insertion(&session, 5), 4);
+    }
+}
