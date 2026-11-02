@@ -3033,7 +3033,13 @@ impl App {
                     let top = area.min.y
                         + TIMELINE_HEADER
                         + track_rows::total_height(&self.track_heights, session);
-                    Rect::from_min_max(Pos2::new(area.min.x, top), area.max)
+                    // The "new track" target is a single standard-height band
+                    // below the last row, never the whole remaining timeline
+                    // (SPEC-059 §1b): a full-area ghost reads as a bug.
+                    Rect::from_min_size(
+                        Pos2::new(area.min.x, top),
+                        Vec2::new(area.width(), track_rows::DEFAULT_TRACK_HEIGHT),
+                    )
                 }
             };
             // The first audio file's length comes from its header, read once
@@ -6212,13 +6218,13 @@ fn draw_take_rect(painter: &egui::Painter, rect: Rect, samples: &[f32]) {
 mod header_drag_tests {
     use super::*;
 
-    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
             events,
             ..Default::default()
         };
-        let _ = ctx.run(raw, |ctx| {
+        ctx.run(raw, |ctx| {
             if ctx.input(|i| i.pointer.any_down()) {
                 app.editor.begin_group();
             } else {
@@ -6230,7 +6236,7 @@ mod header_drag_tests {
                     .id_salt("headers")
                     .show(ui, |ui| app.track_headers(ui));
             });
-        });
+        })
     }
 
     fn names(app: &App) -> Vec<String> {
@@ -6317,5 +6323,63 @@ mod header_drag_tests {
         let mut kids = app.editor.session().folder_children[0].clone();
         kids.sort_unstable();
         assert_eq!(kids.len(), 2, "children: {kids:?}");
+    }
+
+    /// The translucent drag ghost fill colour, exactly as `draw_drag_indicator`
+    /// paints it (SPEC-057/058). Kept in sync by the test below.
+    fn ghost_fill() -> Color32 {
+        Color32::from_rgba_unmultiplied(80, 140, 255, 40)
+    }
+
+    /// Collects the ghost rectangles painted on the given frame output.
+    fn ghost_rects(out: &egui::FullOutput) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            let mut push = |shape: &egui::epaint::Shape| {
+                if let egui::epaint::Shape::Rect(r) = shape {
+                    if r.fill == ghost_fill() {
+                        rects.push(r.rect);
+                    }
+                }
+            };
+            match &clipped.shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(push),
+                other => push(other),
+            }
+        }
+        rects
+    }
+
+    #[test]
+    fn drag_ghost_is_dragged_row_height_not_full_height() {
+        let mut app = app_with_tracks();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(FIRST_LABEL)]);
+        frame(&ctx, &mut app, vec![button(FIRST_LABEL, true)]);
+        // Mid-drag frame: a single track is dragged, so the ghost must be the
+        // height of exactly one track row, never the whole panel.
+        let out = frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(Pos2::new(70.0, 400.0))],
+        );
+        let expected = app.track_height(0);
+        let rects = ghost_rects(&out);
+        assert!(!rects.is_empty(), "no drag ghost was painted");
+        for r in &rects {
+            assert!(
+                (r.height() - expected).abs() < 1.0,
+                "ghost height {} != dragged row height {expected} (rect {r:?})",
+                r.height()
+            );
+            // The ghost spans the header panel, never the whole 1200px window.
+            assert!(
+                r.width() < 400.0,
+                "ghost width {} spans the whole work area (rect {r:?})",
+                r.width()
+            );
+        }
     }
 }
