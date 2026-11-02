@@ -1,0 +1,12 @@
+// Defines and include handling. `included` resolves via the test resolver.
+#define $VOL -3
+#define $ATK 0.01
+<region>
+sample=included.wav
+volume=$VOL
+ampeg_attack=$ATK
+ampeg_sustain=50
+// a line comment that should be ignored
+/* a block
+   comment */
+loop_mode=loop_continuous

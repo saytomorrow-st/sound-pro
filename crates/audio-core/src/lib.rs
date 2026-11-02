@@ -28,6 +28,7 @@ pub mod params;
 pub mod project;
 pub mod render;
 pub mod resample;
+pub mod sampler;
 pub mod schedule;
 pub mod session;
 pub mod synth;
@@ -47,6 +48,9 @@ pub use project::{MAX_NAME_BYTES, ParamState, Project, ProjectError};
 pub use render::{RenderStats, Renderer};
 pub use resample::{
     ResampleError, resample, resample_fast, resample_range, resample_range_fast, resampled_len,
+};
+pub use sampler::sfz::{
+    IncludeResolver, LoopMode, OffMode, Region, SfzDocument, SfzError, SfzWarning, Trigger, parse,
 };
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{

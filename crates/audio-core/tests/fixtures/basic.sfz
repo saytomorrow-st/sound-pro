@@ -1,0 +1,21 @@
+// Basic bank: control default_path, global amp, two regions with inheritance.
+<control>
+default_path=Samples/
+<global>
+volume=-6
+amp_veltrack=100
+<group>
+group=1
+off_by=1
+<region>
+sample=piano_c4.wav
+key=60
+lovel=1
+hivel=127
+<region>
+sample=piano_c5.wav
+lokey=61
+hikey=72
+pitch_keycenter=64
+lovel=1
+hivel=64
