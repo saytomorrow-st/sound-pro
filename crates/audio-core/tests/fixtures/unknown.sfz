@@ -1,0 +1,14 @@
+// Unknown header and unknown opcode: both must be tolerated.
+<effect>
+some_effect_param=1.0
+<region>
+sample=hat.wav
+fil_type=lpf_2p
+group=2
+off_by=2
+off_mode=fast
+trigger=attack
+seq_length=3
+seq_position=1
+lorand=0.1
+hirand=0.9
