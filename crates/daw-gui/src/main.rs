@@ -20,6 +20,7 @@ use audio_core::{
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
 use daw_gui::layout::{Bottom, Layout, MeterState};
+use daw_gui::quantize::{Division, QuantizeMode, QuantizeParams};
 use daw_gui::timeline::{self, CycleHit};
 use daw_gui::track_rows::{self, Row};
 use daw_gui::{
@@ -48,6 +49,8 @@ const KEY_HEIGHT: f32 = 12.0;
 const STEP_PX: f32 = 22.0;
 const KEYS_PX: f32 = 44.0;
 const PIANO_HEIGHT: f32 = 280.0;
+/// Height of the velocity lane below the piano grid (SPEC-061 §2).
+const VELOCITY_LANE_HEIGHT: f32 = 80.0;
 /// Strength of notes drawn with the mouse.
 const NEW_VELOCITY: u8 = 100;
 
@@ -57,6 +60,16 @@ struct NoteDrag {
     index: usize,
     /// Pointer position minus note start, in samples, at the press.
     grab: i64,
+}
+
+/// A velocity bar being dragged in the velocity lane (SPEC-061 §2).
+#[derive(Clone)]
+struct VelocityDrag {
+    /// Velocity at the press, before any pointer movement, of the grabbed note.
+    anchor: u8,
+    /// Every note velocity at the press, keyed by note index, for the
+    /// proportional multi-selection scaling.
+    originals: Vec<(usize, u8)>,
 }
 
 const fn is_black_key(pitch: u8) -> bool {
@@ -737,6 +750,14 @@ struct App {
     /// Audio clip editor (SPEC-039).
     audio_edit: audio_editor::AudioEdit,
     note_drag: Option<NoteDrag>,
+    /// Selected note indices in the open piano roll (SPEC-061).
+    note_selection: Vec<usize>,
+    /// Active velocity-lane drag (SPEC-061 §2).
+    velocity_drag: Option<VelocityDrag>,
+    /// Quantize grid division, mode and strength for the piano roll toolbar.
+    quantize_division: daw_gui::quantize::Division,
+    quantize_mode: daw_gui::quantize::QuantizeMode,
+    quantize_strength: u8,
     /// Scroll the piano roll to middle C on the next frame.
     piano_scroll: bool,
     /// Horizontal zoom of the piano roll and the offset to apply on the
@@ -915,6 +936,11 @@ impl App {
             piano: None,
             audio_edit: audio_editor::AudioEdit::default(),
             note_drag: None,
+            note_selection: Vec::new(),
+            velocity_drag: None,
+            quantize_division: daw_gui::quantize::Division::Sixteenth,
+            quantize_mode: daw_gui::quantize::QuantizeMode::StartOnly,
+            quantize_strength: 100,
             piano_scroll: false,
             piano_zoom: 1.0,
             piano_offset: None,
@@ -4951,12 +4977,16 @@ impl App {
     fn close_piano(&mut self) {
         self.piano = None;
         self.note_drag = None;
+        self.note_selection.clear();
+        self.velocity_drag = None;
     }
 
     fn open_piano(&mut self, at: (usize, usize)) {
         self.audio_edit = audio_editor::AudioEdit::default();
         self.piano = Some(at);
         self.note_drag = None;
+        self.note_selection.clear();
+        self.velocity_drag = None;
         self.piano_scroll = true;
         self.editor.selected_clip = Some(at);
         self.editor.selected_track = Some(at.0);
@@ -4992,9 +5022,12 @@ impl App {
                 if ui.small_button("✕").on_hover_text("Закрыть").clicked() {
                     self.piano = None;
                     self.note_drag = None;
+                    self.note_selection.clear();
+                    self.velocity_drag = None;
                 }
             });
         });
+        self.quantize_bar(ui, t, c);
         if self.piano.is_none() {
             return;
         }
@@ -5005,7 +5038,54 @@ impl App {
         if let Some(offset) = self.piano_offset.take() {
             scroll = scroll.horizontal_scroll_offset(offset);
         }
-        scroll.show(ui, |ui| self.piano_grid(ui, t, c));
+        scroll.show(ui, |ui| {
+            self.piano_grid(ui, t, c);
+            self.velocity_lane(ui, t, c);
+        });
+    }
+
+    /// Quantize toolbar for the open piano roll (SPEC-061 §1): grid division,
+    /// start-only vs start+length, strength and the apply button.
+    fn quantize_bar(&mut self, ui: &mut egui::Ui, t: usize, c: usize) {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("quantize_division")
+                .selected_text(self.quantize_division.label())
+                .show_ui(ui, |ui| {
+                    for d in Division::ALL {
+                        ui.selectable_value(&mut self.quantize_division, d, d.label());
+                    }
+                });
+            let mode_label = match self.quantize_mode {
+                QuantizeMode::StartOnly => "начало",
+                QuantizeMode::StartAndLength => "начало+длина",
+            };
+            egui::ComboBox::from_id_salt("quantize_mode")
+                .selected_text(mode_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.quantize_mode, QuantizeMode::StartOnly, "начало");
+                    ui.selectable_value(
+                        &mut self.quantize_mode,
+                        QuantizeMode::StartAndLength,
+                        "начало+длина",
+                    );
+                });
+            ui.label("сила");
+            ui.add(
+                egui::Slider::new(&mut self.quantize_strength, 0..=100)
+                    .suffix("%")
+                    .fixed_decimals(0),
+            );
+            if ui.button("Квантизировать").clicked() {
+                let params = QuantizeParams {
+                    division: self.quantize_division,
+                    mode: self.quantize_mode,
+                    strength: self.quantize_strength,
+                };
+                let indices = self.note_selection.clone();
+                let result = self.editor.quantize_selection(t, c, &indices, params);
+                self.report(result, "Ноты квантизированы");
+            }
+        });
     }
 
     #[allow(
@@ -5088,18 +5168,25 @@ impl App {
                 Vec2::new((n.length as f32 * px_per_sample).max(3.0), KEY_HEIGHT - 2.0),
             );
             let dragged = self.note_drag.is_some_and(|d| d.index == i);
+            let selected = self.note_selection.contains(&i);
+            // Tint by velocity: dim at 1, saturated at 127; a brighter outline
+            // marks the selection (SPEC-061 §2).
+            let strength = f32::from(n.velocity) / 127.0;
+            let green = (80.0 + 140.0 * strength) as u8;
             let fill = if dragged {
                 Color32::from_rgb(255, 200, 60)
+            } else if selected {
+                Color32::from_rgb(150, green, 160)
             } else {
-                Color32::from_rgb(110, 200, 120)
+                Color32::from_rgb(70, green, 110)
             };
             painter.rect_filled(rect, 2.0, fill);
-            painter.rect_stroke(
-                rect,
-                2.0,
-                Stroke::new(1.0_f32, Color32::from_gray(10)),
-                StrokeKind::Inside,
-            );
+            let outline = if selected {
+                Stroke::new(2.0_f32, Color32::from_rgb(255, 255, 140))
+            } else {
+                Stroke::new(1.0_f32, Color32::from_gray(10))
+            };
+            painter.rect_stroke(rect, 2.0, outline, StrokeKind::Inside);
             note_rects.push(rect);
         }
         // Keys stay visible while the grid scrolls sideways.
@@ -5149,7 +5236,25 @@ impl App {
             return;
         }
         if response.clicked() {
-            if let Some(p) = pointer.filter(|p| p.x >= grid_x && hit(*p).is_none()) {
+            let clicked_note = pointer.and_then(hit);
+            let additive = ui.input(|i| i.modifiers.command);
+            if let Some(index) = clicked_note {
+                // Left-click a note selects it (Ctrl/Cmd toggles membership);
+                // selection drives quantization and velocity scaling.
+                if additive {
+                    if let Some(at) = self.note_selection.iter().position(|&i| i == index) {
+                        self.note_selection.remove(at);
+                    } else {
+                        self.note_selection.push(index);
+                    }
+                } else if !self.note_selection.contains(&index) {
+                    self.note_selection = vec![index];
+                }
+                return;
+            }
+            // Clicking empty grid clears the selection, then adds a note.
+            if let Some(p) = pointer.filter(|p| p.x >= grid_x) {
+                self.note_selection.clear();
                 let (samples, pitch) = at_pos(p);
                 let start = samples / step * step;
                 let length = step.min(content.saturating_sub(start));
@@ -5202,9 +5307,148 @@ impl App {
         self.note_drag = Some(drag);
     }
 
+    /// Velocity lane under the piano grid: one bar per note, height
+    /// proportional to velocity, draggable to edit (SPEC-061 §2). Dragging a
+    /// selected note scales the whole selection proportionally; the drag is
+    /// one undo step (the frame loop groups the whole press).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
+    fn velocity_lane(&mut self, ui: &mut egui::Ui, t: usize, c: usize) {
+        let session = self.editor.session();
+        let map = self.tempo_map();
+        let step = sixteenth_samples(&map);
+        let clip = &session.tracks[t].clips[c];
+        let content = clip.source_length;
+        let notes = clip.notes.clone().unwrap_or_default();
+        let step_px = STEP_PX * self.piano_zoom;
+        let px_per_sample = step_px / step as f32;
+        let width = KEYS_PX + content as f32 * px_per_sample + 2.0;
+        let (area, response) = ui.allocate_exact_size(
+            Vec2::new(width.max(ui.available_width()), VELOCITY_LANE_HEIGHT),
+            Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(area);
+        let grid_x = area.min.x + KEYS_PX;
+        painter.rect_filled(area, 0.0, Color32::from_gray(22));
+        painter.rect_stroke(
+            area,
+            0.0,
+            Stroke::new(1.0_f32, Color32::from_gray(50)),
+            StrokeKind::Inside,
+        );
+
+        // Horizontal guide lines for a few velocities.
+        for v in [0.25_f32, 0.5, 0.75, 1.0] {
+            let y = area.max.y - v * (area.height() - 4.0) - 2.0;
+            painter.line_segment(
+                [Pos2::new(grid_x, y), Pos2::new(area.max.x, y)],
+                Stroke::new(1.0_f32, Color32::from_gray(40)),
+            );
+        }
+
+        // One bar per note, bottom-aligned, height ∝ velocity.
+        let mut bars = Vec::with_capacity(notes.len());
+        for (i, n) in notes.iter().enumerate() {
+            let x = grid_x + n.start as f32 * px_per_sample;
+            let w = (n.length as f32 * px_per_sample).max(3.0);
+            let frac = f32::from(n.velocity) / 127.0;
+            let h = (frac * (area.height() - 4.0)).max(3.0);
+            let rect = Rect::from_min_size(Pos2::new(x, area.max.y - h - 2.0), Vec2::new(w, h));
+            let selected = self.note_selection.contains(&i);
+            let fill = if selected {
+                Color32::from_rgb(230, 180, 80)
+            } else {
+                Color32::from_rgb(120, 160, 200)
+            };
+            painter.rect_filled(rect, 1.0, fill);
+            painter.rect_stroke(
+                rect,
+                1.0,
+                Stroke::new(1.0_f32, Color32::from_gray(10)),
+                StrokeKind::Inside,
+            );
+            bars.push((i, rect));
+        }
+        painter.text(
+            Pos2::new(area.min.x + 4.0, area.min.y + 2.0),
+            Align2::LEFT_TOP,
+            "Velocity",
+            FontId::proportional(10.0),
+            Color32::from_gray(160),
+        );
+
+        let hit = |p: Pos2| bars.iter().rposition(|(_, r)| r.contains(p));
+        let velocity_at = |p: Pos2| {
+            let usable = (area.height() - 4.0).max(1.0);
+            let frac = ((area.max.y - 2.0 - p.y) / usable).clamp(0.0, 1.0);
+            (frac * 127.0).round().clamp(1.0, 127.0) as u8
+        };
+
+        if response.clicked() {
+            let index = response.interact_pointer_pos().and_then(hit);
+            if let Some(index) = index {
+                if !self.note_selection.contains(&index) {
+                    self.note_selection = vec![index];
+                }
+            }
+            return;
+        }
+
+        if response.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            if let Some(index) = origin.and_then(hit) {
+                let originals: Vec<(usize, u8)> =
+                    if self.note_selection.contains(&index) && self.note_selection.len() > 1 {
+                        self.note_selection
+                            .iter()
+                            .filter_map(|&i| notes.get(i).map(|n| (i, n.velocity)))
+                            .collect()
+                    } else {
+                        vec![(index, notes[index].velocity)]
+                    };
+                let anchor = notes[index].velocity;
+                self.velocity_drag = Some(VelocityDrag { anchor, originals });
+            }
+            return;
+        }
+
+        let Some(ref drag) = self.velocity_drag else {
+            return;
+        };
+        if response.drag_stopped() {
+            self.velocity_drag = None;
+            self.status = "Велосити изменено".into();
+            return;
+        }
+        let Some(p) = response.interact_pointer_pos() else {
+            return;
+        };
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+        let new_velocity = velocity_at(p);
+        // Proportional scaling: ratio of the grabbed note's new/old velocity
+        // applied to every note in the drag set.
+        let ratio = f32::from(new_velocity) / f32::from(drag.anchor.max(1));
+        let pairs: Vec<(usize, u8)> = drag
+            .originals
+            .iter()
+            .map(|&(i, orig)| {
+                let scaled = (f32::from(orig) * ratio).round().clamp(1.0, 127.0) as u8;
+                (i, scaled)
+            })
+            .collect();
+        if let Err(e) = self.editor.set_notes_velocity(t, c, &pairs) {
+            self.status = format!("Ошибка: {e}");
+        }
+    }
+
     fn undo(&mut self) {
         self.drag = None;
         self.note_drag = None;
+        self.velocity_drag = None;
         self.status = if self.editor.undo() {
             "Отменено".into()
         } else {
@@ -5215,6 +5459,7 @@ impl App {
     fn redo(&mut self) {
         self.drag = None;
         self.note_drag = None;
+        self.velocity_drag = None;
         self.status = if self.editor.redo() {
             "Повторено".into()
         } else {
@@ -7101,5 +7346,151 @@ mod header_drag_tests {
         app.editor.toggle_folder(0).unwrap();
         settle(&mut app);
         assert_columns_match(&app, "re-expanded");
+    }
+}
+
+#[cfg(test)]
+mod velocity_lane_tests {
+    use super::*;
+
+    /// Renders just the velocity lane in a bare central panel, so its
+    /// geometry is deterministic (top-left at the panel origin).
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            if ctx.input(|i| i.pointer.any_down()) {
+                app.editor.begin_group();
+            } else {
+                app.editor.end_group();
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.velocity_lane(ui, 0, 0);
+            });
+        })
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// App with one MIDI clip holding two notes, piano roll open.
+    fn app_with_midi() -> App {
+        let mut app = App::new(None);
+        app.editor.add_midi_track(0, 48_000).unwrap();
+        // A full 1/16 step (6000 samples) so the velocity bar is 22 px wide
+        // and easy to hit headlessly.
+        for (pitch, start) in [(60_u8, 0_u64), (62_u8, 6_000_u64)] {
+            app.editor
+                .add_note(
+                    0,
+                    0,
+                    Note {
+                        pitch,
+                        start,
+                        length: 6_000,
+                        velocity: 100,
+                    },
+                )
+                .unwrap();
+        }
+        app.piano = Some((0, 0));
+        app.piano_zoom = 1.0;
+        app
+    }
+
+    fn velocities(app: &App) -> Vec<u8> {
+        app.editor.session().tracks[0].clips[0]
+            .notes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|n| n.velocity)
+            .collect()
+    }
+
+    /// The fill colour of an unselected velocity bar (kept in sync with the
+    /// colour used in `velocity_lane`).
+    fn velocity_bar_fill() -> Color32 {
+        Color32::from_rgb(120, 160, 200)
+    }
+
+    /// Finds the leftmost velocity bar painted on the given frame output (the
+    /// note at `start = 0`), so the test drags the real rendered geometry.
+    fn first_velocity_bar(out: &egui::FullOutput) -> Rect {
+        let mut best: Option<Rect> = None;
+        for clipped in &out.shapes {
+            let mut push = |shape: &egui::epaint::Shape| {
+                if let egui::epaint::Shape::Rect(r) = shape {
+                    if r.fill == velocity_bar_fill()
+                        && best.is_none_or(|b| r.rect.left() < b.left())
+                    {
+                        best = Some(r.rect);
+                    }
+                }
+            };
+            match &clipped.shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(push),
+                other => push(other),
+            }
+        }
+        best.expect("no velocity bar painted")
+    }
+
+    /// Drags the first note's velocity bar (at the lane's left edge, where the
+    /// bar for `start = 0` lives) from its mid-height toward the top (louder).
+    fn drag_first_bar_up(app: &mut App) {
+        let ctx = egui::Context::default();
+        frame(&ctx, app, vec![]);
+        let out = frame(&ctx, app, vec![]);
+        let bar = first_velocity_bar(&out);
+        // Bars are bottom-aligned: a note's velocity value lives at its bar's
+        // *top* edge. Grab just inside the top (velocity ≈ 100) and drag up to
+        // raise it above the original value.
+        let from = Pos2::new(bar.center().x, bar.top() + 3.0);
+        let to = Pos2::new(bar.center().x, bar.top() - 12.0);
+        frame(&ctx, app, vec![egui::Event::PointerMoved(from)]);
+        frame(&ctx, app, vec![button(from, true)]);
+        for k in 1..=6 {
+            let t = k as f32 / 6.0;
+            let p = Pos2::new(from.x, from.y + (to.y - from.y) * t);
+            frame(&ctx, app, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(&ctx, app, vec![button(to, false)]);
+        frame(&ctx, app, vec![]);
+    }
+
+    #[test]
+    fn dragging_a_velocity_bar_changes_the_note_velocity() {
+        let mut app = app_with_midi();
+        assert_eq!(velocities(&app), [100, 100]);
+        drag_first_bar_up(&mut app);
+        // Dragging up raises the velocity above its original 100.
+        assert!(
+            velocities(&app)[0] > 100,
+            "velocities: {:?}",
+            velocities(&app)
+        );
+    }
+
+    #[test]
+    fn a_velocity_drag_is_one_undo_step() {
+        let mut app = app_with_midi();
+        drag_first_bar_up(&mut app);
+        let after = velocities(&app);
+        assert_ne!(after, [100, 100]);
+        // A single undo restores the exact pre-drag velocities (not per frame).
+        assert!(app.editor.undo());
+        assert_eq!(velocities(&app), [100, 100]);
+        assert!(app.editor.redo());
+        assert_eq!(velocities(&app), after);
     }
 }
