@@ -49,9 +49,16 @@ pub use render::{RenderStats, Renderer};
 pub use resample::{
     ResampleError, resample, resample_fast, resample_range, resample_range_fast, resampled_len,
 };
+pub use sampler::engine::{
+    DEFAULT_VOICES, MAX_SAMPLER_VOICES, SamplerEngine, SamplerError, playback_ratio,
+};
+pub use sampler::region::{
+    AmpEnvelope, MAX_PER_KEY, MIDI_NOTES, RegionTable, SampleRegion, resolve,
+};
 pub use sampler::sfz::{
     IncludeResolver, LoopMode, OffMode, Region, SfzDocument, SfzError, SfzWarning, Trigger, parse,
 };
+pub use sampler::voice::{NO_REGION, STEAL_FADE_SAMPLES, SamplerVoice};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
     AutoPoint, Automation, Bus, BusSend, CROSSFADE_SAMPLES, Clip, DIM_GAIN, EffectLane, Lane,
