@@ -317,16 +317,70 @@ fn draw_clip_wave(
     rect: Rect,
     body: Rect,
     clip: &audio_core::session::Clip,
+    row_height: f32,
     detail: Color32,
 ) {
     if let Some((left, right)) = editor.stereo_peaks(clip) {
-        let mid = body.center().y;
-        let top = Rect::from_min_max(body.min, Pos2::new(body.max.x, mid));
-        let bottom = Rect::from_min_max(Pos2::new(body.min.x, mid), body.max);
-        draw_peaks(painter, rect, top, clip, left, detail);
-        draw_peaks(painter, rect, bottom, clip, right, detail);
+        // Adaptive waveform (SPEC-058 §4): two lanes only from Expanded on;
+        // below that a single mixed mono waveform so both channels stay legible.
+        if row_height >= track_rows::EXPANDED_TRACK_HEIGHT {
+            let mid = body.center().y;
+            let top = Rect::from_min_max(body.min, Pos2::new(body.max.x, mid));
+            let bottom = Rect::from_min_max(Pos2::new(body.min.x, mid), body.max);
+            draw_peaks(painter, rect, top, clip, left, detail);
+            draw_peaks(painter, rect, bottom, clip, right, detail);
+        } else {
+            draw_mixed_peaks(painter, rect, body, clip, left, right, detail);
+        }
     } else if let Some(peaks) = editor.peaks(clip) {
         draw_peaks(painter, rect, body, clip, peaks, detail);
+    }
+}
+
+/// Draws a single mixed waveform from left+right peak sets, without
+/// allocating (SPEC-058 §4). Mirrors [`draw_peaks`] but folds both channels.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "pixel columns and sample positions stay far below 2^24"
+)]
+fn draw_mixed_peaks(
+    painter: &egui::Painter,
+    rect: Rect,
+    body: Rect,
+    clip: &audio_core::session::Clip,
+    left: &daw_gui::Peaks,
+    right: &daw_gui::Peaks,
+    detail: Color32,
+) {
+    let mid = body.center().y;
+    let half = body.height() * 0.45;
+    let visible = painter.clip_rect().intersect(rect);
+    if visible.width() <= 0.0 {
+        return;
+    }
+    let first = (visible.min.x - rect.min.x).floor().max(0.0) as usize;
+    let last = (visible.max.x - rect.min.x).ceil().min(rect.width().ceil()) as usize;
+    let per_px = clip.length_samples as f32 / rect.width();
+    for px in first..last {
+        let from = clip.offset_samples + (px as f32 * per_px) as u64;
+        let to = clip.offset_samples + ((px + 1) as f32 * per_px).ceil() as u64;
+        let l = left.range(from, to);
+        let r = right.range(from, to);
+        let (lo, hi) = match (l, r) {
+            (Some((l0, l1)), Some((r0, r1))) => (l0.min(r0), l1.max(r1)),
+            (Some(p), None) | (None, Some(p)) => p,
+            (None, None) => continue,
+        };
+        let x = rect.min.x + px as f32 + 0.5;
+        painter.line_segment(
+            [
+                Pos2::new(x, mid - hi.clamp(-1.0, 1.0) * half),
+                Pos2::new(x, mid - lo.clamp(-1.0, 1.0) * half + 1.0),
+            ],
+            Stroke::new(1.0_f32, detail),
+        );
     }
 }
 
@@ -523,6 +577,7 @@ enum TrackAction {
     MoveFolder(usize, usize),
     UngroupFolder(usize),
     DeleteFolder(usize),
+    SetHeight(Vec<usize>, f32),
 }
 
 /// «New track» items of the track-header menus (SPEC-050 §4, SPEC-055 §4).
@@ -972,6 +1027,8 @@ impl App {
 
         if let Some(folder) = drag.folder {
             // Folder drag: reorder the folder with its children (no nesting).
+            // `to` is a full-track-list position, but `move_folder` expects an
+            // index among the non-child tracks (SPEC-058 §0).
             let children = self
                 .editor
                 .session()
@@ -979,10 +1036,11 @@ impl App {
                 .get(folder)
                 .cloned()
                 .unwrap_or_default();
-            if self.editor.move_folder(folder, to).is_ok() {
+            let folder_to = track_rows::folder_drop_position(self.editor.session(), folder, to);
+            if self.editor.move_folder(folder, folder_to).is_ok() {
                 let mut kids = children;
                 kids.sort_unstable();
-                self.reindex_heights_move_tracks(&kids, to);
+                self.reindex_heights_move_tracks(&kids, folder_to);
                 self.status = "Папка перемещена".into();
             }
             return;
@@ -1015,14 +1073,37 @@ impl App {
         self.status = "Дорожки перемещены".into();
     }
 
-    /// Draws the horizontal drop-insertion indicator for an in-progress header
-    /// drag (SPEC-057 §1).
+    /// Draws the drop-insertion indicator and the translucent ghost for an
+    /// in-progress header drag (SPEC-057 §1, SPEC-058 §1). The ghost is the
+    /// height of the dragged rows (or folder), not the full timeline, and is
+    /// clamped only to the row area — never the window height.
     fn draw_drag_indicator(&self, ui: &egui::Ui, pointer_y: f32, rows_top: f32) {
-        let heights = track_rows::row_heights(&self.track_heights, self.editor.session());
+        let session = self.editor.session();
+        let heights = track_rows::row_heights(&self.track_heights, session);
         let offset = pointer_y - rows_top;
         let ins = track_rows::drop_insertion_row(&heights, offset);
-        let y = rows_top + track_rows::row_y(&self.track_heights, self.editor.session(), ins);
+        let y = rows_top + track_rows::row_y(&self.track_heights, session, ins);
         let clip = ui.clip_rect();
+        let Some(drag) = &self.header_drag else {
+            return;
+        };
+        let ghost_h =
+            track_rows::drag_ghost_height(&self.track_heights, session, &drag.tracks, drag.folder);
+        if ghost_h > 0.0 {
+            let ghost =
+                Rect::from_min_size(Pos2::new(clip.min.x, y), Vec2::new(clip.width(), ghost_h));
+            ui.painter().rect_filled(
+                ghost,
+                4.0,
+                Color32::from_rgba_unmultiplied(80, 140, 255, 40),
+            );
+            ui.painter().rect_stroke(
+                ghost,
+                4.0,
+                Stroke::new(1.0_f32, Color32::from_rgb(120, 170, 255)),
+                StrokeKind::Inside,
+            );
+        }
         let stroke = egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 255));
         ui.painter().hline(clip.min.x..=clip.max.x, y, stroke);
     }
@@ -1063,8 +1144,9 @@ impl App {
                             .get(i)
                             .copied()
                             .unwrap_or(track_rows::DEFAULT_TRACK_HEIGHT);
-                        *h = (start + delta)
-                            .clamp(track_rows::MIN_TRACK_HEIGHT, track_rows::MAX_TRACK_HEIGHT);
+                        // Snap to the nearest preset up to Expanded; above it
+                        // the height is free (custom) (SPEC-058 §3).
+                        *h = track_rows::snap_track_height(start + delta);
                     }
                 }
             }
@@ -2311,7 +2393,9 @@ impl App {
                 });
             }
             if response.drag_stopped() {
-                if let (Some(top), Some(pos)) = (rows_top, response.interact_pointer_pos()) {
+                // `interact_pointer_pos()` is `None` on the release frame, so
+                // read the pointer from the input state instead (SPEC-058 §0).
+                if let (Some(top), Some(pos)) = (rows_top, ui.input(|i| i.pointer.latest_pos())) {
                     self.resolve_header_drop(pos.y, top);
                 }
             }
@@ -2369,6 +2453,26 @@ impl App {
                     action = Some(TrackAction::Duplicate(index));
                     ui.close();
                 }
+                // «Track height» submenu: the three fixed presets, applied to
+                // the whole selection when the right-clicked track is selected
+                // (SPEC-058 §3).
+                let height_target: Vec<usize> = if self.editor.is_track_selected(index) {
+                    self.editor.selected_tracks()
+                } else {
+                    vec![index]
+                };
+                ui.menu_button("Высота дорожки", |ui| {
+                    for (label, height) in [
+                        ("Компактная", track_rows::COMPACT_TRACK_HEIGHT),
+                        ("Стандартная", track_rows::STANDARD_TRACK_HEIGHT),
+                        ("Расширенная", track_rows::EXPANDED_TRACK_HEIGHT),
+                    ] {
+                        if ui.button(label).clicked() {
+                            action = Some(TrackAction::SetHeight(height_target.clone(), height));
+                            ui.close();
+                        }
+                    }
+                });
                 // If the right-clicked track belongs to the current selection,
                 // the whole selection is moved to the folder in one undo step;
                 // otherwise only the clicked track. Tracks already inside a
@@ -2420,11 +2524,15 @@ impl App {
             self.track_resize_handle(ui, response.rect, index);
         }
         // Draw the drop-insertion indicator while a header drag is active;
-        // clear the drag if the pointer was released without a captured stop.
+        // resolve the drop if the pointer was released without a captured stop.
         if self.header_drag.is_some() {
             let pointer_up = !ui.input(|i| i.pointer.any_down());
             if pointer_up {
-                self.header_drag = None;
+                if let (Some(top), Some(pos)) = (rows_top, ui.input(|i| i.pointer.latest_pos())) {
+                    self.resolve_header_drop(pos.y, top);
+                } else {
+                    self.header_drag = None;
+                }
             } else if let (Some(top), Some(pos)) = (rows_top, ui.input(|i| i.pointer.latest_pos()))
             {
                 self.draw_drag_indicator(ui, pos.y, top);
@@ -2569,7 +2677,9 @@ impl App {
             });
         }
         if response.drag_stopped() {
-            if let (Some(top), Some(pos)) = (*rows_top, response.interact_pointer_pos()) {
+            // `interact_pointer_pos()` is `None` on the release frame, so read
+            // the pointer from the input state instead (SPEC-058 §0).
+            if let (Some(top), Some(pos)) = (*rows_top, ui.input(|i| i.pointer.latest_pos())) {
                 self.resolve_header_drop(pos.y, top);
             }
         }
@@ -2732,6 +2842,15 @@ impl App {
             TrackAction::DeleteFolder(folder) => {
                 self.delete_folder = Some(folder);
                 return;
+            }
+            TrackAction::SetHeight(tracks, height) => {
+                let height = track_rows::snap_track_height(height);
+                for t in tracks {
+                    if t < self.track_heights.len() {
+                        self.track_heights[t] = height;
+                    }
+                }
+                Ok("Высота изменена")
             }
         };
         self.status = match result {
@@ -3285,7 +3404,7 @@ impl App {
                         );
                     }
                 }
-                draw_clip_wave(&self.editor, &painter, rect, body, clip, detail);
+                draw_clip_wave(&self.editor, &painter, rect, body, clip, h, detail);
                 let hovered = pointer.is_some_and(|p| rect.contains(p));
                 let handles = daw_gui::layout::edges_in_overlap(&track.clips, c);
                 draw_fades(
@@ -3349,6 +3468,7 @@ impl App {
                         rect,
                         wave,
                         clip,
+                        h,
                         rgb_detail(&colors),
                     );
                 }
@@ -4333,16 +4453,17 @@ impl App {
         let result = match drag.mode {
             DragMode::Move => {
                 let start = fit((at as i64 - drag.grab).max(0) as u64);
-                let tracks = self.editor.session().tracks.len();
                 let y = p.y - area.min.y - TIMELINE_HEADER;
                 // A visual row may be a folder header; dragging onto it keeps
-                // the clip on its current track (SPEC-055 §4).
-                let to = track_rows::row_at_y(&self.track_heights, self.editor.session(), y)
-                    .map_or(0, |row| {
-                        track_rows::track_at_row(self.editor.session(), row)
-                            .unwrap_or(drag.track)
-                            .min(tracks.saturating_sub(1))
-                    });
+                // the clip on its current track (SPEC-055 §4). A y below the
+                // last row clamps to the last track, never wrapping to 0
+                // (SPEC-058 §2).
+                let to = track_rows::clip_drop_track(
+                    &self.track_heights,
+                    self.editor.session(),
+                    y,
+                    drag.track,
+                );
                 if self.editor.selected_clips().len() > 1 {
                     // SPEC-047 §4: the grabbed clip leads the whole group.
                     let now =
