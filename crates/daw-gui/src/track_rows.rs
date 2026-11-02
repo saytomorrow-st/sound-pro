@@ -8,6 +8,13 @@
 
 use audio_core::session::Session;
 
+/// Vertical inset between a lane and the clip drawn in it, top and bottom.
+pub const CLIP_INSET: f32 = 3.0;
+/// Tracks shorter than this get the one-line compact header (SPEC-060).
+pub const ONE_LINE_BELOW: f32 = 68.0;
+/// Horizontal indent of a track inside a folder; never changes height.
+pub const FOLDER_INDENT: f32 = 16.0;
+
 /// Default height of a track row, in pixels (SPEC-056 §1). This is also the
 /// [`Standard`] height preset (SPEC-058 §3).
 pub const DEFAULT_TRACK_HEIGHT: f32 = 72.0;
@@ -352,6 +359,17 @@ pub fn track_index_at_insertion(session: &Session, insertion_row: usize) -> usiz
         .count()
 }
 
+/// Converts a pre-removal insertion position (tracks shown above the drop
+/// row) into the post-removal position `Editor::move_tracks` expects: every
+/// dragged track that sits above the drop row no longer counts.
+#[must_use]
+pub fn post_removal_position(moved: &[usize], to: usize) -> usize {
+    let mut m = moved.to_vec();
+    m.sort_unstable();
+    m.dedup();
+    to - m.iter().filter(|&&t| t < to).count()
+}
+
 /// The result of resolving a completed header drag at a vertical offset
 /// (SPEC-057, SPEC-058 §0). Pure state: both fields are rebuilt from the
 /// inputs, so the UI and the tests share one source of truth.
@@ -372,8 +390,9 @@ enum DropTarget {
     /// Insert the dragged tracks as a contiguous block before track position
     /// `to` (in the post-removal track list).
     Reorder(usize),
-    /// Add the dragged tracks to `folder` (their order is unchanged).
-    Folder(usize),
+    /// Move the dragged tracks into `folder` as a block before track position
+    /// `to` (in the full pre-removal list), anywhere inside its block.
+    Folder(usize, usize),
 }
 
 /// Resolves a completed header drag at vertical offset `y` into the resulting
@@ -394,18 +413,12 @@ pub fn apply_header_drop(
     dragged_folder: Option<usize>,
 ) -> Option<DropOutcome> {
     let count = session.tracks.len();
-    let rows = visible_rows(session);
     let ins = drop_insertion_row(row_heights, y);
     let to_full = track_index_at_insertion(session, ins);
 
     // Determine the folder under the pointer (a folder header, or a track
     // that belongs to a folder).
-    let pointer_row = row_at_y_heights(row_heights, y).and_then(|r| rows.get(r).copied());
-    let target_folder = match pointer_row {
-        Some(Row::Folder(f)) => Some(f),
-        Some(Row::Track(t)) => folder_of_track(session, t),
-        None => None,
-    };
+    let target_folder = folder_block_at_heights(session, row_heights, y);
 
     // A folder drag reorders the folder's children as one block; it never
     // nests (single-level folders, SPEC-055 §7).
@@ -417,8 +430,10 @@ pub fn apply_header_drop(
             DropTarget::Reorder(folder_drop_position(session, folder, to_full))
         }
         None => match target_folder {
-            Some(folder) => DropTarget::Folder(folder),
-            None => DropTarget::Reorder(to_full),
+            Some(folder) => {
+                DropTarget::Folder(folder, post_removal_position(dragged_tracks, to_full))
+            }
+            None => DropTarget::Reorder(post_removal_position(dragged_tracks, to_full)),
         },
     };
 
@@ -445,22 +460,7 @@ pub fn apply_header_drop(
     }
 
     match target {
-        DropTarget::Folder(folder) => {
-            // move_tracks_to_folder: keep order, re-parent the tracks.
-            let mut folder_children = session.folder_children.clone();
-            for list in &mut folder_children {
-                list.retain(|c| !moved.contains(c));
-            }
-            if let Some(list) = folder_children.get_mut(folder) {
-                list.extend_from_slice(&moved);
-                list.sort_unstable();
-            }
-            Some(DropOutcome {
-                track_order: (0..count).collect(),
-                folder_children,
-            })
-        }
-        DropTarget::Reorder(to) => {
+        DropTarget::Reorder(to) | DropTarget::Folder(_, to) => {
             // move_tracks (preceded by remove_tracks_from_folder when any
             // moved track was inside a folder): a top-level reorder leaves the
             // dragged tracks un-parented, then re-indexes the rest.
@@ -497,11 +497,52 @@ pub fn apply_header_drop(
                 }
                 list.sort_unstable();
             }
+            if let DropTarget::Folder(folder, _) = target {
+                if let Some(list) = folder_children.get_mut(folder) {
+                    list.extend((0..moved.len()).map(|order| insert_at + order));
+                    list.sort_unstable();
+                }
+            }
             Some(DropOutcome {
                 track_order,
                 folder_children,
             })
         }
+    }
+}
+
+/// The vertical span `(y, height)`, relative to the top of the track area, of
+/// a folder's whole block: its header plus every visible child row (SPEC-060).
+/// A collapsed folder is just its header row.
+#[must_use]
+pub fn folder_block_span(heights: &[f32], session: &Session, folder: usize) -> Option<(f32, f32)> {
+    let rows = visible_rows(session);
+    let first = row_of_folder(session, folder)?;
+    let mut last = first;
+    for (i, r) in rows.iter().enumerate().skip(first + 1) {
+        match r {
+            Row::Track(t) if folder_of_track(session, *t) == Some(folder) => last = i,
+            _ => break,
+        }
+    }
+    let y = row_y(heights, session, first);
+    let end = row_y(heights, session, last) + row_height(heights, session, last);
+    Some((y, end - y))
+}
+
+/// The folder whose block contains vertical offset `y`, if any (SPEC-060).
+#[must_use]
+pub fn folder_block_at(heights: &[f32], session: &Session, y: f32) -> Option<usize> {
+    folder_block_at_heights(session, &row_heights(heights, session), y)
+}
+
+#[must_use]
+/// [`folder_block_at`] over precomputed [`row_heights`] (SPEC-060).
+pub fn folder_block_at_heights(session: &Session, rows_h: &[f32], y: f32) -> Option<usize> {
+    let r = row_at_y_heights(rows_h, y)?;
+    match visible_rows(session).get(r).copied()? {
+        Row::Folder(f) => Some(f),
+        Row::Track(t) => folder_of_track(session, t),
     }
 }
 
@@ -658,8 +699,9 @@ mod tests {
         // Drop in the bottom half of Track3 (row 4) -> insert before track 4.
         let out =
             apply_header_drop(&session, &rh, y_at(&session, &heights, 4, 1.0), &[0], None).unwrap();
-        // Remove 0, insert before track 4 -> [1,2,3,4,0,5].
-        assert_eq!(out.track_order, vec![1, 2, 3, 4, 0, 5]);
+        // Remove 0, insert before track 4 -> [1,2,3,0,4,5] (SPEC-060: the
+        // insertion position counts only the tracks that stay above it).
+        assert_eq!(out.track_order, vec![1, 2, 3, 0, 4, 5]);
     }
 
     #[test]
@@ -670,8 +712,9 @@ mod tests {
         // Track 2 is a free track; drop it onto folder A's header (row 1).
         let out =
             apply_header_drop(&session, &rh, y_at(&session, &heights, 1, 0.5), &[2], None).unwrap();
-        // Order unchanged; folder A now holds {1,2,3}.
-        assert_eq!(out.track_order, vec![0, 1, 2, 3, 4, 5]);
+        // SPEC-060: the track lands at the insertion position (before the
+        // first child); folder A now holds the three positions {1,2,3}.
+        assert_eq!(out.track_order, vec![0, 2, 1, 3, 4, 5]);
         assert_eq!(out.folder_children[0], vec![1, 2, 3]);
         assert_eq!(out.folder_children[1], vec![5]);
     }
@@ -686,11 +729,11 @@ mod tests {
         // lands after track 4.
         let out = apply_header_drop(&session, &rh, y_at(&session, &heights, 5, 0.75), &[1], None)
             .unwrap();
-        assert_eq!(out.track_order, vec![0, 2, 3, 4, 5, 1]);
-        // Track 1 left folder A; track 3 (original index 3) is now at index 2.
+        assert_eq!(out.track_order, vec![0, 2, 3, 4, 1, 5]);
+        // Track 1 left folder A; track 3 is now at index 2.
         assert_eq!(out.folder_children[0], vec![2]);
-        // Track 5 (original index 5) is now at index 4.
-        assert_eq!(out.folder_children[1], vec![4]);
+        // Track 5 keeps index 5.
+        assert_eq!(out.folder_children[1], vec![5]);
     }
 
     #[test]

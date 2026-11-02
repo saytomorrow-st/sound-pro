@@ -43,8 +43,9 @@ fn move_track_keeps_color_with_the_track() {
     editor.set_track_color(0, Some(2)).unwrap();
     editor.set_track_color(2, Some(6)).unwrap();
     editor.move_track(0, 2).unwrap();
-    // t 0 -> end: [t 1, t 2, t 0] = [None, 6, 2].
-    assert_eq!(colors(&editor), [None, Some(6), Some(2)]);
+    // t 0 -> end: [t 1, t 2, t 0]. Untouched t 1 keeps the palette colour it
+    // showed at slot 1 (SPEC-060: defaults are pinned, not slot-derived).
+    assert_eq!(colors(&editor), [Some(1), Some(6), Some(2)]);
 }
 
 #[test]
@@ -76,7 +77,7 @@ fn moving_tracks_into_a_folder_keeps_color() {
     assert_eq!(folder, 0);
     editor.move_tracks_to_folder(0, &[1]).unwrap();
     // Track 1 joins track 0 in the folder; colour rides on each track.
-    assert_eq!(colors(&editor), [Some(2), Some(5), None]);
+    assert_eq!(colors(&editor), [Some(2), Some(5), Some(2)]);
     assert_eq!(editor.session().folder_children[0], vec![0, 1]);
 }
 
@@ -89,5 +90,5 @@ fn moving_tracks_out_of_a_folder_keeps_color() {
     assert_eq!(folder, 0);
     // Drag track 0 out to the top level (below the folder's children).
     editor.move_tracks(&[0], 2).unwrap();
-    assert_eq!(colors(&editor), [Some(5), None, Some(2)]);
+    assert_eq!(colors(&editor), [Some(5), Some(2), Some(2)]);
 }

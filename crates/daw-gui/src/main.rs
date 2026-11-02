@@ -247,6 +247,16 @@ fn draw_fade_curve(painter: &egui::Painter, rect: Rect, x0: f32, width: f32, cur
 /// Width left for a track name once the header's right-hand buttons
 /// (✕, FX, A and, when automation is open, the lane picker) are reserved,
 /// so a long name is cut with "…" instead of running under them (SPEC-044 §4).
+/// One header line: inline in the compact one-line row, its own
+/// `ui.horizontal` otherwise (SPEC-060).
+fn header_line<R>(ui: &mut egui::Ui, compact: bool, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    if compact {
+        f(ui)
+    } else {
+        ui.horizontal(f).inner
+    }
+}
+
 fn name_width(available: f32, lanes_open: bool) -> f32 {
     let reserved = if lanes_open { 210.0 } else { 90.0 };
     (available - reserved).max(24.0)
@@ -267,7 +277,10 @@ fn draw_overlap_zone(
     let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
     let x0 = left + start as f32 * px_per_sample;
     let x1 = (left + end as f32 * px_per_sample).max(x0 + 2.0);
-    let rect = Rect::from_min_max(Pos2::new(x0, top + 3.0), Pos2::new(x1, top + row_h - 3.0));
+    let rect = Rect::from_min_max(
+        Pos2::new(x0, top + track_rows::CLIP_INSET),
+        Pos2::new(x1, top + row_h - track_rows::CLIP_INSET),
+    );
     let header_h = 14.0_f32.min(rect.height() * 0.4);
     let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_h));
     let body = Rect::from_min_max(Pos2::new(rect.min.x, header.max.y), rect.max);
@@ -618,6 +631,16 @@ fn folder_color(color: Option<u8>, index: usize) -> Color32 {
     track_color(color, index)
 }
 
+/// Test-only record of the rects drawn in one frame (SPEC-060).
+#[cfg(test)]
+#[derive(Default)]
+struct Probe {
+    header_rows: Vec<(Row, Rect)>,
+    lane_rows: Vec<(Row, Rect)>,
+    clips: Vec<(usize, Rect)>,
+    gain_sliders: Vec<usize>,
+}
+
 struct App {
     editor: Editor,
     /// Frames drawn so far; used by the `SOUND_PRO_SCREENSHOT` self-snapshot.
@@ -658,6 +681,10 @@ struct App {
     /// `SOUND_PRO_DEBUG_DRAG=1`: log header drags to stderr (read once).
     drag_debug: bool,
     drag_log_row: Option<usize>,
+    /// Rects actually allocated by the header column and the timeline, for
+    /// the headless geometry tests (SPEC-060).
+    #[cfg(test)]
+    probe: Probe,
     /// Log window/viewport state and every `ViewportCommand` sent, to diagnose
     /// broken window controls on Wayland/XWayland (set
     /// `SOUND_PRO_WINDOW_DEBUG=1`). Read once at startup.
@@ -861,6 +888,8 @@ impl App {
             drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
             drag_debug: std::env::var("SOUND_PRO_DEBUG_DRAG").is_ok_and(|v| v == "1"),
             drag_log_row: None,
+            #[cfg(test)]
+            probe: Probe::default(),
             window_debug: std::env::var_os("SOUND_PRO_WINDOW_DEBUG").is_some(),
             fullscreen: false,
             player: None,
@@ -1027,15 +1056,8 @@ impl App {
         let offset = pointer_y - rows_top;
         let ins = track_rows::drop_insertion_row(&heights, offset);
         let to = track_rows::track_index_at_insertion(self.editor.session(), ins);
-        let rows = track_rows::visible_rows(self.editor.session());
-        let row = track_rows::row_at_y_heights(&heights, offset).and_then(|r| rows.get(r).copied());
-        let target_folder = match row {
-            Some(track_rows::Row::Folder(f)) => Some(f),
-            Some(track_rows::Row::Track(t)) => {
-                track_rows::folder_of_track(self.editor.session(), t)
-            }
-            None => None,
-        };
+        let target_folder =
+            track_rows::folder_block_at(&self.track_heights, self.editor.session(), offset);
 
         if let Some(folder) = drag.folder {
             // Folder drag: reorder the folder with its children (no nesting).
@@ -1069,16 +1091,26 @@ impl App {
         if tracks.is_empty() {
             return;
         }
-        // Drop onto a folder header or a child track row adds to that folder.
+        let to = track_rows::post_removal_position(&tracks, to);
+        // Anywhere inside an expanded folder block (header, child rows, gaps)
+        // puts the tracks into the folder at the insertion position.
         if let Some(folder) = target_folder {
-            let added = self.editor.move_tracks_to_folder(folder, &tracks);
+            let n = tracks.len();
+            let count = self.track_heights.len();
+            let insert_at = to.min(count.saturating_sub(n));
+            self.editor.begin_group();
+            let moved = self.editor.move_tracks(&tracks, to);
+            let landed: Vec<usize> = (insert_at..insert_at + n).collect();
+            let added = self.editor.move_tracks_to_folder(folder, &landed);
+            self.editor.end_group();
             if self.drag_debug {
                 eprintln!(
-                    "[drag] action move_tracks_to_folder({folder}, {tracks:?}) ok={}",
-                    added.is_ok()
+                    "[drag] action into_folder({folder}, {tracks:?}, {to}) ok={}",
+                    moved.is_ok() && added.is_ok()
                 );
             }
-            if added.is_ok() {
+            if moved.is_ok() && added.is_ok() {
+                self.reindex_heights_move_tracks(&tracks, to);
                 self.status = "Дорожки добавлены в папку".into();
             }
             return;
@@ -1117,55 +1149,30 @@ impl App {
             return;
         };
 
-        // When tracks are dragged over a folder HEADER, highlight exactly that
-        // folder block (its compact `FOLDER_ROW_HEIGHT` row), not a track-sized
-        // region, so the drop target is unambiguous (SPEC-059 §2). A folder
-        // drag cannot nest, so it keeps the ordinary insertion line.
-        let rows = track_rows::visible_rows(session);
+        // Tracks hovering anywhere in a folder block (header, children, gaps)
+        // highlight the whole block, derived from the unified row geometry
+        // (SPEC-060). A folder drag cannot nest, so it keeps the insertion line.
         let hovered_folder = if drag.folder.is_none() && !drag.tracks.is_empty() {
-            track_rows::row_at_y_heights(&heights, offset)
-                .and_then(|r| rows.get(r).copied())
-                .and_then(|row| match row {
-                    track_rows::Row::Folder(f) => Some(f),
-                    track_rows::Row::Track(_) => None,
-                })
+            track_rows::folder_block_at(&self.track_heights, session, offset)
         } else {
             None
         };
 
         if let Some(folder) = hovered_folder {
-            let fr = track_rows::row_of_folder(session, folder);
-            let Some(fr) = fr else {
+            let Some((by, bh)) =
+                track_rows::folder_block_span(&self.track_heights, session, folder)
+            else {
                 return;
             };
             let color = folder_color(session.folders.get(folder).and_then(|f| f.color), folder);
-            let top = rows_top + track_rows::row_y(&self.track_heights, session, fr);
-            // The folder block itself, exactly its compact header height.
             let block = Rect::from_min_size(
-                Pos2::new(clip.min.x, top),
-                Vec2::new(clip.width(), track_rows::FOLDER_ROW_HEIGHT),
+                Pos2::new(clip.min.x, rows_top + by),
+                Vec2::new(clip.width(), bh),
             );
             ui.painter()
                 .rect_filled(block, 4.0, Self::drag_preview_fill(color));
             ui.painter()
                 .rect_stroke(block, 4.0, Stroke::new(2.0_f32, color), StrokeKind::Inside);
-            // If expanded, bracket the whole child group down the left edge so
-            // the drop scope (folder + children) is clear.
-            let expanded = !session.folders[folder].collapsed;
-            if expanded {
-                let group_h =
-                    track_rows::drag_ghost_height(&self.track_heights, session, &[], Some(folder));
-                if group_h > track_rows::FOLDER_ROW_HEIGHT {
-                    let bar_x = clip.min.x + 4.0;
-                    ui.painter().line_segment(
-                        [
-                            Pos2::new(bar_x, top + track_rows::FOLDER_ROW_HEIGHT),
-                            Pos2::new(bar_x, top + group_h),
-                        ],
-                        Stroke::new(3.0_f32, color),
-                    );
-                }
-            }
             return;
         }
 
@@ -1787,7 +1794,10 @@ impl App {
                 + track_rows::row_y(&self.track_heights, self.editor.session(), row);
             let left = area.min.x + g.start as f32 * px_per_sample;
             let w = (g.clip.length_samples as f32 * px_per_sample).max(2.0);
-            let rect = Rect::from_min_size(Pos2::new(left, top + 3.0), Vec2::new(w, h - 6.0));
+            let rect = Rect::from_min_size(
+                Pos2::new(left, top + track_rows::CLIP_INSET),
+                Vec2::new(w, h - 2.0 * track_rows::CLIP_INSET),
+            );
             let base = track_color(None, g.row);
             let colors = daw_gui::layout::region_colors([base.r(), base.g(), base.b()], false);
             let [r, gr, b] = colors.body;
@@ -2267,7 +2277,13 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn track_headers(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 0.0;
         ui.add_space(TIMELINE_HEADER);
+        #[cfg(test)]
+        {
+            self.probe.header_rows.clear();
+            self.probe.gain_sliders.clear();
+        }
         let count = self.editor.session().tracks.len();
         // Owned layout snapshot, so the loop can mutate the editor freely.
         let rows = track_rows::visible_rows(self.editor.session());
@@ -2295,46 +2311,57 @@ impl App {
             // At the compact preset the header must fit one row: name plus
             // M/S/R pills, with FX/A/✕ and the gain/pan sliders hidden
             // (SPEC-059 §6).
-            let compact = h <= track_rows::COMPACT_TRACK_HEIGHT;
+            let compact = h < track_rows::ONE_LINE_BELOW;
             let base_fill = if selected {
                 Color32::from_rgb(48, 56, 72)
             } else {
                 Color32::from_gray(36)
             };
-            let frame = egui::Frame::new()
-                .fill(match folder_tint {
-                    Some(c) if !selected => {
-                        let mut blended = base_fill;
-                        blended = Color32::from_rgb(
-                            ((blended.r() as u32 * 3 + c.r() as u32) / 4) as u8,
-                            ((blended.g() as u32 * 3 + c.g() as u32) / 4) as u8,
-                            ((blended.b() as u32 * 3 + c.b() as u32) / 4) as u8,
-                        );
-                        blended
-                    }
-                    _ => base_fill,
-                })
-                .inner_margin(4.0);
-            // SPEC-044 §1: the click-sensing scope is registered before
-            // its children, so the M/S/R/I buttons inside get their clicks.
-            let response = ui
-                .scope_builder(
-                    egui::UiBuilder::new().sense(Sense::click_and_drag()),
-                    |ui| {
-                        frame.show(ui, |ui| {
-                            ui.set_height(h - 8.0);
-                            ui.set_width(ui.available_width());
+            let fill = match folder_tint {
+                Some(c) if !selected => Color32::from_rgb(
+                    ((base_fill.r() as u32 * 3 + c.r() as u32) / 4) as u8,
+                    ((base_fill.g() as u32 * 3 + c.g() as u32) / 4) as u8,
+                    ((base_fill.b() as u32 * 3 + c.b() as u32) / 4) as u8,
+                ),
+                _ => base_fill,
+            };
+            // SPEC-060: the row is one exact rect of the unified geometry; the
+            // click-sensing response is registered before its children, so the
+            // M/S/R/I buttons inside still get their clicks (SPEC-044 §1).
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
+            ui.painter().rect_filled(rect, 0.0, fill);
+            let indent = if in_folder {
+                track_rows::FOLDER_INDENT
+            } else {
+                0.0
+            };
+            let content = Rect::from_min_max(
+                Pos2::new(rect.min.x + 4.0 + indent, rect.min.y + 2.0),
+                Pos2::new(rect.max.x - 4.0, rect.max.y - 2.0),
+            );
+            let layout = if compact {
+                egui::Layout::left_to_right(egui::Align::Center)
+            } else {
+                egui::Layout::top_down(egui::Align::Min)
+            };
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content).layout(layout));
+            child.set_clip_rect(rect.intersect(ui.clip_rect()));
+            child.spacing_mut().item_spacing = Vec2::new(3.0, 2.0);
+            {
+                {
+                    {
+                        {
+                            let ui = &mut child;
                             // Folder-coloured vertical bar on the left edge of a
                             // child row, mirroring the folder colour (SPEC-059 §5).
                             if let Some(c) = folder_tint {
-                                let bar = ui.available_rect_before_wrap();
-                                let rect = Rect::from_min_max(
-                                    Pos2::new(bar.min.x + 1.0, bar.min.y + 1.0),
-                                    Pos2::new(bar.min.x + 4.0, bar.max.y - 1.0),
+                                let bar = Rect::from_min_max(
+                                    Pos2::new(rect.min.x + 5.0, rect.min.y + 1.0),
+                                    Pos2::new(rect.min.x + 8.0, rect.max.y - 1.0),
                                 );
-                                ui.painter().rect_filled(rect, 2.0, c);
+                                ui.painter().rect_filled(bar, 2.0, c);
                             }
-                            ui.add_space(if in_folder { 16.0 } else { 0.0 });
                             let track = &self.editor.session().tracks[index];
                             let (mut mute, mut solo) = (track.mute, track.solo);
                             let track_monitor = track.input_monitor;
@@ -2343,8 +2370,10 @@ impl App {
                             let name = track.name.clone();
                             let audio = track.kind == TrackKind::Audio;
                             let color = track_color(track.color, index);
-                            ui.horizontal(|ui| {
-                                ui.add_space(6.0);
+                            header_line(ui, compact, |ui| {
+                                if !compact {
+                                    ui.add_space(6.0);
+                                }
                                 let (icon, _) =
                                     ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
                                 ui.painter()
@@ -2380,6 +2409,13 @@ impl App {
                                             name_width(
                                                 ui.available_width(),
                                                 self.auto == Some(index),
+                                            )
+                                            .min(
+                                                if compact {
+                                                    ui.available_width() * 0.32
+                                                } else {
+                                                    f32::MAX
+                                                },
                                             ),
                                             ui.spacing().interact_size.y,
                                         ),
@@ -2448,8 +2484,10 @@ impl App {
                                     );
                                 }
                             });
-                            ui.horizontal(|ui| {
-                                ui.add_space(if compact { 6.0 } else { 34.0 });
+                            header_line(ui, compact, |ui| {
+                                if !compact {
+                                    ui.add_space(34.0);
+                                }
                                 ui.spacing_mut().item_spacing.x = 3.0;
                                 let m = shell::pill(
                                     ui,
@@ -2514,52 +2552,58 @@ impl App {
                             let automation = &self.editor.session().tracks[index].automation;
                             let (gain_free, pan_free) =
                                 (automation.gain.is_empty(), automation.pan.is_empty());
-                            let (g, p) = if compact {
-                                let d = ui.allocate_response(Vec2::ZERO, Sense::hover());
-                                (d.clone(), d)
-                            } else {
-                                ui.horizontal(|ui| {
+                            let (g, p) = header_line(ui, compact, |ui| {
+                                if !compact {
                                     ui.add_space(30.0);
-                                    ui.spacing_mut().slider_width =
-                                        ((ui.available_width() - 60.0) * 0.6).max(40.0);
-                                    let g = ui
-                                        .add_enabled(
-                                            gain_free,
-                                            egui::Slider::new(&mut gain, 0.0..=1.0)
-                                                .show_value(false),
-                                        )
-                                        .on_hover_text(format!(
-                                            "Громкость {}",
-                                            daw_gui::layout::db_label(gain)
-                                        ));
-                                    ui.spacing_mut().slider_width =
-                                        (ui.available_width() - 8.0).max(30.0);
-                                    let p =
-                                        ui.add_enabled(
-                                            pan_free,
-                                            egui::Slider::new(&mut pan, -1.0..=1.0)
-                                                .show_value(false),
-                                        )
-                                        .on_hover_text(
-                                            format!("Панорама {}", daw_gui::layout::pan_label(pan)),
-                                        );
-                                    (g, p)
-                                })
-                                .inner
-                            };
+                                }
+                                let avail = ui.available_width();
+                                ui.spacing_mut().slider_width = if compact {
+                                    ((avail - 30.0) * 0.55).max(24.0)
+                                } else {
+                                    ((avail - 60.0) * 0.6).max(40.0)
+                                };
+                                let g = ui
+                                    .add_enabled(
+                                        gain_free,
+                                        egui::Slider::new(&mut gain, 0.0..=1.0).show_value(false),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Громкость {}",
+                                        daw_gui::layout::db_label(gain)
+                                    ));
+                                ui.spacing_mut().slider_width = if compact {
+                                    (ui.available_width() - 28.0).max(20.0)
+                                } else {
+                                    (ui.available_width() - 8.0).max(30.0)
+                                };
+                                let p = ui
+                                    .add_enabled(
+                                        pan_free,
+                                        egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Панорама {}",
+                                        daw_gui::layout::pan_label(pan)
+                                    ));
+                                (g, p)
+                            });
+                            #[cfg(test)]
+                            self.probe.gain_sliders.push(index);
                             if g.changed() || p.changed() {
                                 if let Some(t) = self.editor.track_mut(index) {
                                     t.gain = gain;
                                     t.pan = pan;
                                 }
                             }
-                        });
-                    },
-                )
-                .response;
+                        }
+                    }
+                }
+            }
             if rows_top.is_none() {
                 rows_top = Some(response.rect.min.y);
             }
+            #[cfg(test)]
+            self.probe.header_rows.push((row, response.rect));
             if response.drag_started() {
                 // Drag the current selection if this track is in it, else just
                 // this track (SPEC-057 §1).
@@ -2788,20 +2832,30 @@ impl App {
         let color = f.color;
         let child_count = session.folder_children.get(folder).map_or(0, Vec::len);
         let selected = self.editor.is_folder_selected(folder);
-        let frame = egui::Frame::new()
-            .fill(if selected {
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), track_rows::FOLDER_ROW_HEIGHT),
+            Sense::click_and_drag(),
+        );
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            if selected {
                 Color32::from_rgb(48, 56, 72)
             } else {
                 Color32::from_gray(30)
-            })
-            .inner_margin(4.0);
-        let response = ui
-            .scope_builder(
-                egui::UiBuilder::new().sense(Sense::click_and_drag()),
-                |ui| {
-                    frame.show(ui, |ui| {
-                        ui.set_height(track_rows::FOLDER_ROW_HEIGHT - 8.0);
-                        ui.set_width(ui.available_width());
+            },
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect.shrink2(Vec2::new(4.0, 2.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        {
+            {
+                {
+                    {
+                        let ui = &mut child;
                         ui.horizontal(|ui| {
                             ui.add_space(6.0);
                             if ui
@@ -2861,13 +2915,15 @@ impl App {
                                 self.folder_rename = Some((folder, name.clone()));
                             }
                         });
-                    });
-                },
-            )
-            .response;
+                    }
+                }
+            }
+        }
         if rows_top.is_none() {
             *rows_top = Some(response.rect.min.y);
         }
+        #[cfg(test)]
+        self.probe.header_rows.push((row, response.rect));
         if response.drag_started() {
             if self.drag_debug {
                 eprintln!("[drag] start folder={folder}");
@@ -3421,6 +3477,11 @@ impl App {
         // The track area is as tall as the visible rows: every unfolded track
         // at its own height plus one compact folder header per folder
         // (SPEC-055 §4, SPEC-056 §1–2).
+        #[cfg(test)]
+        {
+            self.probe.lane_rows.clear();
+            self.probe.clips.clear();
+        }
         let height = (TIMELINE_HEADER
             + track_rows::total_height(&self.track_heights, self.editor.session()))
         .max(ui.available_height() - 4.0);
@@ -3456,6 +3517,14 @@ impl App {
                 + TIMELINE_HEADER
                 + track_rows::row_y(&self.track_heights, self.editor.session(), row);
             let c = folder_color(folder.color, f);
+            #[cfg(test)]
+            self.probe.lane_rows.push((
+                Row::Folder(f),
+                Rect::from_min_size(
+                    Pos2::new(area.min.x, top),
+                    Vec2::new(area.width(), track_rows::FOLDER_ROW_HEIGHT),
+                ),
+            ));
             painter.rect_filled(
                 Rect::from_min_size(
                     Pos2::new(area.min.x, top),
@@ -3580,6 +3649,11 @@ impl App {
             let top = area.min.y
                 + TIMELINE_HEADER
                 + track_rows::row_y(&self.track_heights, self.editor.session(), row);
+            #[cfg(test)]
+            self.probe.lane_rows.push((
+                Row::Track(t),
+                Rect::from_min_size(Pos2::new(area.min.x, top), Vec2::new(area.width(), h)),
+            ));
             // Folder-coloured bracket on the left edge of a child lane,
             // matching the header panel (SPEC-059 §5).
             if let Some(f) = track_rows::folder_of_track(self.editor.session(), t) {
@@ -3602,7 +3676,12 @@ impl App {
                 let clip = &track.clips[c];
                 let left = area.min.x + clip.start_samples as f32 * px_per_sample;
                 let w = (clip.length_samples as f32 * px_per_sample).max(2.0);
-                let rect = Rect::from_min_size(Pos2::new(left, top + 3.0), Vec2::new(w, h - 6.0));
+                let rect = Rect::from_min_size(
+                    Pos2::new(left, top + track_rows::CLIP_INSET),
+                    Vec2::new(w, h - 2.0 * track_rows::CLIP_INSET),
+                );
+                #[cfg(test)]
+                self.probe.clips.push((t, rect));
                 let selected = self.editor.is_clip_selected((t, c));
                 let base = track_color(track.color, t);
                 let colors = daw_gui::layout::region_colors(
@@ -3896,8 +3975,11 @@ impl App {
                 + TIMELINE_HEADER
                 + track_rows::row_y(&self.track_heights, self.editor.session(), row);
             let rect = Rect::from_min_size(
-                Pos2::new(left, top + 3.0),
-                Vec2::new((seconds * self.zoom).max(2.0), h - 6.0),
+                Pos2::new(left, top + track_rows::CLIP_INSET),
+                Vec2::new(
+                    (seconds * self.zoom).max(2.0),
+                    h - 2.0 * track_rows::CLIP_INSET,
+                ),
             );
             draw_take_rect(painter, rect, samples);
         }
@@ -6678,10 +6760,10 @@ mod header_drag_tests {
         );
         for r in &rects {
             assert!(
-                (r.height() - track_rows::FOLDER_ROW_HEIGHT).abs() < 1.0,
-                "folder highlight height {} != FOLDER_ROW_HEIGHT {} (rect {r:?})",
+                (r.height() - (track_rows::FOLDER_ROW_HEIGHT + 72.0)).abs() < 1.0,
+                "folder highlight height {} != whole folder block {} (rect {r:?})",
                 r.height(),
-                track_rows::FOLDER_ROW_HEIGHT
+                track_rows::FOLDER_ROW_HEIGHT + 72.0
             );
         }
     }
@@ -6716,5 +6798,308 @@ mod header_drag_tests {
             // ghost, so a wide lane is expected and correct here.
             assert!(lane.width() > 100.0, "preview lane too narrow: {lane:?}");
         }
+    }
+
+    // ---- SPEC-060: unified row geometry, colour, folders ----
+
+    fn with_clips(app: &mut App) {
+        for t in 0..3 {
+            app.editor
+                .import_decoded(
+                    std::path::Path::new(&format!("/tmp/spec060-{t}.wav")),
+                    vec![0.5; 4800],
+                    Some(t),
+                    Some(0),
+                )
+                .unwrap();
+        }
+    }
+
+    fn settle(app: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            full_frame(&ctx, app, vec![]);
+        }
+    }
+
+    /// Every visible row, header vs lane: same y (relative to the first
+    /// row) and same height.
+    fn assert_columns_match(app: &App, label: &str) {
+        let head = &app.probe.header_rows;
+        let lanes = &app.probe.lane_rows;
+        assert_eq!(head.len(), lanes.len(), "{label}: row count");
+        let h0 = head.iter().map(|(_, r)| r.min.y).fold(f32::MAX, f32::min);
+        let l0 = lanes.iter().map(|(_, r)| r.min.y).fold(f32::MAX, f32::min);
+        for (row, hr) in head {
+            let (_, lr) = lanes
+                .iter()
+                .find(|(r, _)| r == row)
+                .unwrap_or_else(|| panic!("{label}: no lane for {row:?}"));
+            assert!(
+                ((hr.min.y - h0) - (lr.min.y - l0)).abs() < 0.6,
+                "{label}: {row:?} header y {} vs lane y {}",
+                hr.min.y - h0,
+                lr.min.y - l0
+            );
+            assert!(
+                (hr.height() - lr.height()).abs() < 0.6,
+                "{label}: {row:?} header h {} vs lane h {}",
+                hr.height(),
+                lr.height()
+            );
+        }
+        let sum_h: f32 = head.iter().map(|(_, r)| r.height()).sum();
+        let sum_l: f32 = lanes.iter().map(|(_, r)| r.height()).sum();
+        assert!(
+            (sum_h - sum_l).abs() < 0.6,
+            "{label}: sums {sum_h} vs {sum_l}"
+        );
+    }
+
+    #[test]
+    fn header_and_lane_geometry_match_for_every_preset_and_folder_state() {
+        for height in [
+            track_rows::COMPACT_TRACK_HEIGHT,
+            track_rows::STANDARD_TRACK_HEIGHT,
+            track_rows::EXPANDED_TRACK_HEIGHT,
+        ] {
+            for state in ["none", "open", "closed"] {
+                let mut app = app_with_tracks();
+                with_clips(&mut app);
+                if state != "none" {
+                    app.editor.create_folder(&[0, 1]).unwrap();
+                }
+                if state == "closed" {
+                    app.editor.toggle_folder(0).unwrap();
+                }
+                app.track_heights = vec![height; 3];
+                settle(&mut app);
+                assert_columns_match(&app, &format!("h={height} {state}"));
+            }
+        }
+    }
+
+    #[test]
+    fn clip_rect_height_is_identical_in_and_out_of_a_folder() {
+        for height in [40.0, 72.0, 144.0] {
+            let mut app = app_with_tracks();
+            with_clips(&mut app);
+            app.editor.create_folder(&[0]).unwrap();
+            app.track_heights = vec![height; 3];
+            settle(&mut app);
+            let clip = |t: usize| app.probe.clips.iter().find(|(i, _)| *i == t).unwrap().1;
+            let (inside, outside) = (clip(0), clip(1));
+            assert!(
+                (inside.height() - outside.height()).abs() < 0.01,
+                "h={height}: in-folder clip {} vs outside {}",
+                inside.height(),
+                outside.height()
+            );
+            assert!((outside.height() - (height - 2.0 * track_rows::CLIP_INSET)).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn compact_header_keeps_volume_and_pan_and_fits_its_row() {
+        let mut app = app_with_tracks();
+        app.track_heights = vec![track_rows::COMPACT_TRACK_HEIGHT; 3];
+        settle(&mut app);
+        assert_eq!(app.probe.gain_sliders, vec![0, 1, 2], "sliders in compact");
+        for (_, r) in &app.probe.header_rows {
+            assert!((r.height() - track_rows::COMPACT_TRACK_HEIGHT).abs() < 0.6);
+        }
+    }
+
+    fn displayed(app: &App, name: &str) -> Color32 {
+        let (i, t) = app
+            .editor
+            .session()
+            .tracks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.name.starts_with(name))
+            .unwrap();
+        track_color(t.color, i)
+    }
+
+    #[test]
+    fn explicit_colour_follows_track_dragged_through_header() {
+        let mut app = app_with_tracks();
+        app.editor.set_track_color(0, Some(3)).unwrap();
+        let want = displayed(&app, "T 1");
+        drag(&mut app, FIRST_LABEL, Pos2::new(70.0, 400.0));
+        assert_eq!(names(&app), ["T 2", "T 3", "T 1"]);
+        assert_eq!(displayed(&app, "T 1"), want);
+    }
+
+    #[test]
+    fn default_colour_follows_track_dragged_through_header() {
+        let mut app = app_with_tracks();
+        let want: Vec<Color32> = ["T 1", "T 2", "T 3"]
+            .iter()
+            .map(|n| displayed(&app, n))
+            .collect();
+        drag(&mut app, FIRST_LABEL, Pos2::new(70.0, 400.0));
+        for (n, w) in ["T 1", "T 2", "T 3"].iter().zip(&want) {
+            assert_eq!(displayed(&app, n), *w, "{n} changed colour on move");
+        }
+    }
+
+    #[test]
+    fn colour_survives_delete_duplicate_and_folder_ops() {
+        let mut app = app_with_tracks();
+        let want: Vec<Color32> = ["T 1", "T 2", "T 3"]
+            .iter()
+            .map(|n| displayed(&app, n))
+            .collect();
+        app.editor.delete_track(0);
+        assert_eq!(displayed(&app, "T 2"), want[1], "delete");
+        assert_eq!(displayed(&app, "T 3"), want[2], "delete");
+        let mut app = app_with_tracks();
+        app.editor.duplicate_track(0).unwrap();
+        assert_eq!(displayed(&app, "T 1 копия"), want[0], "duplicate copy");
+        assert_eq!(displayed(&app, "T 2"), want[1], "duplicate shifts");
+        let mut app = app_with_tracks();
+        app.editor.create_folder(&[2]).unwrap();
+        app.editor.add_tracks_to_folder(0, &[0]).unwrap();
+        for (n, w) in ["T 1", "T 2", "T 3"].iter().zip(&want) {
+            assert_eq!(displayed(&app, n), *w, "{n} after folder add");
+        }
+        app.editor.remove_tracks_from_folder(&[0]).unwrap();
+        for (n, w) in ["T 1", "T 2", "T 3"].iter().zip(&want) {
+            assert_eq!(displayed(&app, n), *w, "{n} after folder remove");
+        }
+        app.editor
+            .delete_folder(0, DeleteFolder::KeepChildren)
+            .unwrap();
+        for (n, w) in ["T 1", "T 2", "T 3"].iter().zip(&want) {
+            assert_eq!(displayed(&app, n), *w, "{n} after folder delete");
+        }
+    }
+
+    #[test]
+    fn dropping_track_into_folder_reindexes_heights() {
+        let mut app = app_with_tracks();
+        app.track_heights = vec![40.0, 72.0, 144.0];
+        app.editor.create_folder(&[0]).unwrap();
+        // Rows: folder, T 1, T 2, T 3. Drag T 3 (144px) onto the folder.
+        let y3 = 60.0 + 28.0 + 40.0 + 72.0 + 20.0;
+        drag(&mut app, Pos2::new(70.0, y3), Pos2::new(70.0, 60.0));
+        for (i, t) in app.editor.session().tracks.iter().enumerate() {
+            let want = match t.name.as_str() {
+                "T 1" => 40.0,
+                "T 2" => 72.0,
+                _ => 144.0,
+            };
+            assert_eq!(app.track_heights[i], want, "{} height after drop", t.name);
+        }
+    }
+
+    fn folder_of_name(app: &App, name: &str) -> Option<usize> {
+        let s = app.editor.session();
+        let t = s.tracks.iter().position(|t| t.name == name)?;
+        track_rows::folder_of_track(s, t)
+    }
+
+    // Rows: T 1, Folder{T 2, T 3}, T 4 (all 72px, folder 28px), rows_top 60.
+    fn app_with_block() -> App {
+        let mut app = App::new(None);
+        app.editor.add_tracks(TrackKind::Audio, 4, "T").unwrap();
+        app.editor.create_folder(&[1, 2]).unwrap();
+        app
+    }
+
+    #[test]
+    fn drop_between_two_children_joins_the_folder() {
+        let mut app = app_with_block();
+        // Boundary between the two children.
+        let y = 222.0;
+        drag(&mut app, FIRST_LABEL, Pos2::new(70.0, y));
+        assert_eq!(folder_of_name(&app, "T 1"), Some(0));
+        assert_eq!(names(&app), vec!["T 2", "T 1", "T 3", "T 4"]);
+    }
+
+    #[test]
+    fn drop_on_a_child_row_joins_the_folder() {
+        let mut app = app_with_block();
+        let y = 50.0 + 72.0 + 28.0 + 72.0 + 40.0;
+        drag(&mut app, FIRST_LABEL, Pos2::new(70.0, y));
+        assert_eq!(folder_of_name(&app, "T 1"), Some(0));
+    }
+
+    #[test]
+    fn drop_outside_the_folder_removes_a_child() {
+        let mut app = app_with_block();
+        let start = Pos2::new(70.0, 160.0);
+        let y = 296.0;
+        drag(&mut app, start, Pos2::new(70.0, y));
+        assert_eq!(folder_of_name(&app, "T 2"), None);
+        assert_eq!(folder_of_name(&app, "T 3"), Some(0));
+    }
+
+    #[test]
+    fn collapsed_folder_keeps_header_only_target() {
+        let mut app = app_with_block();
+        app.editor.toggle_folder(0).unwrap();
+        let heights = track_rows::row_heights(&app.track_heights, app.editor.session());
+        let s = app.editor.session();
+        // Header row hits the folder; the row below it is the outside track.
+        assert_eq!(
+            track_rows::folder_block_at_heights(s, &heights, 72.0 + 5.0),
+            Some(0)
+        );
+        assert_eq!(
+            track_rows::folder_block_at_heights(s, &heights, 72.0 + 28.0 + 5.0),
+            None
+        );
+        let (_, h) = track_rows::folder_block_span(&app.track_heights, s, 0).unwrap();
+        assert_eq!(h, track_rows::FOLDER_ROW_HEIGHT);
+    }
+
+    #[test]
+    fn expanded_folder_block_spans_header_and_all_children() {
+        let app = app_with_block();
+        let s = app.editor.session();
+        let (y, h) = track_rows::folder_block_span(&app.track_heights, s, 0).unwrap();
+        assert_eq!((y, h), (72.0, 28.0 + 144.0));
+        assert_eq!(
+            track_rows::folder_block_at(&app.track_heights, s, 72.0 + 100.0),
+            Some(0)
+        );
+        assert_eq!(
+            track_rows::folder_block_at(&app.track_heights, s, 72.0 + 172.0),
+            None
+        );
+    }
+
+    #[test]
+    fn region_drop_never_targets_a_track_in_a_closed_folder() {
+        let mut app = app_with_tracks();
+        app.editor.create_folder(&[0]).unwrap();
+        app.editor.toggle_folder(0).unwrap();
+        let rows = track_rows::visible_rows(app.editor.session());
+        assert!(!rows.contains(&Row::Track(0)));
+        let heights = track_rows::row_heights(&app.track_heights, app.editor.session());
+        for y in 0..400 {
+            let y = y as f32;
+            if let Some(row) = track_rows::row_at_y_heights(&heights, y) {
+                assert_ne!(rows.get(row), Some(&Row::Track(0)));
+            }
+        }
+    }
+
+    #[test]
+    fn folder_collapse_expand_and_grid_alignment() {
+        let mut app = app_with_tracks();
+        with_clips(&mut app);
+        app.editor.create_folder(&[0, 1]).unwrap();
+        settle(&mut app);
+        assert_columns_match(&app, "open");
+        app.editor.toggle_folder(0).unwrap();
+        settle(&mut app);
+        assert_columns_match(&app, "collapsed");
+        app.editor.toggle_folder(0).unwrap();
+        settle(&mut app);
+        assert_columns_match(&app, "re-expanded");
     }
 }
