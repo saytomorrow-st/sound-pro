@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod layout;
+pub mod quantize;
 pub mod timeline;
 pub mod track_rows;
 
@@ -1391,6 +1392,107 @@ impl Editor {
             velocity: u8::try_from((i32::from(n.velocity) + delta).clamp(1, 127)).unwrap_or(1),
             ..n
         })
+    }
+
+    /// Quantizes the selected notes of a MIDI clip to a musical grid
+    /// (SPEC-061 §1). `indices` lists which notes to move; when it is empty
+    /// every note in the clip is quantized. One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip or a bad note index; `self` is unchanged.
+    pub fn quantize_selection(
+        &mut self,
+        track: usize,
+        clip: usize,
+        indices: &[usize],
+        params: quantize::QuantizeParams,
+    ) -> Result<(), EditorError> {
+        let session = &self.project.session;
+        let map = session
+            .build_tempo_map(session.sample_rate)
+            .unwrap_or_else(|_| {
+                audio_core::TempoMap::single_or_default(session.tempo_bpm, session.sample_rate)
+            });
+        let c = self.clip_ref(track, clip)?;
+        let source_length = c.source_length;
+        let mut session = self.project.session.clone();
+        let notes = midi_notes(&mut session, track, clip)?;
+        let all = indices.is_empty();
+        for (i, note) in notes.iter_mut().enumerate() {
+            if !all && !indices.contains(&i) {
+                continue;
+            }
+            let (start, length) =
+                quantize::quantize_note(note.start, note.length, source_length, &map, params);
+            note.start = start;
+            note.length = length;
+        }
+        notes.sort_by_key(|n| (n.start, n.pitch));
+        if session == self.project.session {
+            return Ok(());
+        }
+        self.commit_notes(session, (track, clip))
+    }
+
+    /// Sets one note's velocity to `velocity` (`1..=127`) (SPEC-061 §2).
+    /// One undo step.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip, a bad note index or a velocity out of range; `self`
+    /// is unchanged.
+    pub fn set_note_velocity(
+        &mut self,
+        track: usize,
+        clip: usize,
+        index: usize,
+        velocity: u8,
+    ) -> Result<(), EditorError> {
+        if !(1..=127).contains(&velocity) {
+            return Err(EditorError::InvalidNote);
+        }
+        let mut session = self.project.session.clone();
+        let notes = midi_notes(&mut session, track, clip)?;
+        if index >= notes.len() {
+            return Err(EditorError::InvalidNote);
+        }
+        notes[index].velocity = velocity;
+        self.commit_notes(session, (track, clip))
+    }
+
+    /// Sets the velocity of several notes in one undo step (SPEC-061 §2).
+    /// `pairs` holds `(note_index, velocity)`; every velocity must be in
+    /// `1..=127`. Notes not listed are left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for bad indices, [`EditorError::InvalidNote`]
+    /// for an audio clip, a bad note index or a velocity out of range; `self`
+    /// is unchanged.
+    pub fn set_notes_velocity(
+        &mut self,
+        track: usize,
+        clip: usize,
+        pairs: &[(usize, u8)],
+    ) -> Result<(), EditorError> {
+        if pairs.iter().any(|&(_, v)| !(1..=127).contains(&v)) {
+            return Err(EditorError::InvalidNote);
+        }
+        let mut session = self.project.session.clone();
+        let notes = midi_notes(&mut session, track, clip)?;
+        for &(index, velocity) in pairs {
+            if index >= notes.len() {
+                return Err(EditorError::InvalidNote);
+            }
+            notes[index].velocity = velocity;
+        }
+        if session == self.project.session {
+            return Ok(());
+        }
+        self.commit_notes(session, (track, clip))
     }
 
     /// Scales every note length of a MIDI clip to `percent` (`25..=200`),
