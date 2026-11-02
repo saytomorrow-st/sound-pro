@@ -518,7 +518,7 @@ enum TrackAction {
     Duplicate(usize),
     New(TrackKind),
     GatherFolder(Vec<usize>),
-    AddToFolder(usize, usize),
+    AddToFolder(Vec<usize>, usize),
     NewFolder,
     RenameFolder(usize),
     FolderColor(usize, Option<u8>),
@@ -1089,8 +1089,11 @@ impl App {
     }
 
     fn seek(&mut self, samples: u64) {
-        let end = self.editor.session().length_samples();
-        let samples = samples.min(end);
+        // The playhead follows the user anywhere on the timeline, even past
+        // the last region or on an empty project. The transport clamps a
+        // running player to its end (PlaybackControl::seek), so seeking past
+        // the end is safe and only affects the stopped playhead here.
+        let samples = daw_gui::playhead_seek_target(samples);
         match self.player.as_mut() {
             Some(player) if player.control.is_playing() => {
                 player.control.seek(samples);
@@ -2089,8 +2092,19 @@ impl App {
                     action = Some(TrackAction::Duplicate(index));
                     ui.close();
                 }
-                let already_in_folder =
-                    track_rows::folder_of_track(self.editor.session(), index).is_some();
+                // If the right-clicked track belongs to the current selection,
+                // the whole selection is moved to the folder in one undo step;
+                // otherwise only the clicked track. Tracks already inside a
+                // folder are skipped rather than failing the operation.
+                let target: Vec<usize> = if self.editor.is_track_selected(index) {
+                    self.editor.selected_tracks()
+                } else {
+                    vec![index]
+                };
+                let addable: Vec<usize> = target
+                    .into_iter()
+                    .filter(|&t| track_rows::folder_of_track(self.editor.session(), t).is_none())
+                    .collect();
                 let folder_names: Vec<String> = self
                     .editor
                     .session()
@@ -2098,14 +2112,11 @@ impl App {
                     .iter()
                     .map(|f| f.name.clone())
                     .collect();
-                ui.add_enabled_ui(!already_in_folder, |ui| {
+                ui.add_enabled_ui(!addable.is_empty() && !folder_names.is_empty(), |ui| {
                     ui.menu_button("Добавить в папку…", |ui| {
-                        if folder_names.is_empty() {
-                            ui.weak("Нет папок");
-                        }
                         for (folder, name) in folder_names.iter().enumerate() {
                             if ui.button(name).clicked() {
-                                action = Some(TrackAction::AddToFolder(index, folder));
+                                action = Some(TrackAction::AddToFolder(addable.clone(), folder));
                                 ui.close();
                             }
                         }
@@ -2356,10 +2367,10 @@ impl App {
             TrackAction::GatherFolder(tracks) => {
                 self.editor.create_folder(&tracks).map(|_| "Папка создана")
             }
-            TrackAction::AddToFolder(track, folder) => self
+            TrackAction::AddToFolder(tracks, folder) => self
                 .editor
-                .add_tracks_to_folder(folder, &[track])
-                .map(|()| "Дорожка добавлена в папку"),
+                .add_tracks_to_folder(folder, &tracks)
+                .map(|()| "Дорожки добавлены в папку"),
             TrackAction::NewFolder => self.editor.create_empty_folder().map(|_| "Папка создана"),
             TrackAction::RenameFolder(folder) => {
                 let Some((_, text)) = self.folder_rename.take() else {
@@ -2731,7 +2742,12 @@ impl App {
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let rate = f64::from(self.editor.session().sample_rate);
         let session_seconds = self.editor.session().length_samples() as f64 / rate;
-        let width = ((session_seconds as f32 + 10.0) * self.zoom).max(ui.available_width());
+        // The timeline extends past the last region by ten seconds, and also
+        // past the playhead when it sits beyond the session (SPEC-040), so a
+        // click anywhere the playhead is drawn stays reachable.
+        let playhead_seconds = self.playhead as f64 / rate;
+        let width_seconds = session_seconds.max(playhead_seconds) + 10.0;
+        let width = ((width_seconds as f32) * self.zoom).max(ui.available_width());
         let tracks = self.editor.session().tracks.len();
         // The track area is as tall as the number of visible rows: every
         // unfolded track plus one folder header per folder (SPEC-055 §4).

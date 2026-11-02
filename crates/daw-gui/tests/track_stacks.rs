@@ -327,6 +327,37 @@ fn adding_a_track_to_a_folder_is_one_undo_step() {
 }
 
 #[test]
+fn adding_multiple_tracks_to_a_folder_is_one_undo_step() {
+    let mut editor = editor_with(4);
+    let folder = editor.create_empty_folder().unwrap();
+    editor.add_tracks_to_folder(folder, &[1, 0, 3]).unwrap();
+    assert_eq!(editor.session().folder_children[folder], vec![0, 1, 3]);
+    // One undo step restores all of them at once (SPEC-055 §3).
+    assert!(editor.undo());
+    assert!(editor.session().folder_children[folder].is_empty());
+    assert!(editor.redo());
+    assert_eq!(editor.session().folder_children[folder], vec![0, 1, 3]);
+}
+
+#[test]
+fn adding_a_selection_skips_tracks_already_in_a_folder() {
+    // The UI filters already-foldered tracks before a bulk add, so the
+    // operation adds the remaining tracks instead of failing outright.
+    let mut editor = editor_with(4);
+    let existing = editor.create_folder(&[1]).unwrap();
+    let target = editor.create_empty_folder().unwrap();
+    // Tracks 0, 1, 2 selected; 1 is already inside `existing`, so it is skipped.
+    let addable: Vec<usize> = [0, 1, 2]
+        .into_iter()
+        .filter(|&t| daw_gui::track_rows::folder_of_track(editor.session(), t).is_none())
+        .collect();
+    assert_eq!(addable, vec![0, 2]);
+    editor.add_tracks_to_folder(target, &addable).unwrap();
+    assert_eq!(editor.session().folder_children[target], vec![0, 2]);
+    assert_eq!(editor.session().folder_children[existing], vec![1]);
+}
+
+#[test]
 fn adding_a_foldered_track_to_another_folder_is_rejected() {
     let mut editor = editor_with(3);
     let a = editor.create_folder(&[0]).unwrap();
