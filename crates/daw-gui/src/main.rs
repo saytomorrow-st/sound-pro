@@ -1116,6 +1116,59 @@ impl App {
         let Some(drag) = &self.header_drag else {
             return;
         };
+
+        // When tracks are dragged over a folder HEADER, highlight exactly that
+        // folder block (its compact `FOLDER_ROW_HEIGHT` row), not a track-sized
+        // region, so the drop target is unambiguous (SPEC-059 §2). A folder
+        // drag cannot nest, so it keeps the ordinary insertion line.
+        let rows = track_rows::visible_rows(session);
+        let hovered_folder = if drag.folder.is_none() && !drag.tracks.is_empty() {
+            track_rows::row_at_y_heights(&heights, offset)
+                .and_then(|r| rows.get(r).copied())
+                .and_then(|row| match row {
+                    track_rows::Row::Folder(f) => Some(f),
+                    track_rows::Row::Track(_) => None,
+                })
+        } else {
+            None
+        };
+
+        if let Some(folder) = hovered_folder {
+            let fr = track_rows::row_of_folder(session, folder);
+            let Some(fr) = fr else {
+                return;
+            };
+            let color = folder_color(session.folders.get(folder).and_then(|f| f.color), folder);
+            let top = rows_top + track_rows::row_y(&self.track_heights, session, fr);
+            // The folder block itself, exactly its compact header height.
+            let block = Rect::from_min_size(
+                Pos2::new(clip.min.x, top),
+                Vec2::new(clip.width(), track_rows::FOLDER_ROW_HEIGHT),
+            );
+            ui.painter()
+                .rect_filled(block, 4.0, Self::drag_preview_fill(color));
+            ui.painter()
+                .rect_stroke(block, 4.0, Stroke::new(2.0_f32, color), StrokeKind::Inside);
+            // If expanded, bracket the whole child group down the left edge so
+            // the drop scope (folder + children) is clear.
+            let expanded = !session.folders[folder].collapsed;
+            if expanded {
+                let group_h =
+                    track_rows::drag_ghost_height(&self.track_heights, session, &[], Some(folder));
+                if group_h > track_rows::FOLDER_ROW_HEIGHT {
+                    let bar_x = clip.min.x + 4.0;
+                    ui.painter().line_segment(
+                        [
+                            Pos2::new(bar_x, top + track_rows::FOLDER_ROW_HEIGHT),
+                            Pos2::new(bar_x, top + group_h),
+                        ],
+                        Stroke::new(3.0_f32, color),
+                    );
+                }
+            }
+            return;
+        }
+
         let ghost_h =
             track_rows::drag_ghost_height(&self.track_heights, session, &drag.tracks, drag.folder);
         if ghost_h > 0.0 {
@@ -1135,6 +1188,62 @@ impl App {
         }
         let stroke = egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 255));
         ui.painter().hline(clip.min.x..=clip.max.x, y, stroke);
+    }
+
+    /// The tint used for a live drag preview lane on the timeline (SPEC-059
+    /// §1): the dragged track's colour, made translucent so the underlying
+    /// grid and clips stay visible while the track follows the pointer.
+    fn drag_preview_fill(color: Color32) -> Color32 {
+        let (r, g, b) = (color.r(), color.g(), color.b());
+        Color32::from_rgba_unmultiplied(r, g, b, 48)
+    }
+
+    /// Draws a live preview on the TIMELINE while a header drag is in
+    /// progress (SPEC-059 §1): a semi-transparent ghost lane tinted with the
+    /// dragged track's colour at the insertion position, plus the insertion
+    /// line. Purely visual — the model is unchanged until release. Mirrors
+    /// [`Self::draw_drag_indicator`] but spans the timeline width and uses the
+    /// track colour, so the row visibly follows the pointer before drop.
+    fn draw_timeline_drag_preview(&self, painter: &egui::Painter, area: Rect, rows_top: f32) {
+        let Some(drag) = &self.header_drag else {
+            return;
+        };
+        let Some(pointer_y) = painter.ctx().input(|i| i.pointer.latest_pos()).map(|p| p.y) else {
+            return;
+        };
+        let session = self.editor.session();
+        let heights = track_rows::row_heights(&self.track_heights, session);
+        let ins = track_rows::drop_insertion_row(&heights, pointer_y - rows_top);
+        let y = rows_top + track_rows::row_y(&self.track_heights, session, ins);
+        let ghost_h =
+            track_rows::drag_ghost_height(&self.track_heights, session, &drag.tracks, drag.folder);
+
+        // Representative colour: the first dragged track, else a folder tint.
+        let color = if let Some(t) = drag.tracks.first() {
+            if let Some(track) = session.tracks.get(*t) {
+                track_color(track.color, *t)
+            } else {
+                Color32::from_rgb(80, 140, 255)
+            }
+        } else if let Some(f) = drag.folder {
+            folder_color(session.folders.get(f).and_then(|f| f.color), f)
+        } else {
+            Color32::from_rgb(80, 140, 255)
+        };
+
+        let x0 = area.min.x;
+        let x1 = area.max.x;
+        if ghost_h > 0.0 {
+            let ghost = Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + ghost_h));
+            painter.rect_filled(ghost, 4.0, Self::drag_preview_fill(color));
+            painter.rect_stroke(
+                ghost,
+                4.0,
+                Stroke::new(1.0_f32, color.gamma_multiply(1.3)),
+                StrokeKind::Inside,
+            );
+        }
+        painter.hline(x0..=x1, y, Stroke::new(2.0_f32, color.gamma_multiply(1.3)));
     }
 
     /// The bottom-edge resize handle for a track header (SPEC-056 §1): drag
@@ -2177,12 +2286,33 @@ impl App {
             };
             let selected = self.editor.is_track_selected(index);
             let in_folder = foldered.get(index).copied().unwrap_or(false);
+            // Colour of the enclosing folder, for the left-edge bracket and a
+            // slightly tinted background so a child track reads as "inside a
+            // folder" at a glance (SPEC-059 §5).
+            let folder_tint = track_rows::folder_of_track(self.editor.session(), index)
+                .map(|f| folder_color(self.editor.session().folders[f].color, f));
             let h = self.track_height(index);
+            // At the compact preset the header must fit one row: name plus
+            // M/S/R pills, with FX/A/✕ and the gain/pan sliders hidden
+            // (SPEC-059 §6).
+            let compact = h <= track_rows::COMPACT_TRACK_HEIGHT;
+            let base_fill = if selected {
+                Color32::from_rgb(48, 56, 72)
+            } else {
+                Color32::from_gray(36)
+            };
             let frame = egui::Frame::new()
-                .fill(if selected {
-                    Color32::from_rgb(48, 56, 72)
-                } else {
-                    Color32::from_gray(36)
+                .fill(match folder_tint {
+                    Some(c) if !selected => {
+                        let mut blended = base_fill;
+                        blended = Color32::from_rgb(
+                            ((blended.r() as u32 * 3 + c.r() as u32) / 4) as u8,
+                            ((blended.g() as u32 * 3 + c.g() as u32) / 4) as u8,
+                            ((blended.b() as u32 * 3 + c.b() as u32) / 4) as u8,
+                        );
+                        blended
+                    }
+                    _ => base_fill,
                 })
                 .inner_margin(4.0);
             // SPEC-044 §1: the click-sensing scope is registered before
@@ -2194,6 +2324,16 @@ impl App {
                         frame.show(ui, |ui| {
                             ui.set_height(h - 8.0);
                             ui.set_width(ui.available_width());
+                            // Folder-coloured vertical bar on the left edge of a
+                            // child row, mirroring the folder colour (SPEC-059 §5).
+                            if let Some(c) = folder_tint {
+                                let bar = ui.available_rect_before_wrap();
+                                let rect = Rect::from_min_max(
+                                    Pos2::new(bar.min.x + 1.0, bar.min.y + 1.0),
+                                    Pos2::new(bar.min.x + 4.0, bar.max.y - 1.0),
+                                );
+                                ui.painter().rect_filled(rect, 2.0, c);
+                            }
                             ui.add_space(if in_folder { 16.0 } else { 0.0 });
                             let track = &self.editor.session().tracks[index];
                             let (mut mute, mut solo) = (track.mute, track.solo);
@@ -2256,57 +2396,60 @@ impl App {
                                 {
                                     self.rename = Some((index, name.clone()));
                                 }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .small_button("✕")
-                                            .on_hover_text("Удалить дорожку")
-                                            .clicked()
-                                        {
-                                            delete = Some(index);
-                                        }
-                                        let effects =
-                                            self.editor.session().tracks[index].effects.len();
-                                        let label = if effects == 0 {
-                                            "FX".to_owned()
-                                        } else {
-                                            format!("FX {effects}")
-                                        };
-                                        if ui
-                                            .selectable_label(
-                                                self.fx == Some(FxTarget::Track(index)),
-                                                label,
-                                            )
-                                            .on_hover_text("Эффекты дорожки")
-                                            .clicked()
-                                        {
-                                            self.fx = if self.fx == Some(FxTarget::Track(index)) {
-                                                None
+                                if !compact {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .small_button("✕")
+                                                .on_hover_text("Удалить дорожку")
+                                                .clicked()
+                                            {
+                                                delete = Some(index);
+                                            }
+                                            let effects =
+                                                self.editor.session().tracks[index].effects.len();
+                                            let label = if effects == 0 {
+                                                "FX".to_owned()
                                             } else {
-                                                Some(FxTarget::Track(index))
+                                                format!("FX {effects}")
                                             };
-                                        }
-                                        if ui
-                                            .selectable_label(self.auto == Some(index), "A")
-                                            .on_hover_text("Автоматизация")
-                                            .clicked()
-                                        {
-                                            self.auto = if self.auto == Some(index) {
-                                                None
-                                            } else {
-                                                Some(index)
-                                            };
-                                            self.auto_drag = None;
-                                        }
-                                        if self.auto == Some(index) {
-                                            self.lane_picker(ui, index);
-                                        }
-                                    },
-                                );
+                                            if ui
+                                                .selectable_label(
+                                                    self.fx == Some(FxTarget::Track(index)),
+                                                    label,
+                                                )
+                                                .on_hover_text("Эффекты дорожки")
+                                                .clicked()
+                                            {
+                                                self.fx = if self.fx == Some(FxTarget::Track(index))
+                                                {
+                                                    None
+                                                } else {
+                                                    Some(FxTarget::Track(index))
+                                                };
+                                            }
+                                            if ui
+                                                .selectable_label(self.auto == Some(index), "A")
+                                                .on_hover_text("Автоматизация")
+                                                .clicked()
+                                            {
+                                                self.auto = if self.auto == Some(index) {
+                                                    None
+                                                } else {
+                                                    Some(index)
+                                                };
+                                                self.auto_drag = None;
+                                            }
+                                            if self.auto == Some(index) {
+                                                self.lane_picker(ui, index);
+                                            }
+                                        },
+                                    );
+                                }
                             });
                             ui.horizontal(|ui| {
-                                ui.add_space(34.0);
+                                ui.add_space(if compact { 6.0 } else { 34.0 });
                                 ui.spacing_mut().item_spacing.x = 3.0;
                                 let m = shell::pill(
                                     ui,
@@ -2330,13 +2473,17 @@ impl App {
                                     self.editor.set_armed(index, armed);
                                 }
                                 let mut monitor = track_monitor;
-                                let i = shell::pill(
-                                    ui,
-                                    &mut monitor,
-                                    "I",
-                                    Color32::from_rgb(240, 160, 60),
-                                )
-                                .on_hover_text("Мониторинг входа");
+                                let i = if compact {
+                                    ui.allocate_response(Vec2::ZERO, Sense::hover())
+                                } else {
+                                    shell::pill(
+                                        ui,
+                                        &mut monitor,
+                                        "I",
+                                        Color32::from_rgb(240, 160, 60),
+                                    )
+                                    .on_hover_text("Мониторинг входа")
+                                };
                                 if s.changed() || m.changed() || i.changed() {
                                     if let Some(t) = self.editor.track_mut(index) {
                                         t.mute = mute;
@@ -2344,7 +2491,7 @@ impl App {
                                         t.input_monitor = monitor;
                                     }
                                 }
-                                if audio {
+                                if audio && !compact {
                                     let mut stereo = track_stereo;
                                     if shell::pill(
                                         ui,
@@ -2367,8 +2514,11 @@ impl App {
                             let automation = &self.editor.session().tracks[index].automation;
                             let (gain_free, pan_free) =
                                 (automation.gain.is_empty(), automation.pan.is_empty());
-                            let (g, p) = ui
-                                .horizontal(|ui| {
+                            let (g, p) = if compact {
+                                let d = ui.allocate_response(Vec2::ZERO, Sense::hover());
+                                (d.clone(), d)
+                            } else {
+                                ui.horizontal(|ui| {
                                     ui.add_space(30.0);
                                     ui.spacing_mut().slider_width =
                                         ((ui.available_width() - 60.0) * 0.6).max(40.0);
@@ -2395,7 +2545,8 @@ impl App {
                                         );
                                     (g, p)
                                 })
-                                .inner;
+                                .inner
+                            };
                             if g.changed() || p.changed() {
                                 if let Some(t) = self.editor.track_mut(index) {
                                     t.gain = gain;
@@ -3033,7 +3184,13 @@ impl App {
                     let top = area.min.y
                         + TIMELINE_HEADER
                         + track_rows::total_height(&self.track_heights, session);
-                    Rect::from_min_max(Pos2::new(area.min.x, top), area.max)
+                    // The "new track" target is a single standard-height band
+                    // below the last row, never the whole remaining timeline
+                    // (SPEC-059 §1b): a full-area ghost reads as a bug.
+                    Rect::from_min_size(
+                        Pos2::new(area.min.x, top),
+                        Vec2::new(area.width(), track_rows::DEFAULT_TRACK_HEIGHT),
+                    )
                 }
             };
             // The first audio file's length comes from its header, read once
@@ -3288,6 +3445,34 @@ impl App {
         self.timeline_view = ((view.min.x - area.min.x).max(0.0), view.width());
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 0.0, Color32::from_gray(24));
+        // Folder rows get a matching compact lane band on the timeline so the
+        // grid lines up with the header panel (SPEC-059 §4). The band uses the
+        // folder's own colour, faint, at exactly FOLDER_ROW_HEIGHT.
+        for (f, folder) in self.editor.session().folders.iter().enumerate() {
+            let Some(row) = track_rows::row_of_folder(self.editor.session(), f) else {
+                continue;
+            };
+            let top = area.min.y
+                + TIMELINE_HEADER
+                + track_rows::row_y(&self.track_heights, self.editor.session(), row);
+            let c = folder_color(folder.color, f);
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(area.min.x, top),
+                    Vec2::new(area.width(), track_rows::FOLDER_ROW_HEIGHT),
+                ),
+                0.0,
+                c.gamma_multiply(0.10),
+            );
+            // A thin bottom edge keeps the band visually distinct from a track.
+            painter.line_segment(
+                [
+                    Pos2::new(area.min.x, top + track_rows::FOLDER_ROW_HEIGHT),
+                    Pos2::new(area.max.x, top + track_rows::FOLDER_ROW_HEIGHT),
+                ],
+                Stroke::new(1.0_f32, c.gamma_multiply(0.4)),
+            );
+        }
         self.handle_drop(ui, area, tracks);
 
         // Ruler: one line per beat, labels on bar starts (SPEC-026). Beat and
@@ -3395,6 +3580,16 @@ impl App {
             let top = area.min.y
                 + TIMELINE_HEADER
                 + track_rows::row_y(&self.track_heights, self.editor.session(), row);
+            // Folder-coloured bracket on the left edge of a child lane,
+            // matching the header panel (SPEC-059 §5).
+            if let Some(f) = track_rows::folder_of_track(self.editor.session(), t) {
+                let c = folder_color(self.editor.session().folders[f].color, f);
+                let bar = Rect::from_min_size(
+                    Pos2::new(area.min.x + 1.0, top + 1.0),
+                    Vec2::new(3.0, h - 2.0),
+                );
+                painter.rect_filled(bar, 2.0, c);
+            }
             painter.line_segment(
                 [
                     Pos2::new(area.min.x, top + h),
@@ -3566,6 +3761,9 @@ impl App {
             && self.auto_drag.is_none()
             && on_tempo;
 
+        // Live drag preview lane on the timeline (SPEC-059 §1): the dragged
+        // track row follows the pointer before release, tinted with its colour.
+        self.draw_timeline_drag_preview(&painter, area, area.min.y + TIMELINE_HEADER);
         self.draw_ghosts(&painter, area);
         self.draw_take(&painter, area);
 
@@ -6212,13 +6410,13 @@ fn draw_take_rect(painter: &egui::Painter, rect: Rect, samples: &[f32]) {
 mod header_drag_tests {
     use super::*;
 
-    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
             events,
             ..Default::default()
         };
-        let _ = ctx.run(raw, |ctx| {
+        ctx.run(raw, |ctx| {
             if ctx.input(|i| i.pointer.any_down()) {
                 app.editor.begin_group();
             } else {
@@ -6230,7 +6428,7 @@ mod header_drag_tests {
                     .id_salt("headers")
                     .show(ui, |ui| app.track_headers(ui));
             });
-        });
+        })
     }
 
     fn names(app: &App) -> Vec<String> {
@@ -6317,5 +6515,206 @@ mod header_drag_tests {
         let mut kids = app.editor.session().folder_children[0].clone();
         kids.sort_unstable();
         assert_eq!(kids.len(), 2, "children: {kids:?}");
+    }
+
+    /// The translucent drag ghost fill colour, exactly as `draw_drag_indicator`
+    /// paints it (SPEC-057/058). Kept in sync by the test below.
+    fn ghost_fill() -> Color32 {
+        Color32::from_rgba_unmultiplied(80, 140, 255, 40)
+    }
+
+    /// Collects the ghost rectangles painted on the given frame output.
+    fn ghost_rects(out: &egui::FullOutput) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            let mut push = |shape: &egui::epaint::Shape| {
+                if let egui::epaint::Shape::Rect(r) = shape {
+                    if r.fill == ghost_fill() {
+                        rects.push(r.rect);
+                    }
+                }
+            };
+            match &clipped.shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(push),
+                other => push(other),
+            }
+        }
+        rects
+    }
+
+    #[test]
+    fn drag_ghost_is_dragged_row_height_not_full_height() {
+        let mut app = app_with_tracks();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(FIRST_LABEL)]);
+        frame(&ctx, &mut app, vec![button(FIRST_LABEL, true)]);
+        // Mid-drag frame: a single track is dragged, so the ghost must be the
+        // height of exactly one track row, never the whole panel.
+        let out = frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(Pos2::new(70.0, 400.0))],
+        );
+        let expected = app.track_height(0);
+        let rects = ghost_rects(&out);
+        assert!(!rects.is_empty(), "no drag ghost was painted");
+        for r in &rects {
+            assert!(
+                (r.height() - expected).abs() < 1.0,
+                "ghost height {} != dragged row height {expected} (rect {r:?})",
+                r.height()
+            );
+            // The ghost spans the header panel, never the whole 1200px window.
+            assert!(
+                r.width() < 400.0,
+                "ghost width {} spans the whole work area (rect {r:?})",
+                r.width()
+            );
+        }
+    }
+
+    /// Renders the header panel AND the timeline central panel, so the
+    /// timeline drag preview lane is painted and can be inspected.
+    fn full_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            if ctx.input(|i| i.pointer.any_down()) {
+                app.editor.begin_group();
+            } else {
+                app.editor.end_group();
+            }
+            app.sync_track_heights();
+            egui::SidePanel::left("tracks").show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("headers")
+                    .show(ui, |ui| app.track_headers(ui));
+            });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("timeline")
+                    .show(ui, |ui| app.timeline(ui));
+            });
+        })
+    }
+
+    /// Collects the timeline drag-preview lanes painted for `track` (SPEC-059
+    /// §1): rects filled with the track's colour at the preview alpha.
+    fn preview_lane_rects(out: &egui::FullOutput, track: usize) -> Vec<Rect> {
+        let fill = App::drag_preview_fill(track_color(None, track));
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            let mut push = |shape: &egui::epaint::Shape| {
+                if let egui::epaint::Shape::Rect(r) = shape {
+                    if r.fill == fill {
+                        rects.push(r.rect);
+                    }
+                }
+            };
+            match &clipped.shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(push),
+                other => push(other),
+            }
+        }
+        rects
+    }
+
+    /// Collects the folder-block highlight painted during a track drag over a
+    /// folder header (SPEC-059 §2): a rect filled with the folder's colour at
+    /// the preview alpha. The folder's own full-alpha left bar and dimmed icon
+    /// use different colours, so this matches only the drop highlight.
+    fn folder_highlight_rects(out: &egui::FullOutput, folder: usize) -> Vec<Rect> {
+        let fill = App::drag_preview_fill(folder_color(None, folder));
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            let mut push = |shape: &egui::epaint::Shape| {
+                if let egui::epaint::Shape::Rect(r) = shape {
+                    if r.fill == fill {
+                        rects.push(r.rect);
+                    }
+                }
+            };
+            match &clipped.shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(push),
+                other => push(other),
+            }
+        }
+        rects
+    }
+
+    #[test]
+    fn dropping_tracks_on_a_folder_highlights_the_folder_block_not_a_track() {
+        let mut app = app_with_tracks();
+        app.editor.create_folder(&[0]).unwrap();
+        let ctx = egui::Context::default();
+        // Grab a top-level track's label, then hover the folder header (which
+        // sits at the very top when it has children).
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(Pos2::new(70.0, 262.0))],
+        );
+        frame(&ctx, &mut app, vec![button(Pos2::new(70.0, 262.0), true)]);
+        let out = frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(Pos2::new(70.0, 60.0))],
+        );
+        let rects = folder_highlight_rects(&out, 0);
+        assert!(
+            !rects.is_empty(),
+            "no folder-block highlight was painted over the folder header"
+        );
+        for r in &rects {
+            assert!(
+                (r.height() - track_rows::FOLDER_ROW_HEIGHT).abs() < 1.0,
+                "folder highlight height {} != FOLDER_ROW_HEIGHT {} (rect {r:?})",
+                r.height(),
+                track_rows::FOLDER_ROW_HEIGHT
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_shows_coloured_preview_lane_during_header_drag() {
+        let mut app = app_with_tracks();
+        let ctx = egui::Context::default();
+        full_frame(&ctx, &mut app, vec![]);
+        full_frame(&ctx, &mut app, vec![]);
+        full_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(FIRST_LABEL)]);
+        full_frame(&ctx, &mut app, vec![button(FIRST_LABEL, true)]);
+        let out = full_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(Pos2::new(70.0, 400.0))],
+        );
+        // Track 0 has no explicit colour, so it takes palette slot 0 (red).
+        let expected = app.track_height(0);
+        let lanes = preview_lane_rects(&out, 0);
+        assert!(
+            !lanes.is_empty(),
+            "no coloured timeline preview lane was painted during the drag"
+        );
+        for lane in &lanes {
+            assert!(
+                (lane.height() - expected).abs() < 1.0,
+                "preview lane height {} != dragged row height {expected}",
+                lane.height()
+            );
+            // The preview spans the (wide) timeline, unlike the narrow header
+            // ghost, so a wide lane is expected and correct here.
+            assert!(lane.width() > 100.0, "preview lane too narrow: {lane:?}");
+        }
     }
 }
