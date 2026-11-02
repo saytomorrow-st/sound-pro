@@ -1137,6 +1137,62 @@ impl App {
         ui.painter().hline(clip.min.x..=clip.max.x, y, stroke);
     }
 
+    /// The tint used for a live drag preview lane on the timeline (SPEC-059
+    /// §1): the dragged track's colour, made translucent so the underlying
+    /// grid and clips stay visible while the track follows the pointer.
+    fn drag_preview_fill(color: Color32) -> Color32 {
+        let (r, g, b) = (color.r(), color.g(), color.b());
+        Color32::from_rgba_unmultiplied(r, g, b, 48)
+    }
+
+    /// Draws a live preview on the TIMELINE while a header drag is in
+    /// progress (SPEC-059 §1): a semi-transparent ghost lane tinted with the
+    /// dragged track's colour at the insertion position, plus the insertion
+    /// line. Purely visual — the model is unchanged until release. Mirrors
+    /// [`Self::draw_drag_indicator`] but spans the timeline width and uses the
+    /// track colour, so the row visibly follows the pointer before drop.
+    fn draw_timeline_drag_preview(&self, painter: &egui::Painter, area: Rect, rows_top: f32) {
+        let Some(drag) = &self.header_drag else {
+            return;
+        };
+        let Some(pointer_y) = painter.ctx().input(|i| i.pointer.latest_pos()).map(|p| p.y) else {
+            return;
+        };
+        let session = self.editor.session();
+        let heights = track_rows::row_heights(&self.track_heights, session);
+        let ins = track_rows::drop_insertion_row(&heights, pointer_y - rows_top);
+        let y = rows_top + track_rows::row_y(&self.track_heights, session, ins);
+        let ghost_h =
+            track_rows::drag_ghost_height(&self.track_heights, session, &drag.tracks, drag.folder);
+
+        // Representative colour: the first dragged track, else a folder tint.
+        let color = if let Some(t) = drag.tracks.first() {
+            if let Some(track) = session.tracks.get(*t) {
+                track_color(track.color, *t)
+            } else {
+                Color32::from_rgb(80, 140, 255)
+            }
+        } else if let Some(f) = drag.folder {
+            folder_color(session.folders.get(f).and_then(|f| f.color), f)
+        } else {
+            Color32::from_rgb(80, 140, 255)
+        };
+
+        let x0 = area.min.x;
+        let x1 = area.max.x;
+        if ghost_h > 0.0 {
+            let ghost = Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + ghost_h));
+            painter.rect_filled(ghost, 4.0, Self::drag_preview_fill(color));
+            painter.rect_stroke(
+                ghost,
+                4.0,
+                Stroke::new(1.0_f32, color.gamma_multiply(1.3)),
+                StrokeKind::Inside,
+            );
+        }
+        painter.hline(x0..=x1, y, Stroke::new(2.0_f32, color.gamma_multiply(1.3)));
+    }
+
     /// The bottom-edge resize handle for a track header (SPEC-056 §1): drag
     /// to resize that track, `Alt` to resize all, `Shift`+double-click to
     /// reset to the default.
@@ -3572,6 +3628,9 @@ impl App {
             && self.auto_drag.is_none()
             && on_tempo;
 
+        // Live drag preview lane on the timeline (SPEC-059 §1): the dragged
+        // track row follows the pointer before release, tinted with its colour.
+        self.draw_timeline_drag_preview(&painter, area, area.min.y + TIMELINE_HEADER);
         self.draw_ghosts(&painter, area);
         self.draw_take(&painter, area);
 
@@ -6380,6 +6439,91 @@ mod header_drag_tests {
                 "ghost width {} spans the whole work area (rect {r:?})",
                 r.width()
             );
+        }
+    }
+
+    /// Renders the header panel AND the timeline central panel, so the
+    /// timeline drag preview lane is painted and can be inspected.
+    fn full_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            if ctx.input(|i| i.pointer.any_down()) {
+                app.editor.begin_group();
+            } else {
+                app.editor.end_group();
+            }
+            app.sync_track_heights();
+            egui::SidePanel::left("tracks").show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("headers")
+                    .show(ui, |ui| app.track_headers(ui));
+            });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("timeline")
+                    .show(ui, |ui| app.timeline(ui));
+            });
+        })
+    }
+
+    /// Collects the timeline drag-preview lanes painted for `track` (SPEC-059
+    /// §1): rects filled with the track's colour at the preview alpha.
+    fn preview_lane_rects(out: &egui::FullOutput, track: usize) -> Vec<Rect> {
+        let fill = App::drag_preview_fill(track_color(None, track));
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            let mut push = |shape: &egui::epaint::Shape| {
+                if let egui::epaint::Shape::Rect(r) = shape {
+                    if r.fill == fill {
+                        rects.push(r.rect);
+                    }
+                }
+            };
+            match &clipped.shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(push),
+                other => push(other),
+            }
+        }
+        rects
+    }
+
+    #[test]
+    fn timeline_shows_coloured_preview_lane_during_header_drag() {
+        let mut app = app_with_tracks();
+        let ctx = egui::Context::default();
+        full_frame(&ctx, &mut app, vec![]);
+        full_frame(&ctx, &mut app, vec![]);
+        full_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(FIRST_LABEL)]);
+        full_frame(&ctx, &mut app, vec![button(FIRST_LABEL, true)]);
+        let out = full_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(Pos2::new(70.0, 400.0))],
+        );
+        // Track 0 has no explicit colour, so it takes palette slot 0 (red).
+        let expected = app.track_height(0);
+        let lanes = preview_lane_rects(&out, 0);
+        assert!(
+            !lanes.is_empty(),
+            "no coloured timeline preview lane was painted during the drag"
+        );
+        for lane in &lanes {
+            assert!(
+                (lane.height() - expected).abs() < 1.0,
+                "preview lane height {} != dragged row height {expected}",
+                lane.height()
+            );
+            // The preview spans the (wide) timeline, unlike the narrow header
+            // ghost, so a wide lane is expected and correct here.
+            assert!(lane.width() > 100.0, "preview lane too narrow: {lane:?}");
         }
     }
 }
