@@ -29,10 +29,12 @@ use audio_core::wav::{BitDepth, Recorder, WavSpec, write_mono_slice, write_wav_p
 
 pub mod audio_file;
 pub mod audio_settings;
+pub mod instrument;
 pub mod meters;
 pub mod nodes;
 pub mod pcm_cache;
 pub mod piano;
+pub mod sample_bank;
 
 /// Errors from assembling a session graph (SPEC-010).
 ///
