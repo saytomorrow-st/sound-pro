@@ -293,6 +293,9 @@ pub const DEFAULT_XFADE: u64 = 960;
 #[derive(Debug)]
 pub struct Editor {
     project: Project,
+    /// The session as it was before `pin_default_colors` filled in colours,
+    /// so the next undo step restores it exactly (SPEC-060).
+    pre_pin: Option<Session>,
     path: Option<PathBuf>,
     dirty: bool,
     waves: HashMap<String, Peaks>,
@@ -372,6 +375,7 @@ impl Editor {
             undo: Vec::new(),
             redo: Vec::new(),
             saved: session,
+            pre_pin: None,
             group: None,
             selected_track: None,
             selected_folder: None,
@@ -458,6 +462,7 @@ impl Editor {
             rendered: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
+            pre_pin: None,
             group: None,
             selected_track: None,
             selected_folder: None,
@@ -2930,6 +2935,7 @@ impl Editor {
     ///
     /// [`EditorError::NoClip`] when either index is out of range.
     pub fn move_track(&mut self, from: usize, to: usize) -> Result<(), EditorError> {
+        self.pin_default_colors();
         let count = self.project.session.tracks.len();
         if from >= count || to >= count {
             return Err(EditorError::NoClip);
@@ -2977,6 +2983,7 @@ impl Editor {
     ///
     /// [`EditorError::NoClip`] when an index is out of range.
     pub fn move_tracks(&mut self, tracks: &[usize], to: usize) -> Result<(), EditorError> {
+        self.pin_default_colors();
         let count = self.project.session.tracks.len();
         let mut moved: Vec<usize> = tracks.to_vec();
         moved.sort_unstable();
@@ -3053,6 +3060,7 @@ impl Editor {
         folder: usize,
         tracks: &[usize],
     ) -> Result<(), EditorError> {
+        self.pin_default_colors();
         if folder >= self.project.session.folders.len() {
             return Err(EditorError::NoFolder);
         }
@@ -3083,6 +3091,7 @@ impl Editor {
     /// [`EditorError::NoClip`] for a bad index, [`EditorError::Session`] when
     /// the session already holds [`audio_core::MAX_TRACKS`] tracks.
     pub fn duplicate_track(&mut self, track: usize) -> Result<usize, EditorError> {
+        self.pin_default_colors();
         let mut session = self.project.session.clone();
         let mut copy = session
             .tracks
@@ -3109,6 +3118,7 @@ impl Editor {
 
     /// Removes one track and its clips; out-of-range indices do nothing.
     pub fn delete_track(&mut self, track: usize) {
+        self.pin_default_colors();
         if track < self.project.session.tracks.len() {
             self.record();
             self.project.session.tracks.remove(track);
@@ -3146,6 +3156,7 @@ impl Editor {
     /// [`EditorError::NoClip`] when an index is out of range,
     /// [`EditorError::TrackInFolder`] when a track is already in a folder.
     pub fn create_folder(&mut self, tracks: &[usize]) -> Result<usize, EditorError> {
+        self.pin_default_colors();
         if tracks.is_empty() {
             return Err(EditorError::EmptyFolder);
         }
@@ -3220,6 +3231,7 @@ impl Editor {
     ///
     /// [`EditorError::NoFolder`] for a bad index.
     pub fn delete_folder(&mut self, folder: usize, mode: DeleteFolder) -> Result<(), EditorError> {
+        self.pin_default_colors();
         if folder >= self.project.session.folders.len() {
             return Err(EditorError::NoFolder);
         }
@@ -3332,6 +3344,7 @@ impl Editor {
     ///
     /// [`EditorError::NoFolder`] for a bad folder index.
     pub fn move_folder(&mut self, folder: usize, to: usize) -> Result<(), EditorError> {
+        self.pin_default_colors();
         if folder >= self.project.session.folders.len() {
             return Err(EditorError::NoFolder);
         }
@@ -3388,6 +3401,7 @@ impl Editor {
         folder: usize,
         tracks: &[usize],
     ) -> Result<(), EditorError> {
+        self.pin_default_colors();
         if folder >= self.project.session.folders.len() {
             return Err(EditorError::NoFolder);
         }
@@ -3416,6 +3430,7 @@ impl Editor {
     /// Removes `tracks` from whichever folder holds them (SPEC-055 §3).
     /// Tracks that are not in a folder are ignored.
     pub fn remove_tracks_from_folder(&mut self, tracks: &[usize]) -> Result<(), EditorError> {
+        self.pin_default_colors();
         if tracks.is_empty() {
             return Ok(());
         }
@@ -3424,6 +3439,41 @@ impl Editor {
             list.retain(|c| !tracks.contains(c));
         }
         self.commit_session(session)
+    }
+
+    /// Writes the palette colour a track shows into `Track::color` when it
+    /// has none, so the colour belongs to the track and not to its position
+    /// (SPEC-060). Folders get the same treatment. Visually a no-op, so it
+    /// adds no undo step.
+    fn pin_default_colors(&mut self) {
+        let needs_pin = self
+            .project
+            .session
+            .tracks
+            .iter()
+            .any(|t| t.color.is_none())
+            || self
+                .project
+                .session
+                .folders
+                .iter()
+                .any(|f| f.color.is_none());
+        if !needs_pin {
+            return;
+        }
+        if self.pre_pin.is_none() {
+            self.pre_pin = Some(self.project.session.clone());
+        }
+        for (i, t) in self.project.session.tracks.iter_mut().enumerate() {
+            if t.color.is_none() {
+                t.color = Some(layout::display_color(None, i));
+            }
+        }
+        for (i, f) in self.project.session.folders.iter_mut().enumerate() {
+            if f.color.is_none() {
+                f.color = Some(layout::display_color(None, i));
+            }
+        }
     }
 
     /// Mutable access to one track's mixer settings; marks the project
@@ -3656,6 +3706,7 @@ impl Editor {
 
     /// Remembers the session before an edit (once per group).
     fn record(&mut self) {
+        let pre_pin = self.pre_pin.take();
         match self.group {
             Some(true) => return,
             Some(false) => self.group = Some(true),
@@ -3664,7 +3715,8 @@ impl Editor {
         if self.undo.len() == UNDO_LIMIT {
             self.undo.remove(0);
         }
-        self.undo.push(self.project.session.clone());
+        self.undo
+            .push(pre_pin.unwrap_or_else(|| self.project.session.clone()));
         self.redo.clear();
     }
 
