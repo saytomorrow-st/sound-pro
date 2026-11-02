@@ -655,6 +655,9 @@ struct App {
     /// Draw the XQueryPointer / egui pointer debug crosses while a file is
     /// hovered (set `SOUND_PRO_DROP_DEBUG=1`). Read once at startup.
     drop_debug: bool,
+    /// `SOUND_PRO_DEBUG_DRAG=1`: log header drags to stderr (read once).
+    drag_debug: bool,
+    drag_log_row: Option<usize>,
     /// Log window/viewport state and every `ViewportCommand` sent, to diagnose
     /// broken window controls on Wayland/XWayland (set
     /// `SOUND_PRO_WINDOW_DEBUG=1`). Read once at startup.
@@ -856,6 +859,8 @@ impl App {
             #[cfg(target_os = "linux")]
             x11_cursor: None,
             drop_debug: std::env::var_os("SOUND_PRO_DROP_DEBUG").is_some(),
+            drag_debug: std::env::var("SOUND_PRO_DEBUG_DRAG").is_ok_and(|v| v == "1"),
+            drag_log_row: None,
             window_debug: std::env::var_os("SOUND_PRO_WINDOW_DEBUG").is_some(),
             fullscreen: false,
             player: None,
@@ -1010,6 +1015,13 @@ impl App {
         let Some(drag) = self.header_drag.take() else {
             return;
         };
+        self.drag_log_row = None;
+        if self.drag_debug {
+            eprintln!(
+                "[drag] release y={pointer_y:.1} rows_top={rows_top:.1} folder={:?} tracks={:?}",
+                drag.folder, drag.tracks
+            );
+        }
         // Snapshot all target data from the immutable session before mutating.
         let heights = track_rows::row_heights(&self.track_heights, self.editor.session());
         let offset = pointer_y - rows_top;
@@ -1037,7 +1049,14 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
             let folder_to = track_rows::folder_drop_position(self.editor.session(), folder, to);
-            if self.editor.move_folder(folder, folder_to).is_ok() {
+            let moved = self.editor.move_folder(folder, folder_to);
+            if self.drag_debug {
+                eprintln!(
+                    "[drag] action move_folder({folder}, {folder_to}) ok={}",
+                    moved.is_ok()
+                );
+            }
+            if moved.is_ok() {
                 let mut kids = children;
                 kids.sort_unstable();
                 self.reindex_heights_move_tracks(&kids, folder_to);
@@ -1052,10 +1071,20 @@ impl App {
         }
         // Drop onto a folder header or a child track row adds to that folder.
         if let Some(folder) = target_folder {
-            if self.editor.move_tracks_to_folder(folder, &tracks).is_ok() {
+            let added = self.editor.move_tracks_to_folder(folder, &tracks);
+            if self.drag_debug {
+                eprintln!(
+                    "[drag] action move_tracks_to_folder({folder}, {tracks:?}) ok={}",
+                    added.is_ok()
+                );
+            }
+            if added.is_ok() {
                 self.status = "Дорожки добавлены в папку".into();
             }
             return;
+        }
+        if self.drag_debug {
+            eprintln!("[drag] action move_tracks({tracks:?}, {to})");
         }
         // Otherwise a top-level reorder; tracks already in a folder leave it.
         let any_in_folder = tracks
@@ -2217,6 +2246,7 @@ impl App {
                                         egui::Label::new(egui::RichText::new(&name).strong())
                                             .truncate()
                                             .halign(egui::Align::LEFT)
+                                            .selectable(false)
                                             .sense(Sense::click()),
                                     )
                                     .on_hover_text(format!(
@@ -2387,6 +2417,9 @@ impl App {
                 } else {
                     vec![index]
                 };
+                if self.drag_debug {
+                    eprintln!("[drag] start track={index} dragging={tracks:?}");
+                }
                 self.header_drag = Some(HeaderDrag {
                     tracks,
                     folder: None,
@@ -2528,6 +2561,9 @@ impl App {
         if self.header_drag.is_some() {
             let pointer_up = !ui.input(|i| i.pointer.any_down());
             if pointer_up {
+                if self.drag_debug {
+                    eprintln!("[drag] release without drag_stopped (fallback path)");
+                }
                 if let (Some(top), Some(pos)) = (rows_top, ui.input(|i| i.pointer.latest_pos())) {
                     self.resolve_header_drop(pos.y, top);
                 } else {
@@ -2535,6 +2571,15 @@ impl App {
                 }
             } else if let (Some(top), Some(pos)) = (rows_top, ui.input(|i| i.pointer.latest_pos()))
             {
+                if self.drag_debug {
+                    let heights =
+                        track_rows::row_heights(&self.track_heights, self.editor.session());
+                    let ins = track_rows::drop_insertion_row(&heights, pos.y - top);
+                    if self.drag_log_row != Some(ins) {
+                        self.drag_log_row = Some(ins);
+                        eprintln!("[drag] target insertion_row={ins} y={:.1}", pos.y);
+                    }
+                }
                 self.draw_drag_indicator(ui, pos.y, top);
             }
         }
@@ -2614,6 +2659,7 @@ impl App {
                                         egui::RichText::new(if collapsed { "▸" } else { "▾" })
                                             .strong(),
                                     )
+                                    .selectable(false)
                                     .sense(Sense::click()),
                                 )
                                 .clicked()
@@ -2655,6 +2701,7 @@ impl App {
                                             .strong(),
                                     )
                                     .truncate()
+                                    .selectable(false)
                                     .sense(Sense::click()),
                                 )
                                 .on_hover_text(format!("{name}\nДвойной щелчок — переименовать"))
@@ -2671,6 +2718,9 @@ impl App {
             *rows_top = Some(response.rect.min.y);
         }
         if response.drag_started() {
+            if self.drag_debug {
+                eprintln!("[drag] start folder={folder}");
+            }
             self.header_drag = Some(HeaderDrag {
                 tracks: Vec::new(),
                 folder: Some(folder),
@@ -6155,5 +6205,117 @@ fn draw_take_rect(painter: &egui::Painter, rect: Rect, samples: &[f32]) {
             ],
             Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 200)),
         );
+    }
+}
+
+#[cfg(test)]
+mod header_drag_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            if ctx.input(|i| i.pointer.any_down()) {
+                app.editor.begin_group();
+            } else {
+                app.editor.end_group();
+            }
+            app.sync_track_heights();
+            egui::SidePanel::left("tracks").show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("headers")
+                    .show(ui, |ui| app.track_headers(ui));
+            });
+        });
+    }
+
+    fn names(app: &App) -> Vec<String> {
+        app.editor
+            .session()
+            .tracks
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Presses at `from`, drags in steps to `to`, releases, then one idle frame.
+    /// The release frame carries no `interact_pointer_pos`, like real input.
+    fn drag(app: &mut App, from: Pos2, to: Pos2) {
+        let ctx = egui::Context::default();
+        frame(&ctx, app, vec![]);
+        frame(&ctx, app, vec![]);
+        frame(&ctx, app, vec![egui::Event::PointerMoved(from)]);
+        frame(&ctx, app, vec![button(from, true)]);
+        for k in 1..=6 {
+            let t = k as f32 / 6.0;
+            let p = Pos2::new(from.x, from.y + (to.y - from.y) * t);
+            frame(&ctx, app, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(&ctx, app, vec![button(to, false)]);
+        frame(&ctx, app, vec![]);
+    }
+
+    fn app_with_tracks() -> App {
+        let mut app = App::new(None);
+        app.editor.add_tracks(TrackKind::Audio, 3, "T").unwrap();
+        app
+    }
+
+    // Name label of the first row; before the fix a selectable label took
+    // the press and the row never saw `drag_started`.
+    const FIRST_LABEL: Pos2 = Pos2::new(70.0, 62.0);
+
+    #[test]
+    fn drag_name_label_down_reorders_tracks() {
+        let mut app = app_with_tracks();
+        drag(&mut app, FIRST_LABEL, Pos2::new(70.0, 400.0));
+        assert_eq!(names(&app), ["T 2", "T 3", "T 1"]);
+    }
+
+    #[test]
+    fn drag_name_label_up_reorders_tracks() {
+        let mut app = app_with_tracks();
+        drag(&mut app, Pos2::new(70.0, 214.0), Pos2::new(70.0, 52.0));
+        assert_eq!(names(&app), ["T 3", "T 1", "T 2"]);
+    }
+
+    #[test]
+    fn drag_empty_header_area_reorders_tracks() {
+        let mut app = app_with_tracks();
+        drag(&mut app, Pos2::new(45.0, 80.0), Pos2::new(45.0, 400.0));
+        assert_eq!(names(&app), ["T 2", "T 3", "T 1"]);
+    }
+
+    #[test]
+    fn drag_folder_name_label_moves_folder() {
+        let mut app = app_with_tracks();
+        app.editor.create_folder(&[0]).unwrap();
+        drag(&mut app, Pos2::new(80.0, 60.0), Pos2::new(80.0, 500.0));
+        assert_eq!(names(&app), ["T 2", "T 3", "T 1"]);
+        assert_eq!(app.editor.session().folder_children[0], vec![2]);
+    }
+
+    #[test]
+    fn drag_track_onto_folder_header_adds_it() {
+        let mut app = app_with_tracks();
+        app.editor.create_folder(&[0]).unwrap();
+        // Rows: folder, T 1 (child), T 2, T 3. Grab T 3's label, drop on folder.
+        drag(&mut app, Pos2::new(70.0, 262.0), Pos2::new(70.0, 60.0));
+        let mut kids = app.editor.session().folder_children[0].clone();
+        kids.sort_unstable();
+        assert_eq!(kids.len(), 2, "children: {kids:?}");
     }
 }
