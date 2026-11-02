@@ -31,7 +31,6 @@ use eframe::egui::{
     StrokeKind, Vec2, ViewportCommand,
 };
 
-const TRACK_HEIGHT: f32 = 72.0;
 const RULER_HEIGHT: f32 = 24.0;
 /// Height of the tempo lane between the ruler and the first track (SPEC-054).
 const TEMPO_LANE_HEIGHT: f32 = 24.0;
@@ -261,16 +260,14 @@ fn draw_overlap_zone(
     (start, end): (u64, u64),
     left: f32,
     top: f32,
+    row_h: f32,
     px_per_sample: f32,
     colors: &daw_gui::layout::RegionColors,
 ) -> Rect {
     let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
     let x0 = left + start as f32 * px_per_sample;
     let x1 = (left + end as f32 * px_per_sample).max(x0 + 2.0);
-    let rect = Rect::from_min_max(
-        Pos2::new(x0, top + 3.0),
-        Pos2::new(x1, top + TRACK_HEIGHT - 3.0),
-    );
+    let rect = Rect::from_min_max(Pos2::new(x0, top + 3.0), Pos2::new(x1, top + row_h - 3.0));
     let header_h = 14.0_f32.min(rect.height() * 0.4);
     let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_h));
     let body = Rect::from_min_max(Pos2::new(rect.min.x, header.max.y), rect.max);
@@ -625,6 +622,12 @@ struct App {
     reveal_track: Option<usize>,
     /// Shown level of each track, by track index (SPEC-042).
     track_meters: Vec<MeterState>,
+    /// Per-track header height, by track index (SPEC-056 §1). Cosmetic GUI
+    /// state; not part of the project/audio-core format and not undoable.
+    track_heights: Vec<f32>,
+    /// Active header resize drag, when dragging a track's bottom edge
+    /// (SPEC-056 §1).
+    height_drag: Option<HeightDrag>,
     /// Shown gain reduction, dB, of every insert of every track (SPEC-052).
     track_reduction: Vec<[f32; MAX_EFFECTS_PER_TRACK]>,
     /// Shown level of the master (SPEC-042).
@@ -711,6 +714,18 @@ enum TempoAction {
     Delete(usize),
 }
 
+/// State of a track-header height resize drag (SPEC-056 §1).
+struct HeightDrag {
+    /// Track whose bottom edge was grabbed; the reference track when `all`.
+    track: usize,
+    /// `Alt` was held: resize every track at once.
+    all: bool,
+    /// Pointer y when the drag began, in screen coordinates.
+    start_y: f32,
+    /// Snapshot of every track height at drag start, so dragging is stable.
+    start_heights: Vec<f32>,
+}
+
 /// Device picker: "Системный" plus every listed name. A saved device that
 /// is not plugged in stays visible, marked as missing.
 fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, names: &[String]) {
@@ -784,6 +799,8 @@ impl App {
             zoom_anchor: None,
             reveal_track: None,
             track_meters: Vec::new(),
+            track_heights: Vec::new(),
+            height_drag: None,
             track_reduction: Vec::new(),
             master_meter: MeterState::default(),
             timeline_view: (0.0, 0.0),
@@ -848,6 +865,82 @@ impl App {
 
     fn is_playing(&self) -> bool {
         self.player.as_ref().is_some_and(|p| p.control.is_playing())
+    }
+
+    /// Height of track `track`, falling back to the default when unknown.
+    fn track_height(&self, track: usize) -> f32 {
+        track_rows::track_height(&self.track_heights, track)
+    }
+
+    /// Pad or trim `track_heights` to the current track count, filling new
+    /// slots with the default height (SPEC-056 §1). Called every frame to
+    /// cover track additions, deletions, undo/redo and project open.
+    fn sync_track_heights(&mut self) {
+        let count = self.editor.session().tracks.len();
+        self.track_heights
+            .resize(count, track_rows::DEFAULT_TRACK_HEIGHT);
+    }
+
+    /// Move the height of `from` to `to` and shift the in-between slots, so
+    /// per-track heights follow a track reorder (SPEC-056 §1).
+    fn reindex_height_move(&mut self, from: usize, to: usize) {
+        if from >= self.track_heights.len() {
+            return;
+        }
+        let h = self.track_heights.remove(from);
+        let to = to.min(self.track_heights.len());
+        self.track_heights.insert(to, h);
+    }
+
+    /// The bottom-edge resize handle for a track header (SPEC-056 §1): drag
+    /// to resize that track, `Alt` to resize all, `Shift`+double-click to
+    /// reset to the default.
+    fn track_resize_handle(&mut self, ui: &egui::Ui, row_rect: Rect, track: usize) {
+        let grab = ui.style().interaction.resize_grab_radius_side;
+        let handle_rect = Rect::from_min_max(
+            Pos2::new(row_rect.min.x, row_rect.max.y - grab),
+            row_rect.max,
+        );
+        let id = ui.id().with(("track_height", track));
+        let handle = ui.interact(handle_rect, id, Sense::click_and_drag());
+
+        if handle.drag_started() {
+            let all = ui.input(|i| i.modifiers.alt);
+            self.height_drag = Some(HeightDrag {
+                track,
+                all,
+                start_y: handle
+                    .interact_pointer_pos()
+                    .map_or(row_rect.max.y, |p| p.y),
+                start_heights: self.track_heights.clone(),
+            });
+        }
+        if handle.drag_stopped() {
+            self.height_drag = None;
+        }
+        if let Some(drag) = &self.height_drag {
+            if let Some(pos) = handle.interact_pointer_pos() {
+                let delta = pos.y - drag.start_y;
+                let base = drag.start_heights.clone();
+                for (i, h) in self.track_heights.iter_mut().enumerate() {
+                    if drag.all || i == drag.track {
+                        let start = base
+                            .get(i)
+                            .copied()
+                            .unwrap_or(track_rows::DEFAULT_TRACK_HEIGHT);
+                        *h = (start + delta)
+                            .clamp(track_rows::MIN_TRACK_HEIGHT, track_rows::MAX_TRACK_HEIGHT);
+                    }
+                }
+            }
+        }
+        if handle.double_clicked() && ui.input(|i| i.modifiers.shift) {
+            self.track_heights[track] = track_rows::DEFAULT_TRACK_HEIGHT;
+        }
+        let hovering = handle.hovered() || self.height_drag.is_some();
+        if hovering {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
     }
 
     fn play(&mut self) {
@@ -1333,11 +1426,13 @@ impl App {
             let Some(row) = track_rows::row_of_track(self.editor.session(), g.row) else {
                 continue;
             };
-            let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
+            let h = track_rows::track_height(&self.track_heights, g.row);
+            let top = area.min.y
+                + TIMELINE_HEADER
+                + track_rows::row_y(&self.track_heights, self.editor.session(), row);
             let left = area.min.x + g.start as f32 * px_per_sample;
             let w = (g.clip.length_samples as f32 * px_per_sample).max(2.0);
-            let rect =
-                Rect::from_min_size(Pos2::new(left, top + 3.0), Vec2::new(w, TRACK_HEIGHT - 6.0));
+            let rect = Rect::from_min_size(Pos2::new(left, top + 3.0), Vec2::new(w, h - 6.0));
             let base = track_color(None, g.row);
             let colors = daw_gui::layout::region_colors([base.r(), base.g(), base.b()], false);
             let [r, gr, b] = colors.body;
@@ -1833,6 +1928,7 @@ impl App {
             };
             let selected = self.editor.is_track_selected(index);
             let in_folder = foldered.get(index).copied().unwrap_or(false);
+            let h = self.track_height(index);
             let frame = egui::Frame::new()
                 .fill(if selected {
                     Color32::from_rgb(48, 56, 72)
@@ -1845,7 +1941,7 @@ impl App {
             let response = ui
                 .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
                     frame.show(ui, |ui| {
-                        ui.set_height(TRACK_HEIGHT - 8.0);
+                        ui.set_height(h - 8.0);
                         ui.set_width(ui.available_width());
                         ui.add_space(if in_folder { 16.0 } else { 0.0 });
                         let track = &self.editor.session().tracks[index];
@@ -2140,6 +2236,7 @@ impl App {
                 ui.separator();
                 new_track_items(ui, &mut action);
             });
+            self.track_resize_handle(ui, response.rect, index);
         }
         if let Some(action) = action.take() {
             self.track_action(action);
@@ -2150,6 +2247,7 @@ impl App {
             self.auto = None;
             self.auto_drag = None;
             self.editor.delete_track(index);
+            self.track_heights.splice(index..index + 1, []);
             self.status = "Дорожка удалена".into();
         }
         if count == 0 {
@@ -2162,6 +2260,10 @@ impl App {
             action = Some(TrackAction::New(TrackKind::Audio));
         }
         let rest = ui.available_rect_before_wrap();
+        // Shrink by the resize grab radius so the empty-state click target
+        // does not swallow the SidePanel resize separator (SPEC-056 §3).
+        let grab = ui.style().interaction.resize_grab_radius_side;
+        let rest = rest.shrink2(Vec2::new(grab, 0.0));
         let empty = ui.interact(rest, ui.id().with("headers_empty"), Sense::click());
         empty.context_menu(|ui| new_track_items(ui, &mut action));
         if let Some(action) = action.take() {
@@ -2194,7 +2296,7 @@ impl App {
         let response = ui
             .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
                 frame.show(ui, |ui| {
-                    ui.set_height(TRACK_HEIGHT - 8.0);
+                    ui.set_height(track_rows::FOLDER_ROW_HEIGHT - 8.0);
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
@@ -2352,17 +2454,29 @@ impl App {
                 self.fx = None;
                 self.auto = None;
                 self.auto_drag = None;
-                self.editor
+                let result = self
+                    .editor
                     .move_track(from, to)
-                    .map(|()| "Дорожка перемещена")
+                    .map(|()| "Дорожка перемещена");
+                if result.is_ok() {
+                    self.reindex_height_move(from, to);
+                }
+                result
             }
             TrackAction::Duplicate(track) => {
                 self.fx = None;
                 self.auto = None;
                 self.auto_drag = None;
-                self.editor
+                let result = self
+                    .editor
                     .duplicate_track(track)
-                    .map(|_| "Дорожка продублирована")
+                    .map(|_| "Дорожка продублирована");
+                if result.is_ok() {
+                    let h = self.track_height(track);
+                    let at = (track + 1).min(self.track_heights.len());
+                    self.track_heights.insert(at, h);
+                }
+                result
             }
             TrackAction::GatherFolder(tracks) => {
                 self.editor.create_folder(&tracks).map(|_| "Папка создана")
@@ -2436,7 +2550,6 @@ impl App {
         // cancel (egui 0.33 clones it each frame, it is not drained).
         let hovering = !hovered.is_empty();
         let session = self.editor.session();
-        let visible = track_rows::row_count(session);
         let (rate, tempo) = (session.sample_rate, session.tempo_bpm);
         // `drop_target` indexes by visual row; folder headers take no file, so
         // they read `false`, and each track reports whether it is audio.
@@ -2451,17 +2564,26 @@ impl App {
             .collect();
         let snap = self.snap && !free;
         let zoom = self.zoom;
-        let to_target = |local: (f32, f32)| {
-            daw_gui::drop_target(
-                Some(local),
-                TIMELINE_HEADER,
-                TRACK_HEIGHT,
-                &audio_rows,
-                rate,
-                zoom,
-                tempo,
-                snap,
-            )
+        // Owned snapshot of the per-row heights so the closures below do not
+        // borrow `self` across the mutable `start_hover_peaks` call.
+        let row_heights = track_rows::row_heights(&self.track_heights, session);
+        let to_target = move |local: (f32, f32)| {
+            let (x, y) = local;
+            if !x.is_finite() || !y.is_finite() {
+                return daw_gui::DropTarget {
+                    track: None,
+                    start: 0,
+                };
+            }
+            // Variable-height hit-test: the row under the pointer, using the
+            // same per-track heights the headers/timeline draw with (SPEC-056
+            // §1). Folder headers take no file, so a folder row yields `None`.
+            let row = track_rows::row_at_y_heights(&row_heights, y - TIMELINE_HEADER)
+                .filter(|&r| audio_rows.get(r).copied().unwrap_or(false));
+            daw_gui::DropTarget {
+                track: row,
+                start: daw_gui::drop_start(x.max(0.0), rate, zoom, tempo, snap),
+            }
         };
         // `p` is window-local in egui points; `drop_target` wants the position
         // measured from the timeline's top-left corner.
@@ -2513,14 +2635,16 @@ impl App {
             self.drop_tracker.hover(target);
             let band = match target.and_then(|t| t.track) {
                 Some(t) => {
-                    let top = area.min.y + TIMELINE_HEADER + t as f32 * TRACK_HEIGHT;
-                    Rect::from_min_size(
-                        Pos2::new(area.min.x, top),
-                        Vec2::new(area.width(), TRACK_HEIGHT),
-                    )
+                    let top = area.min.y
+                        + TIMELINE_HEADER
+                        + track_rows::row_y(&self.track_heights, session, t);
+                    let h = track_rows::row_height(&self.track_heights, session, t);
+                    Rect::from_min_size(Pos2::new(area.min.x, top), Vec2::new(area.width(), h))
                 }
                 None => {
-                    let top = area.min.y + TIMELINE_HEADER + visible as f32 * TRACK_HEIGHT;
+                    let top = area.min.y
+                        + TIMELINE_HEADER
+                        + track_rows::total_height(&self.track_heights, session);
                     Rect::from_min_max(Pos2::new(area.min.x, top), area.max)
                 }
             };
@@ -2545,7 +2669,7 @@ impl App {
                     let x1 = area.min.x + samples_to_x(t.start + len, rate, self.zoom);
                     let frame = Rect::from_min_max(
                         Pos2::new(x0, band.min.y + 2.0),
-                        Pos2::new(x1.max(x0 + 2.0), band.min.y + TRACK_HEIGHT - 2.0),
+                        Pos2::new(x1.max(x0 + 2.0), band.max.y - 2.0),
                     );
                     painter.rect_filled(
                         frame,
@@ -2575,7 +2699,7 @@ impl App {
                         eprintln!(
                             "DROP-DEBUG hover ghost_rect=[({x0:.1},{:.1})..({x1:.1},{:.1})] start={} track={:?}",
                             band.min.y + 2.0,
-                            band.min.y + TRACK_HEIGHT - 2.0,
+                            band.max.y - 2.0,
                             t.start,
                             t.track,
                         );
@@ -2652,7 +2776,7 @@ impl App {
             eprintln!(
                 "DROP-DEBUG drop source={pointer_source} xquery_win={xq_win:?} xquery_root={xq_root:?} \
                  ppp={ppp} os_points={os_points:?} egui={pointer:?} effective={effective_pointer:?} \
-                 area_min=({:.1},{:.1}) ruler_h={RULER_HEIGHT} row_h={TRACK_HEIGHT} tracks={tracks} \
+                 area_min=({:.1},{:.1}) ruler_h={RULER_HEIGHT} tracks={tracks} \
                  target.track={:?} target.start={} ghost_at_egui={:?}",
                 area.min.x,
                 area.min.y,
@@ -2749,21 +2873,25 @@ impl App {
         let width_seconds = session_seconds.max(playhead_seconds) + 10.0;
         let width = ((width_seconds as f32) * self.zoom).max(ui.available_width());
         let tracks = self.editor.session().tracks.len();
-        // The track area is as tall as the number of visible rows: every
-        // unfolded track plus one folder header per folder (SPEC-055 §4).
-        let visible = track_rows::row_count(self.editor.session());
-        let height =
-            (TIMELINE_HEADER + TRACK_HEIGHT * visible as f32).max(ui.available_height() - 4.0);
+        // The track area is as tall as the visible rows: every unfolded track
+        // at its own height plus one compact folder header per folder
+        // (SPEC-055 §4, SPEC-056 §1–2).
+        let height = (TIMELINE_HEADER
+            + track_rows::total_height(&self.track_heights, self.editor.session()))
+        .max(ui.available_height() - 4.0);
 
         let (area, response) =
             ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
         self.drawn_zoom = self.zoom;
         if let Some(t) = self.reveal_track.take() {
             if let Some(row) = track_rows::row_of_track(self.editor.session(), t) {
-                let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
+                let top = area.min.y
+                    + TIMELINE_HEADER
+                    + track_rows::row_y(&self.track_heights, self.editor.session(), row);
+                let h = track_rows::track_height(&self.track_heights, t);
                 let left = area.min.x + samples_to_x(self.playhead, rate as u32, self.zoom);
                 ui.scroll_to_rect(
-                    Rect::from_min_size(Pos2::new(left, top), Vec2::new(1.0, TRACK_HEIGHT)),
+                    Rect::from_min_size(Pos2::new(left, top), Vec2::new(1.0, h)),
                     None,
                 );
             }
@@ -2875,11 +3003,14 @@ impl App {
             let Some(row) = track_rows::row_of_track(self.editor.session(), t) else {
                 continue;
             };
-            let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
+            let h = track_rows::track_height(&self.track_heights, t);
+            let top = area.min.y
+                + TIMELINE_HEADER
+                + track_rows::row_y(&self.track_heights, self.editor.session(), row);
             painter.line_segment(
                 [
-                    Pos2::new(area.min.x, top + TRACK_HEIGHT),
-                    Pos2::new(area.max.x, top + TRACK_HEIGHT),
+                    Pos2::new(area.min.x, top + h),
+                    Pos2::new(area.max.x, top + h),
                 ],
                 Stroke::new(1.0_f32, Color32::from_gray(45)),
             );
@@ -2888,10 +3019,7 @@ impl App {
                 let clip = &track.clips[c];
                 let left = area.min.x + clip.start_samples as f32 * px_per_sample;
                 let w = (clip.length_samples as f32 * px_per_sample).max(2.0);
-                let rect = Rect::from_min_size(
-                    Pos2::new(left, top + 3.0),
-                    Vec2::new(w, TRACK_HEIGHT - 6.0),
-                );
+                let rect = Rect::from_min_size(Pos2::new(left, top + 3.0), Vec2::new(w, h - 6.0));
                 let selected = self.editor.is_clip_selected((t, c));
                 let base = track_color(track.color, t);
                 let colors = daw_gui::layout::region_colors(
@@ -2983,7 +3111,7 @@ impl App {
             );
             for zone in daw_gui::layout::overlap_zones(&track.clips) {
                 let body =
-                    draw_overlap_zone(&painter, zone, area.min.x, top, px_per_sample, &colors);
+                    draw_overlap_zone(&painter, zone, area.min.x, top, h, px_per_sample, &colors);
                 // The merged body must not hide the sound (SPEC-045 §6): the
                 // waveforms of every clip under the zone are drawn over it.
                 let zone_painter = painter.with_clip_rect(body.intersect(painter.clip_rect()));
@@ -3017,11 +3145,11 @@ impl App {
             .filter(|&t| t < tracks)
             .and_then(|t| track_rows::row_of_track(self.editor.session(), t))
             .map(|r| {
-                let top = area.min.y + TIMELINE_HEADER + r as f32 * TRACK_HEIGHT;
-                Rect::from_min_max(
-                    Pos2::new(area.min.x, top),
-                    Pos2::new(area.max.x, top + TRACK_HEIGHT),
-                )
+                let top = area.min.y
+                    + TIMELINE_HEADER
+                    + track_rows::row_y(&self.track_heights, self.editor.session(), r);
+                let h = track_rows::row_height(&self.track_heights, self.editor.session(), r);
+                Rect::from_min_max(Pos2::new(area.min.x, top), Pos2::new(area.max.x, top + h))
             });
         if let (Some(t), Some(row)) = (self.auto.filter(|&t| t < tracks), auto_row) {
             self.draw_lane(&painter, area, row, t);
@@ -3089,10 +3217,12 @@ impl App {
                         }
                     }
                     if let Some(p) = pointer {
-                        let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
-                        if row >= 0.0 {
+                        let y = p.y - area.min.y - TIMELINE_HEADER;
+                        if let Some(row) =
+                            track_rows::row_at_y(&self.track_heights, self.editor.session(), y)
+                        {
                             if let Some(track) =
-                                track_rows::track_at_row(self.editor.session(), row as usize)
+                                track_rows::track_at_row(self.editor.session(), row)
                             {
                                 self.editor.select_track(track, false, false);
                             }
@@ -3108,12 +3238,12 @@ impl App {
             // SPEC-049 §6: a double click on an empty spot of an instrument
             // track makes a MIDI region there.
             if let Some(p) = pointer {
-                let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
-                if row >= 0.0 {
+                let y = p.y - area.min.y - TIMELINE_HEADER;
+                if let Some(row) =
+                    track_rows::row_at_y(&self.track_heights, self.editor.session(), y)
+                {
                     let x = x_to_samples((p.x - area.min.x).max(0.0), rate_u32, self.zoom);
-                    if let Some(track) =
-                        track_rows::track_at_row(self.editor.session(), row as usize)
-                    {
+                    if let Some(track) = track_rows::track_at_row(self.editor.session(), row) {
                         self.new_region_on(track, x);
                     }
                 }
@@ -3174,10 +3304,13 @@ impl App {
             let Some(row) = track_rows::row_of_track(self.editor.session(), track) else {
                 continue;
             };
-            let top = area.min.y + TIMELINE_HEADER + row as f32 * TRACK_HEIGHT;
+            let h = track_rows::track_height(&self.track_heights, track);
+            let top = area.min.y
+                + TIMELINE_HEADER
+                + track_rows::row_y(&self.track_heights, self.editor.session(), row);
             let rect = Rect::from_min_size(
                 Pos2::new(left, top + 3.0),
-                Vec2::new((seconds * self.zoom).max(2.0), TRACK_HEIGHT - 6.0),
+                Vec2::new((seconds * self.zoom).max(2.0), h - 6.0),
             );
             draw_take_rect(painter, rect, samples);
         }
@@ -3982,16 +4115,15 @@ impl App {
             DragMode::Move => {
                 let start = fit((at as i64 - drag.grab).max(0) as u64);
                 let tracks = self.editor.session().tracks.len();
-                let row = ((p.y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT).floor();
+                let y = p.y - area.min.y - TIMELINE_HEADER;
                 // A visual row may be a folder header; dragging onto it keeps
                 // the clip on its current track (SPEC-055 §4).
-                let to = if row < 0.0 {
-                    0
-                } else {
-                    track_rows::track_at_row(self.editor.session(), row as usize)
-                        .unwrap_or(drag.track)
-                        .min(tracks.saturating_sub(1))
-                };
+                let to = track_rows::row_at_y(&self.track_heights, self.editor.session(), y)
+                    .map_or(0, |row| {
+                        track_rows::track_at_row(self.editor.session(), row)
+                            .unwrap_or(drag.track)
+                            .min(tracks.saturating_sub(1))
+                    });
                 if self.editor.selected_clips().len() > 1 {
                     // SPEC-047 §4: the grabbed clip leads the whole group.
                     let now =
@@ -4050,9 +4182,13 @@ impl App {
         let rate = self.editor.session().sample_rate;
         let tracks = self.editor.session().tracks.len();
         let row = |y: f32| {
-            ((y - area.min.y - TIMELINE_HEADER) / TRACK_HEIGHT)
-                .floor()
-                .max(0.0) as usize
+            let offset = y - area.min.y - TIMELINE_HEADER;
+            if offset < 0.0 {
+                0
+            } else {
+                track_rows::row_at_y(&self.track_heights, self.editor.session(), offset)
+                    .unwrap_or(usize::MAX)
+            }
         };
         let (top, bottom) = (row(origin.y.min(p.y)), row(origin.y.max(p.y)));
         // Rubber band selects every visible track whose visual row lies in the
@@ -5395,6 +5531,7 @@ impl eframe::App for App {
             self.fullscreen = fs;
         }
         self.screenshot(ctx);
+        self.sync_track_heights();
         self.poll_player(ctx);
         self.poll_meters(ctx);
         self.poll_recorder(ctx);
