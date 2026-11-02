@@ -51,6 +51,11 @@ impl std::error::Error for SamplerError {}
 /// loading, decoding and bank management are out of scope for this module.
 pub struct SamplerEngine {
     voices: Vec<SamplerVoice>,
+    /// Fade-out tails of stolen voices (RFC-001 §3.1): a stolen voice keeps
+    /// ringing its 5 ms tail here while the new note takes its former slot.
+    /// Sized the same as the main pool and preallocated at construction, so
+    /// the render path stays allocation-free.
+    tails: Vec<SamplerVoice>,
     table: RegionTable,
     regions: Vec<SampleRegion>,
     samples: Vec<Arc<[i16]>>,
@@ -86,6 +91,7 @@ impl SamplerEngine {
         let table = RegionTable::build(&regions, samples.len());
         Ok(Self {
             voices: vec![SamplerVoice::idle(); num_voices],
+            tails: vec![SamplerVoice::idle(); num_voices],
             table,
             regions,
             samples,
@@ -127,7 +133,7 @@ impl SamplerEngine {
         self.dropped_starts.load(Ordering::Relaxed)
     }
 
-    /// Silences every voice and resets the statistics.
+    /// Silences every voice (and fade tail) without touching the statistics.
     ///
     /// Call after a backward seek so notes started before the new position do
     /// not ring on.
@@ -135,12 +141,22 @@ impl SamplerEngine {
         self.voices
             .iter_mut()
             .for_each(|v| *v = SamplerVoice::idle());
+        self.tails
+            .iter_mut()
+            .for_each(|v| *v = SamplerVoice::idle());
+    }
+
+    /// Resets the diagnostic counters (`started`, `stolen`, `dropped_starts`).
+    ///
+    /// Separate from [`Self::reset`] so a seek can silence voices without
+    /// zeroing the lifetime statistics, or vice versa.
+    pub fn reset_voice_counters(&mut self) {
         self.started.store(0, Ordering::Relaxed);
         self.stolen.store(0, Ordering::Relaxed);
         self.dropped_starts.store(0, Ordering::Relaxed);
     }
 
-    /// Picks the voice for a new note per RFC-001 §3.1.
+    /// Picks the slot for a new note per RFC-001 §3.1.
     ///
     /// Order: a free voice; else the quietest release-stage voice; else the
     /// oldest held voice (ties broken by lowest velocity). Returns `None` when
@@ -182,8 +198,31 @@ impl SamplerEngine {
         best
     }
 
+    /// Finds a free slot in the fade-tail pool for a stolen voice's tail.
+    ///
+    /// Falls back to the quietest existing tail (nearly done) when all tail
+    /// slots are busy, so a burst of steals cannot allocate and never blocks.
+    fn pick_tail(&self) -> usize {
+        for (i, v) in self.tails.iter().enumerate() {
+            if v.is_idle() {
+                return i;
+            }
+        }
+        let mut best = 0;
+        for (i, v) in self.tails.iter().enumerate() {
+            if v.last_gain < self.tails[best].last_gain {
+                best = i;
+            }
+        }
+        best
+    }
+
     /// Handles a note-on at absolute sample `at`.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines
+    )]
     fn note_on(&mut self, note: u8, velocity: u8, at: u64) {
         if velocity == 0 {
             return;
@@ -242,7 +281,13 @@ impl SamplerEngine {
         };
         let victim = self.voices[index];
         if !victim.is_idle() {
+            // RFC-001 §3.1: a stolen voice fades out over 5 ms rather than
+            // being cut. Move it to the fade-tail pool so its tail keeps
+            // ringing while the new note takes its former slot.
             self.stolen.fetch_add(1, Ordering::Relaxed);
+            let tail = self.pick_tail();
+            self.tails[tail] = victim;
+            self.tails[tail].fast_fade(at);
         }
         self.voices[index].start(
             region_index as u16,
@@ -262,10 +307,26 @@ impl SamplerEngine {
         );
         self.started.fetch_add(1, Ordering::Relaxed);
 
-        // off_by: cut every voice in the target group (RFC-001 §3.1).
+        // off_by: cut every voice in the target group (RFC-001 §3.1), except
+        // the new voice itself — a region with `group == off_by` (e.g. a
+        // closed hi-hat) must not cut its own just-started note.
         if let Some(off_by) = off_by {
             let fast = off_mode == crate::sampler::sfz::OffMode::Fast;
-            for v in &mut self.voices {
+            for (i, v) in self.voices.iter_mut().enumerate() {
+                if i == index || v.region == NO_REGION {
+                    continue;
+                }
+                let same = self.regions[v.region as usize].group == Some(off_by);
+                if !same {
+                    continue;
+                }
+                if fast {
+                    v.fast_fade(at);
+                } else {
+                    v.release(at);
+                }
+            }
+            for v in &mut self.tails {
                 if v.region == NO_REGION {
                     continue;
                 }
@@ -294,15 +355,12 @@ impl SamplerEngine {
     /// Renders `frames` stereo samples of `schedule` from `position` into
     /// `out_l`/`out_r`.
     ///
-    /// Only `[..frames]` is written to each buffer. Events inside
+    /// Only `[..frames]` is written to each buffer; `frames` is clamped to the
+    /// shorter buffer length, so a caller that passes a buffer shorter than
+    /// `frames` gets a shorter render rather than a panic. Events inside
     /// `[position, position + frames)` take effect at their own sample, so a
     /// note starting on `position + k` is silent before `k`. No allocation, no
-    /// locking, no I/O.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `out_l.len() < frames` or `out_r.len() < frames`; that is a
-    /// programming error, not bad input.
+    /// locking, no I/O, no panic.
     pub fn render(
         &mut self,
         schedule: &Schedule,
@@ -312,14 +370,7 @@ impl SamplerEngine {
         out_l: &mut [f32],
         out_r: &mut [f32],
     ) {
-        assert!(
-            out_l.len() >= frames,
-            "left output buffer is shorter than frames"
-        );
-        assert!(
-            out_r.len() >= frames,
-            "right output buffer is shorter than frames"
-        );
+        let frames = frames.min(out_l.len()).min(out_r.len());
         out_l[..frames].fill(0.0);
         out_r[..frames].fill(0.0);
 
@@ -334,58 +385,106 @@ impl SamplerEngine {
             }
         }
 
-        // 2. Sum every sounding voice.
+        // 2. Sum every sounding voice and fade tail.
         let end = position.saturating_add(frames as u64);
         for i in 0..self.voices.len() {
-            let voice = &mut self.voices[i];
-            if voice.region == NO_REGION {
+            if self.voices[i].region == NO_REGION {
                 continue;
             }
-            if voice.started_at >= end {
-                continue;
-            }
-            let region = &self.regions[voice.region as usize];
-            let sample = &self.samples[region.sample_index];
-            let stereo = region.channels == 2;
-            let mono_frames = sample.len();
-            let frames_count = if stereo { mono_frames / 2 } else { mono_frames };
-
-            for (k, (sl, sr)) in out_l[..frames]
-                .iter_mut()
-                .zip(out_r[..frames].iter_mut())
-                .enumerate()
-            {
-                let at = position + k as u64;
-                if at < voice.started_at {
-                    continue;
-                }
-                let gain = voice.gain_at(at);
-                voice.last_gain = gain;
-                if gain <= 0.0 {
-                    continue;
-                }
-                let (sample_l, sample_r) = if stereo {
-                    read_linear_stereo(sample, voice.pos, frames_count)
-                } else {
-                    let m = read_linear_i16(sample, voice.pos, mono_frames);
-                    (m, m)
-                };
-                *sl += sample_l * gain * voice.pan_l;
-                *sr += sample_r * gain * voice.pan_r;
-                if !voice.advance() {
-                    break;
-                }
-            }
-
-            // A voice is finished when its gain hit zero and it was released,
-            // or its playhead ran out.
-            let finished = voice.last_gain <= 0.0
-                && (voice.released_at.is_some() || voice.pos >= voice.end_frame);
+            let finished = render_voice(
+                &mut self.voices[i],
+                &self.regions,
+                &self.samples,
+                position,
+                end,
+                frames,
+                out_l,
+                out_r,
+            );
             if finished {
                 self.voices[i] = SamplerVoice::idle();
             }
         }
+        for i in 0..self.tails.len() {
+            if self.tails[i].region == NO_REGION {
+                continue;
+            }
+            let finished = render_voice(
+                &mut self.tails[i],
+                &self.regions,
+                &self.samples,
+                position,
+                end,
+                frames,
+                out_l,
+                out_r,
+            );
+            if finished {
+                self.tails[i] = SamplerVoice::idle();
+            }
+        }
     }
+}
+
+/// Renders one voice over `[position, end)` into the stereo buffers.
+///
+/// Returns `true` when the voice is exhausted and can be returned to the idle
+/// pool: its playhead ran past the sample end, or its fade (release or fast
+/// fade) reached zero.
+#[allow(clippy::too_many_arguments)]
+fn render_voice(
+    voice: &mut SamplerVoice,
+    regions: &[SampleRegion],
+    samples: &[Arc<[i16]>],
+    position: u64,
+    end: u64,
+    frames: usize,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) -> bool {
+    if voice.started_at >= end {
+        return false;
+    }
+    let region = &regions[voice.region as usize];
+    let sample = &samples[region.sample_index];
+    let stereo = region.channels == 2;
+    let mono_frames = sample.len();
+    let frames_count = if stereo { mono_frames / 2 } else { mono_frames };
+
+    let mut exhausted = false;
+    for (k, (sl, sr)) in out_l[..frames]
+        .iter_mut()
+        .zip(out_r[..frames].iter_mut())
+        .enumerate()
+    {
+        let at = position + k as u64;
+        if at < voice.started_at {
+            continue;
+        }
+        let gain = voice.gain_at(at);
+        voice.last_gain = gain;
+        if gain > 0.0 {
+            let (sample_l, sample_r) = if stereo {
+                read_linear_stereo(sample, voice.pos, frames_count)
+            } else {
+                let m = read_linear_i16(sample, voice.pos, mono_frames);
+                (m, m)
+            };
+            *sl += sample_l * gain * voice.pan_l;
+            *sr += sample_r * gain * voice.pan_r;
+        }
+        // Advance the playhead even when the level is zero, so a looping or
+        // decaying voice does not stall at a silent sample.
+        if !voice.advance() {
+            exhausted = true;
+            break;
+        }
+    }
+
+    // A voice is finished when its playhead ran out, or its level reached zero
+    // while it was released or fading (a held sustain that decays to zero but
+    // is not released keeps its slot).
+    exhausted || (voice.last_gain <= 0.0 && (voice.released_at.is_some() || voice.fading))
 }
 
 /// Playback speed that turns a recording of `root` (with `tune_cents` offset)

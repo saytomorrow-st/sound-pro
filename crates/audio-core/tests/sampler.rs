@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use audio_core::midi::{MidiEvent, MidiMessage};
 use audio_core::sampler::engine::{SamplerEngine, playback_ratio};
-use audio_core::sampler::region::{AmpEnvelope, SampleRegion};
+use audio_core::sampler::region::{AmpEnvelope, RegionTable, SampleRegion};
 use audio_core::sampler::sfz::{LoopMode, OffMode};
-use audio_core::sampler::voice::STEAL_FADE_SAMPLES;
+use audio_core::sampler::voice::{STEAL_FADE_SAMPLES, SamplerVoice};
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 
 const SR: u32 = 48_000;
@@ -308,4 +308,242 @@ fn render_is_bit_exact_across_quantum_sizes() {
             "sample {i} differs between quantum sizes"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests (Sonnet review of PR #85)
+// ---------------------------------------------------------------------------
+
+/// Item 1: a stolen voice must fade out over 5 ms instead of being cut. With a
+/// one-voice pool, a second note-on steals the first; the first's tail must
+/// still ring right after the steal, not drop to silence instantly.
+#[test]
+fn stolen_voice_fades_out_instead_of_clicking() {
+    // note 60 plays a loud DC sample; note 61 plays a silent sample. With a
+    // one-voice pool, note 61 steals note 60, so any output right after the
+    // steal must come from note 60's fading tail.
+    let mut reg_a = dc_region(60);
+    reg_a.sample_index = 0; // DC 10_000
+    let mut reg_b = dc_region(61);
+    reg_b.sample_index = 1; // silence
+    let bank = vec![
+        Arc::from(vec![10_000_i16; 8192]),
+        Arc::from(vec![0_i16; 8192]),
+    ];
+    let mut engine = SamplerEngine::new(SR, vec![reg_a, reg_b], bank, 1).unwrap();
+
+    let sched = schedule(vec![note_on(0, 60, 100), note_on(1000, 61, 100)]);
+    let out = render(&mut engine, &sched, 2048, QUANTUM);
+
+    // At the steal point the victim's 5 ms tail is still sounding; the new
+    // voice (note 61) is silent, so any non-zero output right after sample
+    // 1000 must come from the fading victim.
+    assert!(
+        out[1000].abs() > 5000.0,
+        "victim tail should still ring at the steal, got {}",
+        out[1000].abs()
+    );
+    // And the tail must be gone once the 240-sample fade completes.
+    let after = out[1000 + STEAL_FADE_SAMPLES as usize + 1..]
+        .iter()
+        .cloned()
+        .fold(0.0_f32, f32::max);
+    assert!(
+        after.abs() < 1.0,
+        "victim tail should be silent after the fade, got {after}"
+    );
+    assert_eq!(engine.stolen(), 1);
+}
+
+/// Item 2: a region whose `group == off_by` (a closed hi-hat cutting its own
+/// group) must not cut its own just-started note.
+#[test]
+fn off_by_does_not_cut_its_own_note() {
+    let mut reg = dc_region(60);
+    reg.group = Some(1);
+    reg.off_by = Some(1);
+    reg.off_mode = OffMode::Fast;
+
+    let mut engine = SamplerEngine::new(SR, vec![reg], dc_bank(8192), 8).unwrap();
+    let sched = schedule(vec![note_on(0, 60, 100)]);
+    let out = render(&mut engine, &sched, 8192, QUANTUM);
+
+    // The note must keep sounding at full DC well past the 240-sample fade.
+    let after = out[STEAL_FADE_SAMPLES as usize + 1..]
+        .iter()
+        .cloned()
+        .fold(0.0_f32, f32::max);
+    assert!(
+        after.abs() > 5000.0,
+        "self off_by must not choke its own note, got peak {after}"
+    );
+}
+
+/// Item 3: a fast-faded voice is freed when its fade completes, so the pool
+/// does not leak. With a two-voice pool, re-triggering the choked note after
+/// the fade must reuse the freed slot rather than stealing.
+#[test]
+fn faded_voice_is_freed_so_the_pool_does_not_leak() {
+    let mut a = dc_region(60);
+    a.group = Some(1);
+    let mut b = dc_region(61);
+    b.off_by = Some(1);
+    b.off_mode = OffMode::Fast;
+
+    let mut engine = SamplerEngine::new(SR, vec![a, b], dc_bank(8192), 2).unwrap();
+
+    // note 60 (group 1) starts; note 61 chokes it fast at 100; after the
+    // 240-sample fade note 60's slot is freed; re-triggering note 60 at 1000
+    // (a later block, after the fade has actually rendered out) must land in
+    // that free slot, not steal note 61.
+    let sched = schedule(vec![
+        note_on(0, 60, 100),
+        note_on(100, 61, 100),
+        note_on(1000, 60, 100),
+    ]);
+    let _ = render(&mut engine, &sched, 2048, QUANTUM);
+
+    assert_eq!(engine.stolen(), 0, "freed slot must be reused, not stolen");
+    assert_eq!(engine.voices_started(), 3);
+}
+
+/// Item 4: a held one-shot that runs to its sample end is freed even while its
+/// level is still positive, instead of lingering and emitting a last-frame
+/// sample every block.
+#[test]
+fn held_one_shot_is_freed_at_sample_end() {
+    // A 256-frame DC sample, never looped, never released: note 60 plays to
+    // its end while still at full gain, so the slot is freed only if the
+    // engine idles it when `advance()` returns false (not when gain hits 0).
+    let regs = vec![
+        SampleRegion {
+            sample_index: 0,
+            root: 60,
+            key_lo: 60,
+            key_hi: 60,
+            loop_mode: LoopMode::NoLoop,
+            ..SampleRegion::default()
+        },
+        SampleRegion {
+            sample_index: 0,
+            root: 61,
+            key_lo: 61,
+            key_hi: 61,
+            loop_mode: LoopMode::NoLoop,
+            ..SampleRegion::default()
+        },
+    ];
+    let short = vec![Arc::from(vec![10_000_i16; 256])];
+    let mut engine = SamplerEngine::new(SR, regs, short, 1).unwrap();
+
+    // note 61 (at 1000, a later block after note 60's sample end at ~256 has
+    // rendered out) has a region, so the only way it avoids stealing is if
+    // note 60's slot was freed at sample end.
+    let sched = schedule(vec![note_on(0, 60, 100), note_on(1000, 61, 100)]);
+    let _ = render(&mut engine, &sched, 2048, QUANTUM);
+
+    assert_eq!(
+        engine.stolen(),
+        0,
+        "one-shot freed at sample end must be reused, not stolen"
+    );
+}
+
+/// Item 5: the fast-fade ramp is linear in `fade_from`; it must not multiply
+/// `fade_from` by the live envelope again (which squared the base).
+#[test]
+fn fast_fade_is_linear_not_squared() {
+    let mut v = SamplerVoice::idle();
+    let env = AmpEnvelope {
+        attack_samples: 0,
+        hold_samples: 0,
+        decay_samples: 0,
+        sustain: 0.5,
+        release_samples: 0,
+    };
+    v.start(
+        0, 60, 100, 0, 0.0, 1.0, 1.0, 1.0, 1.0, false, 0.0, 0.0, 1000.0, env,
+    );
+    assert!((v.level_at(0) - 0.5).abs() < 1e-6, "sustain must be 0.5");
+    v.fast_fade(0);
+
+    // Halfway through the 240-sample fade: 0.5 * (1 - 0.5) = 0.25. The old
+    // code returned base * fade_from * (1 - done) = 0.5 * 0.5 * 0.5 = 0.125.
+    let mid = v.level_at(u64::from(STEAL_FADE_SAMPLES / 2));
+    assert!(
+        (mid - 0.25).abs() < 1e-3,
+        "fade midpoint must be 0.25, got {mid}"
+    );
+}
+
+/// Item 7: a voice at zero level must still advance its playhead, otherwise it
+/// stalls and is never freed. A zero-sustain short sample, held forever, must
+/// still run to its end so the slot is freed for a later note.
+#[test]
+fn zero_level_voice_still_advances_playhead() {
+    let mut reg = SampleRegion {
+        sample_index: 0,
+        root: 60,
+        key_lo: 60,
+        key_hi: 60,
+        loop_mode: LoopMode::NoLoop,
+        ..SampleRegion::default()
+    };
+    reg.envelope = AmpEnvelope {
+        attack_samples: 0,
+        hold_samples: 0,
+        decay_samples: 0,
+        sustain: 0.0,
+        release_samples: 0,
+    };
+    let reg61 = SampleRegion {
+        sample_index: 0,
+        root: 61,
+        key_lo: 61,
+        key_hi: 61,
+        loop_mode: LoopMode::NoLoop,
+        ..SampleRegion::default()
+    };
+    let short = vec![Arc::from(vec![10_000_i16; 256])];
+    let mut engine = SamplerEngine::new(SR, vec![reg, reg61], short, 1).unwrap();
+
+    // note 61 (at 1000, a later block after note 60's sample end has rendered
+    // out) has a region, so the only way it avoids stealing is if note 60's
+    // playhead advanced past the sample end despite zero level and freed the
+    // slot. On the old code the playhead stalled at gain 0, so the slot stayed
+    // occupied and note 61 had to steal.
+    let sched = schedule(vec![note_on(0, 60, 100), note_on(1000, 61, 100)]);
+    let _ = render(&mut engine, &sched, 2048, QUANTUM);
+
+    assert_eq!(engine.stolen(), 0, "zero-level voice must free its slot");
+}
+
+/// Item 8: region index `u16::MAX` must not be indexed (it equals the
+/// `NO_REGION` sentinel). A region at enumerate index 65535 is dropped, so
+/// `find` reports no match instead of returning the colliding index.
+#[test]
+fn region_index_65535_is_not_indexed() {
+    // 65536 regions; only the last (index 65535) references a valid sample, so
+    // it is the only one eligible for the table.
+    let mut regions: Vec<SampleRegion> = (0..=u16::MAX as usize + 1)
+        .map(|_| SampleRegion {
+            sample_index: usize::MAX, // skipped: out of range
+            key_lo: 60,
+            key_hi: 60,
+            ..SampleRegion::default()
+        })
+        .collect();
+    regions[u16::MAX as usize] = SampleRegion {
+        sample_index: 0,
+        key_lo: 60,
+        key_hi: 60,
+        ..SampleRegion::default()
+    };
+
+    let table = RegionTable::build(&regions, 1);
+    assert_eq!(
+        table.find(&regions, 60, 100),
+        None,
+        "region index 65535 collides with NO_REGION and must be dropped"
+    );
 }

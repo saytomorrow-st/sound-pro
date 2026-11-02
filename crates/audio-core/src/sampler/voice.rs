@@ -209,7 +209,10 @@ impl SamplerVoice {
             }
             #[allow(clippy::cast_precision_loss)]
             let done = into_fade as f32 / STEAL_FADE_SAMPLES as f32;
-            return base * self.fade_from * (1.0 - done);
+            // `fade_from` was captured at the moment the fade began, so it
+            // already includes the envelope level; the fade is a ramp from
+            // that frozen level to zero, independent of the live envelope.
+            return self.fade_from * (1.0 - done);
         }
         base
     }

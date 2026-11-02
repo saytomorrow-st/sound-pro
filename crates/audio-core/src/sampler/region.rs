@@ -140,6 +140,19 @@ fn seconds_to_samples(seconds: f32, rate: u32) -> u32 {
         .min(u32::MAX as f32) as u32
 }
 
+/// Clamps a value to `0.0..=1.0`, mapping any non-finite input to `0.0`.
+///
+/// Used for normalized SFZ controls so a hand-built [`Region`] with a `NaN` or
+/// infinite field can never produce a `NaN`/infinite gain that survives the
+/// `gain <= 0.0` checks on the audio path.
+fn sanitize_01(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// Resolves a parsed [`Region`] into a [`SampleRegion`].
 ///
 /// `rate` is the output sample rate, used to convert envelope times to
@@ -177,24 +190,40 @@ pub fn resolve(
     }
 
     // `transpose` is semitones; fold it into cents so the playhead ratio needs
-    // a single `tune/1200` term (RFC-001 §3.2).
-    let tune_cents = region.tune.unwrap_or(0) + region.transpose.unwrap_or(0) * 100;
+    // a single `tune/1200` term (RFC-001 §3.2). Saturate the multiply and the
+    // add so a hostile `tune`/`transpose` cannot overflow `i32`.
+    let tune_cents = region
+        .tune
+        .unwrap_or(0)
+        .saturating_add(region.transpose.unwrap_or(0).saturating_mul(100));
 
     // SFZ v1 amplitude: `gain = 10^(volume/20)`, velocity curve handled at
-    // note-on (`vel_track`). `volume` in dB.
-    let gain = 10.0_f32.powf(region.volume.unwrap_or(0.0) / 20.0);
-
+    // note-on (`vel_track`). `volume` in dB. A non-finite `volume` maps to 0.0
+    // gain (silence) and a finite value is clamped so the exponent cannot
+    // produce an infinite/NaN gain that would then pass the `gain <= 0.0`
+    // checks as "loud".
+    let volume_db = region.volume.unwrap_or(0.0);
+    let gain = if volume_db.is_finite() {
+        10.0_f32.powf((volume_db / 20.0).clamp(-150.0, 150.0))
+    } else {
+        0.0
+    };
     // `amp_veltrack` is 0..=100, default 100; stored as 0.0..=1.0.
-    let vel_track = region.amp_veltrack.unwrap_or(100.0).clamp(0.0, 100.0) / 100.0;
+    let vel_track = sanitize_01(region.amp_veltrack.unwrap_or(100.0) / 100.0);
 
-    // `pan` is -100..=100, stored as -1.0..=1.0.
-    let pan = region.pan.unwrap_or(0.0).clamp(-100.0, 100.0) / 100.0;
+    // `pan` is -100..=100, stored as -1.0..=1.0. A non-finite `pan` maps to
+    // center so a NaN cannot leak into `pan_law` and pollute the mix.
+    let pan = if region.pan.unwrap_or(0.0).is_finite() {
+        region.pan.unwrap_or(0.0).clamp(-100.0, 100.0) / 100.0
+    } else {
+        0.0
+    };
 
     let envelope = AmpEnvelope {
         attack_samples: seconds_to_samples(region.ampeg_attack.unwrap_or(0.0), rate),
         hold_samples: seconds_to_samples(region.ampeg_hold.unwrap_or(0.0), rate),
         decay_samples: seconds_to_samples(region.ampeg_decay.unwrap_or(0.0), rate),
-        sustain: region.ampeg_sustain.unwrap_or(100.0).clamp(0.0, 100.0) / 100.0,
+        sustain: sanitize_01(region.ampeg_sustain.unwrap_or(100.0) / 100.0),
         release_samples: seconds_to_samples(region.ampeg_release.unwrap_or(0.0), rate),
     };
 
@@ -263,7 +292,7 @@ impl RegionTable {
             if region.sample_index >= sample_count {
                 continue;
             }
-            if index > u16::MAX as usize {
+            if index >= u16::MAX as usize {
                 break;
             }
             #[allow(clippy::cast_possible_truncation)]
