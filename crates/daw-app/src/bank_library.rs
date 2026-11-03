@@ -529,6 +529,110 @@ pub fn list_installed() -> Result<Vec<InstalledBank>, LibraryError> {
     Ok(InstalledRegistry::load(&path)?.banks)
 }
 
+/// One item in the track instrument picker list (SPEC-065 redesign): the
+/// built-in piano, an installed bank, a not-yet-downloaded catalog bank, or a
+/// selected bank whose folder is missing or corrupt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstrumentListItem {
+    /// The built-in Salamander piano (always available).
+    BuiltinPiano,
+    /// An installed bank, ready to use.
+    Installed {
+        /// Registry id, also used as the project serialisation id.
+        id: String,
+        /// Human-readable bank name.
+        name: String,
+    },
+    /// A catalog bank that has not been downloaded yet. Clicking it opens the
+    /// library window (download is handled there, SPEC-067).
+    Download {
+        /// Catalog id.
+        id: String,
+        /// Human-readable bank name.
+        name: String,
+    },
+    /// The track's currently selected bank is recorded in the registry but its
+    /// folder is missing or unreadable, so it cannot be rendered.
+    Broken {
+        /// Registry id.
+        id: String,
+        /// Human-readable bank name.
+        name: String,
+    },
+}
+
+/// Builds the instrument picker list: the built-in piano, every installed bank
+/// (in install order), every catalog bank not yet installed (as a download
+/// item), and — when the currently selected bank id is recorded but its folder
+/// is missing — a `Broken` entry so the picker can flag it and fall back.
+///
+/// This is a pure function over already-loaded data; the caller supplies the
+/// installed banks and catalog (loading them is I/O and stays with the caller).
+#[must_use]
+pub fn instrument_list(
+    installed: &[InstalledBank],
+    catalog: &[CatalogEntry],
+    selected_id: Option<&str>,
+) -> Vec<InstrumentListItem> {
+    let mut items = Vec::with_capacity(1 + installed.len() + catalog.len() + 1);
+    items.push(InstrumentListItem::BuiltinPiano);
+
+    for bank in installed {
+        let present = Path::new(&bank.path).is_dir();
+        let is_selected = selected_id == Some(bank.id.as_str());
+        if !present && is_selected {
+            items.push(InstrumentListItem::Broken {
+                id: bank.id.clone(),
+                name: bank.name.clone(),
+            });
+        } else if present {
+            items.push(InstrumentListItem::Installed {
+                id: bank.id.clone(),
+                name: bank.name.clone(),
+            });
+        }
+        // A missing-but-not-selected bank is simply not offered; it is neither
+        // installed nor (as a catalog id) downloadable, so it is skipped.
+    }
+
+    for entry in catalog {
+        let already_installed = installed.iter().any(|b| b.id == entry.id);
+        if !already_installed {
+            items.push(InstrumentListItem::Download {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+            });
+        }
+    }
+
+    items
+}
+
+/// Resolves a sampler bank id to its installed folder, falling back to a legacy
+/// absolute path for pre-redesign project files. Returns `None` when the bank
+/// is not installed and the id is not an existing directory (a deleted or
+/// corrupt bank).
+///
+/// Control thread only (reads the registry and the filesystem).
+#[must_use]
+pub fn resolve_bank_dir(bank_id: &str) -> Option<PathBuf> {
+    if let Ok(installed) = list_installed() {
+        if let Some(bank) = installed.iter().find(|b| b.id == bank_id) {
+            let path = Path::new(&bank.path);
+            if path.is_dir() {
+                return Some(path.to_path_buf());
+            }
+            return None;
+        }
+    }
+    // Legacy absolute folder path stored by pre-redesign project files.
+    let legacy = Path::new(bank_id);
+    if legacy.is_absolute() && legacy.is_dir() {
+        return Some(legacy.to_path_buf());
+    }
+    None
+}
+
 /// Installs a local SFZ folder as a bank and records it in the registry.
 ///
 /// `source_dir` is the SFZ folder the user picked; `id` and `name` identify
@@ -1046,5 +1150,84 @@ mod tests {
         }];
         let text = credits_text(&installed);
         assert!(text.contains("(attribution required)"));
+    }
+
+    #[test]
+    fn instrument_list_builtin_installed_download_and_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let osiris = dir.path().join("osiris-piano");
+        std::fs::create_dir(&osiris).unwrap();
+
+        let installed = vec![InstalledBank {
+            id: "osiris-piano".to_owned(),
+            name: "Osiris Piano".to_owned(),
+            family: "piano".to_owned(),
+            path: osiris.to_string_lossy().into_owned(),
+            license_spdx: "CC0-1.0".to_owned(),
+            attribution: String::new(),
+            license_acknowledged: false,
+            installed_at: "0T00:00:00Z".to_owned(),
+        }];
+        // The catalog has salamander-grand-v3 and osiris-piano. Osiris is
+        // installed; salamander is not, so it appears as a Download item.
+        let catalog = catalog().unwrap();
+
+        let items = instrument_list(&installed, &catalog, None);
+        assert!(items.contains(&InstrumentListItem::BuiltinPiano));
+        assert!(items.contains(&InstrumentListItem::Installed {
+            id: "osiris-piano".to_owned(),
+            name: "Osiris Piano".to_owned(),
+        }));
+        assert!(items.contains(&InstrumentListItem::Download {
+            id: "salamander-grand-v3".to_owned(),
+            name: "Salamander Grand Piano V3".to_owned(),
+        }));
+        // No broken item when nothing is selected.
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, InstrumentListItem::Broken { .. }))
+        );
+    }
+
+    #[test]
+    fn instrument_list_marks_selected_broken_bank() {
+        let installed = vec![InstalledBank {
+            id: "osiris-piano".to_owned(),
+            name: "Osiris Piano".to_owned(),
+            family: "piano".to_owned(),
+            // The folder no longer exists.
+            path: "/tmp/does/not/exist".to_owned(),
+            license_spdx: "CC0-1.0".to_owned(),
+            attribution: String::new(),
+            license_acknowledged: false,
+            installed_at: "0T00:00:00Z".to_owned(),
+        }];
+        let catalog = catalog().unwrap();
+
+        // Selected and missing → Broken.
+        let items = instrument_list(&installed, &catalog, Some("osiris-piano"));
+        assert!(items.contains(&InstrumentListItem::Broken {
+            id: "osiris-piano".to_owned(),
+            name: "Osiris Piano".to_owned(),
+        }));
+        assert!(!items.iter().any(
+            |i| matches!(i, InstrumentListItem::Installed { id, .. } if id == "osiris-piano")
+        ));
+    }
+
+    #[test]
+    fn resolve_bank_dir_uses_legacy_absolute_path_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // A legacy absolute folder path resolves directly, even without a
+        // registry entry.
+        let resolved = resolve_bank_dir(&path.to_string_lossy()).unwrap();
+        assert_eq!(resolved, path);
+
+        // A missing folder yields `None` (deleted bank → piano fallback).
+        let missing = dir.path().join("nope");
+        assert!(resolve_bank_dir(&missing.to_string_lossy()).is_none());
     }
 }

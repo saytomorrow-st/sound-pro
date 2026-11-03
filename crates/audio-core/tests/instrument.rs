@@ -40,10 +40,10 @@ fn builtin_piano_is_not_written() {
 }
 
 #[test]
-fn sampler_round_trips() {
+fn sampler_round_trips_by_id() {
     let mut track = instrument_track();
     track.instrument = TrackInstrument::Sampler {
-        bank_path: "/home/user/banks/piano".into(),
+        bank_id: "salamander-grand-v3".into(),
     };
     let project = Project {
         name: "p".into(),
@@ -53,13 +53,52 @@ fn sampler_round_trips() {
         session: session_with(track),
     };
     let text = project.to_json();
-    assert!(text.contains("\"instrument\": { \"sampler\": \"/home/user/banks/piano\" }"));
+    assert!(
+        text.contains("\"instrument\": { \"sampler\": { \"bank\": \"salamander-grand-v3\" } }")
+    );
 
     let back = Project::from_json(&text).unwrap();
     assert_eq!(
         back.session.tracks[0].instrument,
         TrackInstrument::Sampler {
-            bank_path: "/home/user/banks/piano".into(),
+            bank_id: "salamander-grand-v3".into(),
+        }
+    );
+}
+
+#[test]
+fn legacy_sampler_path_still_loads() {
+    // A pre-redesign document serialised the sampler as a bare folder path.
+    let text = r#"{
+    "name": "p",
+    "sample_rate": 48000,
+    "tempo_bpm": 120.0,
+    "params": [],
+    "session": {
+      "name": "s",
+      "sample_rate": 48000,
+      "tempo_bpm": 120.0,
+      "master_gain": 1.0,
+      "tracks": [
+        {
+          "name": "midi",
+          "kind": "instrument",
+          "instrument": { "sampler": "/home/user/banks/piano" },
+          "gain": 1.0,
+          "pan": 0.0,
+          "mute": false,
+          "solo": false,
+          "clips": []
+        }
+      ]
+    }
+  }"#;
+
+    let project = Project::from_json(text).unwrap();
+    assert_eq!(
+        project.session.tracks[0].instrument,
+        TrackInstrument::Sampler {
+            bank_id: "/home/user/banks/piano".into(),
         }
     );
 }

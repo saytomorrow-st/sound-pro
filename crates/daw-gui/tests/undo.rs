@@ -329,7 +329,7 @@ fn instrument_change_is_one_undoable_step() {
         .set_track_instrument(
             0,
             TrackInstrument::Sampler {
-                bank_path: "/tmp/example-bank".to_owned(),
+                bank_id: "example-bank".to_owned(),
             },
         )
         .unwrap();
@@ -372,7 +372,7 @@ fn setting_the_same_instrument_adds_no_step() {
         .set_track_instrument(
             0,
             TrackInstrument::Sampler {
-                bank_path: "/tmp/bank".to_owned(),
+                bank_id: "bank".to_owned(),
             },
         )
         .unwrap();
@@ -381,7 +381,7 @@ fn setting_the_same_instrument_adds_no_step() {
         .set_track_instrument(
             0,
             TrackInstrument::Sampler {
-                bank_path: "/tmp/bank".to_owned(),
+                bank_id: "bank".to_owned(),
             },
         )
         .unwrap();

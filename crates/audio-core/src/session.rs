@@ -794,11 +794,14 @@ pub enum TrackInstrument {
     /// load unchanged.
     #[default]
     BuiltinPiano,
-    /// A locally loaded SFZ sample bank, identified by the path to its folder
-    /// as the user selected it (no download yet — RFC-001 PR 5–6).
+    /// An SFZ sample bank, identified by its library registry id (SPEC-065
+    /// redesign). The application resolves the id to an installed bank folder
+    /// via the library registry. For backward compatibility with pre-redesign
+    /// project files that stored a folder path, the value may also be a legacy
+    /// absolute path, which the application still resolves directly.
     Sampler {
-        /// Absolute path to the bank folder chosen in the file dialog.
-        bank_path: String,
+        /// Bank id from the library registry, or a legacy absolute folder path.
+        bank_id: String,
     },
 }
 
