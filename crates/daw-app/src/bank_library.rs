@@ -576,11 +576,45 @@ pub fn install_local_bank(
     Ok(bank)
 }
 
+/// A cross-process advisory lock on the registry file, held on an open handle
+/// so the kernel releases it on process death (a leftover `banks.json.lock`
+/// file is harmless).
+struct RegistryLock {
+    _file: std::fs::File,
+}
+
+fn acquire_registry_lock(registry_file: &Path) -> Result<RegistryLock, LibraryError> {
+    let lock_path = registry_file.with_extension("json.lock");
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| LibraryError::Io(dir.to_path_buf(), e.to_string()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| LibraryError::Io(lock_path.clone(), e.to_string()))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(RegistryLock { _file: file }),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(LibraryError::Io(
+            lock_path,
+            "registry is locked by another process".to_owned(),
+        )),
+        Err(e) => Err(LibraryError::Io(lock_path, e.to_string())),
+    }
+}
+
 /// Appends (or replaces) a bank entry in the registry file at `registry_file`.
 ///
 /// Used by both [`install_local_bank`] (the user data registry) and the
 /// downloader (which writes `banks.json` next to the banks it installs, so a
 /// download can target a non-default directory in tests).
+///
+/// The read-modify-write is serialised by an advisory lock on
+/// `<registry_file>.lock`, so two concurrent downloads of *different* banks
+/// cannot lose one another's registry entry (per-bank download locks do not
+/// cover this).
 ///
 /// # Errors
 ///
@@ -589,6 +623,9 @@ pub fn record_installed_bank(
     registry_file: &Path,
     bank: &InstalledBank,
 ) -> Result<(), LibraryError> {
+    // Serialise the read-modify-write so two concurrent downloads of different
+    // banks cannot lose one another's registry entry.
+    let _lock = acquire_registry_lock(registry_file)?;
     let mut reg = InstalledRegistry::load(registry_file)?;
     reg.banks.retain(|b| b.id != bank.id);
     reg.banks.push(bank.clone());

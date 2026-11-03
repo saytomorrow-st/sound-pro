@@ -390,18 +390,28 @@ fn download_bank_into_inner(
     Ok(bank)
 }
 
-/// A per-bank lock file guard. `create_new` fails if another process/thread is
-/// already downloading this bank; dropping the guard releases it.
+/// A per-bank advisory lock, held on an open file handle. The kernel releases
+/// the lock when the process exits (including SIGKILL/power loss), so a file
+/// left behind by a crash is harmless — the next download simply acquires the
+/// lock again. The file itself is never deleted, so it cannot be mistaken for
+/// a live lock by a concurrent download.
 struct BankLock {
-    path: PathBuf,
+    _file: std::fs::File,
 }
 
 fn acquire_lock(path: &Path) -> Result<BankLock, DownloadError> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(_) => Ok(BankLock {
-            path: path.to_path_buf(),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+    // `create(true)` (not `create_new`) so an existing stale lock file is
+    // opened rather than treated as "in progress"; the advisory lock then
+    // decides whether it is actually held.
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| DownloadError::Io(path.to_path_buf(), e.to_string()))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(BankLock { _file: file }),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             Err(DownloadError::AlreadyInProgress(
                 path.file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -412,17 +422,18 @@ fn acquire_lock(path: &Path) -> Result<BankLock, DownloadError> {
     }
 }
 
-impl Drop for BankLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Removes stale `.<id>.download.*.tmp`, `.<id>.unpack.*.tmp` and
-/// `.<id>.old.tmp` artifacts for `id`. The `.<id>.lock` file is intentionally
-/// left alone: it is released by `BankLock::drop`, and this function must never
-/// remove a lock held by a concurrent download.
+/// Removes stale `.<id>.download.*.tmp` and `.<id>.unpack.*.tmp` artifacts for
+/// `id`. The `.<id>.old.tmp` backup is handled specially: if `final_dir`
+/// (`banks/<id>`) is missing but the backup still exists (a crash between
+/// `rename(final -> .old)` and `rename(tmp -> final)`), the backup is restored
+/// rather than deleted, so a failed re-download never loses the last good bank.
 fn sweep_stale_artifacts(banks: &Path, id: &str) {
+    let final_dir = banks.join(id);
+    let old = banks.join(format!(".{id}.old.tmp"));
+    if !final_dir.exists() && old.exists() {
+        // Restore the interrupted previous install before anything else runs.
+        let _ = std::fs::rename(&old, &final_dir);
+    }
     let entries = match std::fs::read_dir(banks) {
         Ok(e) => e,
         Err(_) => return,
@@ -430,10 +441,10 @@ fn sweep_stale_artifacts(banks: &Path, id: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // Staging names are `.{id}.download.{token}.tmp`, `.{id}.unpack.{token}.tmp`
-        // and `.{id}.old.tmp`. The lock file `.{id}.lock` is deliberately NOT
-        // swept here: it is released by `BankLock::drop`, and sweeping it would
-        // remove a live lock held by a concurrent download.
+        // Staging names are `.{id}.download.{token}.tmp` and
+        // `.{id}.unpack.{token}.tmp`. The lock file `.{id}.lock` is left alone
+        // (advisory lock released by the kernel on exit), and `.{id}.old.tmp`
+        // was already handled above.
         let is_stale = name.starts_with(&format!(".{id}.")) && name.ends_with(".tmp");
         if is_stale {
             let path = entry.path();
@@ -600,15 +611,24 @@ impl UnpackState {
     }
 
     /// Registers a path for a new entry, rejecting duplicates (even across
-    /// case) and enforcing the per-archive limits.
-    fn register(&mut self, rel: &str, limits: &Limits, size: u64) -> Result<(), DownloadError> {
+    /// case). Per-entry size caps are checked by the caller against the
+    /// declared size; total accounting is done via [`UnpackState::add_bytes`]
+    /// as actual bytes are written, so a forged declared size cannot bypass
+    /// the limits.
+    fn register(&mut self, rel: &str) -> Result<(), DownloadError> {
         let key = rel.to_lowercase();
         if !self.seen.insert(key) {
             return Err(DownloadError::UnsafeEntry(format!(
                 "duplicate entry path {rel:?}"
             )));
         }
-        self.total = self.total.saturating_add(size);
+        Ok(())
+    }
+
+    /// Adds `n` actually-written bytes to the running total, enforcing the
+    /// per-archive limit on real (not declared) byte counts.
+    fn add_bytes(&mut self, n: u64, limits: &Limits) -> Result<(), DownloadError> {
+        self.total = self.total.saturating_add(n);
         if self.total > limits.max_total_unpacked {
             return Err(DownloadError::UnpackLimitExceeded {
                 limit: limits.max_total_unpacked,
@@ -666,7 +686,7 @@ fn unpack_zip(
                 "entry {name:?} is too large ({declared} bytes)"
             )));
         }
-        state.register(&name, limits, declared)?;
+        state.register(&name)?;
 
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)
@@ -679,16 +699,29 @@ fn unpack_zip(
             .open(&out_path)
             .map_err(|e| io_err(&out_path, e))?;
         let mut buf = vec![0u8; 64 * 1024];
+        // Read through a `Take` of `declared + 1` bytes: a forged
+        // `uncompressed_size` that understates the data yields more than
+        // `declared` bytes and is rejected, and the *actual* bytes written are
+        // what count against the total limit (not the declared size).
+        let mut limited = entry.by_ref().take(declared.saturating_add(1));
+        let mut actual: u64 = 0;
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(DownloadError::Cancelled);
             }
-            let n = entry
+            let n = limited
                 .read(&mut buf)
                 .map_err(|e| DownloadError::Unpack(e.to_string()))?;
             if n == 0 {
                 break;
             }
+            actual = actual.saturating_add(n as u64);
+            if actual > declared {
+                return Err(DownloadError::UnsafeEntry(format!(
+                    "entry {name:?} has more bytes than its declared size ({declared})"
+                )));
+            }
+            state.add_bytes(n as u64, limits)?;
             out.write_all(&buf[..n]).map_err(|e| io_err(&out_path, e))?;
         }
     }
@@ -760,7 +793,7 @@ fn unpack_tar_bz2(
                 "entry {name:?} is too large ({declared} bytes)"
             )));
         }
-        state.register(&name, limits, declared)?;
+        state.register(&name)?;
 
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)
@@ -782,6 +815,7 @@ fn unpack_tar_bz2(
             if n == 0 {
                 break;
             }
+            state.add_bytes(n as u64, limits)?;
             out.write_all(&buf[..n]).map_err(|e| io_err(&out_path, e))?;
         }
     }
@@ -1641,15 +1675,75 @@ mod http_tests {
             }
             builder.finish().unwrap();
         }
-        let raw = cursor.into_inner();
+        bzip2_bytes(&cursor.into_inner())
+    }
+
+    /// Build a `.tar.bz2` archive containing a symlink entry (and, optionally,
+    /// a hard-link entry), used to assert that non-regular entries with data
+    /// are rejected rather than extracted.
+    fn make_tar_bz2_link_bytes(symlink: bool, hardlink: bool) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut builder = tar::Builder::new(&mut cursor);
+            // A harmless regular file first.
+            let mut header = tar::Header::new_gnu();
+            header.set_size(2);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "bank/ok.sfz", &b"ok"[..])
+                .unwrap();
+
+            if symlink {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_size(0);
+                h.set_mode(0o644);
+                h.set_cksum();
+                builder
+                    .append_link(&mut h, "bank/link.sfz", "ok.sfz")
+                    .expect("append symlink");
+            }
+            if hardlink {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Link);
+                h.set_size(0);
+                h.set_mode(0o644);
+                h.set_link_name("bank/ok.sfz").unwrap();
+                h.set_cksum();
+                builder
+                    .append(&h, std::io::empty())
+                    .expect("append hardlink");
+            }
+            builder.finish().unwrap();
+        }
+        bzip2_bytes(&cursor.into_inner())
+    }
+
+    fn bzip2_bytes(raw: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         {
             let mut enc = bzip2::write::BzEncoder::new(&mut out, bzip2::Compression::default());
             use std::io::Write;
-            enc.write_all(&raw).unwrap();
+            enc.write_all(raw).unwrap();
             enc.finish().unwrap();
         }
         out
+    }
+
+    /// Rewrites the first central-directory entry's `uncompressed_size` field
+    /// (offset +24 within the central header) to `forged`, so `ZipFile::size()`
+    /// understates the actual stored bytes. This models an archive that lies
+    /// about its decompressed size.
+    fn forge_zip_uncompressed_size(bytes: &mut [u8], forged: u32) {
+        // Locate the first central-directory header: "PK\x01\x02".
+        const CENTRAL_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == CENTRAL_SIG)
+            .expect("central directory signature");
+        let field = pos + 24; // uncompressed_size (4 bytes, little-endian)
+        bytes[field..field + 4].copy_from_slice(&forged.to_le_bytes());
     }
 
     /// A server that serves the CC0 license at `/license` then a body at
@@ -1717,12 +1811,15 @@ mod http_tests {
         assert_eq!(reg.banks[0].id, "test-bank");
         assert_eq!(reg.banks[0].attribution, ""); // CC0 needs none
 
-        // No `.tmp` artifacts are left behind.
+        // No `.tmp` artifacts are left behind. Advisory-lock files
+        // (`.{id}.lock` and `banks.json.lock`) are left in place on purpose:
+        // they are opened (not created) by `try_lock` and are harmless once the
+        // kernel releases the lock, so a stale file never blocks the next run.
         let leftover = std::fs::read_dir(&banks)
             .unwrap()
             .flatten()
             .map(|d| d.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(".tmp") || n.contains(".lock"))
+            .filter(|n| n.contains(".tmp"))
             .collect::<Vec<_>>();
         assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
     }
@@ -2389,5 +2486,194 @@ mod http_tests {
         let result =
             download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
         assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // Non-regular tar entries (symlink / hardlink)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tar_symlink_entry_is_rejected() {
+        let archive = make_tar_bz2_link_bytes(true, false);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.bz2",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-symlink");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+        assert!(!banks.join("test-bank").exists());
+    }
+
+    #[test]
+    fn tar_hardlink_entry_is_rejected() {
+        let archive = make_tar_bz2_link_bytes(false, true);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.bz2",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-hardlink");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+        assert!(!banks.join("test-bank").exists());
+    }
+
+    // ------------------------------------------------------------------
+    // N1: stale lock file must not block a fresh download
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stale_lock_file_does_not_block_download() {
+        let archive = make_zip_bytes(&[("bank/bank.sfz", b"data")]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "zip",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("stale-lock");
+        // A crash/SIGKILL leaves a `.{id}.lock` file behind with no live
+        // holder. The advisory lock is released by the kernel on process
+        // death, so the next download must proceed (not AlreadyInProgress).
+        std::fs::write(banks.join(".test-bank.lock"), b"").unwrap();
+
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(result.is_ok(), "stale lock file must not block: {result:?}");
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // N2: zip forged (understated) uncompressed_size is rejected
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn zip_forged_uncompressed_size_is_rejected() {
+        // A single stored entry whose real data is 20 bytes, but whose central
+        // directory claims only 5. The old code trusted the declared size and
+        // wrote all 20 bytes; the new code reads through a `Take(declared+1)`
+        // and rejects when actual bytes exceed the declared size.
+        let mut archive = make_zip_bytes(&[("bank/bank.sfz", &[b'x'; 20][..])]);
+        forge_zip_uncompressed_size(&mut archive, 5);
+
+        let dir = temp_banks_dir("zip-forged");
+        let archive_path = dir.join("archive.zip");
+        std::fs::write(&archive_path, &archive).unwrap();
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let limits = Limits {
+            max_entries: 100_000,
+            max_total_unpacked: 1_000_000,
+            max_entry_bytes: 1_000_000,
+        };
+        let result = unpack_zip(&archive_path, &dest, &cancel_flag(), &limits);
+        assert!(
+            matches!(result, Err(DownloadError::UnsafeEntry(_))),
+            "forged size must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn zip_actual_bytes_count_against_total_limit() {
+        // Declared size is accurate (10 bytes), but the total unpacked limit is
+        // smaller. This asserts the running total is derived from *actual*
+        // bytes, not the declared size, and trips mid-file.
+        let archive = make_zip_bytes(&[
+            ("bank/a.wav", &[b'a'; 10][..]),
+            ("bank/b.wav", &[b'b'; 10][..]),
+        ]);
+        let dir = temp_banks_dir("zip-total");
+        let archive_path = dir.join("archive.zip");
+        std::fs::write(&archive_path, &archive).unwrap();
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let limits = Limits {
+            max_entries: 100_000,
+            max_total_unpacked: 15,
+            max_entry_bytes: 1_000_000,
+        };
+        let result = unpack_zip(&archive_path, &dest, &cancel_flag(), &limits);
+        assert!(
+            matches!(result, Err(DownloadError::UnpackLimitExceeded { .. })),
+            "actual bytes must trip the total limit: {result:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Entry-count cap
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn entry_count_cap_is_enforced() {
+        // Two entries, but the injected limit allows only one.
+        let archive = make_zip_bytes(&[("bank/a", b"a"), ("bank/b", b"b")]);
+        let dir = temp_banks_dir("entry-count");
+        let archive_path = dir.join("archive.zip");
+        std::fs::write(&archive_path, &archive).unwrap();
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let limits = Limits {
+            max_entries: 1,
+            max_total_unpacked: 1_000_000,
+            max_entry_bytes: 1_000_000,
+        };
+        let result = unpack_zip(&archive_path, &dest, &cancel_flag(), &limits);
+        assert!(matches!(result, Err(DownloadError::TooManyEntries(2))));
+    }
+
+    // ------------------------------------------------------------------
+    // Mid-stream cancel inside the unpack copy loop
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cancel_mid_stream_aborts_unpack() {
+        let archive = make_zip_bytes(&[("bank/big.wav", &[b'z'; 1_000_000][..])]);
+        let dir = temp_banks_dir("mid-cancel");
+        let archive_path = dir.join("archive.zip");
+        std::fs::write(&archive_path, &archive).unwrap();
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let limits = Limits {
+            max_entries: 100_000,
+            max_total_unpacked: 1_000_000_000,
+            max_entry_bytes: 1_000_000_000,
+        };
+        let cancel = Arc::new(AtomicBool::new(true));
+        let result = unpack_zip(&archive_path, &dest, &cancel, &limits);
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
     }
 }
