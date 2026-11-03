@@ -8352,3 +8352,129 @@ mod sound_library_tests {
         assert!(app.library_open);
     }
 }
+
+#[cfg(test)]
+mod inspector_layout_tests {
+    use super::*;
+
+    /// Renders the inspector headlessly and returns the rect of every text
+    /// shape it painted, keyed by its text. Text shapes are the only reliable
+    /// way to locate fields without depending on private widget internals.
+    fn inspector_text_rects(app: &mut App, height: f32) -> Vec<(String, Rect)> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(2000.0, height))),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            app.sync_track_heights();
+            egui::SidePanel::left("inspector")
+                .resizable(true)
+                .default_width(shell::INSPECTOR_WIDTH)
+                .min_width(shell::INSPECTOR_WIDTH)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("inspector")
+                        .show(ui, |ui| app.inspector(ui));
+                });
+            egui::CentralPanel::default().show(ctx, |_| {});
+        });
+
+        let mut texts: Vec<(String, Rect)> = Vec::new();
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                egui::epaint::Shape::Text(t) => {
+                    out.push((
+                        t.galley.job.text.clone(),
+                        Rect::from_min_size(t.pos, t.galley.size()),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn rect_of(texts: &[(String, Rect)], needle: &str) -> Rect {
+        texts
+            .iter()
+            .find(|(t, _)| t == needle)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("text «{needle}» not rendered"))
+    }
+
+    /// The rightmost occurrence of `needle`: the inspector lays the selected
+    /// track's strip out first (left) and the master strip after it (right), so
+    /// the rightmost copy is the master strip's.
+    fn rightmost(texts: &[(String, Rect)], needle: &str) -> Rect {
+        texts
+            .iter()
+            .filter(|(t, _)| t == needle)
+            .map(|(_, r)| *r)
+            .max_by(|a, b| a.min.x.partial_cmp(&b.min.x).unwrap())
+            .unwrap_or_else(|| panic!("text «{needle}» not rendered"))
+    }
+
+    #[test]
+    fn master_strip_bottom_sits_below_its_top_and_the_track_block() {
+        let mut app = App::new(None);
+        app.editor
+            .add_tracks(TrackKind::Instrument, 1, "lead")
+            .unwrap();
+        app.editor.select_track(0, false, false);
+
+        for height in [1250.0, 800.0, 600.0, 400.0] {
+            let texts = inspector_text_rects(&mut app, height);
+
+            // The master strip is the only one with a «D» (dim) pill, and its
+            // «Settings» slot is the rightmost of the two. The bug drew the
+            // master's bottom block (fader/name/pills) on top of the track
+            // fields, so the «D» pill must sit strictly below the master's own
+            // top block — not above or overlapping it.
+            let master_top = rightmost(&texts, "Settings");
+            let dim = rect_of(&texts, "D");
+            assert!(
+                dim.top() >= master_top.bottom(),
+                "height {height}: master bottom («D» {dim:?}) is not below its top \
+                 («Settings» {master_top:?})"
+            );
+
+            // The track fields (including the SPEC-065 instrument picker) must
+            // be fully visible above the master bottom block, never overlapped.
+            for field in ["Инструмент", "Имя", "Тип", "Канал", "Цвет"] {
+                let r = rect_of(&texts, field);
+                assert!(
+                    !r.intersects(dim),
+                    "height {height}: «{field}» {r:?} overlaps the master «D» pill {dim:?}"
+                );
+                assert!(
+                    dim.top() >= r.bottom(),
+                    "height {height}: master «D» pill is above «{field}»: \
+                     field bottom {}, dim top {}",
+                    r.bottom(),
+                    dim.top()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inspector_layout_does_not_panic_at_small_height() {
+        let mut app = App::new(None);
+        app.editor
+            .add_tracks(TrackKind::Instrument, 1, "lead")
+            .unwrap();
+        app.editor.select_track(0, false, false);
+        for height in [300.0, 200.0, 120.0] {
+            let _ = inspector_text_rects(&mut app, height);
+        }
+    }
+}
