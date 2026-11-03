@@ -12,7 +12,19 @@
   },
   "attribution": "Salamander Grand Piano by Alexander Holm, CC-BY 3.0",
   "source_url": "https://archive.org/details/SalamanderGrandPianoV3",
-  "sha256": null,
-  "size_bytes": null,
-  "verified": false
+  "sha256": "fe595c7722b70860e6377f82948d1c0cfcf27ecebf500dc79534408a78a62892",
+  "size_bytes": 488713261,
+  "license_check": {
+    "url": "https://creativecommons.org/licenses/by/3.0/legalcode.txt",
+    "sha256": "e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://archive.org/download/SalamanderGrandPianoV3/SalamanderGrandPianoV3_44.1khz16bit.tar.bz2",
+    "sha256": "fe595c7722b70860e6377f82948d1c0cfcf27ecebf500dc79534408a78a62892",
+    "size_bytes": 488713261
+  },
+  "sfz": "SalamanderGrandPianoV3_44.1khz16bit/SalamanderGrandPianoV3.sfz",
+  "format": "tar.bz2",
+  "verified": true
 }

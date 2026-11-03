@@ -42,6 +42,15 @@ pub enum CatalogError {
     /// The SHA-256 is neither `null` (placeholder) nor 64 lowercase hex.
     #[error("bad sha256 in catalog entry {0:?}: expected 64 lowercase hex chars or null")]
     BadHash(String),
+    /// The `download` block is present but malformed or incomplete.
+    #[error("bad download block in catalog entry {0:?}: {1}")]
+    BadDownload(String, &'static str),
+    /// The `license_check` block is present but malformed or incomplete.
+    #[error("bad license_check block in catalog entry {0:?}: {1}")]
+    BadLicenseCheck(String, &'static str),
+    /// The archive `format` is not one this build can unpack.
+    #[error("unsupported archive format {0:?} in catalog entry {1:?}")]
+    BadFormat(String, String),
 }
 
 /// Why an installed-bank operation failed.
@@ -93,7 +102,8 @@ pub struct CatalogEntry {
     /// Upstream URL (original author's page or repository).
     pub source_url: String,
     /// Pinned SHA-256 of the download, or `None` while unverified (not
-    /// downloadable until SPEC-067 fills it).
+    /// downloadable until SPEC-067 fills it). Kept for SPEC-066 compatibility;
+    /// the downloader reads `download` instead.
     #[serde(default)]
     pub sha256: Option<String>,
     /// Download size in bytes, or `None` while unverified.
@@ -102,6 +112,45 @@ pub struct CatalogEntry {
     /// Whether the hash/size were verified by the owner. Always `false` here.
     #[serde(default)]
     pub verified: bool,
+    /// License re-check source (SPEC-067). `None` while unverified.
+    #[serde(default)]
+    pub license_check: Option<LicenseCheck>,
+    /// The download archive (SPEC-067). `None` while unverified / not
+    /// downloadable.
+    #[serde(default)]
+    pub download: Option<Download>,
+    /// Path to the main `.sfz` inside the archive (`/` separators), or `None`
+    /// to use the first `.sfz` found in the installed bank root.
+    #[serde(default)]
+    pub sfz: Option<String>,
+    /// Archive container: `"zip"` or `"tar.bz2"`.
+    #[serde(default)]
+    pub format: String,
+}
+
+/// How a catalog entry's license is re-checked before every download
+/// (SPEC-067 / RFC-001 §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LicenseCheck {
+    /// URL of the license source (license text, page, or API metadata).
+    pub url: String,
+    /// SHA-256 of the normalized license text for `text-hash` mode; `None`
+    /// for `metadata` mode (only the SPDX id is compared).
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Re-check mode: `text-hash` or `metadata`.
+    pub mode: String,
+}
+
+/// The download archive for a catalog entry (SPEC-067).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Download {
+    /// Upstream URL of the archive (author's original host).
+    pub url: String,
+    /// Pinned SHA-256 of the archive, verified by the owner.
+    pub sha256: String,
+    /// Pinned size in bytes, verified by the owner.
+    pub size_bytes: u64,
 }
 
 /// A bank the user installed from a local SFZ folder (SPEC-066).
@@ -246,7 +295,78 @@ pub fn validate_catalog_entry(entry: &CatalogEntry) -> Result<(), CatalogError> 
             return Err(CatalogError::BadHash(entry.id.clone()));
         }
     }
+    validate_download(entry)?;
+    validate_license_check(entry)?;
     Ok(())
+}
+
+/// Validates the optional `download` block of a catalog entry.
+fn validate_download(entry: &CatalogEntry) -> Result<(), CatalogError> {
+    let Some(dl) = &entry.download else {
+        return Ok(());
+    };
+    if dl.url.trim().is_empty() {
+        return Err(CatalogError::BadDownload(entry.id.clone(), "url is empty"));
+    }
+    if !is_sha256(&dl.sha256) {
+        return Err(CatalogError::BadDownload(
+            entry.id.clone(),
+            "sha256 must be 64 lowercase hex chars",
+        ));
+    }
+    if dl.size_bytes == 0 {
+        return Err(CatalogError::BadDownload(
+            entry.id.clone(),
+            "size_bytes must be positive",
+        ));
+    }
+    match entry.format.as_str() {
+        "zip" | "tar.bz2" => {}
+        other => return Err(CatalogError::BadFormat(other.to_owned(), entry.id.clone())),
+    }
+    Ok(())
+}
+
+/// Validates the optional `license_check` block of a catalog entry.
+fn validate_license_check(entry: &CatalogEntry) -> Result<(), CatalogError> {
+    let Some(lc) = &entry.license_check else {
+        return Ok(());
+    };
+    if lc.url.trim().is_empty() {
+        return Err(CatalogError::BadLicenseCheck(
+            entry.id.clone(),
+            "url is empty",
+        ));
+    }
+    match lc.mode.as_str() {
+        "text-hash" => {
+            if lc.sha256.as_deref().is_none_or(|h| !is_sha256(h)) {
+                return Err(CatalogError::BadLicenseCheck(
+                    entry.id.clone(),
+                    "text-hash mode requires a 64-hex sha256",
+                ));
+            }
+        }
+        "metadata" => {}
+        other => {
+            return Err(CatalogError::BadLicenseCheck(
+                entry.id.clone(),
+                if other.is_empty() {
+                    "mode is empty"
+                } else {
+                    "mode must be text-hash or metadata"
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a catalog entry is downloadable now (SPEC-067): it has a verified
+/// `download` block and a `license_check` block.
+#[must_use]
+pub fn is_downloadable(entry: &CatalogEntry) -> bool {
+    entry.verified && entry.download.is_some() && entry.license_check.is_some()
 }
 
 /// Whether `s` is 64 lowercase hex characters (a SHA-256 digest).
@@ -363,11 +483,27 @@ pub fn install_local_bank(
             "no data directory".to_owned(),
         )
     })?;
-    let mut reg = InstalledRegistry::load(&reg_path)?;
-    reg.banks.retain(|b| b.id != id);
-    reg.banks.push(bank.clone());
-    reg.save(&reg_path)?;
+    record_installed_bank(&reg_path, &bank)?;
     Ok(bank)
+}
+
+/// Appends (or replaces) a bank entry in the registry file at `registry_file`.
+///
+/// Used by both [`install_local_bank`] (the user data registry) and the
+/// downloader (which writes `banks.json` next to the banks it installs, so a
+/// download can target a non-default directory in tests).
+///
+/// # Errors
+///
+/// [`LibraryError`] on I/O or parse failure.
+pub fn record_installed_bank(
+    registry_file: &Path,
+    bank: &InstalledBank,
+) -> Result<(), LibraryError> {
+    let mut reg = InstalledRegistry::load(registry_file)?;
+    reg.banks.retain(|b| b.id != bank.id);
+    reg.banks.push(bank.clone());
+    reg.save(registry_file)
 }
 
 /// Removes an installed bank (folder and registry entry).
@@ -417,7 +553,8 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), LibraryError> {
 }
 
 /// Current UTC time as a minimal ISO-8601-ish string (install timestamps).
-fn timestamp() -> String {
+#[must_use]
+pub fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -486,8 +623,9 @@ mod tests {
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"salamander-grand-v3"));
         assert!(ids.contains(&"osiris-piano"));
-        assert!(entries.iter().all(|e| !e.verified));
-        assert!(entries.iter().all(|e| e.sha256.is_none()));
+        // SPEC-067 filled both entries with verified upstream hashes/sizes.
+        assert!(entries.iter().all(|e| e.verified));
+        assert!(entries.iter().all(is_downloadable));
     }
 
     #[test]
@@ -500,6 +638,13 @@ mod tests {
         assert_eq!(s.license.spdx, "CC-BY-3.0");
         assert!(s.license.attribution_required);
         assert!(!s.attribution.is_empty());
+        assert_eq!(s.format, "tar.bz2");
+        let lc = s.license_check.as_ref().unwrap();
+        assert_eq!(lc.mode, "text-hash");
+        assert!(lc.sha256.as_deref().is_some_and(is_sha256));
+        let dl = s.download.as_ref().unwrap();
+        assert!(is_sha256(&dl.sha256));
+        assert!(dl.size_bytes > 0);
     }
 
     #[test]
@@ -508,6 +653,11 @@ mod tests {
         let o = entries.iter().find(|e| e.id == "osiris-piano").unwrap();
         assert_eq!(o.license.spdx, "CC0-1.0");
         assert!(!o.license.attribution_required);
+        assert_eq!(o.format, "zip");
+        let lc = o.license_check.as_ref().unwrap();
+        assert_eq!(lc.mode, "metadata");
+        assert!(lc.sha256.is_none());
+        assert!(is_sha256(&o.download.as_ref().unwrap().sha256));
     }
 
     #[test]
@@ -582,6 +732,63 @@ mod tests {
         assert!(!is_sha256("a"));
         assert!(!is_sha256(&"A".repeat(64)));
         assert!(!is_sha256(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn bad_download_is_rejected() {
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
+        e.download.as_mut().unwrap().sha256 = "abc".to_owned();
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::BadDownload(_, _))
+        ));
+
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
+        e.download.as_mut().unwrap().size_bytes = 0;
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::BadDownload(_, _))
+        ));
+    }
+
+    #[test]
+    fn bad_license_check_is_rejected() {
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
+        e.license_check.as_mut().unwrap().mode = "bogus".to_owned();
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::BadLicenseCheck(_, _))
+        ));
+    }
+
+    #[test]
+    fn text_hash_mode_requires_sha256() {
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
+        e.license_check.as_mut().unwrap().mode = "text-hash".to_owned();
+        e.license_check.as_mut().unwrap().sha256 = None;
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::BadLicenseCheck(_, _))
+        ));
+    }
+
+    #[test]
+    fn bad_format_is_rejected() {
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
+        e.format = "rar".to_owned();
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::BadFormat(_, _))
+        ));
+    }
+
+    #[test]
+    fn entry_without_download_is_not_downloadable() {
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
+        e.download = None;
+        e.verified = false;
+        assert!(!is_downloadable(&e));
+        assert!(validate_catalog_entry(&e).is_ok());
     }
 
     #[test]
