@@ -1807,6 +1807,7 @@ impl App {
             self.play();
             return;
         }
+        self.editor.interpolation = self.audio.interpolation;
         match self.editor.playback_graph() {
             Ok((graph, _)) => {
                 if player.control.replace_graph(graph).is_ok() {
@@ -2205,6 +2206,7 @@ impl App {
         let tx = self.export_tx.clone();
         // Build the job here (it reads decoded files), then render off the
         // UI thread so the window stays responsive.
+        self.editor.interpolation = self.audio.interpolation;
         let job = match self.editor.prepare_export(&path) {
             Ok(job) => job,
             Err(e) => {
@@ -6902,6 +6904,26 @@ impl App {
                                 buffer_label(n, rate),
                             );
                         }
+                    });
+                ui.end_row();
+                ui.label("Качество интерполяции сэмплера");
+                let shown = match self.audio.interpolation {
+                    audio_core::Interpolation::Linear => "Линейная",
+                    audio_core::Interpolation::Hermite4 => "Эрмит (4 точки)",
+                };
+                egui::ComboBox::from_id_salt("audio-interpolation")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.audio.interpolation,
+                            audio_core::Interpolation::Linear,
+                            "Линейная",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio.interpolation,
+                            audio_core::Interpolation::Hermite4,
+                            "Эрмит (4 точки)",
+                        );
                     });
                 ui.end_row();
                 ui.label("Частота");

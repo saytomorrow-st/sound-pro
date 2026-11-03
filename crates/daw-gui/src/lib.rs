@@ -339,6 +339,9 @@ pub struct Editor {
     pub cycle_enabled: bool,
     /// Whether playback clicks on every beat; not saved (SPEC-026).
     pub metronome: bool,
+    /// Sampler interpolation used when loading for playback or export; a user
+    /// audio setting, not saved in the project.
+    pub interpolation: audio_core::Interpolation,
     /// Clip copied with [`Self::copy_clip`]; not saved (SPEC-027).
     clipboard: Option<Clip>,
     /// Tracks armed for recording, sorted and without repeats; not saved
@@ -389,6 +392,7 @@ impl Editor {
             cycle: None,
             cycle_enabled: false,
             metronome: false,
+            interpolation: audio_core::Interpolation::default(),
             armed: Vec::new(),
             clipboard: None,
             meters: daw_app::meters::Meters::new(),
@@ -476,6 +480,7 @@ impl Editor {
             cycle: None,
             cycle_enabled: false,
             metronome: self.metronome,
+            interpolation: self.interpolation,
             clipboard: None,
             armed: Vec::new(),
             meters: self.meters.clone(),
@@ -882,11 +887,12 @@ impl Editor {
             rendered: &mut rendered,
             used: HashMap::new(),
         };
-        let job = daw_app::load_session_cached(
+        let job = daw_app::load_session_cached_with(
             self.project.session.clone(),
             Path::new(""),
             output,
             &mut cache,
+            self.interpolation,
         )?;
         let used = cache.used;
         rendered.0 = used;

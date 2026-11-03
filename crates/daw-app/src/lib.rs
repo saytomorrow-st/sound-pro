@@ -658,6 +658,29 @@ pub fn load_session_cached(
     output: PathBuf,
     cache: &mut dyn ClipCache,
 ) -> Result<SessionJob, LoadError> {
+    load_session_cached_with(
+        session,
+        base,
+        output,
+        cache,
+        audio_core::Interpolation::default(),
+    )
+}
+
+/// [`load_session_cached`] rendering sampler tracks with `interpolation`
+/// (the user's audio setting). Notes rendered with a non-default mode are
+/// cached under their own key, so modes never share cached audio.
+///
+/// # Errors
+///
+/// As [`load_session`].
+pub fn load_session_cached_with(
+    session: audio_core::Session,
+    base: &std::path::Path,
+    output: PathBuf,
+    cache: &mut dyn ClipCache,
+    interpolation: audio_core::Interpolation,
+) -> Result<SessionJob, LoadError> {
     let rate = session.sample_rate;
     let mut tracks = Vec::with_capacity(session.tracks.len());
     for (track_index, track) in session.tracks.iter().enumerate() {
@@ -675,7 +698,7 @@ pub fn load_session_cached(
                 let (instrument_key, instrument) = match &mut instrument {
                     Some((key, ready)) => (key.as_str(), ready),
                     None => {
-                        let built = build_instrument(&track.instrument);
+                        let built = build_instrument(&track.instrument, interpolation);
                         instrument = Some(built);
                         let (key, ready) = instrument.as_mut().expect("just set");
                         (key.as_str(), ready)
@@ -769,6 +792,7 @@ pub fn load_session_cached(
 /// `"piano"` to match the fallback timbre.
 fn build_instrument(
     instrument: &audio_core::TrackInstrument,
+    interpolation: audio_core::Interpolation,
 ) -> (String, Box<dyn instrument::Instrument>) {
     match instrument {
         audio_core::TrackInstrument::BuiltinPiano => {
@@ -779,10 +803,18 @@ fn build_instrument(
                 crate::sample_bank::load_bank(&dir, crate::sample_bank::DEFAULT_RAM_BUDGET_MIB).ok()
             });
             match loaded {
-                Some(bank) => (
-                    format!("sampler:{bank_id}"),
-                    Box::new(instrument::SamplerInstrument::new(&bank)),
-                ),
+                Some(bank) => {
+                    let key = match interpolation {
+                        audio_core::Interpolation::Linear => format!("sampler:{bank_id}"),
+                        other => format!(
+                            "sampler:{bank_id}:{}",
+                            audio_settings::interpolation_name(other)
+                        ),
+                    };
+                    let sampler =
+                        instrument::SamplerInstrument::new(&bank).with_interpolation(interpolation);
+                    (key, Box::new(sampler))
+                }
                 None => ("piano".to_owned(), Box::new(instrument::PianoInstrument)),
             }
         }
