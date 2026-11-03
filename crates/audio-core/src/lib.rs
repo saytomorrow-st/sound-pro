@@ -58,7 +58,7 @@ pub use sampler::region::{
 pub use sampler::sfz::{
     IncludeResolver, LoopMode, OffMode, Region, SfzDocument, SfzError, SfzWarning, Trigger, parse,
 };
-pub use sampler::voice::{NO_REGION, STEAL_FADE_SAMPLES, SamplerVoice};
+pub use sampler::voice::{Interpolation, NO_REGION, STEAL_FADE_SAMPLES, SamplerVoice};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
     AutoPoint, Automation, Bus, BusSend, CROSSFADE_SAMPLES, Clip, DIM_GAIN, EffectLane, Lane,

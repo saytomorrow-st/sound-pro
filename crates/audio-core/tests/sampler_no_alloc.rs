@@ -20,12 +20,14 @@
 //!   samples run to their end so `advance()` exhausts and frees them.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use audio_core::midi::{MidiEvent, MidiMessage};
 use audio_core::sampler::engine::{DEFAULT_VOICES, SamplerEngine};
 use audio_core::sampler::region::SampleRegion;
 use audio_core::sampler::sfz::{LoopMode, OffMode};
+use audio_core::sampler::voice::Interpolation;
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 
 const SR: u32 = 48_000;
@@ -36,6 +38,10 @@ const TOTAL: u64 = 8192;
 struct CountingAlloc;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+/// Serializes the two allocation-counting tests, which would otherwise run in
+/// parallel threads and corrupt each other's process-global `ALLOCS` count.
+static COUNTING_LOCK: Mutex<()> = Mutex::new(());
 
 // SAFETY: this wrapper only forwards to the system allocator and bumps a
 // counter; it upholds the `GlobalAlloc` contract.
@@ -90,6 +96,7 @@ fn note_off(sample: u64, note: u8) -> ScheduledEvent {
 
 #[test]
 fn render_allocates_nothing_across_the_full_voice_lifecycle() {
+    let _guard = COUNTING_LOCK.lock().unwrap();
     // Sample 0: short mono DC — held notes exhaust and free their voices.
     let mono: Vec<i16> = vec![10_000_i16; 512];
     // Sample 1: stereo DC (interleaved L/R).
@@ -168,6 +175,91 @@ fn render_allocates_nothing_across_the_full_voice_lifecycle() {
 
     // The test is only meaningful if it actually started voices, stole, and
     // produced non-zero output.
+    assert!(engine.voices_started() > 0, "no voices started");
+    assert!(engine.stolen() > 0, "no voices stolen");
+    let peak = left
+        .iter()
+        .chain(right.iter())
+        .cloned()
+        .fold(0.0_f32, f32::max);
+    assert!(peak > 0.0, "output was silent");
+    assert!(peak.is_finite(), "output was non-finite");
+}
+
+/// SPEC-068 step A: the full voice lifecycle under `Hermite4` interpolation
+/// must also allocate nothing in the render path.
+#[test]
+fn render_allocates_nothing_with_hermite4() {
+    let _guard = COUNTING_LOCK.lock().unwrap();
+    // Same sample bank shape as the linear test: short mono, stereo, looped.
+    let mono: Vec<i16> = vec![10_000_i16; 512];
+    let stereo: Vec<i16> = (0..512)
+        .map(|i| if i % 2 == 0 { 9000 } else { 7000 })
+        .collect();
+    let looped: Vec<i16> = vec![8000_i16; 4096];
+    let samples = vec![Arc::from(mono), Arc::from(stereo), Arc::from(looped)];
+
+    let mut regions: Vec<SampleRegion> = (0..=127)
+        .map(|n| SampleRegion {
+            sample_index: 0,
+            root: n,
+            key_lo: n,
+            key_hi: n,
+            ..SampleRegion::default()
+        })
+        .collect();
+    regions[69].group = Some(1);
+    regions[70].off_by = Some(1);
+    regions[70].off_mode = OffMode::Fast;
+    regions[71].sample_index = 1;
+    regions[71].channels = 2;
+    regions[72].sample_index = 2;
+    regions[72].loop_mode = LoopMode::LoopContinuous;
+
+    let mut engine = SamplerEngine::new_with(
+        SR,
+        regions,
+        samples,
+        DEFAULT_VOICES,
+        Interpolation::Hermite4,
+    )
+    .unwrap();
+
+    let mut events: Vec<ScheduledEvent> = (0..=127).map(|n| note_on(0, n as u8, 100)).collect();
+    events.push(note_off(256, 60));
+    events.push(note_on(512, 70, 120));
+    events.push(note_on(1024, 60, 100));
+    events.push(note_off(2048, 72));
+    let sched = Schedule::new(ScheduleSpec {
+        events,
+        length_samples: TOTAL,
+    });
+
+    let mut left = vec![0.0_f32; TOTAL as usize];
+    let mut right = vec![0.0_f32; TOTAL as usize];
+
+    let mut cursor = sched.cursor();
+    engine.render(&sched, &mut cursor, 0, QUANTUM, &mut left, &mut right);
+    let before = ALLOCS.load(Ordering::Relaxed);
+
+    let mut cursor = sched.cursor();
+    let mut position = 0_u64;
+    while position < TOTAL {
+        let n = ((TOTAL - position) as usize).min(QUANTUM);
+        engine.render(
+            &sched,
+            &mut cursor,
+            position,
+            n,
+            &mut left[position as usize..],
+            &mut right[position as usize..],
+        );
+        position += n as u64;
+    }
+
+    let after = ALLOCS.load(Ordering::Relaxed);
+    assert_eq!(before, after, "Hermite4 render path must not allocate");
+
     assert!(engine.voices_started() > 0, "no voices started");
     assert!(engine.stolen() > 0, "no voices stolen");
     let peak = left
