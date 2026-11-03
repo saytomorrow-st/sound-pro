@@ -13,21 +13,43 @@ const RATE: u32 = 48_000;
 #[derive(Default)]
 struct MapCache {
     audio: HashMap<String, Arc<Vec<f32>>>,
-    notes: HashMap<(Vec<Note>, u32, u64), Arc<Vec<f32>>>,
+    notes: HashMap<NotesKey, Arc<Vec<f32>>>,
     note_hits: usize,
 }
+
+/// Cache key for rendered notes: instrument id + note set + rate + length.
+type NotesKey = (String, Vec<Note>, u32, u64);
 
 impl ClipCache for MapCache {
     fn audio(&mut self, source: &str) -> Option<Arc<Vec<f32>>> {
         self.audio.get(source).cloned()
     }
-    fn notes(&mut self, notes: &[Note], rate: u32, frames: u64) -> Option<Arc<Vec<f32>>> {
-        let hit = self.notes.get(&(notes.to_vec(), rate, frames)).cloned();
+    fn notes(
+        &mut self,
+        instrument: &str,
+        notes: &[Note],
+        rate: u32,
+        frames: u64,
+    ) -> Option<Arc<Vec<f32>>> {
+        let hit = self
+            .notes
+            .get(&(instrument.to_owned(), notes.to_vec(), rate, frames))
+            .cloned();
         self.note_hits += usize::from(hit.is_some());
         hit
     }
-    fn store_notes(&mut self, notes: &[Note], rate: u32, frames: u64, samples: Arc<Vec<f32>>) {
-        self.notes.insert((notes.to_vec(), rate, frames), samples);
+    fn store_notes(
+        &mut self,
+        instrument: &str,
+        notes: &[Note],
+        rate: u32,
+        frames: u64,
+        samples: Arc<Vec<f32>>,
+    ) {
+        self.notes.insert(
+            (instrument.to_owned(), notes.to_vec(), rate, frames),
+            samples,
+        );
     }
 }
 

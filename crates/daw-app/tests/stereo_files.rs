@@ -128,10 +128,10 @@ impl ClipCache for StereoCache {
     fn audio_stereo(&mut self, _source: &str) -> Option<(Arc<Vec<f32>>, Arc<Vec<f32>>)> {
         Some((Arc::clone(&self.left), Arc::clone(&self.right)))
     }
-    fn notes(&mut self, _: &[Note], _: u32, _: u64) -> Option<Arc<Vec<f32>>> {
+    fn notes(&mut self, _: &str, _: &[Note], _: u32, _: u64) -> Option<Arc<Vec<f32>>> {
         None
     }
-    fn store_notes(&mut self, _: &[Note], _: u32, _: u64, _: Arc<Vec<f32>>) {}
+    fn store_notes(&mut self, _: &str, _: &[Note], _: u32, _: u64, _: Arc<Vec<f32>>) {}
 }
 
 #[test]

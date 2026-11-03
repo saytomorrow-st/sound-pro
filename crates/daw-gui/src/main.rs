@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use audio_core::{
     AutoPoint, Effect, EffectKind, EffectParam, Lane, MAX_BUSES, MAX_EFFECTS_PER_TRACK, Note,
-    TRACK_COLORS, TempoMap, TrackFormat, TrackKind,
+    TRACK_COLORS, TempoMap, TrackFormat, TrackInstrument, TrackKind,
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
@@ -537,6 +537,40 @@ enum ExportMsg {
     Done(PathBuf, u32, Result<daw_app::SessionReport, EditorError>),
 }
 
+/// The result of a background SFZ bank load (SPEC-065): the track it was
+/// asked for, the folder path that was selected, and the loaded bank or the
+/// error that stopped it.
+enum InstrumentMsg {
+    Loaded {
+        index: usize,
+        bank_path: String,
+        result: Result<daw_app::sample_bank::LoadedBank, daw_app::sample_bank::BankLoadError>,
+    },
+}
+
+/// A lightweight summary of a loaded bank, kept for the inspector readout
+/// (SPEC-065). The heavy sample data lives in the project cache, not here.
+struct InstrumentStatus {
+    /// Bank name derived from the folder path.
+    name: String,
+    /// Non-fatal loader/parser warnings.
+    warnings: usize,
+    /// Regions whose sample could not be decoded.
+    decode_failures: usize,
+    /// Bytes of sample data held in RAM.
+    ram_bytes: u64,
+}
+
+/// Per-track instrument-load state shown in the inspector (SPEC-065).
+/// Cosmetic GUI state; the authoritative value lives on `Track.instrument`.
+#[derive(Default)]
+struct InstrumentLoad {
+    /// True while a background `load_bank` is running for this track.
+    loading: bool,
+    /// Result of the last completed load, for the warnings/errors readout.
+    result: Option<Result<InstrumentStatus, String>>,
+}
+
 /// A region shown while its file still decodes (SPEC-050 §7): its length
 /// comes from the header, its waveform fills in as the decoder advances.
 struct Ghost {
@@ -667,6 +701,10 @@ struct App {
     /// frame while the tempo is unchanged (SPEC-054).
     last_tempo_map: Option<TempoMap>,
     imports: Imports,
+    /// Background SFZ bank loads for the instrument picker (SPEC-065).
+    instrument_tx: std::sync::mpsc::Sender<InstrumentMsg>,
+    instrument_rx: std::sync::mpsc::Receiver<InstrumentMsg>,
+    instrument_loads: HashMap<usize, InstrumentLoad>,
     /// Mix-export progress and options (SPEC-052).
     export_tx: std::sync::mpsc::Sender<ExportMsg>,
     export_rx: std::sync::mpsc::Receiver<ExportMsg>,
@@ -874,6 +912,7 @@ impl App {
     fn new(start: Option<PathBuf>) -> Self {
         let (hover_tx, hover_rx) = std::sync::mpsc::channel();
         let (export_tx, export_rx) = std::sync::mpsc::channel();
+        let (instrument_tx, instrument_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             editor: Editor::new(),
             #[cfg(feature = "audio")]
@@ -891,6 +930,9 @@ impl App {
                     total: 0,
                 }
             },
+            instrument_tx,
+            instrument_rx,
+            instrument_loads: HashMap::new(),
             export_tx,
             export_rx,
             export_open: false,
@@ -1878,6 +1920,77 @@ impl App {
         }
         if self.imports.pending > 0 {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Opens an SFZ-folder picker and starts a background bank load (SPEC-065).
+    /// The actual `load_bank` runs on a worker thread; `poll_instruments`
+    /// applies the result to the session as one undoable command.
+    fn choose_sampler(&mut self, index: usize) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Выбрать папку SFZ")
+            .pick_folder()
+        else {
+            return;
+        };
+        let bank_path = dir.to_string_lossy().into_owned();
+        let entry = self.instrument_loads.entry(index).or_default();
+        entry.loading = true;
+        entry.result = None;
+        let tx = self.instrument_tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                daw_app::sample_bank::load_bank(&dir, daw_app::sample_bank::DEFAULT_RAM_BUDGET_MIB);
+            let _ = tx.send(InstrumentMsg::Loaded {
+                index,
+                bank_path,
+                result,
+            });
+        });
+    }
+
+    /// Applies finished bank loads from the worker thread (SPEC-065).
+    fn poll_instruments(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.instrument_rx.try_recv() {
+            let InstrumentMsg::Loaded {
+                index,
+                bank_path,
+                result,
+            } = msg;
+            match &result {
+                Ok(bank) => {
+                    let name = std::path::Path::new(&bank_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| bank_path.clone());
+                    let status = InstrumentStatus {
+                        name,
+                        warnings: bank.warnings.len(),
+                        decode_failures: bank.decode_failures.len(),
+                        ram_bytes: bank.ram_bytes,
+                    };
+                    if let Some(entry) = self.instrument_loads.get_mut(&index) {
+                        entry.loading = false;
+                        entry.result = Some(Ok(status));
+                    }
+                    if let Err(e) = self
+                        .editor
+                        .set_track_instrument(index, TrackInstrument::Sampler { bank_path })
+                    {
+                        self.status = format!("Ошибка установки инструмента: {e}");
+                    } else {
+                        self.status = "Инструмент загружен.".into();
+                    }
+                }
+                Err(e) => {
+                    if let Some(entry) = self.instrument_loads.get_mut(&index) {
+                        entry.loading = false;
+                        entry.result = Some(Err(e.to_string()));
+                    }
+                    self.status = format!("Ошибка загрузки банка: {e}");
+                }
+            }
+            ctx.request_repaint();
         }
     }
 
@@ -6451,6 +6564,7 @@ impl eframe::App for App {
         self.poll_meters(ctx);
         self.poll_recorder(ctx);
         self.poll_imports(ctx);
+        self.poll_instruments(ctx);
         self.poll_export();
         // Everything done during one mouse press is one undo step.
         if ctx.input(|i| i.pointer.any_down()) {
@@ -7492,5 +7606,104 @@ mod velocity_lane_tests {
         assert_eq!(velocities(&app), [100, 100]);
         assert!(app.editor.redo());
         assert_eq!(velocities(&app), after);
+    }
+}
+
+#[cfg(test)]
+mod instrument_picker_tests {
+    use super::*;
+
+    /// A minimal in-memory bank for driving `poll_instruments` headlessly,
+    /// without a file dialog or worker thread.
+    fn empty_bank(warnings: usize) -> daw_app::sample_bank::LoadedBank {
+        daw_app::sample_bank::LoadedBank {
+            regions: Vec::new(),
+            samples: Vec::new(),
+            warnings: (0..warnings).map(|i| format!("w{i}")).collect(),
+            decode_failures: Vec::new(),
+            ram_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn poll_instruments_applies_a_loaded_bank_and_is_undoable() {
+        let mut app = App::new(None);
+        app.editor
+            .add_tracks(TrackKind::Instrument, 1, "lead")
+            .unwrap();
+        assert!(matches!(
+            app.editor.session().tracks[0].instrument,
+            TrackInstrument::BuiltinPiano
+        ));
+
+        app.instrument_loads.insert(
+            0,
+            InstrumentLoad {
+                loading: true,
+                result: None,
+            },
+        );
+        app.instrument_tx
+            .send(InstrumentMsg::Loaded {
+                index: 0,
+                bank_path: "/tmp/My Bank".to_owned(),
+                result: Ok(empty_bank(2)),
+            })
+            .unwrap();
+        let ctx = egui::Context::default();
+        app.poll_instruments(&ctx);
+
+        assert!(matches!(
+            app.editor.session().tracks[0].instrument,
+            TrackInstrument::Sampler { .. }
+        ));
+        let state = &app.instrument_loads[&0];
+        assert!(!state.loading);
+        let status = state.result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(status.name, "My Bank");
+        assert_eq!(status.warnings, 2);
+
+        // One undo step restores the built-in piano.
+        assert!(app.editor.undo());
+        assert!(matches!(
+            app.editor.session().tracks[0].instrument,
+            TrackInstrument::BuiltinPiano
+        ));
+    }
+
+    #[test]
+    fn poll_instruments_reports_a_failed_load() {
+        let mut app = App::new(None);
+        app.editor
+            .add_tracks(TrackKind::Instrument, 1, "lead")
+            .unwrap();
+
+        app.instrument_loads.insert(
+            0,
+            InstrumentLoad {
+                loading: true,
+                result: None,
+            },
+        );
+        app.instrument_tx
+            .send(InstrumentMsg::Loaded {
+                index: 0,
+                bank_path: "/tmp/none".to_owned(),
+                result: Err(daw_app::sample_bank::BankLoadError::NoSfz(
+                    "/tmp/none".into(),
+                )),
+            })
+            .unwrap();
+        let ctx = egui::Context::default();
+        app.poll_instruments(&ctx);
+
+        // The instrument stays the default and the failure is recorded.
+        assert!(matches!(
+            app.editor.session().tracks[0].instrument,
+            TrackInstrument::BuiltinPiano
+        ));
+        let state = &app.instrument_loads[&0];
+        assert!(!state.loading);
+        assert!(state.result.as_ref().unwrap().is_err());
     }
 }

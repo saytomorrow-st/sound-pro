@@ -17,8 +17,9 @@ use crate::graph::Graph;
 use crate::params::{ParamHandle, ParamId, ParamSpec};
 use crate::session::{
     AutoPoint, Automation, Bus, BusSend, Clip, EffectLane, Lane, MAX_AUTOMATION_POINTS, MAX_BUSES,
-    MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_TRACKS, Marker,
-    Note, Session, SessionError, Track, TrackFolder, TrackFormat, TrackKind,
+    MAX_CLIPS_PER_TRACK, MAX_EFFECT_LANES, MAX_MARKERS, MAX_NOTES_PER_CLIP, MAX_SOURCE_BYTES,
+    MAX_TRACKS, Marker, Note, Session, SessionError, Track, TrackFolder, TrackFormat,
+    TrackInstrument, TrackKind,
 };
 use crate::transport::{TempoPoint, TimeSignature};
 
@@ -444,6 +445,13 @@ fn write_session(out: &mut String, session: &Session) {
         write_string(out, &track.name);
         if track.kind == TrackKind::Instrument {
             out.push_str(",\n        \"kind\": \"instrument\"");
+        }
+        // Written only when not the default, so pre-SPEC-065 documents keep
+        // their exact text (SPEC-065).
+        if let TrackInstrument::Sampler { bank_path } = &track.instrument {
+            out.push_str(",\n        \"instrument\": { \"sampler\": ");
+            write_string(out, bank_path);
+            out.push_str(" }");
         }
         if track.format == TrackFormat::Stereo {
             out.push_str(",\n        \"format\": \"stereo\"");
@@ -955,10 +963,12 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
     let mut notes = None;
     let mut kind = None;
     let mut format = None;
+    let mut instrument = None;
     for (key, value) in entries {
         match key.as_str() {
             "kind" => kind = Some(kind_from_value(value)?),
             "format" => format = Some(format_from_value(value)?),
+            "instrument" => instrument = Some(instrument_from_value(value)?),
             "notes" => notes = Some(require_string(value)?),
             "color" => color = Some(require_u8(value)?),
             "sends" => sends = Some(sends_from_value(value)?),
@@ -1007,6 +1017,8 @@ fn track_from_value(value: &Value) -> Result<Track, ProjectError> {
             field: "session.tracks[].name",
         })?,
         kind,
+        // Optional since SPEC-065: older projects have no instrument field.
+        instrument: instrument.unwrap_or_default(),
         format: format.unwrap_or_default(),
         gain: gain.ok_or(ProjectError::MissingField {
             field: "session.tracks[].gain",
@@ -1974,6 +1986,35 @@ fn format_from_value(value: &Value) -> Result<TrackFormat, ProjectError> {
         "stereo" => Ok(TrackFormat::Stereo),
         _ => Err(ProjectError::Malformed { at: 0 }),
     }
+}
+
+/// `{ "sampler": "<bank_path>" }` (SPEC-065). `BuiltinPiano` is never written
+/// and is represented by the field being absent.
+fn instrument_from_value(value: &Value) -> Result<TrackInstrument, ProjectError> {
+    let Value::Object(entries) = value else {
+        return Err(ProjectError::Malformed { at: 0 });
+    };
+    let mut bank_path = None;
+    for (key, value) in entries {
+        match key.as_str() {
+            "sampler" => {
+                let path = require_string(value)?;
+                if path.len() > MAX_SOURCE_BYTES {
+                    return Err(ProjectError::Malformed { at: 0 });
+                }
+                bank_path = Some(path);
+            }
+            other => {
+                return Err(ProjectError::UnknownField {
+                    field: other.to_owned(),
+                });
+            }
+        }
+    }
+    let bank_path = bank_path.ok_or(ProjectError::MissingField {
+        field: "session.tracks[].instrument.sampler",
+    })?;
+    Ok(TrackInstrument::Sampler { bank_path })
 }
 
 fn require_string(value: &Value) -> Result<String, ProjectError> {

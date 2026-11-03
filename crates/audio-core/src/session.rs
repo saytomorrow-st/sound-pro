@@ -785,6 +785,23 @@ pub enum TrackFormat {
     Stereo,
 }
 
+/// The instrument a software-instrument (MIDI) track renders its clips with
+/// (SPEC-065 / RFC-001 §5). Pure data carried on [`Track`]; `audio-core` does
+/// not read files or load banks — that is the application's job.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TrackInstrument {
+    /// Built-in piano fallback. Default, and how pre-SPEC-065 project files
+    /// load unchanged.
+    #[default]
+    BuiltinPiano,
+    /// A locally loaded SFZ sample bank, identified by the path to its folder
+    /// as the user selected it (no download yet — RFC-001 PR 5–6).
+    Sampler {
+        /// Absolute path to the bank folder chosen in the file dialog.
+        bank_path: String,
+    },
+}
+
 impl TrackKind {
     /// Whether a clip of this kind of content belongs on such a track.
     #[must_use]
@@ -803,6 +820,9 @@ pub struct Track {
     pub name: String,
     /// Audio or software instrument (SPEC-049).
     pub kind: TrackKind,
+    /// Instrument used to render MIDI clips (SPEC-065). Ignored on audio
+    /// tracks; defaults to [`TrackInstrument::BuiltinPiano`].
+    pub instrument: TrackInstrument,
     /// Mono or stereo audio (SPEC-050 §5).
     pub format: TrackFormat,
     /// Linear track gain, `0.0..=1.0`.
@@ -903,6 +923,7 @@ impl Track {
         Self {
             name: name.to_owned(),
             kind: TrackKind::Audio,
+            instrument: TrackInstrument::BuiltinPiano,
             format: TrackFormat::Mono,
             gain: 1.0,
             pan: 0.0,

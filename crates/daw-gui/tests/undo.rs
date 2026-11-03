@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use audio_core::MAX_CLIPS_PER_TRACK;
 use audio_core::buffer::AudioBuffer;
 use audio_core::wav::{WavSpec, write_wav_mono};
+use audio_core::{TrackInstrument, TrackKind};
 use daw_gui::{Editor, UNDO_LIMIT};
 
 const RATE: u32 = 48_000;
@@ -314,5 +315,89 @@ fn undone_project_sounds_like_the_original() {
     assert_eq!(
         std::fs::read(&before).unwrap(),
         std::fs::read(&after).unwrap()
+    );
+}
+
+#[test]
+fn instrument_change_is_one_undoable_step() {
+    let mut editor = Editor::new();
+    editor.add_tracks(TrackKind::Instrument, 1, "lead").unwrap();
+    let before = editor.session().clone();
+
+    // Setting a sampler instrument is one undo step.
+    editor
+        .set_track_instrument(
+            0,
+            TrackInstrument::Sampler {
+                bank_path: "/tmp/example-bank".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_ne!(editor.session(), &before);
+    assert!(editor.can_undo());
+    assert!(editor.is_dirty());
+
+    assert!(editor.undo());
+    assert_eq!(editor.session(), &before);
+    assert!(editor.can_redo());
+    assert!(editor.redo());
+    assert!(matches!(
+        &editor.session().tracks[0].instrument,
+        TrackInstrument::Sampler { .. }
+    ));
+
+    // Switching back to the built-in piano is its own undo step.
+    editor
+        .set_track_instrument(0, TrackInstrument::BuiltinPiano)
+        .unwrap();
+    assert_eq!(editor.session(), &before);
+    assert!(editor.can_undo());
+    assert!(editor.undo());
+    assert!(matches!(
+        &editor.session().tracks[0].instrument,
+        TrackInstrument::Sampler { .. }
+    ));
+}
+
+#[test]
+fn setting_the_same_instrument_adds_no_step() {
+    let mut editor = Editor::new();
+    editor.add_tracks(TrackKind::Instrument, 1, "lead").unwrap();
+    let path = std::env::temp_dir().join(format!("daw-instr-{}.json", std::process::id()));
+    editor.save_as(&path).unwrap();
+    editor.open(&path).unwrap();
+    assert!(!editor.can_undo());
+
+    editor
+        .set_track_instrument(
+            0,
+            TrackInstrument::Sampler {
+                bank_path: "/tmp/bank".to_owned(),
+            },
+        )
+        .unwrap();
+    assert!(editor.can_undo());
+    editor
+        .set_track_instrument(
+            0,
+            TrackInstrument::Sampler {
+                bank_path: "/tmp/bank".to_owned(),
+            },
+        )
+        .unwrap();
+    // No new step: the second set was a no-op.
+    assert!(editor.undo());
+    assert!(!editor.can_undo());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn instrument_change_is_rejected_on_audio_tracks() {
+    let dir = Scratch::new("audio");
+    let mut editor = one_clip(&dir);
+    assert!(
+        editor
+            .set_track_instrument(0, TrackInstrument::BuiltinPiano)
+            .is_err()
     );
 }
