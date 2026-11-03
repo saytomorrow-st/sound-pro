@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use audio_core::Interpolation;
+
 /// Buffer sizes offered in the settings window, in frames.
 pub const BUFFER_SIZES: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 
@@ -19,6 +21,17 @@ pub struct AudioSettings {
     pub input: Option<String>,
     /// Device buffer size in frames.
     pub buffer_frames: Option<u32>,
+    /// Sampler interpolation quality (SPEC-068); linear by default.
+    pub interpolation: Interpolation,
+}
+
+/// The settings-file word for `interpolation`.
+#[must_use]
+pub const fn interpolation_name(interpolation: Interpolation) -> &'static str {
+    match interpolation {
+        Interpolation::Linear => "linear",
+        Interpolation::Hermite4 => "hermite",
+    }
 }
 
 impl AudioSettings {
@@ -42,6 +55,12 @@ impl AudioSettings {
                     settings.buffer_frames =
                         value.parse().ok().filter(|n| BUFFER_SIZES.contains(n));
                 }
+                "interpolation" => {
+                    settings.interpolation = match value {
+                        "hermite" => Interpolation::Hermite4,
+                        _ => Interpolation::Linear,
+                    };
+                }
                 _ => {}
             }
         }
@@ -60,6 +79,10 @@ impl AudioSettings {
         }
         if let Some(frames) = self.buffer_frames {
             text.push_str(&format!("buffer = {frames}\n"));
+        }
+        if self.interpolation != Interpolation::default() {
+            let name = interpolation_name(self.interpolation);
+            text.push_str(&format!("interpolation = {name}\n"));
         }
         text
     }

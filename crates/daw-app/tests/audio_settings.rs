@@ -7,6 +7,7 @@ fn full() -> AudioSettings {
         output: Some("USB Audio CODEC".into()),
         input: Some("Built-in Mic".into()),
         buffer_frames: Some(256),
+        interpolation: audio_core::Interpolation::Hermite4,
     }
 }
 
@@ -104,4 +105,36 @@ fn buffer_latency_in_milliseconds() {
     assert!((buffer_ms(480, 48_000) - 10.0).abs() < 1e-9);
     assert!((buffer_ms(256, 44_100) - 5.804_988_662).abs() < 1e-6);
     assert!(buffer_ms(256, 0).abs() < 1e-12);
+}
+
+#[test]
+fn interpolation_defaults_to_linear_and_round_trips() {
+    use audio_core::Interpolation;
+    assert_eq!(
+        AudioSettings::default().interpolation,
+        Interpolation::Linear
+    );
+    let s = AudioSettings {
+        interpolation: Interpolation::Hermite4,
+        ..AudioSettings::default()
+    };
+    assert!(s.to_text().contains("interpolation = hermite"));
+    assert_eq!(AudioSettings::parse(&s.to_text()), s);
+    let linear = AudioSettings::default();
+    assert_eq!(AudioSettings::parse(&linear.to_text()), linear);
+}
+
+#[test]
+fn invalid_interpolation_falls_back_to_linear() {
+    use audio_core::Interpolation;
+    for text in [
+        "interpolation = cubic\n",
+        "interpolation = \n",
+        "interpolation = HERMITE9\n",
+    ] {
+        assert_eq!(
+            AudioSettings::parse(text).interpolation,
+            Interpolation::Linear
+        );
+    }
 }

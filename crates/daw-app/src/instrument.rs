@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 use audio_core::synth::SynthError;
-use audio_core::{MidiEvent, MidiMessage, Note, SampleRegion, SamplerEngine};
+use audio_core::{Interpolation, MidiEvent, MidiMessage, Note, SampleRegion, SamplerEngine};
 
 use crate::sample_bank::LoadedBank;
 
@@ -67,6 +67,7 @@ impl Instrument for PianoInstrument {
 pub struct SamplerInstrument {
     regions: Vec<SampleRegion>,
     samples: Vec<Arc<[i16]>>,
+    interpolation: Interpolation,
 }
 
 impl SamplerInstrument {
@@ -83,7 +84,15 @@ impl SamplerInstrument {
         Self {
             regions: bank.regions.clone(),
             samples: bank.samples.clone(),
+            interpolation: Interpolation::default(),
         }
+    }
+
+    /// The same instrument rendering with `interpolation`.
+    #[must_use]
+    pub const fn with_interpolation(mut self, interpolation: Interpolation) -> Self {
+        self.interpolation = interpolation;
+        self
     }
 
     /// The regions the instrument plays.
@@ -99,11 +108,12 @@ impl SamplerInstrument {
     }
 
     fn build_engine(&self) -> Result<SamplerEngine, SynthError> {
-        SamplerEngine::new(
+        SamplerEngine::new_with(
             Self::SAMPLE_RATE,
             self.regions.clone(),
             self.samples.clone(),
             audio_core::DEFAULT_VOICES,
+            self.interpolation,
         )
         .map_err(|_| SynthError::InvalidSampleRate)
     }

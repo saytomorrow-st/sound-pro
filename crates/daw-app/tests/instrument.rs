@@ -478,3 +478,52 @@ fn export_falls_back_to_piano_for_a_missing_bank() {
         );
     });
 }
+
+#[test]
+fn hermite_export_differs_from_linear_and_is_deterministic() {
+    use audio_core::{Interpolation, TrackInstrument};
+    use daw_app::{NoCache, load_session_cached_with, render_session};
+
+    let dir = Scratch::new("export-interp");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let render = |name: &str, mode: Interpolation| {
+        let out = dir.join(name);
+        with_bank_data_dir(&data, || {
+            let bank_id = install_synthetic_bank(&data, "synthetic-sine", 69);
+            let session = midi_session(TrackInstrument::Sampler { bank_id });
+            let job =
+                load_session_cached_with(session, Path::new(""), out.clone(), &mut NoCache, mode)
+                    .expect("session loads");
+            render_session(job).expect("session renders");
+        });
+        read_mono(&out)
+    };
+
+    let linear = render("linear.wav", Interpolation::Linear);
+    let hermite_a = render("hermite-a.wav", Interpolation::Hermite4);
+    let hermite_b = render("hermite-b.wav", Interpolation::Hermite4);
+    let linear_b = render("linear-b.wav", Interpolation::Linear);
+
+    assert_eq!(linear.len(), hermite_a.len());
+    assert!(
+        linear
+            .iter()
+            .zip(&hermite_a)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "hermite export must differ from linear"
+    );
+    assert!(
+        hermite_a
+            .iter()
+            .zip(&hermite_b)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    assert!(
+        linear
+            .iter()
+            .zip(&linear_b)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+}
