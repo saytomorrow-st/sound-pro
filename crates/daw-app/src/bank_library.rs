@@ -65,6 +65,9 @@ pub enum LibraryError {
     /// The registry JSON is malformed.
     #[error("registry parse error: {0}")]
     Parse(String),
+    /// The operation was cancelled while waiting for a contended lock.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// A license as declared in a catalog manifest.
@@ -225,8 +228,10 @@ impl InstalledRegistry {
     }
 
     /// Writes the registry to `path`, creating its folder. The write is
-    /// atomic: it goes to a temp file next to `path`, then `rename`s over the
-    /// destination so a crash mid-write cannot leave a truncated registry.
+    /// atomic: it goes to a temp file next to `path`, which is fsynced before
+    /// being `rename`d over the destination, so a crash mid-write cannot leave
+    /// a truncated registry and a crash after the rename cannot lose the new
+    /// contents.
     pub fn save(&self, path: &Path) -> Result<(), LibraryError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -234,7 +239,16 @@ impl InstalledRegistry {
         }
         let text = self.to_text()?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, text).map_err(|e| LibraryError::Io(tmp.clone(), e.to_string()))?;
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| LibraryError::Io(tmp.clone(), e.to_string()))?;
+        use std::io::Write;
+        file.write_all(text.as_bytes())
+            .map_err(|e| LibraryError::Io(tmp.clone(), e.to_string()))?;
+        // Persist the temp file's contents before it becomes the registry, so
+        // the rename below cannot be reordered ahead of the data it points to.
+        file.sync_all()
+            .map_err(|e| LibraryError::Io(tmp.clone(), e.to_string()))?;
+        drop(file);
         std::fs::rename(&tmp, path).map_err(|e| LibraryError::Io(path.to_path_buf(), e.to_string()))
     }
 }
@@ -583,7 +597,14 @@ struct RegistryLock {
     _file: std::fs::File,
 }
 
-fn acquire_registry_lock(registry_file: &Path) -> Result<RegistryLock, LibraryError> {
+/// Acquires the registry lock, optionally honouring a cancellation flag when
+/// `Some`. A long contention retry loop honours the flag and aborts early with
+/// [`LibraryError::Cancelled`]. Used by the downloader so a user cancel is not
+/// delayed by up to the retry window.
+fn acquire_registry_lock_with_cancel(
+    registry_file: &Path,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<RegistryLock, LibraryError> {
     let lock_path = registry_file.with_extension("json.lock");
     if let Some(dir) = lock_path.parent() {
         std::fs::create_dir_all(dir)
@@ -595,20 +616,40 @@ fn acquire_registry_lock(registry_file: &Path) -> Result<RegistryLock, LibraryEr
         .truncate(false)
         .open(&lock_path)
         .map_err(|e| LibraryError::Io(lock_path.clone(), e.to_string()))?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(RegistryLock { _file: file }),
-        // Compare raw OS error codes, not `ErrorKind` (see `acquire_lock` in
-        // bank_download.rs): Windows reports `ERROR_LOCK_VIOLATION`, which is
-        // `ErrorKind::Other`, not `WouldBlock`.
-        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Err(LibraryError::Io(
-                lock_path,
-                "registry is locked by another process".to_owned(),
-            ))
+
+    let contended = fs2::lock_contended_error().raw_os_error();
+    let deadline = std::time::Instant::now() + LOCK_RETRY_WINDOW;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(RegistryLock { _file: file }),
+            // Compare raw OS error codes, not `ErrorKind` (see `acquire_lock`
+            // in bank_download.rs): Windows reports `ERROR_LOCK_VIOLATION`,
+            // which is `ErrorKind::Other`, not `WouldBlock`.
+            Err(e) if e.raw_os_error() == contended => {
+                if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return Err(LibraryError::Cancelled);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(LibraryError::Io(
+                        lock_path,
+                        "registry is locked by another process".to_owned(),
+                    ));
+                }
+                std::thread::sleep(LOCK_RETRY_PAUSE);
+            }
+            Err(e) => return Err(LibraryError::Io(lock_path, e.to_string())),
         }
-        Err(e) => Err(LibraryError::Io(lock_path, e.to_string())),
     }
 }
+
+/// How long to keep retrying a contended registry lock before giving up (the
+/// critical section is a millisecond-scale read-modify-write, so a lock held
+/// by another download finishing at the same moment is released almost
+/// immediately).
+const LOCK_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-attempt pause between registry-lock retries.
+const LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Appends (or replaces) a bank entry in the registry file at `registry_file`.
 ///
@@ -628,9 +669,20 @@ pub fn record_installed_bank(
     registry_file: &Path,
     bank: &InstalledBank,
 ) -> Result<(), LibraryError> {
+    record_installed_bank_with_cancel(registry_file, bank, None)
+}
+
+/// [`record_installed_bank`] with an optional cancellation flag threaded to the
+/// registry-lock acquisition, so the downloader can abort a contended lock
+/// instead of waiting out the retry window after the user cancels.
+pub(crate) fn record_installed_bank_with_cancel(
+    registry_file: &Path,
+    bank: &InstalledBank,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), LibraryError> {
     // Serialise the read-modify-write so two concurrent downloads of different
     // banks cannot lose one another's registry entry.
-    let _lock = acquire_registry_lock(registry_file)?;
+    let _lock = acquire_registry_lock_with_cancel(registry_file, cancel)?;
     let mut reg = InstalledRegistry::load(registry_file)?;
     reg.banks.retain(|b| b.id != bank.id);
     reg.banks.push(bank.clone());

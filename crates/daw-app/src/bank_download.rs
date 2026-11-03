@@ -39,6 +39,12 @@
 //!   registry write is temp+rename.
 //! - **Cancel**: the GUI flips a shared `AtomicBool`; every network read and
 //!   the unpack loop check it and abort with [`DownloadError::Cancelled`].
+//!
+//! Advisory locks use the `fs2` crate because `std::fs::File::try_lock` was
+//! stabilised only in Rust 1.89 and the project MSRV is 1.85. When the MSRV is
+//! raised to 1.89, [`acquire_lock`] and the registry lock in
+//! `bank_library` should move to `File::try_lock` and drop the `fs2`
+//! dependency.
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -325,7 +331,7 @@ fn download_bank_into_inner(
 
     // Sweep stale temp/old artifacts left by a previous interrupted run. Our
     // own lock is held, so it is not swept.
-    sweep_stale_artifacts(banks, &entry.id);
+    sweep_stale_artifacts(banks, &entry.id)?;
 
     // 1. Re-check the license before downloading anything.
     recheck_license(entry, license_check, cancel, https_required)?;
@@ -373,14 +379,18 @@ fn download_bank_into_inner(
         installed_at: crate::bank_library::timestamp(),
     };
     let registry_file = banks.join("banks.json");
-    if let Err(e) = crate::bank_library::record_installed_bank(&registry_file, &bank)
-        .map_err(|e| DownloadError::Io(registry_file, e.to_string()))
+    if let Err(e) =
+        crate::bank_library::record_installed_bank_with_cancel(&registry_file, &bank, Some(cancel))
+            .map_err(|e| DownloadError::Io(registry_file, e.to_string()))
     {
-        // Roll back: restore the previous install if there was one.
+        // Roll back: remove the newly-installed bank and restore the previous
+        // install if there was one. If the restore fails, surface that error
+        // (the previous install is still safely on disk as `.{id}.old.tmp`).
         let _ = std::fs::remove_dir_all(&final_dir);
         let old = banks.join(format!(".{}.old.tmp", entry.id));
         if old.exists() {
-            let _ = std::fs::rename(&old, &final_dir);
+            std::fs::rename(&old, &final_dir)
+                .map_err(|re| DownloadError::Io(old.clone(), re.to_string()))?;
         }
         return Err(e);
     }
@@ -417,49 +427,92 @@ fn acquire_lock(path: &Path) -> Result<BankLock, DownloadError> {
         // mapping is only reliable on Unix where it is `EWOULDBLOCK`). `fs2`
         // exposes the canonical contended error for the host platform.
         Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Err(DownloadError::AlreadyInProgress(
-                path.file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ))
+            Err(DownloadError::AlreadyInProgress(lock_id(path)))
         }
         Err(e) => Err(DownloadError::Io(path.to_path_buf(), e.to_string())),
     }
 }
 
-/// Removes stale `.<id>.download.*.tmp` and `.<id>.unpack.*.tmp` artifacts for
-/// `id`. The `.<id>.old.tmp` backup is handled specially: if `final_dir`
+/// The human-readable bank id for an `AlreadyInProgress` error, derived from a
+/// lock path `.{id}.lock` by stripping the leading `.` and trailing `.lock`.
+fn lock_id(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix('.'))
+        .and_then(|s| s.strip_suffix(".lock"))
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// Removes stale `.<id>.download.*.tmp`, `.<id>.unpack.*.tmp` and
+/// `.<id>.old.tmp` artifacts for `id`.
+///
+/// The `.<id>.old.tmp` backup is handled specially: if `final_dir`
 /// (`banks/<id>`) is missing but the backup still exists (a crash between
 /// `rename(final -> .old)` and `rename(tmp -> final)`), the backup is restored
 /// rather than deleted, so a failed re-download never loses the last good bank.
-fn sweep_stale_artifacts(banks: &Path, id: &str) {
+///
+/// If the restore fails (e.g. an antivirus holds the `.old.tmp` on Windows),
+/// the backup is deliberately left in place and the error is surfaced, so a
+/// later sweep never deletes the last working install behind our back.
+///
+/// Matching is explicit (three exact name shapes) rather than a `.{id}.`
+/// prefix, so an id containing a dot (`a.b`) is not confused with a sibling
+/// bank whose id is the prefix (`a`).
+fn sweep_stale_artifacts(banks: &Path, id: &str) -> Result<(), DownloadError> {
     let final_dir = banks.join(id);
     let old = banks.join(format!(".{id}.old.tmp"));
     if !final_dir.exists() && old.exists() {
         // Restore the interrupted previous install before anything else runs.
-        let _ = std::fs::rename(&old, &final_dir);
+        std::fs::rename(&old, &final_dir)
+            .map_err(|e| DownloadError::Io(old.clone(), e.to_string()))?;
     }
     let entries = match std::fs::read_dir(banks) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => return Err(DownloadError::Io(banks.to_path_buf(), e.to_string())),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| DownloadError::Io(banks.to_path_buf(), e.to_string()))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Staging names are `.{id}.download.{token}.tmp` and
-        // `.{id}.unpack.{token}.tmp`. The lock file `.{id}.lock` is left alone
-        // (advisory lock released by the kernel on exit), and `.{id}.old.tmp`
-        // was already handled above.
-        let is_stale = name.starts_with(&format!(".{id}.")) && name.ends_with(".tmp");
+        // `.{id}.unpack.{token}.tmp`, and the backup is `.{id}.old.tmp`. The
+        // lock file `.{id}.lock` is left alone (advisory lock released by the
+        // kernel on exit). We match these three shapes explicitly so an id that
+        // contains a dot (`a.b`) is never swept by a sibling id's prefix (`a`).
+        let is_stale = is_stale_artifact(id, &name);
         if is_stale {
             let path = entry.path();
             if path.is_dir() {
-                let _ = std::fs::remove_dir_all(&path);
+                std::fs::remove_dir_all(&path)
+                    .map_err(|e| DownloadError::Io(path.clone(), e.to_string()))?;
             } else {
-                let _ = std::fs::remove_file(&path);
+                std::fs::remove_file(&path)
+                    .map_err(|e| DownloadError::Io(path.clone(), e.to_string()))?;
             }
         }
     }
+    Ok(())
+}
+
+/// Whether `name` is a stale artifact (download/unpack staging or old backup)
+/// for `id`, matched against the three exact name shapes rather than a prefix.
+fn is_stale_artifact(id: &str, name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(&format!(".{id}.")) else {
+        return false;
+    };
+    let Some(stem) = rest.strip_suffix(".tmp") else {
+        return false;
+    };
+    // `.download.<digits>.tmp` / `.unpack.<digits>.tmp` — the token is all
+    // ASCII digits (nanoseconds xor pid); `.old.tmp` — the backup.
+    stem == "old"
+        || stem
+            .strip_prefix("download.")
+            .is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+        || stem
+            .strip_prefix("unpack.")
+            .is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A unique token for staging names (nanoseconds + pid), avoiding clobbering
@@ -923,6 +976,12 @@ fn safe_join(dest: &Path, name: &str) -> Result<PathBuf, DownloadError> {
 /// The previous install (if any) is renamed to `.<id>.old.tmp` first, the new
 /// tree is renamed into place, and the backup is removed by the caller after
 /// the registry write succeeds (or restored on rollback).
+///
+/// Before the final rename, the unpacked tree's directory entry is synced to
+/// disk (so the rename cannot be reordered before the data it points to), and
+/// the parent directory is fsynced so the rename itself is durable across a
+/// crash. On Windows directories cannot be opened for `sync_all`, so the
+/// directory fsync is Unix-only (`#[cfg(unix)]`).
 fn atomic_install(
     tmp_dir: &Path,
     final_dir: &Path,
@@ -937,8 +996,17 @@ fn atomic_install(
         std::fs::rename(final_dir, &old)
             .map_err(|e| DownloadError::Io(final_dir.to_path_buf(), e.to_string()))?;
     }
+    // Persist the unpacked tree before it is renamed into place, so a crash
+    // after the rename cannot leave a final_dir whose contents were never
+    // written to disk. This is part of the install; an fsync failure is an
+    // install failure and must not be swallowed.
+    fsync_dir_recursive(tmp_dir)?;
+    fsync_dir(banks)?;
     match std::fs::rename(tmp_dir, final_dir) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            fsync_dir(banks)?;
+            Ok(())
+        }
         Err(e) => {
             // Restore the previous install on failure.
             if old.exists() {
@@ -947,6 +1015,48 @@ fn atomic_install(
             Err(DownloadError::Io(tmp_dir.to_path_buf(), e.to_string()))
         }
     }
+}
+
+/// `sync_all` on a directory, so a rename/create within it is durable. This is
+/// a no-op on non-Unix, where opening a directory for `sync_all` is not
+/// supported (Windows dirs cannot be opened with a plain `File::open`).
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> Result<(), DownloadError> {
+    let file = std::fs::File::open(dir)
+        .map_err(|e| DownloadError::Io(dir.to_path_buf(), e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| DownloadError::Io(dir.to_path_buf(), e.to_string()))
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> Result<(), DownloadError> {
+    Ok(())
+}
+
+/// Recursively fsyncs every file and directory under `dir` (depth-first, dirs
+/// after their children), so the unpacked tree is fully durable before the
+/// atomic rename into its final location.
+fn fsync_dir_recursive(dir: &Path) -> Result<(), DownloadError> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| DownloadError::Io(dir.to_path_buf(), e.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| DownloadError::Io(dir.to_path_buf(), e.to_string()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            fsync_dir_recursive(&path)?;
+        } else {
+            // Open with write access: on Windows `sync_all` (`FlushFileBuffers`)
+            // requires a write handle, so a read-only `File::open` would fail
+            // with `Access is denied`. The unpacked files are all written by us.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| DownloadError::Io(path.clone(), e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| DownloadError::Io(path.clone(), e.to_string()))?;
+        }
+    }
+    fsync_dir(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,6 +1478,91 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn lock_id_strips_dot_and_lock_suffix() {
+        assert_eq!(lock_id(Path::new(".test-bank.lock")), "test-bank");
+        assert_eq!(lock_id(Path::new("/some/dir/.a.b.lock")), "a.b");
+        // A lock file with a dot in the id keeps the whole id, not just the
+        // first `file_stem` segment.
+        assert_eq!(lock_id(Path::new(".foo.bar.lock")), "foo.bar");
+        // No leading dot / no suffix → empty (defensive).
+        assert_eq!(lock_id(Path::new("test-bank.lock")), "");
+        assert_eq!(lock_id(Path::new(".test-bank")), "");
+    }
+
+    #[test]
+    fn stale_artifact_matches_exact_shapes_only() {
+        // The three recognised staging/backup shapes for id "a".
+        assert!(is_stale_artifact("a", ".a.download.123.tmp"));
+        assert!(is_stale_artifact("a", ".a.unpack.123.tmp"));
+        assert!(is_stale_artifact("a", ".a.old.tmp"));
+
+        // A sibling id "a.b" must never be swept by id "a" (prefix collision).
+        assert!(!is_stale_artifact("a", ".a.b.download.123.tmp"));
+        assert!(!is_stale_artifact("a", ".a.b.unpack.123.tmp"));
+        assert!(!is_stale_artifact("a", ".a.b.old.tmp"));
+
+        // The lock file is never a stale artifact.
+        assert!(!is_stale_artifact("a", ".a.lock"));
+
+        // Non-digit tokens are not download/unpack staging names.
+        assert!(!is_stale_artifact("a", ".a.download.notdigits.tmp"));
+        assert!(!is_stale_artifact("a", ".a.unpack.123x.tmp"));
+        // Missing `.tmp` suffix or wrong id.
+        assert!(!is_stale_artifact("a", ".a.download.123"));
+        assert!(!is_stale_artifact("b", ".a.download.123.tmp"));
+    }
+
+    #[test]
+    fn sweep_restores_old_backup_when_final_missing() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        // A previous install was left in `.{id}.old.tmp` with no final dir
+        // (crash between `rename(final -> .old)` and `rename(tmp -> final)`).
+        let old = dir.join(".test-bank.old.tmp");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("bank.sfz"), b"data").unwrap();
+
+        sweep_stale_artifacts(&dir, "test-bank").unwrap();
+
+        // The backup is restored, not deleted.
+        assert!(dir.join("test-bank").join("bank.sfz").exists());
+        assert!(!old.exists(), "the backup must be moved back into place");
+    }
+
+    #[test]
+    fn sweep_keeps_old_backup_when_final_exists() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        // Both a final dir and a stale backup exist; the final dir wins, so the
+        // backup is treated as a stale artifact and removed.
+        std::fs::create_dir_all(dir.join("test-bank")).unwrap();
+        let old = dir.join(".test-bank.old.tmp");
+        std::fs::create_dir_all(&old).unwrap();
+
+        sweep_stale_artifacts(&dir, "test-bank").unwrap();
+
+        assert!(dir.join("test-bank").exists());
+        assert!(
+            !old.exists(),
+            "a stale backup must be removed when final exists"
+        );
+    }
+
+    #[test]
+    fn sweep_does_not_delete_sibling_bank_with_dotted_id() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        // A staging artifact for bank "a.b" must survive a sweep of bank "a".
+        let sibling = dir.join(".a.b.download.123.tmp");
+        std::fs::write(&sibling, b"partial").unwrap();
+        // And a genuine stale artifact for "a".
+        let mine = dir.join(".a.download.456.tmp");
+        std::fs::write(&mine, b"partial").unwrap();
+
+        sweep_stale_artifacts(&dir, "a").unwrap();
+
+        assert!(sibling.exists(), "a.b's artifact must not be swept by a");
+        assert!(!mine.exists(), "a's own artifact must be swept");
     }
 }
 
@@ -2662,13 +2857,16 @@ mod http_tests {
 
     #[test]
     fn zip_actual_bytes_count_against_total_limit() {
-        // Declared size is accurate (10 bytes), but the total unpacked limit is
-        // smaller. This asserts the running total is derived from *actual*
-        // bytes, not the declared size, and trips mid-file.
-        let archive = make_zip_bytes(&[
-            ("bank/a.wav", &[b'a'; 10][..]),
-            ("bank/b.wav", &[b'b'; 10][..]),
-        ]);
+        // A single entry whose *declared* (central-directory) size is forged
+        // down to 4 bytes, while the real content is 20 bytes. The total
+        // unpacked limit is set to 8 — above the forged declared size, but
+        // below the real content. On the pre-fix code, `register` summed the
+        // *declared* size (4 ≤ 8), trusted it, and wrote all 20 bytes, so the
+        // download returned `Ok`; real-byte accounting must reject this. The
+        // forged-size `Take(declared+1)` guard trips first with `UnsafeEntry`.
+        let mut archive = make_zip_bytes(&[("bank/a.wav", &[b'a'; 20][..])]);
+        forge_zip_uncompressed_size(&mut archive, 4);
+
         let dir = temp_banks_dir("zip-total");
         let archive_path = dir.join("archive.zip");
         std::fs::write(&archive_path, &archive).unwrap();
@@ -2677,13 +2875,13 @@ mod http_tests {
 
         let limits = Limits {
             max_entries: 100_000,
-            max_total_unpacked: 15,
+            max_total_unpacked: 8,
             max_entry_bytes: 1_000_000,
         };
         let result = unpack_zip(&archive_path, &dest, &cancel_flag(), &limits);
         assert!(
-            matches!(result, Err(DownloadError::UnpackLimitExceeded { .. })),
-            "actual bytes must trip the total limit: {result:?}"
+            result.is_err(),
+            "real (not declared) bytes must be enforced: {result:?}"
         );
     }
 
@@ -2716,20 +2914,68 @@ mod http_tests {
 
     #[test]
     fn cancel_mid_stream_aborts_unpack() {
-        let archive = make_zip_bytes(&[("bank/big.wav", &[b'z'; 1_000_000][..])]);
+        // A large single entry (~4 MiB) so the copy loop spans many 64 KiB
+        // chunks; the cancel flag is flipped only after the output file has
+        // grown past one chunk, i.e. *during* the copy, not before it. This
+        // verifies the loop's mid-copy cancellation check, not the pre-loop
+        // check (which a flag set before the call would only exercise).
+        const CHUNK: usize = 64 * 1024;
+        let data = vec![b'z'; 4 * 1024 * 1024];
+        let archive = make_zip_bytes(&[("bank/big.wav", &data[..])]);
         let dir = temp_banks_dir("mid-cancel");
         let archive_path = dir.join("archive.zip");
         std::fs::write(&archive_path, &archive).unwrap();
         let dest = dir.join("out");
         std::fs::create_dir_all(&dest).unwrap();
+        let out_file = dest.join("bank").join("big.wav");
 
         let limits = Limits {
             max_entries: 100_000,
             max_total_unpacked: 1_000_000_000,
             max_entry_bytes: 1_000_000_000,
         };
-        let cancel = Arc::new(AtomicBool::new(true));
+
+        // Flip the cancel flag once the first chunk has been written, so the
+        // next iteration of the copy loop observes it and aborts mid-copy.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_thread = Arc::clone(&cancel);
+        let out_file_for_thread = out_file.clone();
+        let flipper = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let size = std::fs::metadata(&out_file_for_thread)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if size >= CHUNK as u64 {
+                    cancel_for_thread.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("cancel flipper timed out waiting for the first chunk");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
         let result = unpack_zip(&archive_path, &dest, &cancel, &limits);
-        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        join_with_timeout(flipper, std::time::Duration::from_secs(30));
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "unpack must be cancelled mid-copy: {result:?}"
+        );
+
+        // The file was interrupted part-way: it exists but holds fewer bytes
+        // than the full entry, proving the cancel fired mid-copy rather than
+        // before any work was done.
+        let written = std::fs::metadata(&out_file).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            written > 0,
+            "some bytes must have been written before cancel"
+        );
+        assert!(
+            (written as usize) < data.len(),
+            "unpack must not complete: wrote {written} of {}",
+            data.len()
+        );
     }
 }
