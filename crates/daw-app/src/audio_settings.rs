@@ -87,16 +87,49 @@ fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
-/// Default settings file: `$XDG_CONFIG_HOME/sound-pro/audio.conf`,
-/// `~/.config/sound-pro/audio.conf`, or `%APPDATA%\sound-pro\audio.conf`.
+/// The config directory: `$XDG_CONFIG_HOME/sound-pro`,
+/// `~/.config/sound-pro`, or `%APPDATA%\sound-pro`.
 #[must_use]
-pub fn default_path() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("sound-pro").join("audio.conf"))
+    Some(base.join("sound-pro"))
+}
+
+/// Default settings file: `$XDG_CONFIG_HOME/sound-pro/audio.conf`,
+/// `~/.config/sound-pro/audio.conf`, or `%APPDATA%\sound-pro\audio.conf`.
+#[must_use]
+pub fn default_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("audio.conf"))
+}
+
+/// Marker file recording that the first-run dialog has been shown (SPEC-066).
+#[must_use]
+pub fn first_run_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("first-run-done"))
+}
+
+/// Whether the first-run dialog has already been acknowledged (SPEC-066).
+#[must_use]
+pub fn first_run_done() -> bool {
+    first_run_path().is_some_and(|p| p.exists())
+}
+
+/// Marks the first-run dialog as acknowledged, creating the config folder.
+///
+/// # Errors
+///
+/// The I/O error from creating the folder or writing the marker.
+pub fn mark_first_run_done() -> std::io::Result<()> {
+    let path = first_run_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no config directory"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, b"1")
 }
 
 /// Buffer size to ask the device for (SPEC-033).

@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "salamander-grand-v3",
+  "name": "Salamander Grand Piano V3",
+  "family": "piano",
+  "version": "3",
+  "author": "Alexander Holm",
+  "license": {
+    "spdx": "CC-BY-3.0",
+    "url": "https://creativecommons.org/licenses/by/3.0/",
+    "attribution_required": true
+  },
+  "attribution": "Salamander Grand Piano by Alexander Holm, CC-BY 3.0",
+  "source_url": "https://archive.org/details/SalamanderGrandPianoV3",
+  "sha256": null,
+  "size_bytes": null,
+  "verified": false
+}

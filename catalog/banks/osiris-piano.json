@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "osiris-piano",
+  "name": "Osiris Piano",
+  "family": "piano",
+  "version": "1",
+  "author": "Versilian Studios and Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Osiris Piano by Versilian Studios and Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/Osiris_Piano",
+  "sha256": null,
+  "size_bytes": null,
+  "verified": false
+}

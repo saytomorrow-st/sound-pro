@@ -29,6 +29,7 @@ use audio_core::wav::{BitDepth, Recorder, WavSpec, write_mono_slice, write_wav_p
 
 pub mod audio_file;
 pub mod audio_settings;
+pub mod bank_library;
 pub mod instrument;
 pub mod meters;
 pub mod nodes;
