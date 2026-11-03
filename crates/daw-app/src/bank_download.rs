@@ -1066,7 +1066,12 @@ fn fsync_dir_recursive(dir: &Path) -> Result<(), DownloadError> {
         if path.is_dir() {
             fsync_dir_recursive(&path)?;
         } else {
-            let file = std::fs::File::open(&path)
+            // Open with write access: on Windows `sync_all` (`FlushFileBuffers`)
+            // requires a write handle, so a read-only `File::open` would fail
+            // with `Access is denied`. The unpacked files are all written by us.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
                 .map_err(|e| DownloadError::Io(path.clone(), e.to_string()))?;
             file.sync_all()
                 .map_err(|e| DownloadError::Io(path.clone(), e.to_string()))?;
