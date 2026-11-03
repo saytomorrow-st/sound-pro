@@ -577,7 +577,7 @@ enum DownloadMsg {
     /// The download finished (success or failure).
     Done {
         bank_id: String,
-        result: Result<daw_app::bank_library::InstalledBank, String>,
+        result: Result<daw_app::bank_library::InstalledBank, daw_app::bank_download::DownloadError>,
     },
 }
 
@@ -2104,6 +2104,10 @@ impl App {
             self.library_status = "Загрузка недоступна для этого банка".to_owned();
             return;
         };
+        // A bank already downloading must not start a second worker (H4).
+        if self.downloads.contains_key(&entry.id) {
+            return;
+        }
         let progress = daw_app::bank_download::Progress::new(download.size_bytes);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let bank_id = entry.id.clone();
@@ -2117,10 +2121,7 @@ impl App {
         let tx = self.download_tx.clone();
         std::thread::spawn(move || {
             let result = daw_app::bank_download::download_bank(&entry, &progress, &cancel);
-            let _ = tx.send(DownloadMsg::Done {
-                bank_id,
-                result: result.map_err(|e| e.to_string()),
-            });
+            let _ = tx.send(DownloadMsg::Done { bank_id, result });
         });
     }
 
@@ -2135,13 +2136,16 @@ impl App {
                     self.library_status = format!("Скачано и установлено: {}", bank.name);
                     self.refresh_installed_banks();
                 }
+                Err(daw_app::bank_download::DownloadError::Cancelled) => {
+                    self.library_status = "Загрузка отменена".to_owned();
+                }
                 Err(e) => {
                     self.library_status = format!("Ошибка загрузки: {e}");
                 }
             }
         }
         if !self.downloads.is_empty() {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
@@ -2166,6 +2170,7 @@ impl App {
                 ui.strong(&entry.name);
                 ui.label(format!("Автор: {}", entry.author));
                 ui.label(format!("Лицензия: {}", entry.license.spdx));
+                ui.label(format!("Источник лицензии: {}", entry.license.url));
                 if !entry.attribution.is_empty() {
                     ui.label(format!("Атрибуция: {}", entry.attribution));
                 }

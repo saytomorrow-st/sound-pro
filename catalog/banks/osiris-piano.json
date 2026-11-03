@@ -15,14 +15,15 @@
   "sha256": "54ef210b671ea38c4e77291714b5376af28f35803f7c1338737d0f402de02768",
   "size_bytes": 458671376,
   "license_check": {
-    "url": "https://api.github.com/repos/sfzinstruments/Osiris_Piano/license",
+    "url": "https://api.github.com/repos/sfzinstruments/Osiris_Piano/license?ref=v0.925",
     "sha256": null,
     "mode": "metadata"
   },
   "download": {
     "url": "https://github.com/sfzinstruments/Osiris_Piano/releases/download/v0.925/Osiris_Piano_0925.zip",
     "sha256": "54ef210b671ea38c4e77291714b5376af28f35803f7c1338737d0f402de02768",
-    "size_bytes": 458671376
+    "size_bytes": 458671376,
+    "redirect_hosts": [".githubusercontent.com"]
   },
   "sfz": "Osiris Piano/Programs/01-natural.sfz",
   "format": "zip",

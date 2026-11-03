@@ -125,15 +125,23 @@ SPDX), (3) безопасная распаковка с защитой от zip-
 API достаточен: загрузка идёт в отдельном потоке). `ureq` тянет `rustls`
 (→ `ring`, чистый Rust; собирается C-компилятором только на машине сборки, у
 пользователя ничего не требуется) и `rustls-native-certs`/`webpki-roots` для
-корневых сертификатов. Выбор и цена по размеру — в §7 «Риски».
+корневых сертификатов. `url` — только для `Url::join` (относительные
+редиректы по RFC 3986) и сравнения host/port; `tempfile` — только
+dev-dependency для изолированных временных каталогов в тестах. Выбор и цена
+по размеру — в §7 «Риски».
 
 Поведение клиента (тип `HttpOptions`):
 
 - **Таймауты**: connect 10 с, общий read 30 с (разрешает медленное
   скачивание большого архива), для `license_check` — read 10 с.
-- **Redirects**: разрешён редирект на тот же хост (same-origin, сравнение
-  по `host`); редирект на другой хост — блокируется ошибкой
-  `RedirectToOtherHost` («Источник изменился»). Максимум 5 редиректов.
+- **Redirects**: каждый `download` в каталоге несёт `redirect_hosts`
+  allow-list (только HTTPS; точный хост или `.suffix`). Редирект на хост из
+  списка разрешён, на невключённый хост — `RedirectToOtherHost`, а
+  понижение HTTPS→HTTP — `InsecureUrl` (целостность держит SHA-256). Относительные
+  `Location` резолвятся через `Url::join` (RFC 3986); сравнение хостов —
+  регистронезависимо с нормализацией портов по умолчанию. Максимум 5
+  редиректов; 3xx без `Location` — ошибка `RedirectMissingLocation`, а не
+  `TooManyRedirects`.
 - **TLS**: только HTTPS для данных (`download.url`), `rustls` с проверкой
   сертификата. `http://` для данных запрещён (ошибка `InsecureUrl`).
 - **Размер**: `Content-Length` сверяется с `download.size_bytes` (лимит);
@@ -328,8 +336,9 @@ DownloadError>` (выполняется в отдельном потоке):
 проигнорированы с предупреждением, и много-микрофонные программы загрузятся в
 упрощённом виде (один слой микрофона). Кроме того, `sample=`-ссылки вида
 `sample=../UC/A/Piano_UC_MicA_A-1_vl1.flac` используют `..` относительно
-`Programs/modules/mappings/`, а текущий `resolve_sample_path` не нормализует
-`..`. Без ремаппинга часть сэмплов не найдётся. Это документируется в PR как
+`Programs/modules/mappings/`, что `confine_path` разрешает **в пределах корня
+банка** (обратный слэш нормализуется в `/`, `..` не может выйти выше корня —
+иначе `None` и запись о decode-failure). Это документируется в PR как
 известное ограничение, а не исправляется молча.
 
 ### Salamander Grand Piano V3 (tar.bz2, CC-BY-3.0)
@@ -339,7 +348,7 @@ DownloadError>` (выполняется в отдельном потоке):
 - `download.size_bytes`: `488713261`
 - `license_check.url`: `https://creativecommons.org/licenses/by/3.0/legalcode.txt`
 - `license_check.mode`: `text-hash` (хэш нормализованного текста CC-BY 3.0
-  legalcode: `e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76`)
+  legalcode: `11dbf7126ae9794e4a7dc54334f3c82a67efcf22df888d396dc2ed707b2a3f9b`)
 - `sfz`: `SalamanderGrandPianoV3_44.1khz16bit/SalamanderGrandPianoV3.sfz`
 - Формат: `.tar.bz2` (WAV 16-бит, **не** FLAC/zip как в черновике RFC),
   верхняя папка `SalamanderGrandPianoV3_44.1khz16bit/`, внутри
@@ -347,9 +356,10 @@ DownloadError>` (выполняется в отдельном потоке):
   `SalamanderGrandPianoV3Retuned.sfz` + `README`.
 
 **Предупреждение о путях (для PR).** SFZ использует `sample=44.1khz16bit\A0v1.wav`
-(обратный слэш `\` как разделитель) — на Linux/Windows путь надо
-нормализовать (`\`→`/`) при разрешении сэмплов, иначе `resolve_sample_path`
-(`dir.join(sample)`) не найдёт файлы. Документируется в PR.
+(обратный слэш `\` как разделитель) — при разрешении сэмплов путь
+нормализуется (`\`→`/`) в `confine_path` (покрыто тестом
+`confine_path_normalises_backslashes`), так что на Linux/Windows файлы
+находятся.
 
 **Замечание о лицензии Salamander.** `archive.org` отдаёт только
 md5/sha1/crc32 (не sha256); SHA-256 вычислен вручную из скачанного архива.

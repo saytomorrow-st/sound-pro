@@ -151,6 +151,18 @@ pub struct Download {
     pub sha256: String,
     /// Pinned size in bytes, verified by the owner.
     pub size_bytes: u64,
+    /// Hosts the download may redirect to (HTTPS only). Each entry is either
+    /// an exact host or a `.`-prefixed suffix (matching `host` and any
+    /// subdomain). The pinned URL's own host is always allowed. Empty (the
+    /// SPEC-066-compatible default) means redirects stay same-host only.
+    ///
+    /// Many real archives redirect to a CDN with a *different* host than the
+    /// pinned URL (e.g. `github.com` → `release-assets.githubusercontent.com`,
+    /// `archive.org` → `dn*.ca.archive.org`), so a pure same-host rule would
+    /// block every bank. The SHA-256 still guarantees integrity even when the
+    /// bytes come from a CDN.
+    #[serde(default)]
+    pub redirect_hosts: Vec<String>,
 }
 
 /// A bank the user installed from a local SFZ folder (SPEC-066).
@@ -212,14 +224,18 @@ impl InstalledRegistry {
         }
     }
 
-    /// Writes the registry to `path`, creating its folder.
+    /// Writes the registry to `path`, creating its folder. The write is
+    /// atomic: it goes to a temp file next to `path`, then `rename`s over the
+    /// destination so a crash mid-write cannot leave a truncated registry.
     pub fn save(&self, path: &Path) -> Result<(), LibraryError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| LibraryError::Io(dir.to_path_buf(), e.to_string()))?;
         }
-        std::fs::write(path, self.to_text()?)
-            .map_err(|e| LibraryError::Io(path.to_path_buf(), e.to_string()))
+        let text = self.to_text()?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text).map_err(|e| LibraryError::Io(tmp.clone(), e.to_string()))?;
+        std::fs::rename(&tmp, path).map_err(|e| LibraryError::Io(path.to_path_buf(), e.to_string()))
     }
 }
 
@@ -282,6 +298,14 @@ pub fn validate_catalog_entry(entry: &CatalogEntry) -> Result<(), CatalogError> 
             entry.id.clone(),
         ));
     }
+    if !is_valid_entry_id(&entry.id) {
+        return Err(CatalogError::MissingField("id", entry.id.clone()));
+    }
+    if let Some(sfz) = &entry.sfz {
+        if !is_valid_sfz_path(sfz) {
+            return Err(CatalogError::MissingField("sfz", entry.id.clone()));
+        }
+    }
     if is_forbidden(spdx) || is_share_alike(spdx) {
         return Err(CatalogError::ForbiddenLicense(spdx.to_owned()));
     }
@@ -320,11 +344,41 @@ fn validate_download(entry: &CatalogEntry) -> Result<(), CatalogError> {
             "size_bytes must be positive",
         ));
     }
+    for host in &dl.redirect_hosts {
+        if !is_valid_redirect_host(host) {
+            return Err(CatalogError::BadDownload(
+                entry.id.clone(),
+                "redirect_hosts entries must be exact hosts or .-suffixed suffixes",
+            ));
+        }
+    }
     match entry.format.as_str() {
         "zip" | "tar.bz2" => {}
         other => return Err(CatalogError::BadFormat(other.to_owned(), entry.id.clone())),
     }
     Ok(())
+}
+
+/// Whether a `redirect_hosts` entry is well-formed: a non-empty hostname
+/// (letters, digits, `-`, `.`), optionally with a leading `.` to mean "this
+/// host and any subdomain". No scheme, port, path, or whitespace is allowed.
+#[must_use]
+pub fn is_valid_redirect_host(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let body = s.strip_prefix('.').unwrap_or(s);
+    if body.is_empty() {
+        return false;
+    }
+    body.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        && !body.starts_with('.')
+        && !body.ends_with('.')
+        && body
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'))
 }
 
 /// Validates the optional `license_check` block of a catalog entry.
@@ -360,6 +414,41 @@ fn validate_license_check(entry: &CatalogEntry) -> Result<(), CatalogError> {
         }
     }
     Ok(())
+}
+
+/// Whether `s` is a valid catalog entry id: `^[a-z0-9][a-z0-9._-]{0,63}$`,
+/// and not a reserved name (e.g. the registry file `banks.json`).
+#[must_use]
+pub fn is_valid_entry_id(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    if !chars
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-')
+    {
+        return false;
+    }
+    if s.len() > 64 {
+        return false;
+    }
+    // Reserved names that would collide with files we manage next to the bank
+    // directory (the registry, temp/lock artifacts).
+    !matches!(s, "banks" | "banks.json" | "registry")
+}
+
+/// Whether `s` is a valid archive-relative `sfz` path: non-empty, `/`-separated
+/// relative `Normal` components only (no `..`, `.`, empty, `\`, drive letters,
+/// or leading `/`).
+#[must_use]
+pub fn is_valid_sfz_path(s: &str) -> bool {
+    if s.is_empty() || s.starts_with('/') || s.contains('\\') || s.contains(':') {
+        return false;
+    }
+    s.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 /// Whether a catalog entry is downloadable now (SPEC-067): it has a verified

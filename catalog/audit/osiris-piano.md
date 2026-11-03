@@ -1,7 +1,7 @@
 # Аудит: Osiris Piano
 
 - **id**: `osiris-piano`
-- **Дата проверки**: 2026 (SPEC-067, PR 6)
+- **Дата проверки**: 2026-11-03 (SPEC-067, PR 6)
 - **Метод**: реальная загрузка архива и страницы лицензии с апстрима.
 
 ## Источник
@@ -20,9 +20,17 @@
 - **SPDX**: `CC0-1.0`
 - **attribution_required**: `false`
 - **license_check**: mode `metadata` — получаем SPDX из
-  `https://api.github.com/repos/sfzinstruments/Osiris_Piano/license`
-  (поле `license.spdx_id`), сравниваем с `CC0-1.0`. `sha256` отсутствует
+  `https://api.github.com/repos/sfzinstruments/Osiris_Piano/license?ref=v0.925`
+  (поле `license.spdx_id`, привязано к тегу `v0.925`, а не к ветке по
+  умолчанию `main`), сравниваем с `CC0-1.0`. `sha256` отсутствует
   (в режиме `metadata` сравнение идёт по SPDX, а не по хэшу текста).
+
+## Редиректы
+
+`download.url` на `github.com` (`…/releases/download/v0.925/…`) отвечает `302`
+на `https://release-assets.githubusercontent.com/…`. В
+`download.redirect_hosts` добавлен `.githubusercontent.com` (HTTPS-only,
+суффикс). SHA-256 архива по-прежнему гарантирует целостность.
 
 ## Замечания для интеграции
 

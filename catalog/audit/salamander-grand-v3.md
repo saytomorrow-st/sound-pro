@@ -1,7 +1,7 @@
 # Аудит: Salamander Grand Piano V3
 
 - **id**: `salamander-grand-v3`
-- **Дата проверки**: 2026 (SPEC-067, PR 6)
+- **Дата проверки**: 2026-11-03 (SPEC-067, PR 6)
 - **Метод**: реальная загрузка архива и текста лицензии с апстрима.
 
 ## Источник
@@ -21,9 +21,16 @@
 - **attribution_required**: `true`
 - **license_check**: mode `text-hash` — загружаем
   `https://creativecommons.org/licenses/by/3.0/legalcode.txt`, нормализуем
-  (UTF-8, trim, CRLF→LF), считаем SHA-256 и сравниваем с закреплённым
-  значением. Хэш:
-  `e6bc9e9c474700b708f568bac9e5a8a9bcb2b1dad53442f5ba449fcb848b8e76`.
+  (UTF-8 lossy, trim, CRLF→LF), считаем SHA-256 и сравниваем с закреплённым
+  значением. Файл: **19467 байт**. Хэш:
+  `11dbf7126ae9794e4a7dc54334f3c82a67efcf22df888d396dc2ed707b2a3f9b`.
+
+## Редиректы
+
+`download.url` на `archive.org` отвечает `302` на
+`https://dn*.ca.archive.org/0/items/…`. В `download.redirect_hosts` добавлен
+`.ca.archive.org` (HTTPS-only, суффикс — любой поддомен `dn*`). SHA-256
+архива по-прежнему гарантирует целостность, независимо от CDN-хоста.
 
 ## Замечания для интеграции
 

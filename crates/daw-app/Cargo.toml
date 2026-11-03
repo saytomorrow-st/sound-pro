@@ -30,7 +30,14 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "fla
 # SPEC-067: HTTP download (rustls, no OpenSSL), archive hashing, and safe
 # unpacking (zip for Osiris, tar.bz2 for Salamander). All pure Rust at runtime;
 # `ring`/`bzip2-sys` compile C at build time only (end users install nothing).
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+#
+# `gzip` (transparent Content-Encoding decoding) is intentionally disabled so
+# the size cap and SHA-256 apply to the real bytes; we send no Accept-Encoding.
+# `url` is used only for RFC 3986 relative-redirect resolution (Url::join) and
+# host/port comparison — hand-rolling it caused the redirect bug fixed in
+# SPEC-067 §5.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
@@ -42,3 +49,5 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 bzip2 = "0.5"
 sha2 = "0.10"
+# Scoped temp dirs for integration tests (no reliance on /tmp naming).
+tempfile = "3"
