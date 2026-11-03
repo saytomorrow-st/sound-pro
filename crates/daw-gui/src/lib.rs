@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod dialog;
 pub mod layout;
 pub mod quantize;
 pub mod timeline;
