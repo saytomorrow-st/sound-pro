@@ -836,6 +836,18 @@ struct App {
     /// The audio settings window is open, with the device names last listed.
     audio_open: bool,
     about_open: bool,
+    /// The sound library window is open (SPEC-066).
+    library_open: bool,
+    /// The credits window is open (SPEC-066).
+    credits_open: bool,
+    /// The first-run dialog is open (SPEC-066).
+    first_run_open: bool,
+    /// Installed banks from the registry, refreshed when the window opens.
+    installed_banks: Vec<daw_app::bank_library::InstalledBank>,
+    /// Last library/credits operation result, shown as a status line.
+    library_status: String,
+    /// A pending local import awaiting license acknowledgement (SPEC-066).
+    install_license: Option<InstallLicense>,
     /// The «Новая дорожка» dialog, when open (SPEC-049).
     new_track: Option<shell::NewTrack>,
     outputs: Vec<String>,
@@ -859,6 +871,18 @@ enum TempoAction {
     Move(usize, u64),
     Edit(usize),
     Delete(usize),
+}
+
+/// A pending local SFZ import awaiting a license choice (SPEC-066 §3).
+struct InstallLicense {
+    /// The source folder the user picked.
+    source_dir: PathBuf,
+    /// SPDX identifier chosen by the user.
+    spdx: String,
+    /// Attribution text (optional).
+    attribution: String,
+    /// The share-alike/GPL acknowledgement checkbox.
+    acknowledged: bool,
 }
 
 /// State of a track-header height resize drag (SPEC-056 §1).
@@ -906,6 +930,40 @@ fn buffer_label(frames: u32, rate: u32) -> String {
         "{frames} ({:.1} мс)",
         daw_app::audio_settings::buffer_ms(frames, rate)
     )
+}
+
+/// Licenses a user may pick for a purely-local import (SPEC-066 §3). Share-alike
+/// and GPL entries require an acknowledgement; NC/ND are never offered.
+const LOCAL_LICENSES: [&str; 7] = [
+    "CC0-1.0",
+    "Unlicense",
+    "MIT",
+    "BSD-2-Clause",
+    "CC-BY-4.0",
+    "CC-BY-SA-4.0",
+    "GPL-3.0-only",
+];
+
+/// A filesystem-safe id from a folder name (lowercase, alphanumeric + `-`).
+fn slug(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bank".to_owned());
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_owned();
+    if out.is_empty() {
+        "bank".to_owned()
+    } else {
+        out
+    }
 }
 
 impl App {
@@ -1004,6 +1062,12 @@ impl App {
             audio_path: daw_app::audio_settings::default_path(),
             audio_open: false,
             about_open: false,
+            library_open: false,
+            credits_open: false,
+            first_run_open: false,
+            installed_banks: Vec::new(),
+            library_status: String::new(),
+            install_license: None,
             new_track: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -1014,6 +1078,7 @@ impl App {
         if let Some(path) = &app.audio_path {
             app.audio = AudioSettings::load(path);
         }
+        app.first_run_open = !daw_app::audio_settings::first_run_done();
         if let Some(path) = start {
             app.open(path);
         }
@@ -2406,6 +2471,15 @@ impl App {
                 }
             });
             ui.menu_button("Справка", |ui| {
+                if ui.button("Библиотека звуков…").clicked() {
+                    self.open_library();
+                    ui.close();
+                }
+                if ui.button("Авторы…").clicked() {
+                    self.credits_open = true;
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("О программе").clicked() {
                     self.about_open = true;
                     ui.close();
@@ -6292,8 +6366,331 @@ impl App {
                 ui.heading(format!("Sound Pro {}", env!("CARGO_PKG_VERSION")));
                 ui.label("Открытая DAW для Linux и Windows.");
                 ui.separator();
-                ui.label(daw_app::piano::PIANO_CREDIT);
+                ui.label("Авторы сторонних звуков — в меню Справка → Авторы….");
+                if ui.button("Открыть список авторов").clicked() {
+                    self.credits_open = true;
+                }
             });
+    }
+
+    /// Opens the sound library window, refreshing the installed list (SPEC-066).
+    fn open_library(&mut self) {
+        self.library_open = true;
+        self.refresh_installed_banks();
+    }
+
+    /// Reloads the installed-bank list into `installed_banks` (SPEC-066).
+    fn refresh_installed_banks(&mut self) {
+        match daw_app::bank_library::list_installed() {
+            Ok(banks) => self.installed_banks = banks,
+            Err(e) => self.library_status = e.to_string(),
+        }
+    }
+
+    /// The sound library window: catalog + installed banks with status
+    /// (SPEC-066 §4). Download is deferred to SPEC-067, so catalog entries
+    /// are installed from a local SFZ folder instead.
+    fn library_window(&mut self, ctx: &egui::Context) {
+        if !self.library_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Библиотека звуков")
+            .id(egui::Id::new("library"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| self.library_ui(ui));
+        if !open {
+            self.library_open = false;
+        }
+    }
+
+    fn library_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("Каталог звуков. Мы не храним банки — только список с лицензиями.");
+        ui.add_space(6.0);
+
+        let catalog = match daw_app::bank_library::catalog() {
+            Ok(c) => c,
+            Err(e) => {
+                ui.colored_label(egui::Color32::RED, format!("Ошибка каталога: {e}"));
+                return;
+            }
+        };
+
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                for entry in &catalog {
+                    ui.group(|ui| {
+                        ui.strong(&entry.name);
+                        ui.label(format!(
+                            "Семейство: {} · Версия: {}",
+                            entry.family, entry.version
+                        ));
+                        ui.label(format!("Автор: {}", entry.author));
+                        ui.label(format!("Лицензия: {}", entry.license.spdx));
+                        if !entry.attribution.is_empty() {
+                            ui.small(format!("Атрибуция: {}", entry.attribution));
+                        }
+                        let downloadable = entry.sha256.is_some() && entry.verified;
+                        ui.horizontal(|ui| {
+                            let download = egui::Button::new("Скачать");
+                            if downloadable {
+                                let _ = ui.add(download);
+                            } else {
+                                ui.add_enabled(false, download).on_disabled_hover_text(
+                                    "Загрузка появится в следующей версии (SPEC-067).",
+                                );
+                            }
+                            if ui.button("Установить из папки…").clicked() {
+                                self.install_from_catalog(entry);
+                            }
+                        });
+                    });
+                }
+            });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.strong("Установленные банки");
+        if self.installed_banks.is_empty() {
+            ui.label("Пока ничего не установлено.");
+        } else {
+            for bank in self.installed_banks.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(&bank.name);
+                    ui.small(format!("({})", bank.license_spdx));
+                    if ui.button("Удалить").clicked() {
+                        match daw_app::bank_library::remove(&bank.id) {
+                            Ok(()) => {
+                                self.library_status = format!("Удалено: {}", bank.name);
+                                self.refresh_installed_banks();
+                            }
+                            Err(e) => self.library_status = e.to_string(),
+                        }
+                    }
+                });
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        if ui.button("Импорт SFZ-папки…").clicked() {
+            self.pick_local_import();
+        }
+        if !self.library_status.is_empty() {
+            ui.add_space(6.0);
+            ui.label(&self.library_status);
+        }
+    }
+
+    /// Installs a catalog entry from a user-picked SFZ folder (SPEC-066).
+    fn install_from_catalog(&mut self, entry: &daw_app::bank_library::CatalogEntry) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title(format!("Выбрать папку SFZ: {}", entry.name))
+            .pick_folder()
+        else {
+            return;
+        };
+        let result = daw_app::bank_library::install_local_bank(
+            &dir,
+            &entry.id,
+            &entry.name,
+            &entry.family,
+            &entry.license.spdx,
+            &entry.attribution,
+            false,
+        );
+        match result {
+            Ok(bank) => {
+                self.library_status = format!("Установлено: {}", bank.name);
+                self.refresh_installed_banks();
+            }
+            Err(e) => self.library_status = e.to_string(),
+        }
+    }
+
+    /// Opens the folder picker for a generic local import, then the license
+    /// acknowledgement dialog (SPEC-066 §3).
+    fn pick_local_import(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Выбрать папку SFZ")
+            .pick_folder()
+        else {
+            return;
+        };
+        self.install_license = Some(InstallLicense {
+            source_dir: dir,
+            spdx: "CC0-1.0".to_owned(),
+            attribution: String::new(),
+            acknowledged: false,
+        });
+    }
+
+    /// The license acknowledgement dialog for a local import (SPEC-066 §3).
+    fn install_license_window(&mut self, ctx: &egui::Context) {
+        if self.install_license.is_none() {
+            return;
+        }
+        let mut close = false;
+        let mut confirm = false;
+        let share_alike = self
+            .install_license
+            .as_ref()
+            .is_some_and(|d| daw_app::bank_library::is_share_alike(&d.spdx));
+        let mut can_confirm = !share_alike;
+        egui::Window::new("Лицензия банка")
+            .id(egui::Id::new("install-license"))
+            .resizable(false)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                let Some(dialog) = self.install_license.as_mut() else {
+                    return;
+                };
+                ui.label("Какой лицензией распространяется этот банк?");
+                egui::ComboBox::from_id_salt("local-license-spdx")
+                    .selected_text(&dialog.spdx)
+                    .show_ui(ui, |ui| {
+                        for spdx in LOCAL_LICENSES {
+                            ui.selectable_value(&mut dialog.spdx, spdx.to_owned(), spdx);
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Атрибуция:");
+                    ui.text_edit_singleline(&mut dialog.attribution);
+                });
+                let is_sa = daw_app::bank_library::is_share_alike(&dialog.spdx);
+                if is_sa {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Лицензия с «share-alike»/GPL: банк можно использовать, \
+                         но он не войдёт в каталог и распространяется как есть.",
+                    );
+                    ui.checkbox(&mut dialog.acknowledged, "Я понимаю условия лицензии");
+                }
+                can_confirm = !is_sa || dialog.acknowledged;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_confirm, egui::Button::new("Установить"))
+                        .clicked()
+                    {
+                        confirm = true;
+                        close = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if confirm {
+            self.finish_local_import();
+        }
+        if close {
+            self.install_license = None;
+        }
+    }
+
+    /// Performs the local import once the license is acknowledged (SPEC-066).
+    fn finish_local_import(&mut self) {
+        let Some(dialog) = self.install_license.take() else {
+            return;
+        };
+        let id = slug(&dialog.source_dir);
+        let name = dialog
+            .source_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Банк".to_owned());
+        let result = daw_app::bank_library::install_local_bank(
+            &dialog.source_dir,
+            &id,
+            &name,
+            "",
+            &dialog.spdx,
+            &dialog.attribution,
+            dialog.acknowledged,
+        );
+        match result {
+            Ok(bank) => {
+                self.library_status = format!("Установлено: {}", bank.name);
+                self.refresh_installed_banks();
+            }
+            Err(e) => self.library_status = e.to_string(),
+        }
+    }
+
+    /// The credits window: built-in piano plus installed banks (SPEC-066 §4).
+    fn credits_window(&mut self, ctx: &egui::Context) {
+        if !self.credits_open {
+            return;
+        }
+        let mut open = true;
+        let text = daw_app::bank_library::credits_text(&self.installed_banks);
+        egui::Window::new("Авторы")
+            .id(egui::Id::new("credits"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label("Благодарим авторов звуков:");
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        ui.monospace(&text);
+                    });
+                ui.add_space(6.0);
+                if ui.button("Скопировать авторов").clicked() {
+                    ui.ctx().copy_text(text.clone());
+                    self.library_status = "Список авторов скопирован".to_owned();
+                }
+            });
+        if !open {
+            self.credits_open = false;
+        }
+    }
+
+    /// The first-run dialog: "Скачать звуки сейчас / Позже" (SPEC-066 §4).
+    fn first_run_window(&mut self, ctx: &egui::Context) {
+        if !self.first_run_open {
+            return;
+        }
+        let mut close = false;
+        let mut open_library = false;
+        egui::Window::new("Добро пожаловать")
+            .id(egui::Id::new("first-run"))
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.heading("Добро пожаловать в Sound Pro");
+                ui.label(
+                    "Sound Pro не хранит и не поставляет звуковые банки. \
+                     Вы можете установить их из папки на вашем компьютере.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Скачать звуки сейчас").clicked() {
+                        open_library = true;
+                        close = true;
+                    }
+                    if ui.button("Позже").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.first_run_open = false;
+            if let Err(e) = daw_app::audio_settings::mark_first_run_done() {
+                self.library_status = format!("Не удалось запомнить выбор: {e}");
+            }
+        }
+        if open_library {
+            self.open_library();
+        }
     }
 
     /// The audio settings window (SPEC-033): output, input, buffer size.
@@ -6648,6 +7045,10 @@ impl eframe::App for App {
         self.buses_window(ctx);
         self.audio_window(ctx);
         self.about_window(ctx);
+        self.library_window(ctx);
+        self.credits_window(ctx);
+        self.install_license_window(ctx);
+        self.first_run_window(ctx);
         self.new_track_window(ctx);
         self.export_window(ctx);
 
@@ -7705,5 +8106,81 @@ mod instrument_picker_tests {
         let state = &app.instrument_loads[&0];
         assert!(!state.loading);
         assert!(state.result.as_ref().unwrap().is_err());
+    }
+}
+
+#[cfg(test)]
+mod sound_library_tests {
+    use super::*;
+    use daw_app::bank_library::InstalledBank;
+
+    fn frame(ctx: &egui::Context, app: &mut App) {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.library_window(ctx);
+            app.credits_window(ctx);
+            app.install_license_window(ctx);
+            app.first_run_window(ctx);
+        });
+    }
+
+    #[test]
+    fn slug_normalizes_folder_names() {
+        assert_eq!(slug(std::path::Path::new("/tmp/My Bank V2")), "my-bank-v2");
+        assert_eq!(
+            slug(std::path::Path::new("/tmp/Osiris_Piano")),
+            "osiris-piano"
+        );
+        assert_eq!(slug(std::path::Path::new("/tmp/---")), "bank");
+        assert_eq!(slug(std::path::Path::new("/tmp/Осирис")), "bank");
+    }
+
+    #[test]
+    fn credits_window_renders_with_builtin_and_installed() {
+        let mut app = App::new(None);
+        app.installed_banks = vec![InstalledBank {
+            id: "osiris-piano".to_owned(),
+            name: "Osiris Piano".to_owned(),
+            family: "piano".to_owned(),
+            path: "/nonexistent/osiris-piano".to_owned(),
+            license_spdx: "CC0-1.0".to_owned(),
+            attribution: "Osiris Piano by Versilian Studios and Karoryfer Samples".to_owned(),
+            license_acknowledged: false,
+            installed_at: "1T00:00:00Z".to_owned(),
+        }];
+        app.credits_open = true;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app);
+        assert!(app.credits_open);
+        let text = daw_app::bank_library::credits_text(&app.installed_banks);
+        assert!(text.contains("Osiris Piano"));
+    }
+
+    #[test]
+    fn library_window_renders_catalog_headlessly() {
+        let mut app = App::new(None);
+        app.library_open = true;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app);
+        assert!(app.library_open);
+    }
+
+    #[test]
+    fn first_run_window_renders_headlessly() {
+        let mut app = App::new(None);
+        app.first_run_open = true;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app);
+        assert!(app.first_run_open);
+    }
+
+    #[test]
+    fn open_library_sets_flag_and_refreshes() {
+        let mut app = App::new(None);
+        app.open_library();
+        assert!(app.library_open);
     }
 }
