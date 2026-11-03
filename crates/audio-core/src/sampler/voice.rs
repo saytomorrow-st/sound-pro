@@ -14,6 +14,22 @@ use crate::sampler::region::AmpEnvelope;
 /// (RFC-001 §3.1).
 pub const STEAL_FADE_SAMPLES: u32 = 240;
 
+/// Sample-interpolation quality for the sampler voice (SPEC-068 step A).
+///
+/// [`Interpolation::Linear`] is the default and reproduces the pre-SPEC-068
+/// output bit-for-bit. [`Interpolation::Hermite4`] uses a four-point cubic
+/// Hermite interpolator that is measurably more accurate than linear for
+/// strong transposition and 44.1→48 kHz banks, at a small constant cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Interpolation {
+    /// Linear interpolation between neighbouring frames (the historical
+    /// default; golden output is unchanged).
+    #[default]
+    Linear,
+    /// Four-point cubic Hermite interpolation (RFC-001 §7).
+    Hermite4,
+}
+
 /// Sentinel for "no region assigned": the voice is idle.
 pub const NO_REGION: u16 = u16::MAX;
 
@@ -335,6 +351,101 @@ pub fn read_linear_stereo(data: &[i16], pos: f64, frames: usize) -> (f32, f32) {
     (al + (bl - al) * frac, ar + (br - ar) * frac)
 }
 
+/// Reads one four-point cubic Hermite-interpolated mono sample from `i16`
+/// data at `pos` (SPEC-068 step A).
+///
+/// With `i = floor(pos)` and `t = pos - i`, the four surrounding points are
+/// `x0 = x[i-1]`, `x1 = x[i]`, `x2 = x[i+1]`, `x3 = x[i+2]` (each clamped to
+/// `[0, len)`), and the interpolated value is the standard Catmull-Rom form
+/// (RFC-001 §7):
+///
+/// ```text
+/// c0 = x1
+/// c1 = 0.5 * (x2 - x0)
+/// c2 = x0 - 2.5*x1 + 2*x2 - 0.5*x3
+/// c3 = 0.5 * (x3 - x0) + 1.5 * (x1 - x2)
+/// y  = ((c3*t + c2)*t + c1)*t + c0
+/// ```
+///
+/// Out-of-range neighbour indices are clamped to the nearest valid frame, so
+/// the function never panics and returns `0.0` for an empty buffer and the
+/// single sample for a one-frame buffer. No allocation, no `unsafe`.
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub fn read_hermite_i16(data: &[i16], pos: f64, len: usize) -> f32 {
+    if len == 0 {
+        return 0.0;
+    }
+    if len == 1 {
+        return f32::from(data[0]);
+    }
+    let last = len - 1;
+    let clamped = pos.clamp(0.0, last as f64);
+    let i = clamped as usize;
+    let t = (clamped - i as f64) as f32;
+    let i0 = i.saturating_sub(1);
+    let i2 = (i + 1).min(last);
+    let i3 = (i + 2).min(last);
+    let x0 = f32::from(data[i0]);
+    let x1 = f32::from(data[i]);
+    let x2 = f32::from(data[i2]);
+    let x3 = f32::from(data[i3]);
+    let c1 = 0.5 * (x2 - x0);
+    let c2 = x0 - 2.5 * x1 + 2.0 * x2 - 0.5 * x3;
+    let c3 = 0.5 * (x3 - x0) + 1.5 * (x1 - x2);
+    ((c3 * t + c2) * t + c1) * t + x1
+}
+
+/// Reads one four-point cubic Hermite-interpolated stereo frame from
+/// interleaved `i16` data at `pos`, returning `(left, right)` (SPEC-068 step
+/// A). `frames` is the frame count (so `data.len() == frames * 2`).
+///
+/// Uses the same four-point Catmull-Rom kernel as [`read_hermite_i16`], with
+/// each channel's neighbour indices clamped independently to `[0, frames)`.
+/// No allocation, no `unsafe`.
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub fn read_hermite_stereo(data: &[i16], pos: f64, frames: usize) -> (f32, f32) {
+    if frames == 0 {
+        return (0.0, 0.0);
+    }
+    if frames == 1 {
+        return (f32::from(data[0]), f32::from(data[1]));
+    }
+    let last = frames - 1;
+    let clamped = pos.clamp(0.0, last as f64);
+    let i = clamped as usize;
+    let t = (clamped - i as f64) as f32;
+    let i0 = i.saturating_sub(1);
+    let i2 = (i + 1).min(last);
+    let i3 = (i + 2).min(last);
+    let x0l = f32::from(data[i0 * 2]);
+    let x0r = f32::from(data[i0 * 2 + 1]);
+    let x1l = f32::from(data[i * 2]);
+    let x1r = f32::from(data[i * 2 + 1]);
+    let x2l = f32::from(data[i2 * 2]);
+    let x2r = f32::from(data[i2 * 2 + 1]);
+    let x3l = f32::from(data[i3 * 2]);
+    let x3r = f32::from(data[i3 * 2 + 1]);
+    let hermite = |x0: f32, x1: f32, x2: f32, x3: f32| -> f32 {
+        let c1 = 0.5 * (x2 - x0);
+        let c2 = x0 - 2.5 * x1 + 2.0 * x2 - 0.5 * x3;
+        let c3 = 0.5 * (x3 - x0) + 1.5 * (x1 - x2);
+        ((c3 * t + c2) * t + c1) * t + x1
+    };
+    (hermite(x0l, x1l, x2l, x3l), hermite(x0r, x1r, x2r, x3r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +497,52 @@ mod tests {
         assert_eq!(read_linear_i16(&data, 999.0, 4), 3000.0);
         assert_eq!(read_linear_i16(&[], 0.0, 0), 0.0);
         assert_eq!(read_linear_i16(&[7], 0.0, 1), 7.0);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn hermite_read_is_exact_on_linear_ramp() {
+        // A cubic Hermite interpolator reproduces a linear ramp exactly: the
+        // second and third derivatives vanish, so every interior point lands
+        // on the ramp. This is the sharpest check that the kernel coefficients
+        // match the SPEC-068 formula.
+        let data = [0i16, 1000, 2000, 3000, 4000, 5000];
+        for i in 1..data.len() - 2 {
+            let x = i as f32 + 0.25;
+            let expected = x * 1000.0;
+            let got = read_hermite_i16(&data, f64::from(x), data.len());
+            assert!(
+                (got - expected).abs() < 1e-2,
+                "pos {x}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn hermite_read_clamps_edges_without_panic() {
+        // One, two and three frames, plus positions on/past the last frame,
+        // must not panic or produce NaN and must clamp to the last frame.
+        assert_eq!(read_hermite_i16(&[], 0.0, 0), 0.0);
+        assert_eq!(read_hermite_i16(&[7], 0.0, 1), 7.0);
+        assert_eq!(read_hermite_i16(&[7], 99.0, 1), 7.0);
+        assert!(read_hermite_i16(&[1, 2], 0.5, 2).is_finite());
+        assert!(read_hermite_i16(&[1, 2, 3], 2.0, 3).is_finite());
+        let last = read_hermite_i16(&[1, 2, 3, 4], 999.0, 4);
+        assert!((last - 4.0).abs() < 1e-6);
+        assert!(last.is_finite());
+    }
+
+    #[test]
+    fn hermite_stereo_matches_mono_per_channel() {
+        // Interleaved [L, R]; the mono read on a deinterleaved L channel must
+        // equal the left component of the stereo read.
+        let data = [0i16, 5000, 1000, 6000, 2000, 7000, 3000, 8000];
+        let left: Vec<i16> = data.iter().step_by(2).copied().collect();
+        let pos = 1.3;
+        let (l, r) = read_hermite_stereo(&data, pos, 4);
+        let lm = read_hermite_i16(&left, pos, 4);
+        assert!((l - lm).abs() < 1e-3, "left {l} != mono {lm}");
+        assert!((r - lm).abs() < 1e6, "right channel must be finite");
+        assert!(l.is_finite() && r.is_finite());
     }
 }

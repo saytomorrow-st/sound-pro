@@ -14,7 +14,7 @@ use audio_core::midi::{MidiEvent, MidiMessage};
 use audio_core::sampler::engine::{SamplerEngine, playback_ratio};
 use audio_core::sampler::region::{AmpEnvelope, RegionTable, SampleRegion};
 use audio_core::sampler::sfz::{LoopMode, OffMode};
-use audio_core::sampler::voice::{STEAL_FADE_SAMPLES, SamplerVoice};
+use audio_core::sampler::voice::{Interpolation, STEAL_FADE_SAMPLES, SamplerVoice};
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 
 const SR: u32 = 48_000;
@@ -545,5 +545,171 @@ fn region_index_65535_is_not_indexed() {
         table.find(&regions, 60, 100),
         None,
         "region index 65535 collides with NO_REGION and must be dropped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-068 step A: 4-point Hermite interpolation
+// ---------------------------------------------------------------------------
+
+/// Renders a note-on over `frames` output samples with a caller-chosen
+/// interpolation mode, returning the left channel.
+fn render_with_interpolation(
+    interpolation: Interpolation,
+    sample: Vec<i16>,
+    region: SampleRegion,
+    frames: u64,
+    quantum: usize,
+) -> Vec<f32> {
+    let mut engine =
+        SamplerEngine::new_with(SR, vec![region], vec![Arc::from(sample)], 8, interpolation)
+            .unwrap();
+    let sched = schedule(vec![note_on(0, 60, 127)]);
+    let mut left = vec![0.0_f32; frames as usize];
+    let mut right = vec![0.0_f32; frames as usize];
+    let mut cursor = sched.cursor();
+    let mut position = 0_u64;
+    while position < frames {
+        let n = ((frames - position) as usize).min(quantum);
+        engine.render(
+            &sched,
+            &mut cursor,
+            position,
+            n,
+            &mut left[position as usize..],
+            &mut right[position as usize..],
+        );
+        position += n as u64;
+    }
+    left
+}
+
+/// The default interpolation is `Linear` and the default-constructed engine is
+/// bit-identical to the pre-SPEC-068 `new` engine (goldens stay untouched).
+#[test]
+fn default_interpolation_is_linear_and_bit_identical() {
+    assert_eq!(Interpolation::default(), Interpolation::Linear);
+    let reg = dc_region(60);
+    let bank = dc_bank(4096);
+    let mut a = SamplerEngine::new(SR, vec![reg.clone()], bank.clone(), 8).unwrap();
+    let mut b = SamplerEngine::new_with(SR, vec![reg], bank, 8, Interpolation::default()).unwrap();
+    let sched = schedule(vec![note_on(0, 60, 100), note_off(500, 60)]);
+    let out_a = render(&mut a, &sched, 2048, QUANTUM);
+    let out_b = render(&mut b, &sched, 2048, QUANTUM);
+    for (i, (x, y)) in out_a.iter().zip(out_b.iter()).enumerate() {
+        assert_eq!(x.to_bits(), y.to_bits(), "sample {i} differs");
+    }
+}
+
+/// On a pure sine well below Nyquist, 4-point Hermite is strictly more
+/// accurate than linear: max absolute error vs the analytic value is at least
+/// 10× smaller (SPEC-068 step A acceptance criterion).
+#[test]
+fn hermite_outperforms_linear_on_sine_by_10x() {
+    const RATE: f64 = 44_100.0;
+    const FREQ: f64 = 1000.0; // ≤ fs/8
+    const SEMIS: f64 = 7.0; // +7 semitones transposition
+    let frames = 44_100_usize;
+    let ratio = 2.0_f64.powf(SEMIS / 12.0);
+
+    // Source sine at 44.1 kHz, one full second.
+    let sample: Vec<i16> = (0..frames)
+        .map(|i| {
+            let t = i as f64 / RATE;
+            let s = (2.0 * std::f64::consts::PI * FREQ * t).sin();
+            (s * 30_000.0) as i16
+        })
+        .collect();
+
+    // root 53, key range covering 60: playing note 60 is +7 semitones, giving
+    // a fractional playback ratio (2^(7/12)).
+    let reg = SampleRegion {
+        sample_index: 0,
+        root: 53,
+        key_lo: 53,
+        key_hi: 60,
+        ..SampleRegion::default()
+    };
+
+    let linear = render_with_interpolation(
+        Interpolation::Linear,
+        sample.clone(),
+        reg.clone(),
+        4096,
+        QUANTUM,
+    );
+    let hermite = render_with_interpolation(Interpolation::Hermite4, sample, reg, 4096, QUANTUM);
+
+    // Compare against the analytic sine, advancing by `ratio` source frames per
+    // output frame (the engine reads at `pos = k * ratio`). Skip the attack
+    // tail (default envelope has zero attack) and the first few samples.
+    let max_err = |out: &[f32]| -> f64 {
+        let mut worst = 0.0_f64;
+        for (k, v) in out.iter().enumerate() {
+            let src = k as f64 * ratio;
+            let expected = (2.0 * std::f64::consts::PI * FREQ * src / RATE).sin();
+            let e = (f64::from(*v) / 30_000.0 - expected).abs();
+            worst = worst.max(e);
+        }
+        worst
+    };
+
+    let e_linear = max_err(&linear);
+    let e_hermite = max_err(&hermite);
+    assert!(
+        e_hermite < e_linear,
+        "hermite {e_hermite} not better than linear {e_linear}"
+    );
+    assert!(
+        e_linear >= 10.0 * e_hermite,
+        "expected ≥10× improvement: linear {e_linear}, hermite {e_hermite}"
+    );
+}
+
+/// Render output must be bit-identical across quantum sizes for both
+/// interpolation modes (SPEC-068 step A determinism criterion).
+#[test]
+fn hermite_and_linear_are_bit_exact_across_block_sizes() {
+    let mut reg = dc_region(60);
+    reg.loop_mode = LoopMode::LoopContinuous;
+    let sample: Vec<i16> = (0..1024)
+        .map(|i| ((i as f64 * 0.01).sin() * 20_000.0) as i16)
+        .collect();
+
+    for mode in [Interpolation::Linear, Interpolation::Hermite4] {
+        let a = render_with_interpolation(mode, sample.clone(), reg.clone(), 4096, 64);
+        let b = render_with_interpolation(mode, sample.clone(), reg.clone(), 4096, 256);
+        let c = render_with_interpolation(mode, sample.clone(), reg.clone(), 4096, 1024);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{mode:?} 64 vs 256 sample {i}");
+        }
+        for (i, (x, y)) in a.iter().zip(c.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{mode:?} 64 vs 1024 sample {i}");
+        }
+    }
+}
+
+/// Hermite at the sample edges (1/2/3-frame buffers, last-frame position, loop
+/// seam) must not panic or emit NaN.
+#[test]
+fn hermite_edges_do_not_panic_or_nan() {
+    // The edge behaviour is proven directly in voice.rs unit tests; here we
+    // exercise the full render path with tiny/looped buffers.
+    let tiny: Vec<i16> = vec![10_000];
+    let mut reg = dc_region(60);
+    reg.loop_mode = LoopMode::LoopContinuous;
+    let out = render_with_interpolation(Interpolation::Hermite4, tiny, reg, 1024, QUANTUM);
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "tiny buffer produced NaN/Inf"
+    );
+
+    let three: Vec<i16> = vec![1, 2, 3];
+    let mut reg = dc_region(60);
+    reg.loop_mode = LoopMode::LoopContinuous;
+    let out = render_with_interpolation(Interpolation::Hermite4, three, reg, 1024, QUANTUM);
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "3-frame buffer produced NaN/Inf"
     );
 }

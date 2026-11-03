@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::midi::MidiMessage;
 use crate::sampler::region::{RegionTable, SampleRegion};
-use crate::sampler::voice::{NO_REGION, SamplerVoice, read_linear_i16, read_linear_stereo};
+use crate::sampler::voice::{
+    Interpolation, NO_REGION, SamplerVoice, read_hermite_i16, read_hermite_stereo, read_linear_i16,
+    read_linear_stereo,
+};
 use crate::schedule::{Schedule, ScheduleCursor};
 use crate::session::pan_law;
 
@@ -60,6 +63,7 @@ pub struct SamplerEngine {
     regions: Vec<SampleRegion>,
     samples: Vec<Arc<[i16]>>,
     sample_rate: u32,
+    interpolation: Interpolation,
     started: AtomicU32,
     stolen: AtomicU32,
     dropped_starts: AtomicU32,
@@ -82,6 +86,34 @@ impl SamplerEngine {
         samples: Vec<Arc<[i16]>>,
         num_voices: usize,
     ) -> Result<Self, SamplerError> {
+        Self::new_with(
+            sample_rate,
+            regions,
+            samples,
+            num_voices,
+            Interpolation::default(),
+        )
+    }
+
+    /// Builds an engine like [`Self::new`], but with an explicit
+    /// [`Interpolation`] mode (SPEC-068 step A).
+    ///
+    /// `interpolation` is fixed for the lifetime of the engine unless changed
+    /// via [`Self::set_interpolation`]; both are control-thread only. The
+    /// default ([`Interpolation::Linear`]) reproduces the pre-SPEC-068 output
+    /// bit-for-bit.
+    ///
+    /// # Errors
+    ///
+    /// [`SamplerError::InvalidSampleRate`] for a zero rate,
+    /// [`SamplerError::InvalidVoices`] for `num_voices` outside `1..=128`.
+    pub fn new_with(
+        sample_rate: u32,
+        regions: Vec<SampleRegion>,
+        samples: Vec<Arc<[i16]>>,
+        num_voices: usize,
+        interpolation: Interpolation,
+    ) -> Result<Self, SamplerError> {
         if sample_rate == 0 {
             return Err(SamplerError::InvalidSampleRate);
         }
@@ -96,10 +128,24 @@ impl SamplerEngine {
             regions,
             samples,
             sample_rate,
+            interpolation,
             started: AtomicU32::new(0),
             stolen: AtomicU32::new(0),
             dropped_starts: AtomicU32::new(0),
         })
+    }
+
+    /// The interpolation mode used by the render path.
+    #[must_use]
+    pub const fn interpolation(&self) -> Interpolation {
+        self.interpolation
+    }
+
+    /// Sets the interpolation mode (control thread only; never from the audio
+    /// callback). Changing the mode does not affect voices already sounding
+    /// until the next rendered frame.
+    pub fn set_interpolation(&mut self, interpolation: Interpolation) {
+        self.interpolation = interpolation;
     }
 
     /// Sample rate the engine renders at.
@@ -395,6 +441,7 @@ impl SamplerEngine {
                 &mut self.voices[i],
                 &self.regions,
                 &self.samples,
+                self.interpolation,
                 position,
                 end,
                 frames,
@@ -413,6 +460,7 @@ impl SamplerEngine {
                 &mut self.tails[i],
                 &self.regions,
                 &self.samples,
+                self.interpolation,
                 position,
                 end,
                 frames,
@@ -436,6 +484,7 @@ fn render_voice(
     voice: &mut SamplerVoice,
     regions: &[SampleRegion],
     samples: &[Arc<[i16]>],
+    interpolation: Interpolation,
     position: u64,
     end: u64,
     frames: usize,
@@ -464,11 +513,23 @@ fn render_voice(
         let gain = voice.gain_at(at);
         voice.last_gain = gain;
         if gain > 0.0 {
-            let (sample_l, sample_r) = if stereo {
-                read_linear_stereo(sample, voice.pos, frames_count)
-            } else {
-                let m = read_linear_i16(sample, voice.pos, mono_frames);
-                (m, m)
+            let (sample_l, sample_r) = match interpolation {
+                Interpolation::Linear => {
+                    if stereo {
+                        read_linear_stereo(sample, voice.pos, frames_count)
+                    } else {
+                        let m = read_linear_i16(sample, voice.pos, mono_frames);
+                        (m, m)
+                    }
+                }
+                Interpolation::Hermite4 => {
+                    if stereo {
+                        read_hermite_stereo(sample, voice.pos, frames_count)
+                    } else {
+                        let m = read_hermite_i16(sample, voice.pos, mono_frames);
+                        (m, m)
+                    }
+                }
             };
             *sl += sample_l * gain * voice.pan_l;
             *sr += sample_r * gain * voice.pan_r;
