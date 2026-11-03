@@ -327,7 +327,7 @@ fn download_bank_into_inner(
     // the stale-artifact sweep so a live lock held by another download is never
     // removed.
     let lock_path = banks.join(format!(".{}.lock", entry.id));
-    let _lock = acquire_lock(&lock_path, cancel)?;
+    let _lock = acquire_lock(&lock_path)?;
 
     // Sweep stale temp/old artifacts left by a previous interrupted run. Our
     // own lock is held, so it is not swept.
@@ -409,17 +409,7 @@ struct BankLock {
     _file: std::fs::File,
 }
 
-/// How long to keep retrying a contended advisory lock before giving up. A
-/// download's critical section (unpack + rename) lasts milliseconds, so a lock
-/// held by another download finishing at the same moment is released almost
-/// immediately; retrying here avoids forcing the user to re-download hundreds
-/// of megabytes just because two banks finished at once.
-const LOCK_RETRY_WINDOW: Duration = Duration::from_secs(10);
-
-/// Per-attempt pause between lock retries.
-const LOCK_RETRY_PAUSE: Duration = Duration::from_millis(20);
-
-fn acquire_lock(path: &Path, cancel: &Arc<AtomicBool>) -> Result<BankLock, DownloadError> {
+fn acquire_lock(path: &Path) -> Result<BankLock, DownloadError> {
     // `create(true)` (not `create_new`) so an existing stale lock file is
     // opened rather than treated as "in progress"; the advisory lock then
     // decides whether it is actually held.
@@ -429,28 +419,17 @@ fn acquire_lock(path: &Path, cancel: &Arc<AtomicBool>) -> Result<BankLock, Downl
         .truncate(false)
         .open(path)
         .map_err(|e| DownloadError::Io(path.to_path_buf(), e.to_string()))?;
-
-    let contended = fs2::lock_contended_error().raw_os_error();
-    let deadline = std::time::Instant::now() + LOCK_RETRY_WINDOW;
-    loop {
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(BankLock { _file: file }),
-            // Detect lock contention by comparing the raw OS error code, NOT
-            // `ErrorKind`: on Windows `LockFileEx` reports `ERROR_LOCK_VIOLATION`
-            // (33), which Rust maps to `ErrorKind::Other`, not `WouldBlock` (that
-            // mapping is only reliable on Unix where it is `EWOULDBLOCK`). `fs2`
-            // exposes the canonical contended error for the host platform.
-            Err(e) if e.raw_os_error() == contended => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(DownloadError::Cancelled);
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(DownloadError::AlreadyInProgress(lock_id(path)));
-                }
-                std::thread::sleep(LOCK_RETRY_PAUSE);
-            }
-            Err(e) => return Err(DownloadError::Io(path.to_path_buf(), e.to_string())),
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(BankLock { _file: file }),
+        // Detect lock contention by comparing the raw OS error code, NOT
+        // `ErrorKind`: on Windows `LockFileEx` reports `ERROR_LOCK_VIOLATION`
+        // (33), which Rust maps to `ErrorKind::Other`, not `WouldBlock` (that
+        // mapping is only reliable on Unix where it is `EWOULDBLOCK`). `fs2`
+        // exposes the canonical contended error for the host platform.
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Err(DownloadError::AlreadyInProgress(lock_id(path)))
         }
+        Err(e) => Err(DownloadError::Io(path.to_path_buf(), e.to_string())),
     }
 }
 
