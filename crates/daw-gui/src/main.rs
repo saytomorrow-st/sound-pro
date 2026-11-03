@@ -547,6 +547,33 @@ enum DownloadMsg {
     },
 }
 
+/// A message from the native-dialog worker thread (SPEC-066/SPEC-067). The
+/// worker runs the blocking `rfd::FileDialog` off the UI thread and reports the
+/// result here; the GUI polls it in [`Self::poll_dialog`].
+enum DialogMsg {
+    /// The dialog finished with the picked path(s), or `None` when cancelled.
+    /// Single-path dialogs produce a one-element vector.
+    Done(DialogKind, Option<Vec<PathBuf>>),
+}
+
+/// Which native file/folder dialog to show, and what to do with its result.
+/// Captures everything the worker needs so the UI thread never touches `rfd`
+/// and never blocks.
+enum DialogKind {
+    /// «Открыть…»: open a project JSON.
+    OpenProject,
+    /// «Сохранить как…»: choose a project JSON path.
+    SaveProject,
+    /// «Импорт WAV…»: pick one or more audio files.
+    ImportAudio,
+    /// «Экспорт сведения…»: choose the mixdown WAV path.
+    ExportMix,
+    /// «Импорт SFZ-папки…» from a catalog entry: install that bank.
+    InstallCatalog(Box<daw_app::bank_library::CatalogEntry>),
+    /// «Импорт SFZ-папки…» generic: proceed to the license dialog.
+    PickLocalImport,
+}
+
 /// Per-bank download state shown in the library window (SPEC-067). The heavy
 /// network work runs on a worker thread; this keeps only the cosmetic state
 /// the GUI needs: a shared progress counter, a cancellation flag, and a status
@@ -840,6 +867,11 @@ struct App {
     download_tx: std::sync::mpsc::Sender<DownloadMsg>,
     download_rx: std::sync::mpsc::Receiver<DownloadMsg>,
     downloads: HashMap<String, DownloadState>,
+    /// Native file/folder dialogs, shown on a worker thread (SPEC-066/SPEC-067).
+    dialog_tx: std::sync::mpsc::Sender<DialogMsg>,
+    dialog_rx: std::sync::mpsc::Receiver<DialogMsg>,
+    /// At most one native dialog may be open; a second request is refused.
+    dialog_guard: daw_gui::dialog::DialogGuard,
     /// A catalog entry awaiting the user's acceptance (SPEC-067).
     download_accept: Option<DownloadAccept>,
     /// The «Новая дорожка» dialog, when open (SPEC-049).
@@ -965,6 +997,7 @@ impl App {
         let (hover_tx, hover_rx) = std::sync::mpsc::channel();
         let (export_tx, export_rx) = std::sync::mpsc::channel();
         let (download_tx, download_rx) = std::sync::mpsc::channel();
+        let (dialog_tx, dialog_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             editor: Editor::new(),
             #[cfg(feature = "audio")]
@@ -1063,6 +1096,9 @@ impl App {
             download_rx,
             downloads: HashMap::new(),
             download_accept: None,
+            dialog_tx,
+            dialog_rx,
+            dialog_guard: daw_gui::dialog::DialogGuard::default(),
             new_track: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -2036,6 +2072,156 @@ impl App {
         }
     }
 
+    /// Shows a native file/folder dialog on a worker thread and reports the
+    /// result back through [`Self::poll_dialog`]. Never called on the UI thread:
+    /// `rfd::FileDialog` blocks, and blocking the egui/winit event loop is the
+    /// likely cause of the Linux freeze/crash (portal timeouts or a wedged GTK
+    /// main loop).
+    ///
+    /// Only one dialog may be open at a time; a request while one is in flight
+    /// is a no-op (the guard refuses it).
+    fn request_dialog(&mut self, kind: DialogKind) {
+        if !self.dialog_guard.begin() {
+            return;
+        }
+        let tx = self.dialog_tx.clone();
+        std::thread::spawn(move || {
+            let result: Option<Vec<PathBuf>> = match kind {
+                DialogKind::OpenProject => rfd::FileDialog::new()
+                    .add_filter("Проект Sound Pro", &["json"])
+                    .pick_file()
+                    .map(|p| vec![p]),
+                DialogKind::SaveProject => rfd::FileDialog::new()
+                    .add_filter("Проект Sound Pro", &["json"])
+                    .set_file_name("song.json")
+                    .save_file()
+                    .map(|p| vec![p]),
+                DialogKind::ImportAudio => rfd::FileDialog::new()
+                    .add_filter(
+                        "WAV, MP3, FLAC, OGG",
+                        &[
+                            "wav", "WAV", "mp3", "MP3", "flac", "FLAC", "ogg", "OGG", "oga", "OGA",
+                        ],
+                    )
+                    .pick_files(),
+                DialogKind::ExportMix => rfd::FileDialog::new()
+                    .add_filter("WAV", &["wav"])
+                    .set_file_name("mixdown.wav")
+                    .save_file()
+                    .map(|p| vec![p]),
+                DialogKind::InstallCatalog(ref entry) => rfd::FileDialog::new()
+                    .set_title(format!("Выбрать папку SFZ: {}", entry.name))
+                    .pick_folder()
+                    .map(|p| vec![p]),
+                DialogKind::PickLocalImport => rfd::FileDialog::new()
+                    .set_title("Выбрать папку SFZ")
+                    .pick_folder()
+                    .map(|p| vec![p]),
+            };
+            let _ = tx.send(DialogMsg::Done(kind, result));
+        });
+    }
+
+    /// Collects a finished native dialog and applies its result on the UI
+    /// thread. A cancel (`None`) is a no-op for every dialog kind, and the
+    /// guard is released on every path — including cancel — so a later dialog
+    /// can open.
+    fn poll_dialog(&mut self, ctx: &egui::Context) {
+        let Some(msg) = self.dialog_rx.try_recv().ok() else {
+            return;
+        };
+        let DialogMsg::Done(kind, paths) = msg;
+        // Release the guard first: both `Some(paths)` and cancel (`None`) close it.
+        self.dialog_guard.end();
+        let Some(paths) = paths else {
+            // Cancel: no-op everywhere.
+            return;
+        };
+        match kind {
+            DialogKind::OpenProject => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.open(path);
+                }
+            }
+            DialogKind::SaveProject => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.save_to(path);
+                }
+            }
+            DialogKind::ImportAudio => {
+                let track = self.editor.selected_track;
+                self.import_in_background(paths, track, None);
+            }
+            DialogKind::ExportMix => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.begin_export(path);
+                }
+            }
+            DialogKind::InstallCatalog(entry) => {
+                let Some(dir) = paths.into_iter().next() else {
+                    return;
+                };
+                let result = daw_app::bank_library::install_local_bank(
+                    &dir,
+                    &entry.id,
+                    &entry.name,
+                    &entry.family,
+                    &entry.license.spdx,
+                    &entry.attribution,
+                    false,
+                );
+                match result {
+                    Ok(bank) => {
+                        self.library_status = format!("Установлено: {}", bank.name);
+                        self.refresh_installed_banks();
+                    }
+                    Err(e) => self.library_status = e.to_string(),
+                }
+            }
+            DialogKind::PickLocalImport => {
+                let Some(dir) = paths.into_iter().next() else {
+                    return;
+                };
+                self.install_license = Some(InstallLicense {
+                    source_dir: dir,
+                    spdx: "CC0-1.0".to_owned(),
+                    attribution: String::new(),
+                    acknowledged: false,
+                });
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Starts the background mix export once the destination path is known
+    /// (SPEC-052). Split out of the dialog flow so the export spec is captured
+    /// only after the user actually picks a path.
+    fn begin_export(&mut self, path: PathBuf) {
+        let spec = daw_app::ExportSpec {
+            bit_depth: self.export_bits,
+            sample_rate: self.export_rate,
+            normalize: self.export_normalize.then_some(self.export_target_db),
+        };
+        let tx = self.export_tx.clone();
+        // Build the job here (it reads decoded files), then render off the
+        // UI thread so the window stays responsive.
+        let job = match self.editor.prepare_export(&path) {
+            Ok(job) => job,
+            Err(e) => {
+                self.status = format!("Ошибка экспорта: {e}");
+                return;
+            }
+        };
+        self.export_pending = true;
+        self.status = "Экспорт…".into();
+        let rate = spec.sample_rate;
+        std::thread::spawn(move || {
+            let result =
+                daw_app::render_export(job, spec).map_err(|e| EditorError::Render(e.to_string()));
+            let _ = tx.send(ExportMsg::Done(path, rate, result));
+        });
+    }
+
     /// The acceptance screen shown before a download (SPEC-067 §4): license
     /// name, author, attribution and size, with «Скачать» / «Отмена».
     fn download_accept_window(&mut self, ctx: &egui::Context) {
@@ -2251,12 +2437,7 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Проект Sound Pro", &["json"])
-            .pick_file()
-        {
-            self.open(path);
-        }
+        self.request_dialog(DialogKind::OpenProject);
     }
 
     fn save(&mut self) {
@@ -2267,13 +2448,7 @@ impl App {
     }
 
     fn save_as_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Проект Sound Pro", &["json"])
-            .set_file_name("song.json")
-            .save_file()
-        {
-            self.save_to(path);
-        }
+        self.request_dialog(DialogKind::SaveProject);
     }
 
     fn save_to(&mut self, path: PathBuf) {
@@ -2282,19 +2457,7 @@ impl App {
     }
 
     fn import_dialog(&mut self) {
-        let Some(paths) = rfd::FileDialog::new()
-            .add_filter(
-                "WAV, MP3, FLAC, OGG",
-                &[
-                    "wav", "WAV", "mp3", "MP3", "flac", "FLAC", "ogg", "OGG", "oga", "OGA",
-                ],
-            )
-            .pick_files()
-        else {
-            return;
-        };
-        let track = self.editor.selected_track;
-        self.import_in_background(paths, track, None);
+        self.request_dialog(DialogKind::ImportAudio);
     }
 
     /// Opens the mix-export options window (SPEC-052). The project's sample
@@ -2381,38 +2544,10 @@ impl App {
     }
 
     /// Asks for a destination and starts the export on a background thread so
-    /// the UI stays responsive (SPEC-052).
+    /// the UI stays responsive (SPEC-052). The file dialog itself is also shown
+    /// off the UI thread; the picked path comes back through [`Self::poll_dialog`].
     fn start_export(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("WAV", &["wav"])
-            .set_file_name("mixdown.wav")
-            .save_file()
-        else {
-            return;
-        };
-        let spec = daw_app::ExportSpec {
-            bit_depth: self.export_bits,
-            sample_rate: self.export_rate,
-            normalize: self.export_normalize.then_some(self.export_target_db),
-        };
-        let tx = self.export_tx.clone();
-        // Build the job here (it reads decoded files), then render off the
-        // UI thread so the window stays responsive.
-        let job = match self.editor.prepare_export(&path) {
-            Ok(job) => job,
-            Err(e) => {
-                self.status = format!("Ошибка экспорта: {e}");
-                return;
-            }
-        };
-        self.export_pending = true;
-        self.status = "Экспорт…".into();
-        let rate = spec.sample_rate;
-        std::thread::spawn(move || {
-            let result =
-                daw_app::render_export(job, spec).map_err(|e| EditorError::Render(e.to_string()));
-            let _ = tx.send(ExportMsg::Done(path, rate, result));
-        });
+        self.request_dialog(DialogKind::ExportMix);
     }
 
     /// Collects a finished export and reports its result.
@@ -6539,45 +6674,13 @@ impl App {
 
     /// Installs a catalog entry from a user-picked SFZ folder (SPEC-066).
     fn install_from_catalog(&mut self, entry: &daw_app::bank_library::CatalogEntry) {
-        let Some(dir) = rfd::FileDialog::new()
-            .set_title(format!("Выбрать папку SFZ: {}", entry.name))
-            .pick_folder()
-        else {
-            return;
-        };
-        let result = daw_app::bank_library::install_local_bank(
-            &dir,
-            &entry.id,
-            &entry.name,
-            &entry.family,
-            &entry.license.spdx,
-            &entry.attribution,
-            false,
-        );
-        match result {
-            Ok(bank) => {
-                self.library_status = format!("Установлено: {}", bank.name);
-                self.refresh_installed_banks();
-            }
-            Err(e) => self.library_status = e.to_string(),
-        }
+        self.request_dialog(DialogKind::InstallCatalog(Box::new(entry.clone())));
     }
 
     /// Opens the folder picker for a generic local import, then the license
     /// acknowledgement dialog (SPEC-066 §3).
     fn pick_local_import(&mut self) {
-        let Some(dir) = rfd::FileDialog::new()
-            .set_title("Выбрать папку SFZ")
-            .pick_folder()
-        else {
-            return;
-        };
-        self.install_license = Some(InstallLicense {
-            source_dir: dir,
-            spdx: "CC0-1.0".to_owned(),
-            attribution: String::new(),
-            acknowledged: false,
-        });
+        self.request_dialog(DialogKind::PickLocalImport);
     }
 
     /// The license acknowledgement dialog for a local import (SPEC-066 §3).
@@ -7016,6 +7119,7 @@ impl eframe::App for App {
         self.poll_imports(ctx);
         self.poll_export();
         self.poll_downloads(ctx);
+        self.poll_dialog(ctx);
         // Everything done during one mouse press is one undo step.
         if ctx.input(|i| i.pointer.any_down()) {
             self.editor.begin_group();
