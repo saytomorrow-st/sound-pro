@@ -636,6 +636,56 @@ fn strip_rest(match_height: Option<f32>, used: f32, minimum: f32) -> f32 {
     (inner - used).max(minimum)
 }
 
+/// Draw a strip's bottom block pinned to the bottom of a `rest`-tall region,
+/// so the strip's outer height matches its neighbour. A `ScrollArea` has no
+/// bounded bottom, so `Layout::bottom_up` + `set_min_size` misplaces content;
+/// instead we reserve an exact `rest`-tall rect and, inside it, lay the block
+/// out top-down after a spacer that pushes it to the bottom. The spacer is
+/// measured in an invisible sizing pass so no shapes leak and the layout
+/// cannot overlap the block above.
+fn pin_to_bottom<S>(
+    ui: &mut egui::Ui,
+    rest: f32,
+    state: &mut S,
+    draw: impl Fn(&mut S, &mut egui::Ui),
+) {
+    // Reserve the exact rect in the outer layout so the strip's outer height
+    // is fixed and the block above it can never be overlapped.
+    let rect = ui
+        .allocate_exact_size(Vec2::new(STRIP_WIDTH, rest), Sense::hover())
+        .0;
+
+    let style_builder = |builder: egui::UiBuilder| {
+        builder
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Center))
+    };
+
+    // Measure the block's height without drawing anything.
+    let content_height = ui
+        .scope_builder(
+            style_builder(egui::UiBuilder::new())
+                .sizing_pass()
+                .invisible(),
+            |ui| {
+                ui.set_width(STRIP_WIDTH);
+                ui.spacing_mut().item_spacing.y = 3.0;
+                draw(state, ui);
+            },
+        )
+        .response
+        .rect
+        .height();
+
+    // Draw for real, top-down, with a spacer pinning the block to the bottom.
+    let spacer = (rect.height() - content_height).max(0.0);
+    let mut child = ui.new_child(style_builder(egui::UiBuilder::new()));
+    child.set_width(STRIP_WIDTH);
+    child.spacing_mut().item_spacing.y = 3.0;
+    child.add_space(spacer);
+    draw(state, &mut child);
+}
+
 /// Viewport commands for a drag on the bare control-bar strip: in full
 /// screen the window leaves it and the system starts moving it.
 fn window_drag_commands(
@@ -1830,39 +1880,39 @@ impl App {
                 });
                 // Outer height minus the frame's margins and stroke.
                 let rest = strip_rest(match_height, ui.cursor().top() - top, height + 70.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(STRIP_WIDTH, rest),
-                    egui::Layout::bottom_up(egui::Align::Center),
-                    |ui| {
-                        ui.set_min_size(Vec2::new(STRIP_WIDTH, rest));
-                        name_plate(ui, "Stereo Out", Color32::from_gray(170));
-                        ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let session = self.editor.session();
-                            let (mut mute, mut dim) = (session.master_mute, session.master_dim);
-                            if pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
-                                .on_hover_text("Выключить звук мастера")
-                                .changed()
-                            {
-                                self.editor.set_master_mute(mute);
-                            }
-                            if pill(ui, &mut dim, "D", Color32::from_rgb(240, 160, 60))
-                                .on_hover_text("Приглушить мастер на 20 дБ")
-                                .changed()
-                            {
-                                self.editor.set_master_dim(dim);
-                            }
-                        });
-                        let mut master = self.editor.session().master_gain;
-                        let meter = self.master_meter;
-                        if fader(ui, &mut master, true, height, &meter).changed() {
-                            self.editor.set_master_gain(master);
-                        }
-                        level_labels(ui, master, &mut self.master_meter);
-                    },
-                );
+                pin_to_bottom(ui, rest, self, |slf, ui| {
+                    slf.master_bottom(ui, height);
+                });
             });
+    }
+
+    /// Bottom block of the master strip: name, M/D pills, fader, meters.
+    fn master_bottom(&mut self, ui: &mut egui::Ui, height: f32) {
+        name_plate(ui, "Stereo Out", Color32::from_gray(170));
+        ui.horizontal(|ui| {
+            ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let session = self.editor.session();
+            let (mut mute, mut dim) = (session.master_mute, session.master_dim);
+            if pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
+                .on_hover_text("Выключить звук мастера")
+                .changed()
+            {
+                self.editor.set_master_mute(mute);
+            }
+            if pill(ui, &mut dim, "D", Color32::from_rgb(240, 160, 60))
+                .on_hover_text("Приглушить мастер на 20 дБ")
+                .changed()
+            {
+                self.editor.set_master_dim(dim);
+            }
+        });
+        let mut master = self.editor.session().master_gain;
+        let meter = self.master_meter;
+        if fader(ui, &mut master, true, height, &meter).changed() {
+            self.editor.set_master_gain(master);
+        }
+        level_labels(ui, master, &mut self.master_meter);
     }
 
     /// Bus channel strip. With `match_height` it is stretched like the
@@ -1938,38 +1988,38 @@ impl App {
                 });
                 let used = ui.cursor().top() - top;
                 let rest = strip_rest(match_height, used, 130.0 + 70.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(STRIP_WIDTH, rest),
-                    egui::Layout::bottom_up(egui::Align::Center),
-                    |ui| {
-                        ui.set_min_size(Vec2::new(STRIP_WIDTH, rest));
-                        name_plate(ui, &bus.name, Color32::from_rgb(140, 150, 170));
-                        let mut gain = bus.gain;
-                        // Buses have no measurement of their own yet (SPEC-042).
-                        let mut meter = MeterState::default();
-                        if fader(ui, &mut gain, true, 130.0, &meter).changed() {
-                            let _ = self.editor.set_bus_gain(index, gain);
-                        }
-                        level_labels(ui, gain, &mut meter);
-                        // SPEC-051: mute/solo on the bus return only.
-                        let (mut mute, mut solo) = (bus.mute, bus.solo);
-                        ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let m = pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
-                                .on_hover_text("Без звука шины");
-                            let s = pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
-                                .on_hover_text("Соло шины");
-                            if m.changed() {
-                                let _ = self.editor.set_bus_mute(index, mute);
-                            }
-                            if s.changed() {
-                                let _ = self.editor.set_bus_solo(index, solo);
-                            }
-                        });
-                    },
-                );
+                pin_to_bottom(ui, rest, self, |slf, ui| {
+                    slf.bus_bottom(ui, index, &bus);
+                });
             });
+    }
+
+    /// Bottom block of a bus strip: name, fader, meters, M/S pills.
+    fn bus_bottom(&mut self, ui: &mut egui::Ui, index: usize, bus: &audio_core::Bus) {
+        name_plate(ui, &bus.name, Color32::from_rgb(140, 150, 170));
+        let mut gain = bus.gain;
+        // Buses have no measurement of their own yet (SPEC-042).
+        let mut meter = MeterState::default();
+        if fader(ui, &mut gain, true, 130.0, &meter).changed() {
+            let _ = self.editor.set_bus_gain(index, gain);
+        }
+        level_labels(ui, gain, &mut meter);
+        // SPEC-051: mute/solo on the bus return only.
+        let (mut mute, mut solo) = (bus.mute, bus.solo);
+        ui.horizontal(|ui| {
+            ui.add_space((ui.available_width() - 44.0).max(0.0) / 2.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let m = pill(ui, &mut mute, "M", Color32::from_rgb(90, 170, 255))
+                .on_hover_text("Без звука шины");
+            let s = pill(ui, &mut solo, "S", Color32::from_rgb(240, 200, 60))
+                .on_hover_text("Соло шины");
+            if m.changed() {
+                let _ = self.editor.set_bus_mute(index, mute);
+            }
+            if s.changed() {
+                let _ = self.editor.set_bus_solo(index, solo);
+            }
+        });
     }
 
     /// Mixer: a strip per track, then buses and the master.
