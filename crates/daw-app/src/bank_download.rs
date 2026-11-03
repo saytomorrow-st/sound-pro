@@ -411,7 +411,12 @@ fn acquire_lock(path: &Path) -> Result<BankLock, DownloadError> {
         .map_err(|e| DownloadError::Io(path.to_path_buf(), e.to_string()))?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(BankLock { _file: file }),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        // Detect lock contention by comparing the raw OS error code, NOT
+        // `ErrorKind`: on Windows `LockFileEx` reports `ERROR_LOCK_VIOLATION`
+        // (33), which Rust maps to `ErrorKind::Other`, not `WouldBlock` (that
+        // mapping is only reliable on Unix where it is `EWOULDBLOCK`). `fs2`
+        // exposes the canonical contended error for the host platform.
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Err(DownloadError::AlreadyInProgress(
                 path.file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -1377,54 +1382,73 @@ mod http_tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
-    /// A small single-threaded HTTP server. The handler returns a
-    /// [`ServerResponse`]; it must *not* panic or assert — a panic in the
-    /// server thread would not fail the test, so handlers return error
-    /// responses (e.g. 404) instead and the test asserts on the downloader's
-    /// behaviour.
+    /// A small multi-threaded HTTP server: the accept loop runs on one thread
+    /// and each connection is served on its own worker thread, so a handler
+    /// that blocks (e.g. to hold a download's lock while the test races a
+    /// second download) never stalls the listener or another in-flight
+    /// request. The handler returns a [`ServerResponse`]; it must *not* panic
+    /// or assert — a panic in a worker thread would not fail the test, so
+    /// handlers return error responses (e.g. 404) instead and the test asserts
+    /// on the downloader's behaviour.
     struct TestServer {
         addr: String,
         stop: Arc<AtomicBool>,
+        /// Tracked so `Drop` can stop the listener; the worker threads are
+        /// detached and bounded by the connection lifetime, not joined here.
         handle: Option<thread::JoinHandle<()>>,
     }
 
     impl TestServer {
-        fn start(handler: impl Fn(usize, &str) -> ServerResponse + Send + 'static) -> Self {
+        fn start(handler: impl Fn(usize, &str) -> ServerResponse + Send + Sync + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let addr = format!("http://{}", listener.local_addr().unwrap());
             let stop = Arc::new(AtomicBool::new(false));
             let stop2 = Arc::clone(&stop);
+            let index = Arc::new(AtomicUsize::new(0));
+            // Share the handler across worker threads.
+            let handler = Arc::new(handler);
             let handle = thread::spawn(move || {
-                let mut index = 0usize;
                 for stream in listener.incoming() {
                     if stop2.load(Ordering::Relaxed) {
                         break;
                     }
                     let Ok(mut stream) = stream else { continue };
-                    let mut buf = [0u8; 8192];
-                    let mut read = 0;
-                    loop {
-                        let n = stream.read(&mut buf[read..]).unwrap_or(0);
-                        if n == 0 {
-                            break;
+                    let index = Arc::clone(&index);
+                    let handler = Arc::clone(&handler);
+                    // Serve this connection on its own thread so a blocking
+                    // handler cannot deadlock the accept loop or another
+                    // request (this is what previously hung on Windows: the
+                    // blocking `/license` handler stalled the single server
+                    // thread, and `Drop::join` then waited forever).
+                    thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        let mut read = 0;
+                        loop {
+                            let n = stream.read(&mut buf[read..]).unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            read += n;
+                            if read >= buf.len() || buf[..read].windows(4).any(|w| w == b"\r\n\r\n")
+                            {
+                                break;
+                            }
                         }
-                        read += n;
-                        if read >= buf.len() || buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let req = String::from_utf8_lossy(&buf[..read]);
-                    let target = req
-                        .lines()
-                        .next()
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .unwrap_or("/");
-                    let resp = handler(index, target);
-                    index += 1;
-                    write_response(&mut stream, &resp);
+                        let req = String::from_utf8_lossy(&buf[..read]);
+                        let target = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        // Assign a monotonic request index; the handler uses it
+                        // to distinguish the first vs. later license requests.
+                        let idx = index.fetch_add(1, Ordering::Relaxed);
+                        let resp = handler(idx, target);
+                        write_response(&mut stream, &resp);
+                    });
                 }
             });
             TestServer {
@@ -1458,7 +1482,14 @@ mod http_tests {
             self.stop.store(true, Ordering::Relaxed);
             let _ = std::net::TcpStream::connect(self.addr.trim_start_matches("http://"));
             if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
+                // Bounded join: the accept loop must observe `stop` and exit
+                // quickly. If it does not, do not hang the whole test run.
+                for _ in 0..100 {
+                    if handle.is_finished() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         }
     }
@@ -1541,6 +1572,26 @@ mod http_tests {
 
     fn cancel_flag() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+
+    /// Join a worker thread with a hard deadline. A test that spawns threads or
+    /// servers must never be able to hang the run: if the worker has not
+    /// finished within `timeout`, this panics (turning a hang into a failure)
+    /// instead of blocking forever. Once the handle reports finished, `join`
+    /// returns immediately.
+    fn join_with_timeout<T>(handle: thread::JoinHandle<T>, timeout: std::time::Duration) -> T {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if handle.is_finished() {
+                return handle
+                    .join()
+                    .unwrap_or_else(|_| panic!("worker thread panicked"));
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("worker thread did not finish within {timeout:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn temp_banks_dir(tag: &str) -> PathBuf {
@@ -2425,20 +2476,25 @@ mod http_tests {
             download_bank_into_with_https(&e1, &banks1, &Progress::new(size), &cancel_flag(), false)
         });
         // Wait until the first download has acquired the lock and requested its
-        // license, then start the competing download.
-        started_rx.recv().unwrap();
+        // license, then start the competing download. Use a hard timeout so a
+        // bug that prevents the signal becomes a failure, not a hang.
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the first download must reach the license check");
         let t2 = thread::spawn(move || {
             download_bank_into_with_https(&e2, &banks2, &Progress::new(size), &cancel_flag(), false)
         });
-        let r2 = t2.join().unwrap();
         // The second download must observe the held lock and bail out.
+        // `join` here is bounded by the downloader's own timeouts; the server
+        // worker for `/license` is independent, so nothing blocks forever.
+        let r2 = join_with_timeout(t2, std::time::Duration::from_secs(30));
         assert!(
             matches!(r2, Err(DownloadError::AlreadyInProgress(_))),
             "the loser must report AlreadyInProgress: r2={r2:?}"
         );
         // Release the first download and let it finish.
         release_flag.store(true, Ordering::Relaxed);
-        let r1 = t1.join().unwrap();
+        let r1 = join_with_timeout(t1, std::time::Duration::from_secs(30));
         assert!(r1.is_ok(), "the first download must succeed: r1={r1:?}");
     }
 

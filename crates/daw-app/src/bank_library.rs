@@ -597,10 +597,15 @@ fn acquire_registry_lock(registry_file: &Path) -> Result<RegistryLock, LibraryEr
         .map_err(|e| LibraryError::Io(lock_path.clone(), e.to_string()))?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(RegistryLock { _file: file }),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(LibraryError::Io(
-            lock_path,
-            "registry is locked by another process".to_owned(),
-        )),
+        // Compare raw OS error codes, not `ErrorKind` (see `acquire_lock` in
+        // bank_download.rs): Windows reports `ERROR_LOCK_VIOLATION`, which is
+        // `ErrorKind::Other`, not `WouldBlock`.
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Err(LibraryError::Io(
+                lock_path,
+                "registry is locked by another process".to_owned(),
+            ))
+        }
         Err(e) => Err(LibraryError::Io(lock_path, e.to_string())),
     }
 }
