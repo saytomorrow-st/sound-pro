@@ -522,6 +522,14 @@ pub enum LoadError {
         /// Synthesizer error.
         source: audio_core::SynthError,
     },
+    /// The track's sample bank could not be loaded (SPEC-065).
+    #[error("track {track}: {source}")]
+    Bank {
+        /// Track index.
+        track: usize,
+        /// Bank load error.
+        source: crate::sample_bank::BankLoadError,
+    },
     /// A clip's WAV file holds fewer frames than its `source_length`.
     #[error("{path}: {file_frames} frame(s), clip needs source_length {source_length}")]
     SourceTooShort {
@@ -594,9 +602,12 @@ pub trait ClipCache {
     fn audio_stereo(&mut self, _source: &str) -> Option<StereoSamples> {
         None
     }
-    /// Rendered `notes` of `frames` frames at `rate`, if cached.
+    /// Rendered `notes` of `frames` frames at `rate` for `instrument`, if
+    /// cached (SPEC-065: the instrument id is part of the cache key, so
+    /// changing the instrument re-renders).
     fn notes(
         &mut self,
+        instrument: &str,
         notes: &[audio_core::session::Note],
         rate: u32,
         frames: u64,
@@ -604,6 +615,7 @@ pub trait ClipCache {
     /// Called after `notes` were rendered on a miss.
     fn store_notes(
         &mut self,
+        instrument: &str,
         notes: &[audio_core::session::Note],
         rate: u32,
         frames: u64,
@@ -621,6 +633,7 @@ impl ClipCache for NoCache {
     }
     fn notes(
         &mut self,
+        _instrument: &str,
         _notes: &[audio_core::session::Note],
         _rate: u32,
         _frames: u64,
@@ -629,6 +642,7 @@ impl ClipCache for NoCache {
     }
     fn store_notes(
         &mut self,
+        _instrument: &str,
         _notes: &[audio_core::session::Note],
         _rate: u32,
         _frames: u64,
@@ -653,23 +667,48 @@ pub fn load_session_cached(
     let rate = session.sample_rate;
     let mut tracks = Vec::with_capacity(session.tracks.len());
     for (track_index, track) in session.tracks.iter().enumerate() {
+        // Build the track's instrument and its cache key once, only when the
+        // track actually has MIDI clips to render (SPEC-065). Loading a sample
+        // bank reads files and allocates, so this stays on the control thread.
+        let instrument_key = instrument_key(&track.instrument);
+        let mut instrument: Option<Box<dyn instrument::Instrument>> = None;
         let mut clips: Vec<Box<dyn nodes::ClipSource + Send>> =
             Vec::with_capacity(track.clips.len());
         for (clip_index, clip) in track.clips.iter().enumerate() {
             let length = clip.source_length;
             if let Some(notes) = &clip.notes {
-                let samples = match cache.notes(notes, rate, length) {
+                let instrument = match &mut instrument {
+                    Some(ready) => ready,
+                    None => {
+                        instrument =
+                            Some(build_instrument(&track.instrument).map_err(|source| {
+                                LoadError::Bank {
+                                    track: track_index,
+                                    source,
+                                }
+                            })?);
+                        instrument.as_mut().expect("just set")
+                    }
+                };
+                let samples = match cache.notes(&instrument_key, notes, rate, length) {
                     Some(hit) => hit,
                     None => {
-                        let fresh =
-                            std::sync::Arc::new(piano::render_piano(notes, rate, length).map_err(
-                                |source| LoadError::Synth {
+                        let fresh = std::sync::Arc::new(
+                            instrument
+                                .render_notes(notes, rate, length)
+                                .map_err(|source| LoadError::Synth {
                                     track: track_index,
                                     clip: clip_index,
                                     source,
-                                },
-                            )?);
-                        cache.store_notes(notes, rate, length, std::sync::Arc::clone(&fresh));
+                                })?,
+                        );
+                        cache.store_notes(
+                            &instrument_key,
+                            notes,
+                            rate,
+                            length,
+                            std::sync::Arc::clone(&fresh),
+                        );
                         fresh
                     }
                 };
@@ -724,6 +763,34 @@ pub fn load_session_cached(
         frames: None,
         output,
     })
+}
+
+/// The cache-key string for a track's instrument (SPEC-065). `BuiltinPiano`
+/// uses the stable id `"piano"`; a sampler bank includes its path so distinct
+/// banks do not collide in the note cache.
+fn instrument_key(instrument: &audio_core::TrackInstrument) -> String {
+    match instrument {
+        audio_core::TrackInstrument::BuiltinPiano => "piano".to_owned(),
+        audio_core::TrackInstrument::Sampler { bank_path } => format!("sampler:{bank_path}"),
+    }
+}
+
+/// Builds the [`instrument::Instrument`] for a track's [`TrackInstrument`]
+/// (SPEC-065). Loading a sample bank reads files and allocates; callers must
+/// run this on the control thread, never in the audio callback.
+fn build_instrument(
+    instrument: &audio_core::TrackInstrument,
+) -> Result<Box<dyn instrument::Instrument>, crate::sample_bank::BankLoadError> {
+    match instrument {
+        audio_core::TrackInstrument::BuiltinPiano => Ok(Box::new(instrument::PianoInstrument)),
+        audio_core::TrackInstrument::Sampler { bank_path } => {
+            let bank = crate::sample_bank::load_bank(
+                std::path::Path::new(bank_path),
+                crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
+            )?;
+            Ok(Box::new(instrument::SamplerInstrument::new(&bank)))
+        }
+    }
 }
 
 fn audio_file_error(path: &std::path::Path, e: audio_file::AudioFileError) -> LoadError {

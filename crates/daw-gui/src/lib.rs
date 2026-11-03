@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use audio_core::session::{
-    AutoPoint, Clip, Lane, Note, Session, Track, TrackFolder, TrackFormat, TrackKind,
+    AutoPoint, Clip, Lane, Note, Session, Track, TrackFolder, TrackFormat, TrackInstrument,
+    TrackKind,
 };
 use audio_core::{
     Bus, BusSend, Effect, EffectKind, MAX_CLIPS_PER_TRACK, MAX_NAME_BYTES, MAX_TEMPO_POINTS,
@@ -3031,6 +3032,34 @@ impl Editor {
         self.commit_session(session)
     }
 
+    /// Sets a software-instrument track's instrument (SPEC-065). One undo
+    /// step; ignored on audio tracks.
+    ///
+    /// # Errors
+    ///
+    /// [`EditorError::NoClip`] for a bad index or an audio track.
+    pub fn set_track_instrument(
+        &mut self,
+        track: usize,
+        instrument: TrackInstrument,
+    ) -> Result<(), EditorError> {
+        let current = self
+            .project
+            .session
+            .tracks
+            .get(track)
+            .filter(|t| t.kind == TrackKind::Instrument)
+            .ok_or(EditorError::NoClip)?
+            .instrument
+            .clone();
+        if current == instrument {
+            return Ok(());
+        }
+        let mut session = self.project.session.clone();
+        session.tracks[track].instrument = instrument;
+        self.commit_session(session)
+    }
+
     /// Moves a track to position `to`; the others shift (SPEC-029).
     ///
     /// # Errors
@@ -4320,9 +4349,10 @@ fn file_error(path: &Path, e: daw_app::audio_file::AudioFileError) -> EditorErro
     }
 }
 
-type NotesKey = (Vec<Note>, u32, u64);
+type NotesKey = (String, Vec<Note>, u32, u64);
 
-/// MIDI clips rendered by the last load, keyed by notes, rate and length.
+/// MIDI clips rendered by the last load, keyed by instrument id, notes, rate
+/// and length (SPEC-065).
 #[derive(Debug, Default)]
 struct RenderedNotes(HashMap<NotesKey, Arc<Vec<f32>>>);
 
@@ -4344,8 +4374,14 @@ impl daw_app::ClipCache for EditorCache<'_> {
         self.stereo.get(source).cloned()
     }
 
-    fn notes(&mut self, notes: &[Note], rate: u32, frames: u64) -> Option<Arc<Vec<f32>>> {
-        let key = (notes.to_vec(), rate, frames);
+    fn notes(
+        &mut self,
+        instrument: &str,
+        notes: &[Note],
+        rate: u32,
+        frames: u64,
+    ) -> Option<Arc<Vec<f32>>> {
+        let key = (instrument.to_owned(), notes.to_vec(), rate, frames);
         let hit = self
             .used
             .get(&key)
@@ -4355,8 +4391,18 @@ impl daw_app::ClipCache for EditorCache<'_> {
         Some(hit)
     }
 
-    fn store_notes(&mut self, notes: &[Note], rate: u32, frames: u64, samples: Arc<Vec<f32>>) {
-        self.used.insert((notes.to_vec(), rate, frames), samples);
+    fn store_notes(
+        &mut self,
+        instrument: &str,
+        notes: &[Note],
+        rate: u32,
+        frames: u64,
+        samples: Arc<Vec<f32>>,
+    ) {
+        self.used.insert(
+            (instrument.to_owned(), notes.to_vec(), rate, frames),
+            samples,
+        );
     }
 }
 

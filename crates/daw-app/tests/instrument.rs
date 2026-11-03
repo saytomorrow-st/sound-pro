@@ -192,3 +192,78 @@ fn sampler_instrument_rejects_wrong_rate() {
     assert!(instrument.render_notes(&[], 44_100, 0).is_err());
     assert!(instrument.render_notes(&[], 0, 0).is_err());
 }
+
+#[test]
+fn pre_render_selects_the_chosen_instrument() {
+    use audio_core::session::{Clip, Session, Track as SessionTrack};
+    use daw_app::{NoCache, load_session, load_session_cached, render_session};
+
+    // A 440 Hz sine bank at root 60, distinct from the piano timbre.
+    let dir = Scratch::new("select");
+    let sample = sine(440.0, RATE as usize * 2);
+    write_wav(&dir.join("tone.wav"), &sample);
+    let sfz =
+        "<region> sample=tone.wav lokey=0 hikey=127 pitch_keycenter=60 loop_mode=loop_continuous\n";
+    std::fs::write(dir.join("bank.sfz"), sfz).unwrap();
+
+    let note = Note {
+        pitch: 60,
+        start: 0,
+        length: RATE as u64 / 2,
+        velocity: 100,
+    };
+
+    // Session A: built-in piano. Session B: the same notes through the sampler.
+    let make = |instrument| {
+        let mut clip = Clip::full(0, RATE as u64 / 2);
+        clip.notes = Some(vec![note]);
+        let mut track = SessionTrack::new("m");
+        track.instrument = instrument;
+        track.clips.push(clip);
+        let mut session = Session::new("s", RATE, 120.0);
+        session.tracks.push(track);
+        session
+    };
+
+    let piano = make(audio_core::TrackInstrument::BuiltinPiano);
+    let sampler = make(audio_core::TrackInstrument::Sampler {
+        bank_path: dir.0.to_string_lossy().into_owned(),
+    });
+
+    let piano_out =
+        render_session(load_session(piano, std::path::Path::new(""), dir.join("p.wav")).unwrap())
+            .unwrap();
+    let sampler_out =
+        render_session(load_session(sampler, std::path::Path::new(""), dir.join("s.wav")).unwrap())
+            .unwrap();
+
+    // Both produce audio, and the two instruments differ.
+    assert!(piano_out.frames > 0 && sampler_out.frames > 0);
+    let read = |p| {
+        let (_, buf) = audio_core::wav::read_wav_mono(p).unwrap();
+        buf.channel(0).to_vec()
+    };
+    let p_wav = dir.join("p.wav");
+    let s_wav = dir.join("s.wav");
+    let a = read(&p_wav);
+    let b = read(&s_wav);
+    assert_eq!(a.len(), b.len());
+    assert!(
+        a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits()),
+        "piano and sampler must render differently"
+    );
+
+    // A missing bank must fail loudly, not silently fall back to piano.
+    let broken = make(audio_core::TrackInstrument::Sampler {
+        bank_path: dir.join("nope").to_string_lossy().into_owned(),
+    });
+    assert!(
+        load_session_cached(
+            broken,
+            std::path::Path::new(""),
+            dir.join("x.wav"),
+            &mut NoCache
+        )
+        .is_err()
+    );
+}

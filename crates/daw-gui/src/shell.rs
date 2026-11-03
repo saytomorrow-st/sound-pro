@@ -2,7 +2,7 @@
 //! with position display, library, inspector, browser and the bottom area
 //! with mixer, editor and smart controls. Placeholders are marked as such.
 
-use audio_core::{TrackFormat, TrackKind};
+use audio_core::{TrackFormat, TrackInstrument, TrackKind};
 use daw_gui::layout::{
     Bottom, FADER_FLOOR_DB, MeterState, MeterZone, db_label, fader_gain, fader_position,
     lcd_position, meter_zone, pan_angle, pan_label,
@@ -1496,6 +1496,8 @@ impl App {
                     self.report(result, "Формат дорожки изменён");
                 }
                 ui.end_row();
+            } else {
+                self.instrument_row(ui, index);
             }
             row_label(ui, "Канал");
             ui.label(format!("{}", index + 1));
@@ -1539,6 +1541,67 @@ impl App {
                 "No Transpose",
             ],
         );
+    }
+
+    /// The instrument picker row for a software-instrument track (SPEC-065):
+    /// choose «Встроенное пианино» or «Сэмплер: выбрать SFZ-папку…», and show
+    /// the loaded bank's name and any load warnings/errors.
+    fn instrument_row(&mut self, ui: &mut egui::Ui, index: usize) {
+        row_label(ui, "Инструмент");
+        let track = &self.editor.session().tracks[index];
+        let is_sampler = matches!(track.instrument, TrackInstrument::Sampler { .. });
+        let mut kind = if is_sampler { 1 } else { 0 };
+        ui.horizontal(|ui| {
+            if ui.selectable_value(&mut kind, 0, "Пианино").changed() && is_sampler {
+                let result = self
+                    .editor
+                    .set_track_instrument(index, TrackInstrument::BuiltinPiano);
+                self.report(result, "Инструмент изменён");
+                self.instrument_loads.remove(&index);
+            }
+            if ui.selectable_value(&mut kind, 1, "Сэмплер…").changed() && !is_sampler {
+                self.choose_sampler(index);
+            }
+        });
+        ui.end_row();
+
+        // Status line: loading spinner, bank name, warnings/errors.
+        let status = self.instrument_loads.get(&index);
+        if let Some(entry) = status {
+            if entry.loading {
+                row_label(ui, "");
+                ui.spinner();
+                ui.label("Загрузка банка…");
+                ui.end_row();
+            } else if let Some(result) = &entry.result {
+                match result {
+                    Ok(s) => {
+                        row_label(ui, "");
+                        ui.label(RichText::new(&s.name).strong());
+                        let mut info = Vec::new();
+                        if s.warnings > 0 {
+                            info.push(format!("предупреждений: {}", s.warnings));
+                        }
+                        if s.decode_failures > 0 {
+                            info.push(format!("не загружено сэмплов: {}", s.decode_failures));
+                        }
+                        info.push(format!("RAM: {:.1} МиБ", s.ram_bytes as f64 / 1_048_576.0));
+                        ui.label(
+                            RichText::new(info.join(" · "))
+                                .small()
+                                .color(Color32::from_gray(170)),
+                        );
+                        ui.end_row();
+                    }
+                    Err(e) => {
+                        row_label(ui, "");
+                        ui.label(RichText::new("Ошибка").color(Color32::from_rgb(220, 90, 90)));
+                        ui.label(RichText::new(e).small().color(Color32::from_gray(170)));
+                        ui.end_row();
+                    }
+                }
+            }
+        }
     }
 
     /// Track and project notes tabs at the bottom (SPEC-043 §6).
