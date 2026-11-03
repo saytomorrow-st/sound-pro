@@ -226,8 +226,9 @@ fn pre_render_selects_the_chosen_instrument() {
     };
 
     let piano = make(audio_core::TrackInstrument::BuiltinPiano);
+    // A legacy absolute path still resolves directly (backward compatibility).
     let sampler = make(audio_core::TrackInstrument::Sampler {
-        bank_path: dir.0.to_string_lossy().into_owned(),
+        bank_id: dir.0.to_string_lossy().into_owned(),
     });
 
     let piano_out =
@@ -253,17 +254,26 @@ fn pre_render_selects_the_chosen_instrument() {
         "piano and sampler must render differently"
     );
 
-    // A missing bank must fail loudly, not silently fall back to piano.
+    // A missing bank falls back to the built-in piano rather than failing
+    // (SPEC-065 redesign): it renders the same audio as the piano track.
     let broken = make(audio_core::TrackInstrument::Sampler {
-        bank_path: dir.join("nope").to_string_lossy().into_owned(),
+        bank_id: dir.join("nope").to_string_lossy().into_owned(),
     });
-    assert!(
+    let broken_out = render_session(
         load_session_cached(
             broken,
             std::path::Path::new(""),
             dir.join("x.wav"),
-            &mut NoCache
+            &mut NoCache,
         )
-        .is_err()
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(broken_out.frames > 0);
+    let x_wav = dir.join("x.wav");
+    let x = read(&x_wav);
+    assert_eq!(
+        x, a,
+        "a broken sampler bank must fall back to the piano timbre"
     );
 }

@@ -447,11 +447,12 @@ fn write_session(out: &mut String, session: &Session) {
             out.push_str(",\n        \"kind\": \"instrument\"");
         }
         // Written only when not the default, so pre-SPEC-065 documents keep
-        // their exact text (SPEC-065).
-        if let TrackInstrument::Sampler { bank_path } = &track.instrument {
-            out.push_str(",\n        \"instrument\": { \"sampler\": ");
-            write_string(out, bank_path);
-            out.push_str(" }");
+        // their exact text (SPEC-065). A sampler bank is serialised by its
+        // library id (not its folder path); see `instrument_from_value`.
+        if let TrackInstrument::Sampler { bank_id } = &track.instrument {
+            out.push_str(",\n        \"instrument\": { \"sampler\": { \"bank\": ");
+            write_string(out, bank_id);
+            out.push_str(" } }");
         }
         if track.format == TrackFormat::Stereo {
             out.push_str(",\n        \"format\": \"stereo\"");
@@ -1988,21 +1989,25 @@ fn format_from_value(value: &Value) -> Result<TrackFormat, ProjectError> {
     }
 }
 
-/// `{ "sampler": "<bank_path>" }` (SPEC-065). `BuiltinPiano` is never written
-/// and is represented by the field being absent.
+/// `{ "sampler": { "bank": "<bank_id>" } }` (SPEC-065 redesign). `BuiltinPiano`
+/// is never written and is represented by the field being absent.
+///
+/// Backward compatibility: pre-redesign documents wrote a bare string,
+/// `{ "sampler": "<bank_path>" }`. That string is an absolute folder path and
+/// is read as the bank id, which the application still resolves by path.
 fn instrument_from_value(value: &Value) -> Result<TrackInstrument, ProjectError> {
     let Value::Object(entries) = value else {
         return Err(ProjectError::Malformed { at: 0 });
     };
-    let mut bank_path = None;
+    let mut bank_id = None;
     for (key, value) in entries {
         match key.as_str() {
             "sampler" => {
-                let path = require_string(value)?;
-                if path.len() > MAX_SOURCE_BYTES {
+                let id = sampler_bank_id(value)?;
+                if id.len() > MAX_SOURCE_BYTES {
                     return Err(ProjectError::Malformed { at: 0 });
                 }
-                bank_path = Some(path);
+                bank_id = Some(id);
             }
             other => {
                 return Err(ProjectError::UnknownField {
@@ -2011,10 +2016,39 @@ fn instrument_from_value(value: &Value) -> Result<TrackInstrument, ProjectError>
             }
         }
     }
-    let bank_path = bank_path.ok_or(ProjectError::MissingField {
+    let bank_id = bank_id.ok_or(ProjectError::MissingField {
         field: "session.tracks[].instrument.sampler",
     })?;
-    Ok(TrackInstrument::Sampler { bank_path })
+    Ok(TrackInstrument::Sampler { bank_id })
+}
+
+/// Reads the bank id from the `sampler` value, which is either the new
+/// `{ "bank": "<id>" }` object or the legacy bare-string folder path.
+fn sampler_bank_id(value: &Value) -> Result<String, ProjectError> {
+    match value {
+        // Legacy: `"sampler": "/absolute/path/to/bank"`.
+        Value::String(path) => Ok(path.clone()),
+        // New: `"sampler": { "bank": "<id>" }`.
+        Value::Object(entries) => {
+            let mut id = None;
+            for (key, value) in entries {
+                match key.as_str() {
+                    "bank" => {
+                        id = Some(require_string(value)?);
+                    }
+                    other => {
+                        return Err(ProjectError::UnknownField {
+                            field: other.to_owned(),
+                        });
+                    }
+                }
+            }
+            id.ok_or(ProjectError::MissingField {
+                field: "session.tracks[].instrument.sampler.bank",
+            })
+        }
+        _ => Err(ProjectError::Malformed { at: 0 }),
+    }
 }
 
 fn require_string(value: &Value) -> Result<String, ProjectError> {

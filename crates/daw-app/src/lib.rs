@@ -524,14 +524,6 @@ pub enum LoadError {
         /// Synthesizer error.
         source: audio_core::SynthError,
     },
-    /// The track's sample bank could not be loaded (SPEC-065).
-    #[error("track {track}: {source}")]
-    Bank {
-        /// Track index.
-        track: usize,
-        /// Bank load error.
-        source: crate::sample_bank::BankLoadError,
-    },
     /// A clip's WAV file holds fewer frames than its `source_length`.
     #[error("{path}: {file_frames} frame(s), clip needs source_length {source_length}")]
     SourceTooShort {
@@ -672,27 +664,24 @@ pub fn load_session_cached(
         // Build the track's instrument and its cache key once, only when the
         // track actually has MIDI clips to render (SPEC-065). Loading a sample
         // bank reads files and allocates, so this stays on the control thread.
-        let instrument_key = instrument_key(&track.instrument);
-        let mut instrument: Option<Box<dyn instrument::Instrument>> = None;
+        // A missing or corrupt bank falls back to the built-in piano (SPEC-065
+        // redesign), so a deleted bank never blocks playback.
+        let mut instrument: Option<(String, Box<dyn instrument::Instrument>)> = None;
         let mut clips: Vec<Box<dyn nodes::ClipSource + Send>> =
             Vec::with_capacity(track.clips.len());
         for (clip_index, clip) in track.clips.iter().enumerate() {
             let length = clip.source_length;
             if let Some(notes) = &clip.notes {
-                let instrument = match &mut instrument {
-                    Some(ready) => ready,
+                let (instrument_key, instrument) = match &mut instrument {
+                    Some((key, ready)) => (key.as_str(), ready),
                     None => {
-                        instrument =
-                            Some(build_instrument(&track.instrument).map_err(|source| {
-                                LoadError::Bank {
-                                    track: track_index,
-                                    source,
-                                }
-                            })?);
-                        instrument.as_mut().expect("just set")
+                        let built = build_instrument(&track.instrument);
+                        instrument = Some(built);
+                        let (key, ready) = instrument.as_mut().expect("just set");
+                        (key.as_str(), ready)
                     }
                 };
-                let samples = match cache.notes(&instrument_key, notes, rate, length) {
+                let samples = match cache.notes(instrument_key, notes, rate, length) {
                     Some(hit) => hit,
                     None => {
                         let fresh = std::sync::Arc::new(
@@ -705,7 +694,7 @@ pub fn load_session_cached(
                                 })?,
                         );
                         cache.store_notes(
-                            &instrument_key,
+                            instrument_key,
                             notes,
                             rate,
                             length,
@@ -767,30 +756,35 @@ pub fn load_session_cached(
     })
 }
 
-/// The cache-key string for a track's instrument (SPEC-065). `BuiltinPiano`
-/// uses the stable id `"piano"`; a sampler bank includes its path so distinct
-/// banks do not collide in the note cache.
-fn instrument_key(instrument: &audio_core::TrackInstrument) -> String {
-    match instrument {
-        audio_core::TrackInstrument::BuiltinPiano => "piano".to_owned(),
-        audio_core::TrackInstrument::Sampler { bank_path } => format!("sampler:{bank_path}"),
-    }
-}
-
 /// Builds the [`instrument::Instrument`] for a track's [`TrackInstrument`]
-/// (SPEC-065). Loading a sample bank reads files and allocates; callers must
-/// run this on the control thread, never in the audio callback.
+/// and its note-cache key (SPEC-065). `BuiltinPiano` uses the stable id
+/// `"piano"`; a sampler bank includes its id so distinct banks do not collide
+/// in the note cache. Loading a sample bank reads files and allocates; callers
+/// must run this on the control thread, never in the audio callback.
+///
+/// The sampler bank id is resolved to an installed folder via the library
+/// registry (with a legacy absolute-path fallback). A bank that cannot be
+/// resolved or loaded falls back to the built-in piano (SPEC-065 redesign), so
+/// a deleted or corrupt bank never blocks playback; the note cache key is then
+/// `"piano"` to match the fallback timbre.
 fn build_instrument(
     instrument: &audio_core::TrackInstrument,
-) -> Result<Box<dyn instrument::Instrument>, crate::sample_bank::BankLoadError> {
+) -> (String, Box<dyn instrument::Instrument>) {
     match instrument {
-        audio_core::TrackInstrument::BuiltinPiano => Ok(Box::new(instrument::PianoInstrument)),
-        audio_core::TrackInstrument::Sampler { bank_path } => {
-            let bank = crate::sample_bank::load_bank(
-                std::path::Path::new(bank_path),
-                crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
-            )?;
-            Ok(Box::new(instrument::SamplerInstrument::new(&bank)))
+        audio_core::TrackInstrument::BuiltinPiano => {
+            ("piano".to_owned(), Box::new(instrument::PianoInstrument))
+        }
+        audio_core::TrackInstrument::Sampler { bank_id } => {
+            let loaded = crate::bank_library::resolve_bank_dir(bank_id).and_then(|dir| {
+                crate::sample_bank::load_bank(&dir, crate::sample_bank::DEFAULT_RAM_BUDGET_MIB).ok()
+            });
+            match loaded {
+                Some(bank) => (
+                    format!("sampler:{bank_id}"),
+                    Box::new(instrument::SamplerInstrument::new(&bank)),
+                ),
+                None => ("piano".to_owned(), Box::new(instrument::PianoInstrument)),
+            }
         }
     }
 }

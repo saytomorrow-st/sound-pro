@@ -1594,63 +1594,132 @@ impl App {
     }
 
     /// The instrument picker row for a software-instrument track (SPEC-065):
-    /// choose «Встроенное пианино» or «Сэмплер: выбрать SFZ-папку…», and show
-    /// the loaded bank's name and any load warnings/errors.
+    /// a `ComboBox` listing the built-in piano and every installed bank by
+    /// name, with not-yet-downloaded catalog banks shown greyed («… — скачать»)
+    /// and opening the library window on click. A selected bank whose folder is
+    /// missing is marked and rendered as the piano fallback.
     fn instrument_row(&mut self, ui: &mut egui::Ui, index: usize) {
         row_label(ui, "Инструмент");
         let track = &self.editor.session().tracks[index];
-        let is_sampler = matches!(track.instrument, TrackInstrument::Sampler { .. });
-        let mut kind = if is_sampler { 1 } else { 0 };
+        let selected_id = match &track.instrument {
+            TrackInstrument::BuiltinPiano => None,
+            TrackInstrument::Sampler { bank_id } => Some(bank_id.clone()),
+        };
+
+        let catalog = daw_app::bank_library::catalog().unwrap_or_default();
+        let items = daw_app::bank_library::instrument_list(
+            &self.installed_banks,
+            &catalog,
+            selected_id.as_deref(),
+        );
+
+        // Current label: the selected item's display text, or a broken marker.
+        let mut current_label = "Пианино (встроенное)".to_owned();
+        let mut broken = false;
+        for item in &items {
+            let is_current = match item {
+                daw_app::bank_library::InstrumentListItem::BuiltinPiano => selected_id.is_none(),
+                daw_app::bank_library::InstrumentListItem::Installed { id, .. }
+                | daw_app::bank_library::InstrumentListItem::Broken { id, .. } => {
+                    selected_id.as_deref() == Some(id.as_str())
+                }
+                daw_app::bank_library::InstrumentListItem::Download { .. } => false,
+            };
+            if !is_current {
+                continue;
+            }
+            match item {
+                daw_app::bank_library::InstrumentListItem::BuiltinPiano => {
+                    current_label = "Пианино (встроенное)".to_owned();
+                }
+                daw_app::bank_library::InstrumentListItem::Installed { name, .. } => {
+                    current_label = name.clone();
+                }
+                daw_app::bank_library::InstrumentListItem::Broken { name, .. } => {
+                    current_label = format!("{name} — повреждён");
+                    broken = true;
+                }
+                daw_app::bank_library::InstrumentListItem::Download { name, .. } => {
+                    current_label = name.clone();
+                }
+            }
+            break;
+        }
+
+        let mut changed_to: Option<TrackInstrument> = None;
+        let mut open_library = false;
         ui.horizontal(|ui| {
-            if ui.selectable_value(&mut kind, 0, "Пианино").changed() && is_sampler {
-                let result = self
-                    .editor
-                    .set_track_instrument(index, TrackInstrument::BuiltinPiano);
-                self.report(result, "Инструмент изменён");
-                self.instrument_loads.remove(&index);
-            }
-            if ui.selectable_value(&mut kind, 1, "Сэмплер…").changed() && !is_sampler {
-                self.choose_sampler(index);
-            }
+            let text = if broken {
+                RichText::new(&current_label).color(Color32::from_rgb(220, 90, 90))
+            } else {
+                RichText::new(&current_label)
+            };
+            egui::ComboBox::from_id_salt(("instrument", index))
+                .selected_text(text)
+                .show_ui(ui, |ui| {
+                    for item in &items {
+                        match item {
+                            daw_app::bank_library::InstrumentListItem::BuiltinPiano => {
+                                if ui
+                                    .selectable_label(selected_id.is_none(), "Пианино (встроенное)")
+                                    .clicked()
+                                {
+                                    changed_to = Some(TrackInstrument::BuiltinPiano);
+                                }
+                            }
+                            daw_app::bank_library::InstrumentListItem::Installed { id, name } => {
+                                if ui
+                                    .selectable_label(
+                                        selected_id.as_deref() == Some(id.as_str()),
+                                        name,
+                                    )
+                                    .clicked()
+                                {
+                                    changed_to = Some(TrackInstrument::Sampler {
+                                        bank_id: id.clone(),
+                                    });
+                                }
+                            }
+                            daw_app::bank_library::InstrumentListItem::Broken { id, name } => {
+                                let label = format!("{name} — повреждён");
+                                if ui
+                                    .selectable_label(
+                                        selected_id.as_deref() == Some(id.as_str()),
+                                        RichText::new(label).color(Color32::from_rgb(220, 90, 90)),
+                                    )
+                                    .clicked()
+                                {
+                                    changed_to = Some(TrackInstrument::Sampler {
+                                        bank_id: id.clone(),
+                                    });
+                                }
+                            }
+                            daw_app::bank_library::InstrumentListItem::Download {
+                                name, ..
+                            } => {
+                                let label = format!("{name} — скачать");
+                                if ui
+                                    .selectable_label(
+                                        false,
+                                        RichText::new(label).color(Color32::from_gray(150)),
+                                    )
+                                    .clicked()
+                                {
+                                    open_library = true;
+                                }
+                            }
+                        }
+                    }
+                });
         });
         ui.end_row();
 
-        // Status line: loading spinner, bank name, warnings/errors.
-        let status = self.instrument_loads.get(&index);
-        if let Some(entry) = status {
-            if entry.loading {
-                row_label(ui, "");
-                ui.spinner();
-                ui.label("Загрузка банка…");
-                ui.end_row();
-            } else if let Some(result) = &entry.result {
-                match result {
-                    Ok(s) => {
-                        row_label(ui, "");
-                        ui.label(RichText::new(&s.name).strong());
-                        let mut info = Vec::new();
-                        if s.warnings > 0 {
-                            info.push(format!("предупреждений: {}", s.warnings));
-                        }
-                        if s.decode_failures > 0 {
-                            info.push(format!("не загружено сэмплов: {}", s.decode_failures));
-                        }
-                        info.push(format!("RAM: {:.1} МиБ", s.ram_bytes as f64 / 1_048_576.0));
-                        ui.label(
-                            RichText::new(info.join(" · "))
-                                .small()
-                                .color(Color32::from_gray(170)),
-                        );
-                        ui.end_row();
-                    }
-                    Err(e) => {
-                        row_label(ui, "");
-                        ui.label(RichText::new("Ошибка").color(Color32::from_rgb(220, 90, 90)));
-                        ui.label(RichText::new(e).small().color(Color32::from_gray(170)));
-                        ui.end_row();
-                    }
-                }
-            }
+        if let Some(instrument) = changed_to {
+            let result = self.editor.set_track_instrument(index, instrument);
+            self.report(result, "Инструмент изменён");
+        }
+        if open_library {
+            self.open_library();
         }
     }
 
