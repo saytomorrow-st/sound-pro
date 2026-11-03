@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use daw_app::bank_library::{
     BUILTIN_PIANO_CREDIT, CatalogError, InstalledBank, InstalledRegistry, catalog, credits_text,
-    is_sha256, parse_catalog_entry, validate_catalog_entry,
+    is_downloadable, is_sha256, parse_catalog_entry, validate_catalog_entry,
 };
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -39,9 +39,9 @@ fn catalog_has_exactly_two_known_entries() {
     let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
     assert!(ids.contains(&"salamander-grand-v3"));
     assert!(ids.contains(&"osiris-piano"));
-    // No entry is downloadable yet: every hash is a placeholder.
-    assert!(entries.iter().all(|e| e.sha256.is_none()));
-    assert!(entries.iter().all(|e| !e.verified));
+    // SPEC-067: both entries are now fully verified and downloadable.
+    assert!(entries.iter().all(is_downloadable));
+    assert!(entries.iter().all(|e| e.verified));
 }
 
 #[test]

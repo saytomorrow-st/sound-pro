@@ -72,16 +72,18 @@ pub struct LoadedBank {
 
 /// A filesystem-backed [`IncludeResolver`] rooted at the bank directory.
 ///
-/// `#include`d paths are resolved relative to `root`; the parser already
-/// rejects absolute paths and `..` (`SfzError::UnsafePath`), so a path that
-/// reaches here is a plain relative path.
+/// `#include`d paths are resolved relative to `root` and confined to it; the
+/// parser already rejects absolute paths and `..` (`SfzError::UnsafePath`),
+/// but we re-check here and normalise `\` → `/` (defense in depth, and so a
+/// Windows-authored SFZ works on Linux and vice versa).
 struct DirResolver {
     root: PathBuf,
 }
 
 impl IncludeResolver for DirResolver {
     fn resolve(&mut self, path: &str) -> Result<String, String> {
-        let full = self.root.join(path);
+        let full =
+            confine_path(&self.root, path).ok_or_else(|| format!("unsafe include path: {path}"))?;
         std::fs::read_to_string(&full).map_err(|e| format!("{}: {e}", full.display()))
     }
 }
@@ -136,6 +138,13 @@ pub fn load_bank(dir: &Path, budget_mib: u64) -> Result<LoadedBank, BankLoadErro
             continue;
         };
         let full = resolve_sample_path(dir, doc.default_path.as_deref(), sample_path);
+        let Some(full) = full else {
+            decode_failures.push(RegionFailure {
+                sample: sample_path.to_owned(),
+                reason: format!("sample path escapes the bank root: {sample_path}"),
+            });
+            continue;
+        };
         match decode_sample(&full) {
             Ok((data, channels)) if !data.is_empty() => {
                 // `data` is interleaved i16; one i16 is two bytes (RFC-001 §3.3).
@@ -194,15 +203,52 @@ fn find_sfz(dir: &Path) -> Result<PathBuf, BankLoadError> {
 }
 
 /// Resolves a region's `sample` path: `default_path` (if any) then the bank
-/// directory, keeping the result inside `dir` where possible.
-fn resolve_sample_path(dir: &Path, default_path: Option<&str>, sample: &str) -> PathBuf {
-    if let Some(base) = default_path {
-        let candidate = dir.join(base).join(sample);
-        if candidate.is_file() {
-            return candidate;
+/// directory, keeping the result inside the **bank root** `dir`.
+///
+/// SFZ `sample=` paths may legitimately climb *within* the bank (e.g. Osiris
+/// uses `sample=../UC/...` to reach a sibling folder under the bank root), but
+/// they must never escape the bank root itself. This normalises `\` → `/` and
+/// rejects absolute paths, drive letters, and `..` that leave `dir`.
+///
+/// Returns `None` when the path is unsafe (escapes `dir`); the caller records
+/// it as a decode failure rather than reading an arbitrary file.
+fn resolve_sample_path(dir: &Path, default_path: Option<&str>, sample: &str) -> Option<PathBuf> {
+    // `sample` is relative to `default_path` (a subdirectory of the bank root),
+    // or to the bank root when there is no `default_path`. Joining them and
+    // confining against `dir` keeps `..` from escaping the bank root.
+    let joined = match default_path {
+        Some(base) if !base.is_empty() => format!("{base}/{sample}"),
+        _ => sample.to_owned(),
+    };
+    confine_path(dir, &joined)
+}
+
+/// Joins `path` onto `root`, normalising `\` → `/` and rejecting any path that
+/// escapes `root` (absolute, drive-letter, or `..` that climbs above `root`).
+/// A leading `..` or an empty path yields `None`.
+fn confine_path(root: &Path, path: &str) -> Option<PathBuf> {
+    let normalized = path.replace('\\', "/");
+    // Absolute (POSIX or Windows-style) and drive letters are never allowed.
+    if normalized.starts_with('/') || (normalized.len() >= 2 && normalized.as_bytes()[1] == b':') {
+        return None;
+    }
+    // Track components relative to `root` so that `..` never climbs above it.
+    let mut components: Vec<&str> = Vec::new();
+    for comp in normalized.split('/') {
+        match comp {
+            "" | "." => continue,
+            // A `..` with nothing to pop climbs above `root`.
+            ".." => {
+                components.pop()?;
+            }
+            other => components.push(other),
         }
     }
-    dir.join(sample)
+    let mut out = root.to_path_buf();
+    for comp in components {
+        out.push(comp);
+    }
+    Some(out)
 }
 
 /// Decodes `path` to interleaved `i16` PCM via the SPEC-053 symphonia decoder.
@@ -270,5 +316,65 @@ mod tests {
         assert_eq!(to_i16(0.0), 0);
         assert_eq!(to_i16(2.0), 32767);
         assert_eq!(to_i16(-2.0), -32767);
+    }
+
+    #[test]
+    fn confine_path_normalises_backslashes() {
+        let root = Path::new("/bank/root");
+        assert_eq!(
+            confine_path(root, "samples\\tone.wav"),
+            Some(PathBuf::from("/bank/root/samples/tone.wav"))
+        );
+        assert_eq!(
+            confine_path(root, "UC\\Piano\\C4.wav"),
+            Some(PathBuf::from("/bank/root/UC/Piano/C4.wav"))
+        );
+    }
+
+    #[test]
+    fn confine_path_allows_climbing_within_root() {
+        let root = Path::new("/bank/root");
+        // `..` that stays at/above root is allowed (Osiris `sample=../UC/...`),
+        // where `..` climbs relative to a subdirectory but never above `root`.
+        assert_eq!(
+            confine_path(root, "Programs/../UC/Piano/C4.wav"),
+            Some(PathBuf::from("/bank/root/UC/Piano/C4.wav"))
+        );
+        // Climbing back down within the root is fine.
+        assert_eq!(
+            confine_path(root, "sub/../other.wav"),
+            Some(PathBuf::from("/bank/root/other.wav"))
+        );
+    }
+
+    #[test]
+    fn confine_path_rejects_escape_above_root() {
+        let root = Path::new("/bank/root");
+        assert_eq!(confine_path(root, "../../etc/passwd"), None);
+        assert_eq!(confine_path(root, ".."), None);
+        assert_eq!(confine_path(root, "sub/../../.."), None);
+    }
+
+    #[test]
+    fn confine_path_rejects_absolute_and_drive() {
+        let root = Path::new("/bank/root");
+        assert_eq!(confine_path(root, "/etc/passwd"), None);
+        assert_eq!(confine_path(root, "\\etc\\passwd"), None);
+        assert_eq!(confine_path(root, "C:\\evil"), None);
+        assert_eq!(confine_path(root, "C:/evil"), None);
+    }
+
+    #[test]
+    fn confine_path_handles_dot_and_empty_components() {
+        let root = Path::new("/bank/root");
+        assert_eq!(
+            confine_path(root, "./samples/./tone.wav"),
+            Some(PathBuf::from("/bank/root/samples/tone.wav"))
+        );
+        assert_eq!(
+            confine_path(root, "samples//tone.wav"),
+            Some(PathBuf::from("/bank/root/samples/tone.wav"))
+        );
+        assert_eq!(confine_path(root, ""), Some(root.to_path_buf()));
     }
 }

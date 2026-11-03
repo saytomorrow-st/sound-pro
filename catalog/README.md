@@ -13,15 +13,20 @@
 
 | id | Банк | Автор | Лицензия | Атрибуция | sha256 | Проверено |
 |---|---|---|---|---|---|---|
-| `salamander-grand-v3` | Salamander Grand Piano V3 | Alexander Holm | CC-BY-3.0 | обязательна | плейсхолдер (`null`) | нет |
-| `osiris-piano` | Osiris Piano | Versilian Studios + Karoryfer Samples | CC0-1.0 | не обязательна | плейсхолдер (`null`) | нет |
+| `salamander-grand-v3` | Salamander Grand Piano V3 | Alexander Holm | CC-BY-3.0 | обязательна | `fe595c77…` | да |
+| `osiris-piano` | Osiris Piano | Versilian Studios + Karoryfer Samples | CC0-1.0 | не обязательна | `54ef210b…` | да |
 
-`sha256: null` означает «не скачиваем»: SPEC-067 заполнит хэши и
-размеры, после чего запись станет скачиваемой. Не выдумывайте хэши и
-размеры.
+Обе записи заполнены реальными, проверенными значениями (SPEC-067):
+SHA-256 архивов, размеры, `license_check` и `sfz` подтверждены загрузкой
+с апстрима. Полные хэши и детали — в `catalog/audit/<bank_id>.md`.
+
+`sha256: null` означает «не скачиваем». Не выдумывайте хэши и размеры —
+любое значение должно быть проверено реальной загрузкой с апстрима.
 
 ## Журнал аудита лицензий
 
 `catalog/audit/<bank_id>.md` — отдельные записи аудита (SPEC-067, PR 6).
-Пока записи выше опираются на подтверждённые в RFC-001 §6 факты:
-Salamander — CC-BY-3.0 (атрибуция обязательна), Osiris Piano — CC0-1.0.
+Для обеих записей выше созданы записи аудита:
+- `catalog/audit/salamander-grand-v3.md` — CC-BY-3.0 (атрибуция обязательна),
+  формат архива `tar.bz2`.
+- `catalog/audit/osiris-piano.md` — CC0-1.0, формат `zip`.

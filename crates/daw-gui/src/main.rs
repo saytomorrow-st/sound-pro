@@ -571,6 +571,32 @@ struct InstrumentLoad {
     result: Option<Result<InstrumentStatus, String>>,
 }
 
+/// A message from a background bank download (SPEC-067). The worker reports
+/// progress and a final result; the GUI polls these on the main thread.
+enum DownloadMsg {
+    /// The download finished (success or failure).
+    Done {
+        bank_id: String,
+        result: Result<daw_app::bank_library::InstalledBank, daw_app::bank_download::DownloadError>,
+    },
+}
+
+/// Per-bank download state shown in the library window (SPEC-067). The heavy
+/// network work runs on a worker thread; this keeps only the cosmetic state
+/// the GUI needs: a shared progress counter, a cancellation flag, and a status
+/// line.
+struct DownloadState {
+    /// Shared progress counter, updated by the worker thread.
+    progress: daw_app::bank_download::Progress,
+    /// Set to cancel the in-flight download.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A catalog entry awaiting the user's acceptance before download (SPEC-067).
+struct DownloadAccept {
+    entry: daw_app::bank_library::CatalogEntry,
+}
+
 /// A region shown while its file still decodes (SPEC-050 §7): its length
 /// comes from the header, its waveform fills in as the decoder advances.
 struct Ghost {
@@ -848,6 +874,12 @@ struct App {
     library_status: String,
     /// A pending local import awaiting license acknowledgement (SPEC-066).
     install_license: Option<InstallLicense>,
+    /// Background bank downloads (SPEC-067).
+    download_tx: std::sync::mpsc::Sender<DownloadMsg>,
+    download_rx: std::sync::mpsc::Receiver<DownloadMsg>,
+    downloads: HashMap<String, DownloadState>,
+    /// A catalog entry awaiting the user's acceptance (SPEC-067).
+    download_accept: Option<DownloadAccept>,
     /// The «Новая дорожка» dialog, when open (SPEC-049).
     new_track: Option<shell::NewTrack>,
     outputs: Vec<String>,
@@ -971,6 +1003,7 @@ impl App {
         let (hover_tx, hover_rx) = std::sync::mpsc::channel();
         let (export_tx, export_rx) = std::sync::mpsc::channel();
         let (instrument_tx, instrument_rx) = std::sync::mpsc::channel();
+        let (download_tx, download_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             editor: Editor::new(),
             #[cfg(feature = "audio")]
@@ -1068,6 +1101,10 @@ impl App {
             installed_banks: Vec::new(),
             library_status: String::new(),
             install_license: None,
+            download_tx,
+            download_rx,
+            downloads: HashMap::new(),
+            download_accept: None,
             new_track: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -2056,6 +2093,116 @@ impl App {
                 }
             }
             ctx.request_repaint();
+        }
+    }
+
+    /// Starts a background download for an accepted catalog entry (SPEC-067).
+    /// The network + unpack work runs on a worker thread; the GUI updates the
+    /// progress bar and reads the result in [`Self::poll_downloads`].
+    fn start_download(&mut self, entry: daw_app::bank_library::CatalogEntry) {
+        let Some(download) = entry.download.as_ref() else {
+            self.library_status = "Загрузка недоступна для этого банка".to_owned();
+            return;
+        };
+        // A bank already downloading must not start a second worker (H4).
+        if self.downloads.contains_key(&entry.id) {
+            return;
+        }
+        let progress = daw_app::bank_download::Progress::new(download.size_bytes);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bank_id = entry.id.clone();
+        self.downloads.insert(
+            bank_id.clone(),
+            DownloadState {
+                progress: progress.clone(),
+                cancel: std::sync::Arc::clone(&cancel),
+            },
+        );
+        let tx = self.download_tx.clone();
+        std::thread::spawn(move || {
+            let result = daw_app::bank_download::download_bank(&entry, &progress, &cancel);
+            let _ = tx.send(DownloadMsg::Done { bank_id, result });
+        });
+    }
+
+    /// Applies finished bank downloads and repaints while one is in flight
+    /// (SPEC-067).
+    fn poll_downloads(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.download_rx.try_recv() {
+            let DownloadMsg::Done { bank_id, result } = msg;
+            self.downloads.remove(&bank_id);
+            match result {
+                Ok(bank) => {
+                    self.library_status = format!("Скачано и установлено: {}", bank.name);
+                    self.refresh_installed_banks();
+                }
+                Err(daw_app::bank_download::DownloadError::Cancelled) => {
+                    self.library_status = "Загрузка отменена".to_owned();
+                }
+                Err(e) => {
+                    self.library_status = format!("Ошибка загрузки: {e}");
+                }
+            }
+        }
+        if !self.downloads.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// The acceptance screen shown before a download (SPEC-067 §4): license
+    /// name, author, attribution and size, with «Скачать» / «Отмена».
+    fn download_accept_window(&mut self, ctx: &egui::Context) {
+        if self.download_accept.is_none() {
+            return;
+        }
+        let mut confirm = false;
+        let mut close = false;
+        egui::Window::new("Скачать банк")
+            .id(egui::Id::new("download-accept"))
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                let Some(dialog) = self.download_accept.as_ref() else {
+                    return;
+                };
+                let entry = &dialog.entry;
+                ui.strong(&entry.name);
+                ui.label(format!("Автор: {}", entry.author));
+                ui.label(format!("Лицензия: {}", entry.license.spdx));
+                ui.label(format!("Источник лицензии: {}", entry.license.url));
+                if !entry.attribution.is_empty() {
+                    ui.label(format!("Атрибуция: {}", entry.attribution));
+                }
+                if let Some(download) = entry.download.as_ref() {
+                    ui.label(format!(
+                        "Размер: {:.1} МБ",
+                        download.size_bytes as f64 / (1024.0 * 1024.0)
+                    ));
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    "Перед загрузкой лицензия будет проверена повторно по \
+                     источнику, а целостность архива — по SHA-256.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Скачать").clicked() {
+                        confirm = true;
+                        close = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if confirm {
+            if let Some(dialog) = self.download_accept.take() {
+                self.start_download(dialog.entry);
+            }
+        }
+        if close {
+            self.download_accept = None;
         }
     }
 
@@ -6433,15 +6580,33 @@ impl App {
                         if !entry.attribution.is_empty() {
                             ui.small(format!("Атрибуция: {}", entry.attribution));
                         }
-                        let downloadable = entry.sha256.is_some() && entry.verified;
+                        let downloadable = daw_app::bank_library::is_downloadable(entry);
                         ui.horizontal(|ui| {
-                            let download = egui::Button::new("Скачать");
-                            if downloadable {
-                                let _ = ui.add(download);
-                            } else {
-                                ui.add_enabled(false, download).on_disabled_hover_text(
-                                    "Загрузка появится в следующей версии (SPEC-067).",
+                            if let Some(state) = self.downloads.get(&entry.id) {
+                                let fraction = state.progress.fraction();
+                                ui.add(
+                                    egui::ProgressBar::new(fraction)
+                                        .text(format!("Скачивание {:.0}%…", fraction * 100.0))
+                                        .desired_width(140.0),
                                 );
+                                if ui.button("Отмена").clicked() {
+                                    state
+                                        .cancel
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            } else {
+                                let download = egui::Button::new("Скачать");
+                                if downloadable {
+                                    if ui.add(download).clicked() {
+                                        self.download_accept = Some(DownloadAccept {
+                                            entry: entry.clone(),
+                                        });
+                                    }
+                                } else {
+                                    ui.add_enabled(false, download).on_disabled_hover_text(
+                                        "Загрузка недоступна: хэш/лицензия не проверены.",
+                                    );
+                                }
                             }
                             if ui.button("Установить из папки…").clicked() {
                                 self.install_from_catalog(entry);
@@ -6669,7 +6834,8 @@ impl App {
                 ui.heading("Добро пожаловать в Sound Pro");
                 ui.label(
                     "Sound Pro не хранит и не поставляет звуковые банки. \
-                     Вы можете установить их из папки на вашем компьютере.",
+                     Вы можете скачать их с сайта автора или установить \
+                     из папки на вашем компьютере.",
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -6963,6 +7129,7 @@ impl eframe::App for App {
         self.poll_imports(ctx);
         self.poll_instruments(ctx);
         self.poll_export();
+        self.poll_downloads(ctx);
         // Everything done during one mouse press is one undo step.
         if ctx.input(|i| i.pointer.any_down()) {
             self.editor.begin_group();
@@ -7049,6 +7216,7 @@ impl eframe::App for App {
         self.credits_window(ctx);
         self.install_license_window(ctx);
         self.first_run_window(ctx);
+        self.download_accept_window(ctx);
         self.new_track_window(ctx);
         self.export_window(ctx);
 

@@ -27,3 +27,32 @@ thiserror = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg"] }
+# SPEC-067: HTTP download (rustls, no OpenSSL), archive hashing, and safe
+# unpacking (zip for Osiris, tar.bz2 for Salamander). All pure Rust at runtime;
+# `ring`/`bzip2-sys` compile C at build time only (end users install nothing).
+#
+# `gzip` (transparent Content-Encoding decoding) is intentionally disabled so
+# the size cap and SHA-256 apply to the real bytes; we send no Accept-Encoding.
+# `url` is used only for RFC 3986 relative-redirect resolution (Url::join) and
+# host/port comparison — hand-rolling it caused the redirect bug fixed in
+# SPEC-067 §5.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+bzip2 = "0.5"
+# SPEC-067 N1/N4: OS advisory file locks (flock/LockFileEx) for the per-bank
+# download lock and the global registry lock. The kernel releases the lock on
+# process death, so a leftover lock file is harmless (unlike create_new+Drop).
+# `std::fs::File::try_lock` needs Rust 1.89 but MSRV is 1.85, hence fs2.
+fs2 = "0.4"
+
+[dev-dependencies]
+# Reused by `tests/bank_download.rs` to build zip/tar fixtures and hash them.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+bzip2 = "0.5"
+sha2 = "0.10"
+# Scoped temp dirs for integration tests (no reliance on /tmp naming).
+tempfile = "3"
