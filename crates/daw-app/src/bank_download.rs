@@ -513,32 +513,68 @@ fn unpack_tar_bz2(
     Ok(())
 }
 
-/// Resolves an archive entry name against `dest`, rejecting absolute paths,
-/// parent-directory traversal, and (for zip) names that would escape `dest`.
-fn safe_join(dest: &Path, name: &str) -> Result<PathBuf, DownloadError> {
-    // Normalize `\` to `/` (Salamander uses backslashes in the SFZ only; the
-    // tar paths are `/`-separated, but be defensive).
+/// Validates an archive entry name and returns it as a clean, `/`-separated
+/// relative path. This is a **string-level** check, independent of the host
+/// OS, so an archive produced on any platform is judged by the same rules and
+/// a name that is dangerous on Windows is rejected even when we run on Linux
+/// (and vice versa). Rejects:
+///
+/// - a NUL byte;
+/// - an absolute or root-relative path (leading `/`, or a `\` normalised to
+///   `/`, plus UNC `//server/share`);
+/// - a Windows drive prefix or alternate-stream name (any `:`, e.g. `C:`,
+///   `name:stream`, `::$DATA`);
+/// - any `..` component;
+/// - any empty component (leading/trailing separators other than a single
+///   trailing `/` for directory entries, and internal `//`).
+fn validate_entry_name(name: &str) -> Result<String, DownloadError> {
+    if name.contains('\0') {
+        return Err(DownloadError::UnsafeEntry(format!(
+            "NUL byte in entry name {name:?}"
+        )));
+    }
+    // Normalize `\` to `/` before any check (Salamander ships Windows-style
+    // separators; this is also the documented remapping).
     let normalized = name.replace('\\', "/");
-    let p = Path::new(&normalized);
-    if p.is_absolute() {
+    // A single trailing slash marks a directory entry; allow it.
+    let cleaned = normalized.trim_end_matches('/');
+    if cleaned.is_empty() {
+        return Err(DownloadError::UnsafeEntry(format!(
+            "empty entry name {name:?}"
+        )));
+    }
+    if cleaned.starts_with('/') {
         return Err(DownloadError::UnsafeEntry(format!(
             "absolute path {name:?}"
         )));
     }
-    let joined = dest.join(p);
-    // Reject any `..` component that escapes `dest`.
-    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
-    if let Ok(Some(parent)) = joined.parent().map(Path::canonicalize).transpose() {
-        if !parent.starts_with(&canonical_dest) {
+    if cleaned.contains(':') {
+        return Err(DownloadError::UnsafeEntry(format!(
+            "colon in entry name {name:?}"
+        )));
+    }
+    for comp in cleaned.split('/') {
+        if comp.is_empty() {
             return Err(DownloadError::UnsafeEntry(format!(
-                "path escapes destination: {name:?}"
+                "empty component in {name:?}"
+            )));
+        }
+        if comp == ".." {
+            return Err(DownloadError::UnsafeEntry(format!(
+                "parent traversal in {name:?}"
             )));
         }
     }
-    if normalized.split('/').any(|c| c == "..") {
-        return Err(DownloadError::UnsafeEntry(format!(
-            "parent traversal in {name:?}"
-        )));
+    Ok(cleaned.to_owned())
+}
+
+/// Resolves a validated archive entry name against `dest`, joining one clean
+/// component at a time so the result is deterministic on every platform.
+fn safe_join(dest: &Path, name: &str) -> Result<PathBuf, DownloadError> {
+    let cleaned = validate_entry_name(name)?;
+    let mut joined = dest.to_path_buf();
+    for comp in cleaned.split('/') {
+        joined.push(comp);
     }
     Ok(joined)
 }
@@ -796,10 +832,47 @@ mod tests {
     #[test]
     fn safe_join_rejects_traversal_and_absolute() {
         let dest = Path::new("/tmp/dest");
-        assert!(safe_join(dest, "../evil").is_err());
-        assert!(safe_join(dest, "/abs/path").is_err());
-        assert!(safe_join(dest, "a/../../evil").is_err());
+        // Safe names are accepted.
         assert!(safe_join(dest, "ok/file.sfz").is_ok());
+        assert!(safe_join(dest, "dir/").is_ok(), "directory entry");
+        assert!(safe_join(dest, "./ok.sfz").is_ok(), "leading dot component");
+
+        // Parent traversal, in both separator styles and at any depth.
+        for bad in ["../evil", "a/../b", "..\\evil", "a\\..\\b", "a/b/../../c"] {
+            assert!(
+                safe_join(dest, bad).is_err(),
+                "must reject parent traversal: {bad:?}"
+            );
+        }
+
+        // Absolute / root-relative / UNC, in both separator styles.
+        for bad in [
+            "/abs/path",
+            "\\abs\\path",
+            "//server/share",
+            "\\\\server\\share",
+        ] {
+            assert!(
+                safe_join(dest, bad).is_err(),
+                "must reject absolute: {bad:?}"
+            );
+        }
+
+        // Windows drive prefixes and alternate-stream / reserved names.
+        for bad in ["C:", "C:/foo", "C:\\foo", "a:b", "a::b", "::$DATA"] {
+            assert!(safe_join(dest, bad).is_err(), "must reject colon: {bad:?}");
+        }
+
+        // Empty components (internal double separator).
+        for bad in ["a//b", "a\\/b", "a/\\b"] {
+            assert!(
+                safe_join(dest, bad).is_err(),
+                "must reject empty component: {bad:?}"
+            );
+        }
+
+        // NUL byte.
+        assert!(safe_join(dest, "a\0b").is_err(), "must reject NUL");
     }
 
     #[test]

@@ -413,6 +413,49 @@ fn zip_slip_archive_is_rejected() {
 }
 
 #[test]
+fn zip_slip_windows_style_entries_are_rejected() {
+    // Drive-letter, alternate-stream, UNC, and backslash-absolute names must
+    // be rejected on every platform (string-level, not host-OS dependent).
+    for evil in [
+        "C:/evil.sfz",
+        "C:\\evil.sfz",
+        "evil.sfz:stream",
+        "//server/evil.sfz",
+    ] {
+        let archive = make_zip_bytes(&[(evil, b"x")]);
+        let size = archive.len() as u64;
+        let archive_hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let license_body: Vec<u8> = br#"{"license":{"spdx_id":"CC0-1.0"}}"#.to_vec();
+
+        let server = TestServer::start(move |idx, _target| {
+            if idx == 0 {
+                ServerResponse::ok(license_body.clone())
+            } else {
+                ServerResponse::ok((*archive_arc).clone())
+            }
+        });
+
+        let e = entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "zip",
+            size,
+            archive_hash,
+        );
+
+        let banks = temp_banks_dir("zip-slip-win");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(
+            matches!(result, Err(DownloadError::UnsafeEntry(_))),
+            "must reject {evil:?}"
+        );
+        assert!(!banks.join("test-bank").exists());
+    }
+}
+
+#[test]
 fn oversize_archive_is_rejected() {
     let archive = make_zip_bytes(&[("bank/bank.sfz", b"0123456789")]);
     let declared_size = 5u64;
