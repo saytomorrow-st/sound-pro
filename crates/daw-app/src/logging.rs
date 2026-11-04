@@ -30,6 +30,12 @@ pub enum LogLevel {
     Trace = 5,
 }
 
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 impl LogLevel {
     /// All levels in menu order.
     pub const ALL: [Self; 6] = [

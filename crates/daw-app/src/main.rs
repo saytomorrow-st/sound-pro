@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use daw_app::{OfflineJob, run_offline};
 
 fn main() -> ExitCode {
+    daw_app::logging::init(daw_app::logging::LogLevel::Info);
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
         usage();
