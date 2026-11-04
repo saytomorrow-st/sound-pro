@@ -26,6 +26,9 @@ pub const MAX_SAMPLER_VOICES: usize = 128;
 /// Default voice pool size.
 pub const DEFAULT_VOICES: usize = 64;
 
+/// Scale from signed 16-bit sample values to the engine's `-1.0..=1.0` float range.
+const I16_TO_F32: f32 = 1.0 / 32768.0;
+
 /// Why the sampler engine could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplerError {
@@ -302,7 +305,7 @@ impl SamplerEngine {
         let v2 = vel_gain * vel_gain;
         let curve = 1.0 - region.vel_track + region.vel_track * v2;
         let (pan_l, pan_r) = pan_law(region.pan);
-        let peak = region.gain * curve;
+        let peak = region.gain * curve * I16_TO_F32;
         let pos = f64::from(region.offset);
         let (loop_start, loop_end, loop_enabled) = match region.loop_mode {
             crate::sampler::sfz::LoopMode::LoopContinuous

@@ -119,8 +119,7 @@ pub fn load_bank(dir: &Path, budget_mib: u64) -> Result<LoadedBank, BankLoadErro
 /// `dir`, `/`-separated). A hint that is unsafe or names no file falls back to
 /// the recursive search, so a bank installed by an older version still loads.
 ///
-/// Logs one line to stderr per load attempt (success or failure) for
-/// diagnostics.
+/// Logs timings and the outcome of every attempt via [`crate::logging`].
 ///
 /// # Errors
 ///
@@ -134,33 +133,49 @@ pub fn load_bank_with_hint(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.display().to_string());
-    match load_bank_with_hint_impl(dir, budget_mib, hint) {
+    let t_total = std::time::Instant::now();
+    crate::log_info!("bank {bank_id}: load start ({})", dir.display());
+    match load_bank_with_hint_impl(dir, budget_mib, hint, &bank_id) {
         Ok(bank) => {
             let ram_mib = bank.ram_bytes.div_ceil(1024 * 1024);
-            eprintln!(
-                "Loaded bank {bank_id}: {} regions, {ram_mib} MiB",
-                bank.regions.len()
+            crate::log_info!(
+                "bank {bank_id}: loaded in {} ms: {} regions, {} samples, {ram_mib} MiB, {} decode failures",
+                t_total.elapsed().as_millis(),
+                bank.regions.len(),
+                bank.samples.len(),
+                bank.decode_failures.len()
             );
+            for f in bank.decode_failures.iter().take(20) {
+                crate::log_warn!("bank {bank_id}: decode failure {}: {}", f.sample, f.reason);
+            }
+            for w in bank.warnings.iter().take(20) {
+                crate::log_debug!("bank {bank_id}: sfz warning {w}");
+            }
             Ok(bank)
         }
         Err(e) => {
-            eprintln!("Failed to load {bank_id}: {e}");
+            crate::log_error!(
+                "bank {bank_id}: load failed after {} ms: {e}",
+                t_total.elapsed().as_millis()
+            );
             Err(e)
         }
     }
 }
 
 /// Actual bank loading logic for [`load_bank_with_hint`]; the public wrapper
-/// adds the stderr diagnostics line.
+/// adds the timing/outcome logging.
 fn load_bank_with_hint_impl(
     dir: &Path,
     budget_mib: u64,
     hint: Option<&str>,
+    bank_id: &str,
 ) -> Result<LoadedBank, BankLoadError> {
     if budget_mib == 0 {
         return Err(BankLoadError::InvalidBudget);
     }
 
+    let t_start = std::time::Instant::now();
     let sfz = find_sfz(dir, hint)?;
     let base = sfz
         .parent()
@@ -193,67 +208,90 @@ fn load_bank_with_hint_impl(
     let mut samples: Vec<Arc<[i16]>> = Vec::new();
     let mut decode_failures: Vec<RegionFailure> = Vec::new();
     let mut ram_bytes: u64 = 0;
-    // Dedup by resolved sample path: many regions (velocity layers, round
-    // robins, release/pedal groups) point at the same file, which must be
-    // decoded once and shared. Maps resolved path → (sample_index, channels).
-    let mut seen: HashMap<PathBuf, (usize, u8)> = HashMap::new();
 
+    // Resolve every region's path; unique files are decoded once (velocity
+    // layers, round robins and release groups share files), in first-seen order.
+    let mut unique: Vec<PathBuf> = Vec::new();
+    let mut index_of: HashMap<PathBuf, usize> = HashMap::new();
+    let mut plan: Vec<Option<usize>> = Vec::with_capacity(doc.regions.len());
     for region in &doc.regions {
         let Some(sample_path) = region.sample.as_deref() else {
             decode_failures.push(RegionFailure {
                 sample: String::new(),
                 reason: "region has no sample".to_owned(),
             });
+            plan.push(None);
             continue;
         };
-        let full = resolve_sample_path(dir, &base, doc.default_path.as_deref(), sample_path);
-        let Some(full) = full else {
+        let Some(full) = resolve_sample_path(dir, &base, doc.default_path.as_deref(), sample_path)
+        else {
             decode_failures.push(RegionFailure {
                 sample: sample_path.to_owned(),
                 reason: format!("sample path escapes the bank root: {sample_path}"),
             });
+            plan.push(None);
             continue;
         };
+        let idx = *index_of.entry(full.clone()).or_insert_with(|| {
+            unique.push(full);
+            unique.len() - 1
+        });
+        plan.push(Some(idx));
+    }
+    crate::log_info!(
+        "bank {bank_id}: sfz read+parse {} ms ({} regions, {} unique samples)",
+        t_start.elapsed().as_millis(),
+        doc.regions.len(),
+        unique.len()
+    );
 
-        // Reuse an already-decoded sample for this file.
-        if let Some(&(sample_index, channels)) = seen.get(&full) {
+    let t_decode = std::time::Instant::now();
+    let mut decoded = decode_all(&unique, budget_bytes, &bank_id);
+    crate::log_info!(
+        "bank {bank_id}: decode {} ms",
+        t_decode.elapsed().as_millis()
+    );
+
+    // Assemble in region order so the result is independent of thread timing.
+    let mut slot_of: Vec<Option<(usize, u8)>> = vec![None; unique.len()];
+    let mut slot_failure: Vec<Option<String>> = vec![None; unique.len()];
+    for (region, idx) in doc.regions.iter().zip(&plan) {
+        let Some(idx) = *idx else { continue };
+        let sample_path = region.sample.as_deref().unwrap_or_default();
+        if slot_of[idx].is_none() && slot_failure[idx].is_none() {
+            match decoded[idx].take() {
+                Some(Ok((data, channels))) if !data.is_empty() => {
+                    let bytes = (data.len() as u64).saturating_mul(2);
+                    if ram_bytes.saturating_add(bytes) > budget_bytes {
+                        let needed_mib = ram_bytes.saturating_add(bytes).div_ceil(1024 * 1024);
+                        return Err(BankLoadError::RamBudgetExceeded {
+                            budget_mib,
+                            needed_mib,
+                        });
+                    }
+                    ram_bytes += bytes;
+                    slot_of[idx] = Some((samples.len(), channels));
+                    samples.push(Arc::from(data));
+                }
+                Some(Ok(_)) => slot_failure[idx] = Some("sample is empty".to_owned()),
+                Some(Err(reason)) => slot_failure[idx] = Some(reason),
+                None => {
+                    return Err(BankLoadError::RamBudgetExceeded {
+                        budget_mib,
+                        needed_mib: ram_bytes.div_ceil(1024 * 1024).saturating_add(1),
+                    });
+                }
+            }
+        }
+        if let Some((sample_index, channels)) = slot_of[idx] {
             if let Some(r) = resolve(region, 48_000, sample_index, channels) {
                 regions.push(r);
             }
-            continue;
-        }
-
-        match decode_sample(&full) {
-            Ok((data, channels)) if !data.is_empty() => {
-                // `data` is interleaved i16; one i16 is two bytes (RFC-001 §3.3).
-                let bytes = (data.len() as u64).saturating_mul(2);
-                if ram_bytes.saturating_add(bytes) > budget_bytes {
-                    let needed_mib = ram_bytes.saturating_add(bytes).div_ceil(1024 * 1024);
-                    return Err(BankLoadError::RamBudgetExceeded {
-                        budget_mib,
-                        needed_mib,
-                    });
-                }
-                ram_bytes += bytes;
-                let sample_index = samples.len();
-                samples.push(Arc::from(data));
-                seen.insert(full, (sample_index, channels));
-                if let Some(r) = resolve(region, 48_000, sample_index, channels) {
-                    regions.push(r);
-                }
-            }
-            Ok((_, _)) => {
-                decode_failures.push(RegionFailure {
-                    sample: sample_path.to_owned(),
-                    reason: "sample is empty".to_owned(),
-                });
-            }
-            Err(reason) => {
-                decode_failures.push(RegionFailure {
-                    sample: sample_path.to_owned(),
-                    reason,
-                });
-            }
+        } else if let Some(reason) = &slot_failure[idx] {
+            decode_failures.push(RegionFailure {
+                sample: sample_path.to_owned(),
+                reason: reason.clone(),
+            });
         }
     }
 
@@ -405,6 +443,56 @@ fn confine_path(root: &Path, path: &str) -> Option<PathBuf> {
 /// # Errors
 ///
 /// A human-readable reason on any I/O or decode failure.
+type Decoded = Result<(Vec<i16>, u8), String>;
+
+/// Decodes `paths` on up to `available_parallelism` threads. Slot `i` always
+/// holds the result for `paths[i]`; workers stop early once the decoded total
+/// passes `budget_bytes` (unfinished slots stay `None`).
+fn decode_all(paths: &[PathBuf], budget_bytes: u64, bank_id: &str) -> Vec<Option<Decoded>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    let slots: Vec<Mutex<Option<Decoded>>> = paths.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let total = AtomicU64::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(paths.len().max(1));
+    crate::log_info!(
+        "bank {bank_id}: decoding {} files on {threads} threads",
+        paths.len()
+    );
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    if total.load(Ordering::Relaxed) > budget_bytes {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = paths.get(i) else { return };
+                    let result = decode_sample(path);
+                    if let Ok((data, _)) = &result {
+                        total.fetch_add((data.len() as u64).saturating_mul(2), Ordering::Relaxed);
+                    }
+                    if let Ok(mut slot) = slots[i].lock() {
+                        *slot = Some(result);
+                    }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 100 == 0 {
+                        crate::log_debug!("bank {bank_id}: decoded {n}/{} files", paths.len());
+                    }
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap_or(None))
+        .collect()
+}
+
 fn decode_sample(path: &Path) -> Result<(Vec<i16>, u8), String> {
     let (spec, buffer) = crate::audio_file::read_audio(path).map_err(|e| e.to_string())?;
     let channels = usize::from(spec.channels).max(1);

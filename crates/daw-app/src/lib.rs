@@ -1,3 +1,4 @@
+#![allow(clippy::needless_borrow)]
 //! Application shell.
 //!
 //! This crate wires a sound backend to [`audio_core::Renderer`]. The split
@@ -32,6 +33,7 @@ pub mod audio_settings;
 pub mod bank_download;
 pub mod bank_library;
 pub mod instrument;
+pub mod logging;
 pub mod meters;
 pub mod nodes;
 pub mod pcm_cache;
