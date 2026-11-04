@@ -14,6 +14,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// The name of the cache folder inside a bank directory.
+pub const CACHE_DIR_NAME: &str = "cache";
+
+/// The manifest file name inside [`CACHE_DIR_NAME`].
+pub const MANIFEST_FILE_NAME: &str = "manifest.json";
+
 /// The `.pcm` header size in bytes; sample data is 64-byte aligned right
 /// after it.
 pub const PCM_HEADER_LEN: usize = 64;
@@ -229,6 +235,115 @@ fn crc32(bytes: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+/// The cache folder for a bank: `<bank_dir>/cache`.
+#[must_use]
+pub fn cache_dir(bank_dir: &Path) -> PathBuf {
+    bank_dir.join(CACHE_DIR_NAME)
+}
+
+/// The manifest path for a bank: `<bank_dir>/cache/manifest.json`.
+#[must_use]
+pub fn manifest_path(bank_dir: &Path) -> PathBuf {
+    cache_dir(bank_dir).join(MANIFEST_FILE_NAME)
+}
+
+/// What [`write_pcm_file`] computed about the written sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenPcm {
+    /// Full `.pcm` file size in bytes (`64 + frames × channels × 2`).
+    pub size: u64,
+    /// xxh3-128 of the `.pcm` payload (header + data), lowercase hex.
+    pub xxh3_128: String,
+    /// blake3 of the `.pcm` payload (header + data), lowercase hex, when
+    /// requested.
+    pub blake3: Option<String>,
+}
+
+/// Serializes one decoded sample to `<cache_dir>/<name>` atomically (`.tmp`
+/// then rename), computing its size and hashes over the exact bytes written.
+///
+/// `header` and `data` (interleaved `i16`, `frames × channels` samples) are
+/// the only inputs; `src_size`/`src_xxh3`/`mtime_ns` are filled by the caller
+/// from the source file. Hashing and file I/O run on the control/loader
+/// threads, never the audio path.
+///
+/// # Errors
+///
+/// A human-readable reason on I/O failure.
+pub fn write_pcm_file(
+    cache_dir: &Path,
+    name: &str,
+    header: &PcmHeader,
+    data: &[i16],
+    compute_blake3: bool,
+) -> Result<WrittenPcm, String> {
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|e| format!("mkdir {}: {e}", cache_dir.display()))?;
+
+    // Header + raw interleaved i16 payload, hashed as a single byte stream so
+    // the manifest hash matches the file on disk bit-for-bit.
+    let header_bytes = header.encode();
+    let mut payload = Vec::with_capacity(PCM_HEADER_LEN + data.len() * 2);
+    payload.extend_from_slice(&header_bytes);
+    for s in data {
+        payload.extend_from_slice(&s.to_le_bytes());
+    }
+
+    let xxh3_128 = xxh3_128_hex(&payload);
+    let blake3 = compute_blake3.then(|| blake3_hex(&payload));
+
+    let path = cache_dir.join(name);
+    let tmp = temp_path(&path);
+    std::fs::write(&tmp, &payload).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+
+    Ok(WrittenPcm {
+        size: payload.len() as u64,
+        xxh3_128,
+        blake3,
+    })
+}
+
+/// The source-file metadata recorded in a manifest entry, read with a single
+/// `stat` for the mtime and size (the xxh3-64 source hash is computed by the
+/// caller, which already streams the file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceMeta {
+    /// Source file size in bytes.
+    pub size: u64,
+    /// Source file modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+}
+
+/// Reads `path`'s size and modification time for the manifest. Returns `None`
+/// if the file cannot be stat-ed (the caller then records the sample as
+/// missing).
+#[must_use]
+pub fn source_meta(path: &Path) -> Option<SourceMeta> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let mtime_ns = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Some(SourceMeta {
+        size: meta.len(),
+        mtime_ns,
+    })
+}
+
+/// xxh3-64 of a source file, read in full (used when building the cache).
+///
+/// # Errors
+///
+/// A human-readable reason on read failure.
+pub fn xxh3_64_file(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(xxh3_64_hex(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +494,54 @@ mod tests {
         let bl = blake3_hex(b"hello");
         assert_eq!(bl.len(), 64);
         assert_eq!(xxh3_64_hex(b"hello").len(), 16);
+    }
+
+    #[test]
+    fn write_pcm_file_round_trips_header_and_data() {
+        let dir = std::env::temp_dir().join(format!("bank-cache-pcm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let header = PcmHeader {
+            channels: 2,
+            sample_rate: 48_000,
+            frames: 3,
+            src_flac_size: 10,
+            src_flac_xxh3: 0x1234_5678,
+        };
+        let data: [i16; 6] = [0, 1, -2, 3, 32767, -32768];
+        let written =
+            write_pcm_file(&dir, "000001.pcm", &header, &data, true).expect("write succeeds");
+        assert_eq!(written.size, 64 + 6 * 2);
+        assert_eq!(written.xxh3_128.len(), 32);
+        assert_eq!(written.blake3.as_deref().map(str::len), Some(64));
+
+        // The file on disk parses back to the same header and payload.
+        let on_disk = std::fs::read(dir.join("000001.pcm")).expect("file exists");
+        assert_eq!(on_disk.len(), written.size as usize);
+        assert_eq!(PcmHeader::decode(&on_disk), Some(header));
+        for (i, s) in data.iter().enumerate() {
+            let lo = on_disk[64 + i * 2];
+            let hi = on_disk[64 + i * 2 + 1];
+            assert_eq!(i16::from_le_bytes([lo, hi]), *s);
+        }
+        // No `.tmp` leftover.
+        assert!(!temp_path(&dir.join("000001.pcm")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_pcm_file_blake3_is_optional() {
+        let dir = std::env::temp_dir().join(format!("bank-cache-noblake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let header = PcmHeader {
+            channels: 1,
+            sample_rate: 44_100,
+            frames: 1,
+            src_flac_size: 0,
+            src_flac_xxh3: 0,
+        };
+        let written = write_pcm_file(&dir, "000000.pcm", &header, &[0], false).unwrap();
+        assert_eq!(written.blake3, None);
+        assert_eq!(written.xxh3_128.len(), 32);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

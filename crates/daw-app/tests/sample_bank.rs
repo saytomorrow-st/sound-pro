@@ -230,3 +230,104 @@ fn timestamp_is_valid_rfc3339_utc() {
         (b'-', b'-', b'T', b':', b':', b'Z')
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage 2: PCM cache generation (RFC-002 §5.3).
+// ---------------------------------------------------------------------------
+
+use daw_app::sample_bank::{CacheBuildError, build_bank_cache};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+type ProgressCb = Box<Mutex<dyn FnMut(u64, u64, u64) + Send>>;
+type ProgressRecord = Arc<Mutex<Option<(u64, u64, u64)>>>;
+
+/// A progress sink that records the last `(done, total, bytes)` triple.
+fn recording_progress() -> (ProgressCb, ProgressRecord) {
+    let last: ProgressRecord = Arc::new(Mutex::new(None));
+    let last2 = Arc::clone(&last);
+    (
+        Box::new(Mutex::new(move |done, total, bytes| {
+            *last2.lock().unwrap() = Some((done, total, bytes));
+        })),
+        last,
+    )
+}
+
+#[test]
+fn builds_pcm_cache_and_manifest() {
+    let dir = Scratch::new("cache-build");
+    write_wav(&dir.join("sample.wav"), RATE, &tone(4800));
+    // Two regions on one sample → exactly one .pcm entry.
+    let sfz = "<region> sample=sample.wav lokey=0 hikey=127 pitch_keycenter=60\n";
+    std::fs::write(dir.join("bank.sfz"), sfz).unwrap();
+
+    let (cb, last) = recording_progress();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let outcome = build_bank_cache(&dir.0, None, &cb, &cancel).unwrap();
+
+    assert_eq!(outcome.samples, 1);
+    assert_eq!(outcome.failures, 0);
+    // 4800 mono frames → 64-byte header + 4800*2 = 9664 bytes.
+    assert_eq!(outcome.total_bytes, 64 + 4800 * 2);
+
+    // Progress was reported to completion.
+    let (done, total, _bytes) = last.lock().unwrap().expect("progress called");
+    assert_eq!(done, 1);
+    assert_eq!(total, 1);
+
+    // The manifest and cache file exist.
+    let cache_dir = dir.join("cache");
+    let manifest_path = cache_dir.join("manifest.json");
+    assert!(manifest_path.is_file(), "manifest.json written");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(parsed["format_version"], 1);
+    assert_eq!(parsed["entries"].as_array().unwrap().len(), 1);
+    let entry = &parsed["entries"][0];
+    assert_eq!(entry["sample_rate"], RATE);
+    assert_eq!(entry["channels"], 1);
+    assert_eq!(entry["frames"], 4800);
+    assert_eq!(entry["size"], 64 + 4800 * 2);
+    let cache_name = entry["cache"].as_str().unwrap();
+    assert!(cache_dir.join(cache_name).is_file(), ".pcm written");
+}
+
+#[test]
+fn cache_build_failure_is_reported_not_fatal() {
+    // A bank whose only sample is missing: decode fails for that sample, so the
+    // build returns Ok with `failures == 1` rather than Err (the cache is
+    // derived data and the bank remains playable via on-demand decode).
+    let dir = Scratch::new("cache-missing");
+    let sfz = "<region> sample=absent.wav\n";
+    std::fs::write(dir.join("bank.sfz"), sfz).unwrap();
+
+    let cb: ProgressCb = Box::new(Mutex::new(|_: u64, _: u64, _: u64| {}));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let outcome = build_bank_cache(&dir.0, None, &cb, &cancel).unwrap();
+    assert_eq!(outcome.samples, 0);
+    assert_eq!(outcome.failures, 1);
+    assert_eq!(outcome.total_bytes, 0);
+}
+
+#[test]
+fn cache_build_can_be_cancelled() {
+    let dir = Scratch::new("cache-cancel");
+    write_wav(&dir.join("sample.wav"), RATE, &tone(4800));
+    let sfz = "<region> sample=sample.wav lokey=0 hikey=127\n";
+    std::fs::write(dir.join("bank.sfz"), sfz).unwrap();
+
+    let cb: ProgressCb = Box::new(Mutex::new(|_: u64, _: u64, _: u64| {}));
+    let cancel = Arc::new(AtomicBool::new(true));
+    let err = build_bank_cache(&dir.0, None, &cb, &cancel).unwrap_err();
+    assert!(matches!(err, CacheBuildError::Cancelled));
+}
+
+#[test]
+fn cache_build_without_sfz_is_an_error() {
+    let dir = Scratch::new("cache-nosfz");
+    let cb: ProgressCb = Box::new(Mutex::new(|_: u64, _: u64, _: u64| {}));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = build_bank_cache(&dir.0, None, &cb, &cancel).unwrap_err();
+    assert!(matches!(err, CacheBuildError::Load(_)), "got {err:?}");
+}
