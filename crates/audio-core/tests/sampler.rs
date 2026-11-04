@@ -339,7 +339,7 @@ fn stolen_voice_fades_out_instead_of_clicking() {
     // voice (note 61) is silent, so any non-zero output right after sample
     // 1000 must come from the fading victim.
     assert!(
-        out[1000].abs() > 5000.0,
+        out[1000].abs() > 5000.0 / 32768.0,
         "victim tail should still ring at the steal, got {}",
         out[1000].abs()
     );
@@ -349,7 +349,7 @@ fn stolen_voice_fades_out_instead_of_clicking() {
         .cloned()
         .fold(0.0_f32, f32::max);
     assert!(
-        after.abs() < 1.0,
+        after.abs() < 1.0 / 32768.0,
         "victim tail should be silent after the fade, got {after}"
     );
     assert_eq!(engine.stolen(), 1);
@@ -374,7 +374,7 @@ fn off_by_does_not_cut_its_own_note() {
         .cloned()
         .fold(0.0_f32, f32::max);
     assert!(
-        after.abs() > 5000.0,
+        after.abs() > 5000.0 / 32768.0,
         "self off_by must not choke its own note, got peak {after}"
     );
 }
@@ -648,7 +648,7 @@ fn hermite_outperforms_linear_on_sine_by_10x() {
         for (k, v) in out.iter().enumerate() {
             let src = k as f64 * ratio;
             let expected = (2.0 * std::f64::consts::PI * FREQ * src / RATE).sin();
-            let e = (f64::from(*v) / 30_000.0 - expected).abs();
+            let e = (f64::from(*v) * 32768.0 / 30_000.0 - expected).abs();
             worst = worst.max(e);
         }
         worst
@@ -712,4 +712,30 @@ fn hermite_edges_do_not_panic_or_nan() {
         out.iter().all(|v| v.is_finite()),
         "3-frame buffer produced NaN/Inf"
     );
+}
+
+/// Rendered amplitude is normalised to `-1.0..=1.0` and follows velocity.
+#[test]
+fn rendered_amplitude_is_normalised_and_velocity_dependent() {
+    let peak_for = |velocity: u8| -> f32 {
+        let mut reg = dc_region(60);
+        reg.vel_track = 1.0;
+        reg.gain = 1.0;
+        let bank = vec![Arc::from(vec![i16::MAX; 4096])];
+        let mut engine = SamplerEngine::new(SR, vec![reg], bank, 8).unwrap();
+        let sched = schedule(vec![note_on(0, 60, velocity)]);
+        let out = render(&mut engine, &sched, 1024, QUANTUM);
+        out.iter().cloned().fold(0.0_f32, f32::max)
+    };
+    let loud = peak_for(120);
+    let soft = peak_for(20);
+    assert!(
+        loud <= 1.0,
+        "full-scale sample must not exceed 1.0, got {loud}"
+    );
+    assert!(
+        soft < loud * 0.1,
+        "vel 20 ({soft}) must be far quieter than vel 120 ({loud})"
+    );
+    assert!(soft > 0.0);
 }

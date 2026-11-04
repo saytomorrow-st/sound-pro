@@ -451,6 +451,12 @@ fn draw_peaks(
 }
 
 fn main() -> eframe::Result {
+    let audio_path = daw_app::audio_settings::default_path();
+    let settings = audio_path
+        .as_ref()
+        .map(|p| AudioSettings::load(p))
+        .unwrap_or_default();
+    daw_app::logging::init(settings.log_level);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sound Pro")
@@ -7070,10 +7076,69 @@ impl App {
                         );
                     });
                 ui.end_row();
+                ui.label("Уровень логирования");
+                let shown = match self.audio.log_level {
+                    daw_app::logging::LogLevel::Off => "Off",
+                    daw_app::logging::LogLevel::Error => "Error",
+                    daw_app::logging::LogLevel::Warn => "Warn",
+                    daw_app::logging::LogLevel::Info => "Info",
+                    daw_app::logging::LogLevel::Debug => "Debug",
+                    daw_app::logging::LogLevel::Trace => "Trace",
+                };
+                let before = self.audio.log_level;
+                egui::ComboBox::from_id_salt("log-level")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.audio.log_level,
+                            daw_app::logging::LogLevel::Off,
+                            "Off",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio.log_level,
+                            daw_app::logging::LogLevel::Error,
+                            "Error",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio.log_level,
+                            daw_app::logging::LogLevel::Warn,
+                            "Warn",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio.log_level,
+                            daw_app::logging::LogLevel::Info,
+                            "Info",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio.log_level,
+                            daw_app::logging::LogLevel::Debug,
+                            "Debug",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio.log_level,
+                            daw_app::logging::LogLevel::Trace,
+                            "Trace",
+                        );
+                    });
+                if self.audio.log_level != before {
+                    daw_app::logging::set_level(self.audio.log_level);
+                }
+                ui.end_row();
                 ui.label("Частота");
                 ui.label(format!("{rate} Гц (частота проекта)"));
                 ui.end_row();
             });
+        ui.add_space(6.0);
+        if let Some(dir) = daw_app::logging::log_dir() {
+            ui.horizontal(|ui| {
+                ui.label("Логи:");
+                if ui.button("Открыть папку").clicked() {
+                    if let Err(e) = std::process::Command::new("xdg-open").arg(dir).spawn() {
+                        self.status = format!("Не удалось открыть папку логов: {e}");
+                    }
+                }
+            });
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Обновить список").clicked() {

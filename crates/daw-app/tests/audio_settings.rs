@@ -1,13 +1,15 @@
 //! SPEC-033: audio device settings, tested without a sound card.
 
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES, buffer_ms, choose_buffer, find_device};
+use daw_app::logging::LogLevel;
 
 fn full() -> AudioSettings {
     AudioSettings {
-        output: Some("USB Audio CODEC".into()),
-        input: Some("Built-in Mic".into()),
+        output: Some("OUT".to_owned()),
+        input: Some("IN".to_owned()),
         buffer_frames: Some(256),
         interpolation: audio_core::Interpolation::Hermite4,
+        log_level: LogLevel::default(),
     }
 }
 

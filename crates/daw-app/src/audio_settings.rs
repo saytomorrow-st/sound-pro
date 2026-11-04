@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::logging::LogLevel;
 use audio_core::Interpolation;
 
 /// Buffer sizes offered in the settings window, in frames.
@@ -13,7 +14,7 @@ pub const BUFFER_SIZES: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 /// Which devices to open and how large the device buffer should be.
 ///
 /// `None` means "system default" for every field.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AudioSettings {
     /// Output device name.
     pub output: Option<String>,
@@ -23,6 +24,8 @@ pub struct AudioSettings {
     pub buffer_frames: Option<u32>,
     /// Sampler interpolation quality (SPEC-068); linear by default.
     pub interpolation: Interpolation,
+    /// Log verbosity (info by default).
+    pub log_level: LogLevel,
 }
 
 /// The settings-file word for `interpolation`.
@@ -55,6 +58,9 @@ impl AudioSettings {
                     settings.buffer_frames =
                         value.parse().ok().filter(|n| BUFFER_SIZES.contains(n));
                 }
+                "log_level" => {
+                    settings.log_level = LogLevel::parse(value).unwrap_or_default();
+                }
                 "interpolation" => {
                     settings.interpolation = match value {
                         "hermite" => Interpolation::Hermite4,
@@ -79,6 +85,9 @@ impl AudioSettings {
         }
         if let Some(frames) = self.buffer_frames {
             text.push_str(&format!("buffer = {frames}\n"));
+        }
+        if self.log_level != LogLevel::default() {
+            text.push_str(&format!("log_level = {}\n", self.log_level.name()));
         }
         if self.interpolation != Interpolation::default() {
             let name = interpolation_name(self.interpolation);
