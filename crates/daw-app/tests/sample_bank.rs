@@ -141,3 +141,71 @@ fn a_directory_without_an_sfz_is_an_error() {
         Err(BankLoadError::NoSfz(_))
     ));
 }
+
+#[test]
+fn nested_sfz_is_found_and_hint_beats_search() {
+    use daw_app::sample_bank::load_bank_with_hint;
+
+    let dir = Scratch::new("hint");
+    let nested = dir.join("Pack").join("Programs");
+    std::fs::create_dir_all(&nested).unwrap();
+    write_wav(&nested.join("sample.wav"), RATE, &tone(4800));
+    let two = "<region> sample=sample.wav lokey=0 hikey=63 pitch_keycenter=60\n\
+               <region> sample=sample.wav lokey=64 hikey=127 pitch_keycenter=70\n";
+    std::fs::write(nested.join("main.sfz"), two).unwrap();
+    // A shallower decoy that plain search would prefer.
+    write_wav(&dir.join("sample.wav"), RATE, &tone(4800));
+    std::fs::write(dir.join("decoy.sfz"), simple_sfz()).unwrap();
+
+    let searched = load_bank_with_hint(&dir.0, DEFAULT_RAM_BUDGET_MIB, None).unwrap();
+    assert_eq!(searched.regions.len(), 1, "search picks the shallowest sfz");
+
+    let hinted = load_bank_with_hint(
+        &dir.0,
+        DEFAULT_RAM_BUDGET_MIB,
+        Some("Pack/Programs/main.sfz"),
+    )
+    .unwrap();
+    assert_eq!(hinted.regions.len(), 2, "the hint wins over the search");
+
+    let escaping = load_bank_with_hint(&dir.0, DEFAULT_RAM_BUDGET_MIB, Some("../outside.sfz"));
+    assert_eq!(
+        escaping.unwrap().regions.len(),
+        1,
+        "escaping hint is ignored"
+    );
+}
+
+#[test]
+fn search_prefers_non_retuned_sfz_deterministically() {
+    use daw_app::sample_bank::load_bank_with_hint;
+
+    let dir = Scratch::new("retuned");
+    let sub = dir.join("Grand");
+    std::fs::create_dir_all(&sub).unwrap();
+    write_wav(&sub.join("sample.wav"), RATE, &tone(4800));
+    std::fs::write(sub.join("A-Retuned.sfz"), simple_sfz()).unwrap();
+    let two = "<region> sample=sample.wav lokey=0 hikey=63 pitch_keycenter=60\n\
+               <region> sample=sample.wav lokey=64 hikey=127 pitch_keycenter=70\n";
+    std::fs::write(sub.join("Z-Standard.sfz"), two).unwrap();
+
+    let bank = load_bank_with_hint(&dir.0, DEFAULT_RAM_BUDGET_MIB, None).unwrap();
+    assert_eq!(bank.regions.len(), 2);
+}
+
+#[test]
+fn timestamp_is_valid_rfc3339_utc() {
+    use daw_app::bank_library::{rfc3339_utc, timestamp};
+
+    assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+    assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+    assert_eq!(rfc3339_utc(1_793_786_654), "2026-11-04T10:04:14Z");
+    let now = timestamp();
+    let b = now.as_bytes();
+    assert_eq!(b.len(), 20, "{now}");
+    assert!(b[..4].iter().all(u8::is_ascii_digit), "{now}");
+    assert_eq!(
+        (b[4], b[7], b[10], b[13], b[16], b[19]),
+        (b'-', b'-', b'T', b':', b':', b'Z')
+    );
+}

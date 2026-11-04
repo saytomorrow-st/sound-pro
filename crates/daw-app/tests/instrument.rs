@@ -527,3 +527,108 @@ fn hermite_export_differs_from_linear_and_is_deterministic() {
             .all(|(a, b)| a.to_bits() == b.to_bits())
     );
 }
+
+/// Installs a nested bank (`Osiris Piano/Programs/01-natural.sfz`, the layout
+/// of the real download) under the catalog id `osiris-piano`.
+fn install_nested_osiris(data: &Path) -> String {
+    use daw_app::bank_library::{InstalledBank, InstalledRegistry, REGISTRY_SCHEMA};
+
+    let bank_dir = data.join("sound-pro").join("banks").join("osiris-piano");
+    let programs = bank_dir.join("Osiris Piano").join("Programs");
+    std::fs::create_dir_all(&programs).unwrap();
+    write_wav(&programs.join("tone.wav"), &sine(440.0, RATE as usize));
+    std::fs::write(
+        programs.join("01-natural.sfz"),
+        "<region> sample=tone.wav lokey=0 hikey=127 pitch_keycenter=69 loop_mode=loop_continuous\n",
+    )
+    .unwrap();
+    let registry = InstalledRegistry {
+        schema: REGISTRY_SCHEMA,
+        banks: vec![InstalledBank {
+            id: "osiris-piano".to_owned(),
+            name: "Osiris Piano".to_owned(),
+            family: "piano".to_owned(),
+            path: bank_dir.to_string_lossy().into_owned(),
+            license_spdx: "CC0-1.0".to_owned(),
+            attribution: String::new(),
+            license_acknowledged: false,
+            installed_at: daw_app::bank_library::timestamp(),
+        }],
+    };
+    registry
+        .save(&data.join("sound-pro").join("banks").join("banks.json"))
+        .unwrap();
+    "osiris-piano".to_owned()
+}
+
+#[test]
+fn nested_bank_loads_without_warning_and_differs_from_builtin_piano() {
+    use audio_core::TrackInstrument;
+    use daw_app::{NoCache, load_session_reporting, render_session};
+
+    let dir = Scratch::new("nested-bank");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    with_bank_data_dir(&data, || {
+        let bank_id = install_nested_osiris(&data);
+        let (job, warnings) = load_session_reporting(
+            midi_session(TrackInstrument::Sampler { bank_id }),
+            Path::new(""),
+            dir.join("nested.wav"),
+            &mut NoCache,
+            audio_core::Interpolation::Linear,
+        )
+        .expect("nested bank session loads");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        render_session(job).unwrap();
+
+        let (job, _) = load_session_reporting(
+            midi_session(TrackInstrument::BuiltinPiano),
+            Path::new(""),
+            dir.join("piano.wav"),
+            &mut NoCache,
+            audio_core::Interpolation::Linear,
+        )
+        .unwrap();
+        render_session(job).unwrap();
+    });
+
+    let nested = read_mono(&dir.join("nested.wav"));
+    let piano = read_mono(&dir.join("piano.wav"));
+    assert!(nested.iter().fold(0.0_f32, |m, s| m.max(s.abs())) > 0.01);
+    assert_ne!(nested, piano, "nested bank must not fall back to the piano");
+}
+
+#[test]
+fn bank_without_sfz_reports_a_visible_warning() {
+    use audio_core::TrackInstrument;
+    use daw_app::{NoCache, load_session_reporting};
+
+    let dir = Scratch::new("no-sfz-warning");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    with_bank_data_dir(&data, || {
+        let bank_id = install_nested_osiris(&data);
+        let bank_dir = data.join("sound-pro").join("banks").join("osiris-piano");
+        std::fs::remove_dir_all(bank_dir.join("Osiris Piano")).unwrap();
+        std::fs::write(bank_dir.join("readme.txt"), "no sfz here").unwrap();
+
+        let (_job, warnings) = load_session_reporting(
+            midi_session(TrackInstrument::Sampler { bank_id }),
+            Path::new(""),
+            dir.join("warn.wav"),
+            &mut NoCache,
+            audio_core::Interpolation::Linear,
+        )
+        .expect("a broken bank must not block loading");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("osiris-piano"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("встроенное пианино"),
+            "{}",
+            warnings[0]
+        );
+    });
+}

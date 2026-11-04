@@ -78,19 +78,23 @@ pub struct LoadedBank {
 /// Windows-authored SFZ works on Linux and vice versa).
 struct DirResolver {
     root: PathBuf,
+    /// Folder of the main `.sfz` relative to `root` (`/`-separated, may be
+    /// empty); includes and samples are relative to the `.sfz`, not the root.
+    base: String,
 }
 
 impl IncludeResolver for DirResolver {
     fn resolve(&mut self, path: &str) -> Result<String, String> {
-        let full =
-            confine_path(&self.root, path).ok_or_else(|| format!("unsafe include path: {path}"))?;
+        let joined = join_rel(&self.base, path);
+        let full = confine_path(&self.root, &joined)
+            .ok_or_else(|| format!("unsafe include path: {path}"))?;
         std::fs::read_to_string(&full).map_err(|e| format!("{}: {e}", full.display()))
     }
 }
 
 /// Loads the SFZ bank in `dir`, decoding every sample into `i16` PCM.
 ///
-/// The only `.sfz` file in `dir` is used (the first, if several). `budget_mib`
+/// The `.sfz` is found by [`find_sfz`] (searched recursively). `budget_mib`
 /// is the RAM budget for the decoded samples; exceeding it is
 /// [`BankLoadError::RamBudgetExceeded`] and the whole bank is refused rather
 /// than risking an OOM. A region whose sample is missing or undecodable is
@@ -103,16 +107,42 @@ impl IncludeResolver for DirResolver {
 ///
 /// [`BankLoadError`].
 pub fn load_bank(dir: &Path, budget_mib: u64) -> Result<LoadedBank, BankLoadError> {
+    load_bank_with_hint(dir, budget_mib, None)
+}
+
+/// [`load_bank`] preferring the catalog's `sfz` path `hint` (relative to
+/// `dir`, `/`-separated). A hint that is unsafe or names no file falls back to
+/// the recursive search, so a bank installed by an older version still loads.
+///
+/// # Errors
+///
+/// [`BankLoadError`].
+pub fn load_bank_with_hint(
+    dir: &Path,
+    budget_mib: u64,
+    hint: Option<&str>,
+) -> Result<LoadedBank, BankLoadError> {
     if budget_mib == 0 {
         return Err(BankLoadError::InvalidBudget);
     }
 
-    let sfz = find_sfz(dir)?;
+    let sfz = find_sfz(dir, hint)?;
+    let base = sfz
+        .parent()
+        .and_then(|p| p.strip_prefix(dir).ok())
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default();
     let text = std::fs::read_to_string(&sfz)
         .map_err(|e| BankLoadError::ReadSfz(sfz.clone(), e.to_string()))?;
 
     let mut resolver = DirResolver {
         root: dir.to_path_buf(),
+        base: base.clone(),
     };
     let doc =
         parse(&text, &mut resolver).map_err(|e| BankLoadError::Sfz(sfz.clone(), e.to_string()))?;
@@ -137,7 +167,7 @@ pub fn load_bank(dir: &Path, budget_mib: u64) -> Result<LoadedBank, BankLoadErro
             });
             continue;
         };
-        let full = resolve_sample_path(dir, doc.default_path.as_deref(), sample_path);
+        let full = resolve_sample_path(dir, &base, doc.default_path.as_deref(), sample_path);
         let Some(full) = full else {
             decode_failures.push(RegionFailure {
                 sample: sample_path.to_owned(),
@@ -187,19 +217,77 @@ pub fn load_bank(dir: &Path, budget_mib: u64) -> Result<LoadedBank, BankLoadErro
     })
 }
 
-/// Finds the `.sfz` in `dir`. Several files produce an error-free result using
-/// the first; the caller does not need to know which.
-fn find_sfz(dir: &Path) -> Result<PathBuf, BankLoadError> {
-    let mut found: Option<PathBuf> = None;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("sfz") && found.is_none() {
-                found = Some(path);
+/// Deepest folder level searched for a `.sfz` below the bank root.
+const MAX_SFZ_DEPTH: usize = 4;
+
+/// Whether `dir` holds an `.sfz` that [`load_bank_with_hint`] would pick.
+#[must_use]
+pub fn has_loadable_sfz(dir: &Path, hint: Option<&str>) -> bool {
+    find_sfz(dir, hint).is_ok()
+}
+
+/// Finds the `.sfz` of the bank in `dir`.
+///
+/// 1. The catalog `hint`, when it is confined to `dir` and is a file.
+/// 2. Otherwise a breadth-first search up to [`MAX_SFZ_DEPTH`] folders deep.
+///    Candidates are ordered deterministically: shallowest first, then files
+///    without "retuned" in the name before those with it (Salamander ships a
+///    `...Retuned.sfz` next to the standard one; the standard tuning wins),
+///    then by file name. Symlinks are not followed.
+fn find_sfz(dir: &Path, hint: Option<&str>) -> Result<PathBuf, BankLoadError> {
+    if let Some(path) = hint.and_then(|h| confine_path(dir, h))
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+    let mut candidates: Vec<(usize, bool, String, PathBuf)> = Vec::new();
+    let mut level = vec![dir.to_path_buf()];
+    for depth in 0..=MAX_SFZ_DEPTH {
+        let mut next = Vec::new();
+        for folder in &level {
+            let Ok(entries) = std::fs::read_dir(folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if kind.is_dir() {
+                    next.push(path);
+                } else if kind.is_file()
+                    && path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("sfz"))
+                {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let retuned = name.to_lowercase().contains("retuned");
+                    candidates.push((depth, retuned, name, path));
+                }
             }
         }
+        if !candidates.is_empty() {
+            break;
+        }
+        level = next;
     }
-    found.ok_or_else(|| BankLoadError::NoSfz(dir.to_path_buf()))
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, _, path)| path)
+        .ok_or_else(|| BankLoadError::NoSfz(dir.to_path_buf()))
+}
+
+/// Joins a `/`-separated folder `base` and `path` (`\` normalised).
+fn join_rel(base: &str, path: &str) -> String {
+    let path = path.replace('\\', "/");
+    if base.is_empty() {
+        path
+    } else {
+        format!("{base}/{path}")
+    }
 }
 
 /// Resolves a region's `sample` path: `default_path` (if any) then the bank
@@ -212,7 +300,12 @@ fn find_sfz(dir: &Path) -> Result<PathBuf, BankLoadError> {
 ///
 /// Returns `None` when the path is unsafe (escapes `dir`); the caller records
 /// it as a decode failure rather than reading an arbitrary file.
-fn resolve_sample_path(dir: &Path, default_path: Option<&str>, sample: &str) -> Option<PathBuf> {
+fn resolve_sample_path(
+    dir: &Path,
+    base: &str,
+    default_path: Option<&str>,
+    sample: &str,
+) -> Option<PathBuf> {
     // `sample` is relative to `default_path` (a subdirectory of the bank root),
     // or to the bank root when there is no `default_path`. Joining them and
     // confining against `dir` keeps `..` from escaping the bank root.
@@ -220,7 +313,7 @@ fn resolve_sample_path(dir: &Path, default_path: Option<&str>, sample: &str) -> 
         Some(base) if !base.is_empty() => format!("{base}/{sample}"),
         _ => sample.to_owned(),
     };
-    confine_path(dir, &joined)
+    confine_path(dir, &join_rel(base, &joined))
 }
 
 /// Joins `path` onto `root`, normalising `\` → `/` and rejecting any path that
