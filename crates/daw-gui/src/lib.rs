@@ -315,6 +315,10 @@ pub struct Editor {
     rendered: Mutex<RenderedNotes>,
     /// Sampler banks that fell back to the built-in piano in the last load.
     bank_warnings: Mutex<Vec<String>>,
+    /// Banks preloaded in the background before switching a track's
+    /// instrument, keyed by bank id (SPEC-066). Consulted by [`Self::load`] so
+    /// switching to a large bank never blocks the UI on disk I/O.
+    preloaded: Mutex<HashMap<String, Arc<daw_app::sample_bank::LoadedBank>>>,
     undo: Vec<Session>,
     redo: Vec<Session>,
     /// The session as last opened or saved.
@@ -381,6 +385,7 @@ impl Editor {
             pcm_cache: daw_app::pcm_cache::PcmCache::default_location(),
             rendered: Mutex::default(),
             bank_warnings: Mutex::default(),
+            preloaded: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             saved: session,
@@ -471,6 +476,7 @@ impl Editor {
             pcm_cache: self.pcm_cache.clone(),
             rendered: Mutex::default(),
             bank_warnings: Mutex::default(),
+            preloaded: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             pre_pin: None,
@@ -891,12 +897,16 @@ impl Editor {
             rendered: &mut rendered,
             used: HashMap::new(),
         };
-        let (job, warnings) = daw_app::load_session_reporting(
+        let (job, warnings) = daw_app::load_session_reporting_with_preloaded(
             self.project.session.clone(),
             Path::new(""),
             output,
             &mut cache,
             self.interpolation,
+            &self
+                .preloaded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         )?;
         let used = cache.used;
         rendered.0 = used;
@@ -916,6 +926,20 @@ impl Editor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Stores a bank that was decoded in the background (SPEC-066), so the next
+    /// [`Self::load`] builds its sampler instrument from memory instead of
+    /// re-reading the SFZ and samples from disk.
+    pub fn insert_preloaded_bank(
+        &self,
+        bank_id: String,
+        bank: Arc<daw_app::sample_bank::LoadedBank>,
+    ) {
+        self.preloaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(bank_id, bank);
     }
 
     /// Builds a stopped playback pair for the current project, positioned

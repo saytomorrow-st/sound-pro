@@ -698,6 +698,32 @@ pub fn load_session_reporting(
     cache: &mut dyn ClipCache,
     interpolation: audio_core::Interpolation,
 ) -> Result<(SessionJob, Vec<String>), LoadError> {
+    load_session_reporting_with_preloaded(
+        session,
+        base,
+        output,
+        cache,
+        interpolation,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// [`load_session_reporting`] that first consults `preloaded` for sampler
+/// banks already decoded in memory (SPEC-066). Each entry maps a bank id to a
+/// [`sample_bank::LoadedBank`] loaded on another thread, so switching a track's
+/// instrument never blocks the UI on a slow disk read or `.sfz` search.
+///
+/// # Errors
+///
+/// As [`load_session`].
+pub fn load_session_reporting_with_preloaded(
+    session: audio_core::Session,
+    base: &std::path::Path,
+    output: PathBuf,
+    cache: &mut dyn ClipCache,
+    interpolation: audio_core::Interpolation,
+    preloaded: &std::collections::HashMap<String, std::sync::Arc<sample_bank::LoadedBank>>,
+) -> Result<(SessionJob, Vec<String>), LoadError> {
     let mut warnings: Vec<String> = Vec::new();
     let rate = session.sample_rate;
     let mut tracks = Vec::with_capacity(session.tracks.len());
@@ -717,7 +743,7 @@ pub fn load_session_reporting(
                     Some((key, ready)) => (key.as_str(), ready),
                     None => {
                         let (key, ready, warning) =
-                            build_instrument(&track.instrument, interpolation);
+                            build_instrument(&track.instrument, interpolation, preloaded);
                         if let Some(msg) = warning {
                             warnings.push(msg);
                         }
@@ -820,6 +846,7 @@ pub fn load_session_reporting(
 fn build_instrument(
     instrument: &audio_core::TrackInstrument,
     interpolation: audio_core::Interpolation,
+    preloaded: &std::collections::HashMap<String, std::sync::Arc<sample_bank::LoadedBank>>,
 ) -> (String, Box<dyn instrument::Instrument>, Option<String>) {
     match instrument {
         audio_core::TrackInstrument::BuiltinPiano => (
@@ -828,16 +855,23 @@ fn build_instrument(
             None,
         ),
         audio_core::TrackInstrument::Sampler { bank_id } => {
-            let loaded = match crate::bank_library::resolve_bank_dir(bank_id) {
-                None => Err("папка банка не найдена".to_owned()),
-                Some(dir) => {
-                    let hint = crate::bank_library::find_catalog_sfz(bank_id);
-                    crate::sample_bank::load_bank_with_hint(
-                        &dir,
-                        crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
-                        hint.as_deref(),
-                    )
-                    .map_err(|e| e.to_string())
+            let loaded = if let Some(bank) = preloaded.get(bank_id) {
+                // A bank already decoded in memory (SPEC-066): build the
+                // instrument directly without touching disk.
+                Ok(std::sync::Arc::clone(bank))
+            } else {
+                match crate::bank_library::resolve_bank_dir(bank_id) {
+                    None => Err("папка банка не найдена".to_owned()),
+                    Some(dir) => {
+                        let hint = crate::bank_library::find_catalog_sfz(bank_id);
+                        crate::sample_bank::load_bank_with_hint(
+                            &dir,
+                            crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
+                            hint.as_deref(),
+                        )
+                        .map(std::sync::Arc::new)
+                        .map_err(|e| e.to_string())
+                    }
                 }
             };
             match loaded {
@@ -863,6 +897,30 @@ fn build_instrument(
             }
         }
     }
+}
+
+/// Resolves and loads the SFZ bank `bank_id` into memory (SPEC-066).
+///
+/// This is the blocking half of [`load_session_reporting_with_preloaded`]'s
+/// sampler branch, factored out so a GUI can run it on a background thread and
+/// hand the resulting [`sample_bank::LoadedBank`] to the next load. Loading and
+/// decoding happen off the audio callback; the returned bank is behind an
+/// [`std::sync::Arc`] so it can be shared with the note cache.
+///
+/// # Errors
+///
+/// A [`String`] describing why the bank could not be resolved or loaded.
+pub fn preload_bank(bank_id: &str) -> Result<std::sync::Arc<sample_bank::LoadedBank>, String> {
+    let dir = crate::bank_library::resolve_bank_dir(bank_id)
+        .ok_or_else(|| "папка банка не найдена".to_owned())?;
+    let hint = crate::bank_library::find_catalog_sfz(bank_id);
+    crate::sample_bank::load_bank_with_hint(
+        &dir,
+        crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
+        hint.as_deref(),
+    )
+    .map(std::sync::Arc::new)
+    .map_err(|e| e.to_string())
 }
 
 fn audio_file_error(path: &std::path::Path, e: audio_file::AudioFileError) -> LoadError {

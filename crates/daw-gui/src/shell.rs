@@ -1648,75 +1648,103 @@ impl App {
 
         let mut changed_to: Option<TrackInstrument> = None;
         let mut open_library = false;
+        // The bank being loaded for this track, if any (SPEC-066).
+        let loading_name = self
+            .pending_bank_load
+            .as_ref()
+            .filter(|(i, _, _)| *i == index)
+            .map(|(_, id, _)| self.bank_display_name(id));
         ui.horizontal(|ui| {
             let text = if broken {
                 RichText::new(&current_label).color(Color32::from_rgb(220, 90, 90))
             } else {
                 RichText::new(&current_label)
             };
-            egui::ComboBox::from_id_salt(("instrument", index))
-                .selected_text(text)
-                .show_ui(ui, |ui| {
-                    for item in &items {
-                        match item {
-                            daw_app::bank_library::InstrumentListItem::BuiltinPiano => {
-                                if ui
-                                    .selectable_label(selected_id.is_none(), "Пианино (встроенное)")
-                                    .clicked()
-                                {
-                                    changed_to = Some(TrackInstrument::BuiltinPiano);
+            if let Some(name) = &loading_name {
+                ui.spinner();
+                ui.label(RichText::new(format!("Загрузка {name}…")).italics());
+            } else {
+                egui::ComboBox::from_id_salt(("instrument", index))
+                    .selected_text(text)
+                    .show_ui(ui, |ui| {
+                        for item in &items {
+                            match item {
+                                daw_app::bank_library::InstrumentListItem::BuiltinPiano => {
+                                    if ui
+                                        .selectable_label(
+                                            selected_id.is_none(),
+                                            "Пианино (встроенное)",
+                                        )
+                                        .clicked()
+                                    {
+                                        changed_to = Some(TrackInstrument::BuiltinPiano);
+                                    }
                                 }
-                            }
-                            daw_app::bank_library::InstrumentListItem::Installed { id, name } => {
-                                if ui
-                                    .selectable_label(
-                                        selected_id.as_deref() == Some(id.as_str()),
-                                        name,
-                                    )
-                                    .clicked()
-                                {
-                                    changed_to = Some(TrackInstrument::Sampler {
-                                        bank_id: id.clone(),
-                                    });
+                                daw_app::bank_library::InstrumentListItem::Installed {
+                                    id,
+                                    name,
+                                } => {
+                                    if ui
+                                        .selectable_label(
+                                            selected_id.as_deref() == Some(id.as_str()),
+                                            name,
+                                        )
+                                        .clicked()
+                                    {
+                                        changed_to = Some(TrackInstrument::Sampler {
+                                            bank_id: id.clone(),
+                                        });
+                                    }
                                 }
-                            }
-                            daw_app::bank_library::InstrumentListItem::Broken { id, name } => {
-                                let label = format!("{name} — повреждён");
-                                if ui
-                                    .selectable_label(
-                                        selected_id.as_deref() == Some(id.as_str()),
-                                        RichText::new(label).color(Color32::from_rgb(220, 90, 90)),
-                                    )
-                                    .clicked()
-                                {
-                                    changed_to = Some(TrackInstrument::Sampler {
-                                        bank_id: id.clone(),
-                                    });
+                                daw_app::bank_library::InstrumentListItem::Broken { id, name } => {
+                                    let label = format!("{name} — повреждён");
+                                    if ui
+                                        .selectable_label(
+                                            selected_id.as_deref() == Some(id.as_str()),
+                                            RichText::new(label)
+                                                .color(Color32::from_rgb(220, 90, 90)),
+                                        )
+                                        .clicked()
+                                    {
+                                        changed_to = Some(TrackInstrument::Sampler {
+                                            bank_id: id.clone(),
+                                        });
+                                    }
                                 }
-                            }
-                            daw_app::bank_library::InstrumentListItem::Download {
-                                name, ..
-                            } => {
-                                let label = format!("{name} — скачать");
-                                if ui
-                                    .selectable_label(
-                                        false,
-                                        RichText::new(label).color(Color32::from_gray(150)),
-                                    )
-                                    .clicked()
-                                {
-                                    open_library = true;
+                                daw_app::bank_library::InstrumentListItem::Download {
+                                    name,
+                                    ..
+                                } => {
+                                    let label = format!("{name} — скачать");
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            RichText::new(label).color(Color32::from_gray(150)),
+                                        )
+                                        .clicked()
+                                    {
+                                        open_library = true;
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    });
+            }
         });
         ui.end_row();
 
         if let Some(instrument) = changed_to {
-            let result = self.editor.set_track_instrument(index, instrument);
-            self.report(result, "Инструмент изменён");
+            match instrument {
+                TrackInstrument::BuiltinPiano => {
+                    let result = self
+                        .editor
+                        .set_track_instrument(index, TrackInstrument::BuiltinPiano);
+                    self.report(result, "Инструмент изменён");
+                }
+                TrackInstrument::Sampler { bank_id } => {
+                    self.start_bank_load(index, bank_id);
+                }
+            }
         }
         if open_library {
             self.open_library();

@@ -707,6 +707,13 @@ struct Probe {
     gain_sliders: Vec<usize>,
 }
 
+/// A bank being decoded on a background thread for the inspector (SPEC-066).
+type PendingBankLoad = (
+    usize,
+    String,
+    std::sync::mpsc::Receiver<Result<std::sync::Arc<daw_app::sample_bank::LoadedBank>, String>>,
+);
+
 struct App {
     editor: Editor,
     /// Frames drawn so far; used by the `SOUND_PRO_SCREENSHOT` self-snapshot.
@@ -859,6 +866,10 @@ struct App {
     first_run_open: bool,
     /// Installed banks from the registry, refreshed when the window opens.
     installed_banks: Vec<daw_app::bank_library::InstalledBank>,
+    /// A bank being loaded on a background thread after the user picked it in
+    /// the inspector (SPEC-066): track index, bank id, and the channel that
+    /// will deliver the decoded bank. `None` while nothing is loading.
+    pending_bank_load: Option<PendingBankLoad>,
     /// Last library/credits operation result, shown as a status line.
     library_status: String,
     /// A pending local import awaiting license acknowledgement (SPEC-066).
@@ -1090,6 +1101,7 @@ impl App {
             credits_open: false,
             first_run_open: false,
             installed_banks: Vec::new(),
+            pending_bank_load: None,
             library_status: String::new(),
             install_license: None,
             download_tx,
@@ -1110,6 +1122,7 @@ impl App {
             app.audio = AudioSettings::load(path);
         }
         app.first_run_open = !daw_app::audio_settings::first_run_done();
+        app.refresh_installed_banks();
         if let Some(path) = start {
             app.open(path);
         }
@@ -6023,11 +6036,60 @@ impl App {
         self.status = match self.editor.copy_clip(t, c) {
             Ok(()) => {
                 // egui only reports Ctrl+V when the system clipboard holds text.
-                ctx.copy_text("Sound Pro: клип".into());
+                // Put a human-readable dump of the copied clip there (SPEC-066),
+                // so pasting into a text editor is useful for debugging instead
+                // of leaving a placeholder marker behind.
+                ctx.copy_text(self.clip_json(t, c));
                 "Скопировано".into()
             }
             Err(e) => format!("Не удалось скопировать: {e}"),
         };
+    }
+
+    /// A compact JSON description of the clip at `(t, c)`, used as the
+    /// clipboard text on copy (SPEC-066). Falls back to an empty object if the
+    /// indices are no longer valid.
+    fn clip_json(&self, t: usize, c: usize) -> String {
+        let Some(clip) = self
+            .editor
+            .session()
+            .tracks
+            .get(t)
+            .and_then(|tr| tr.clips.get(c))
+        else {
+            return "{}".to_owned();
+        };
+        let mut out = String::from("{");
+        out.push_str(&format!(
+            "\"start\":{},\"length\":{},\"offset\":{},\"source_length\":{},",
+            clip.start_samples, clip.length_samples, clip.offset_samples, clip.source_length
+        ));
+        out.push_str(&format!(
+            "\"gain\":{:?},\"name\":{:?},",
+            clip.gain, clip.name
+        ));
+        if let Some(source) = &clip.source {
+            out.push_str(&format!("\"source\":{:?},", source));
+        }
+        if let Some(notes) = &clip.notes {
+            out.push_str("\"notes\":[");
+            for (i, note) in notes.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!(
+                    "{{\"pitch\":{},\"start\":{},\"length\":{},\"velocity\":{}}}",
+                    note.pitch, note.start, note.length, note.velocity
+                ));
+            }
+            out.push_str("],");
+        }
+        out.push_str(&format!(
+            "\"fade_in\":{},\"fade_out\":{}",
+            clip.fade_in_samples, clip.fade_out_samples
+        ));
+        out.push('}');
+        out
     }
 
     fn paste_clip(&mut self) {
@@ -6565,6 +6627,76 @@ impl App {
         match daw_app::bank_library::list_installed() {
             Ok(banks) => self.installed_banks = banks,
             Err(e) => self.library_status = e.to_string(),
+        }
+    }
+
+    /// The human-readable name for `bank_id`, for the loading indicator
+    /// (SPEC-066). Falls back to the id itself when the bank is unknown.
+    fn bank_display_name(&self, bank_id: &str) -> String {
+        self.installed_banks
+            .iter()
+            .find(|b| b.id == bank_id)
+            .map(|b| b.name.clone())
+            .or_else(|| {
+                daw_app::bank_library::catalog()
+                    .ok()
+                    .and_then(|c| c.into_iter().find(|e| e.id == bank_id).map(|e| e.name))
+            })
+            .unwrap_or_else(|| bank_id.to_owned())
+    }
+
+    /// Starts decoding `bank_id` on a background thread, then applies it to
+    /// `track` (SPEC-066). A previous pending load for the same track is
+    /// dropped (cancelled) first. The UI thread never blocks on the disk read
+    /// or the `.sfz` search.
+    fn start_bank_load(&mut self, track: usize, bank_id: String) {
+        // Cancel any in-flight load for this track by dropping its receiver.
+        if let Some((t, _, _)) = &self.pending_bank_load {
+            if *t == track {
+                self.pending_bank_load = None;
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let id = bank_id.clone();
+        std::thread::spawn(move || {
+            let result = daw_app::preload_bank(&id);
+            let _ = tx.send(result);
+        });
+        self.pending_bank_load = Some((track, bank_id, rx));
+    }
+
+    /// Applies a finished background bank load and repaints while one is in
+    /// flight (SPEC-066).
+    fn poll_bank_load(&mut self, ctx: &egui::Context) {
+        let completed = match &self.pending_bank_load {
+            Some((track, bank_id, rx)) => match rx.try_recv() {
+                Ok(result) => Some((*track, bank_id.clone(), result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some((*track, bank_id.clone(), Err("загрузка прервана".to_owned())))
+                }
+            },
+            None => None,
+        };
+        if let Some((track, bank_id, result)) = completed {
+            self.pending_bank_load = None;
+            match result {
+                Ok(bank) => {
+                    self.editor
+                        .insert_preloaded_bank(bank_id.clone(), std::sync::Arc::clone(&bank));
+                    let result = self.editor.set_track_instrument(
+                        track,
+                        audio_core::TrackInstrument::Sampler { bank_id },
+                    );
+                    self.report(result, "Инструмент изменён");
+                }
+                Err(e) => {
+                    self.status = format!("Ошибка загрузки банка: {e}");
+                }
+            }
+        }
+        if self.pending_bank_load.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
@@ -7154,6 +7286,7 @@ impl eframe::App for App {
         self.poll_export();
         self.poll_downloads(ctx);
         self.poll_dialog(ctx);
+        self.poll_bank_load(ctx);
         // Everything done during one mouse press is one undo step.
         if ctx.input(|i| i.pointer.any_down()) {
             self.editor.begin_group();
