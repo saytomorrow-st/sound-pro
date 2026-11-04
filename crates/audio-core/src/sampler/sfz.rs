@@ -665,14 +665,14 @@ fn apply_field(
     match name {
         "sample" => region.sample = Some(value.to_string()),
         "key" => {
-            let key = parse_u8(value, at)?;
+            let key = parse_key(value, at)?;
             region.lokey = Some(key);
             region.hikey = Some(key);
             region.pitch_keycenter = Some(key);
         }
-        "lokey" => region.lokey = Some(parse_u8(value, at)?),
-        "hikey" => region.hikey = Some(parse_u8(value, at)?),
-        "pitch_keycenter" => region.pitch_keycenter = Some(parse_u8(value, at)?),
+        "lokey" => region.lokey = Some(parse_key(value, at)?),
+        "hikey" => region.hikey = Some(parse_key(value, at)?),
+        "pitch_keycenter" => region.pitch_keycenter = Some(parse_key(value, at)?),
         "lovel" => region.lovel = Some(velocity()?),
         "hivel" => region.hivel = Some(velocity()?),
         "tune" => region.tune = Some(parse_i32(value, at)?),
@@ -802,6 +802,27 @@ fn overlay(dst: &mut Region, src: &Region) {
 // ---------------------------------------------------------------------------
 // Small parsing helpers (no panics)
 // ---------------------------------------------------------------------------
+
+/// Sentinel for an SFZ key value of `-1`: "no note" (RFC-001 §2). A keyless
+/// region (release/pedal-noise groups, `lokey=-1 hikey=-1`) must never match a
+/// note-on, so [`crate::sampler::region::resolve`] drops it.
+pub const NO_KEY: u8 = u8::MAX;
+
+/// Parses a MIDI key opcode (`key`/`lokey`/`hikey`/`pitch_keycenter`).
+///
+/// SFZ v1 uses `-1` to mean "no note"; it is mapped to [`NO_KEY`] rather than
+/// treated as an invalid number, so a keyless region is accepted and then
+/// dropped at resolve time instead of failing the whole bank.
+fn parse_key(value: &str, at: usize) -> Result<u8, SfzError> {
+    let trimmed = value.trim();
+    if trimmed == "-1" {
+        return Ok(NO_KEY);
+    }
+    trimmed.parse::<u8>().map_err(|_| SfzError::InvalidNumber {
+        at,
+        value: value.to_string(),
+    })
+}
 
 fn parse_u8(value: &str, at: usize) -> Result<u8, SfzError> {
     value

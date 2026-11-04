@@ -134,6 +134,27 @@ fn a_missing_sample_is_skipped_and_reported() {
 }
 
 #[test]
+fn two_regions_on_one_file_decode_once() {
+    let dir = Scratch::new("dedup");
+    write_wav(&dir.join("sample.wav"), RATE, &tone(4800));
+    // Two regions (velocity layers / round robins) on the same file.
+    let sfz = "<region> sample=sample.wav lokey=0 hikey=127 lovel=1 hivel=64\n\
+               <region> sample=sample.wav lokey=0 hikey=127 lovel=65 hivel=127\n";
+    std::fs::write(dir.join("bank.sfz"), sfz).unwrap();
+
+    let bank = load_bank(&dir.0, DEFAULT_RAM_BUDGET_MIB).unwrap();
+    // Two playable regions, but the sample is decoded exactly once.
+    assert_eq!(bank.regions.len(), 2);
+    assert_eq!(bank.samples.len(), 1);
+    // Both regions reference the same decoded sample.
+    assert_eq!(bank.regions[0].sample_index, 0);
+    assert_eq!(bank.regions[1].sample_index, 0);
+    // RAM is counted once, not twice.
+    assert_eq!(bank.ram_bytes, 9600);
+    assert!(bank.decode_failures.is_empty());
+}
+
+#[test]
 fn a_directory_without_an_sfz_is_an_error() {
     let dir = Scratch::new("nosfz");
     assert!(matches!(

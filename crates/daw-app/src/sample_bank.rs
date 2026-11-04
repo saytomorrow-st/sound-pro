@@ -8,6 +8,7 @@
 //! control thread only (I/O and allocation are allowed here); nothing here is
 //! ever called from the audio callback.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,7 +16,11 @@ use audio_core::sampler::region::resolve;
 use audio_core::sampler::sfz::{IncludeResolver, parse};
 
 /// Default RAM budget for one bank, in MiB (RFC-001 §3.3).
-pub const DEFAULT_RAM_BUDGET_MIB: u64 = 2048;
+///
+/// Osiris (multi-mic, multi-velocity, round-robin, sustain + noise) decodes to
+/// ~2.6 GiB of 16-bit PCM; 3072 MiB leaves headroom while still bounding a
+/// single bank's memory footprint.
+pub const DEFAULT_RAM_BUDGET_MIB: u64 = 3072;
 
 /// Why a bank could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +193,10 @@ fn load_bank_with_hint_impl(
     let mut samples: Vec<Arc<[i16]>> = Vec::new();
     let mut decode_failures: Vec<RegionFailure> = Vec::new();
     let mut ram_bytes: u64 = 0;
+    // Dedup by resolved sample path: many regions (velocity layers, round
+    // robins, release/pedal groups) point at the same file, which must be
+    // decoded once and shared. Maps resolved path → (sample_index, channels).
+    let mut seen: HashMap<PathBuf, (usize, u8)> = HashMap::new();
 
     for region in &doc.regions {
         let Some(sample_path) = region.sample.as_deref() else {
@@ -205,6 +214,15 @@ fn load_bank_with_hint_impl(
             });
             continue;
         };
+
+        // Reuse an already-decoded sample for this file.
+        if let Some(&(sample_index, channels)) = seen.get(&full) {
+            if let Some(r) = resolve(region, 48_000, sample_index, channels) {
+                regions.push(r);
+            }
+            continue;
+        }
+
         match decode_sample(&full) {
             Ok((data, channels)) if !data.is_empty() => {
                 // `data` is interleaved i16; one i16 is two bytes (RFC-001 §3.3).
@@ -219,6 +237,7 @@ fn load_bank_with_hint_impl(
                 ram_bytes += bytes;
                 let sample_index = samples.len();
                 samples.push(Arc::from(data));
+                seen.insert(full, (sample_index, channels));
                 if let Some(r) = resolve(region, 48_000, sample_index, channels) {
                     regions.push(r);
                 }
