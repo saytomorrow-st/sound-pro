@@ -9,7 +9,7 @@
 //! Nothing here touches the filesystem or the audio thread; table construction
 //! happens once at bank/engine setup.
 
-use crate::sampler::sfz::{LoopMode, OffMode, Region};
+use crate::sampler::sfz::{LoopMode, NO_KEY, OffMode, Region};
 
 /// Maximum regions considered per MIDI note (RFC-001 §4: extra regions are
 /// dropped at load time with a warning).
@@ -177,6 +177,11 @@ pub fn resolve(
 ) -> Option<SampleRegion> {
     let key_lo = region.lokey.unwrap_or(0);
     let key_hi = region.hikey.unwrap_or(127);
+    // A keyless region (`lokey=-1`/`hikey=-1`, mapped to [`NO_KEY`]) has no
+    // note assignment (release/pedal groups); drop it so it never matches.
+    if key_lo == NO_KEY || key_hi == NO_KEY {
+        return None;
+    }
     if key_lo > key_hi {
         return None;
     }
@@ -376,5 +381,16 @@ mod tests {
         let table = RegionTable::build(&regions, regions.len());
         assert_eq!(table.by_key[60].len(), MAX_PER_KEY);
         assert_eq!(table.truncated_regions, 2);
+    }
+
+    #[test]
+    fn keyless_region_is_dropped() {
+        use crate::sampler::sfz::NO_KEY;
+        let region = Region {
+            lokey: Some(NO_KEY),
+            hikey: Some(NO_KEY),
+            ..Region::default()
+        };
+        assert_eq!(resolve(&region, 48_000, 0, 1), None);
     }
 }

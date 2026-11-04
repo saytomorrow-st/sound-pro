@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use audio_core::sampler::sfz::{
-    IncludeResolver, LoopMode, OffMode, Region, SfzDocument, SfzError, Trigger, parse,
+    IncludeResolver, LoopMode, NO_KEY, OffMode, Region, SfzDocument, SfzError, Trigger, parse,
 };
 
 /// A test resolver backed by an in-memory map of path → text.
@@ -42,6 +42,29 @@ fn key_sets_all_three() {
     assert_eq!(r.hikey, Some(60));
     assert_eq!(r.pitch_keycenter, Some(60));
     assert_eq!(r.sample.as_deref(), Some("x.wav"));
+}
+
+/// `-1` is SFZ's "no note" sentinel: it must parse (not error) and be mapped
+/// to [`NO_KEY`], so a keyless release/pedal group loads but matches nothing.
+#[test]
+fn key_minus_one_is_no_key() {
+    let text = "<group>\ngroup=1\nhikey=-1\nlokey=-1\n<region>\nsample=release.wav\n";
+    let doc = parse_text(text).expect("-1 keys parse without error");
+    assert_eq!(doc.regions.len(), 1);
+    let r = &doc.regions[0];
+    assert_eq!(r.lokey, Some(NO_KEY));
+    assert_eq!(r.hikey, Some(NO_KEY));
+    assert!(doc.warnings.is_empty());
+}
+
+/// `key=-1` maps all three key fields to [`NO_KEY`] and still parses.
+#[test]
+fn key_minus_one_sets_all_three() {
+    let doc = parse_text("<region>\nsample=release.wav\nkey=-1\n").expect("parse");
+    let r = &doc.regions[0];
+    assert_eq!(r.lokey, Some(NO_KEY));
+    assert_eq!(r.hikey, Some(NO_KEY));
+    assert_eq!(r.pitch_keycenter, Some(NO_KEY));
 }
 
 /// `<control>` `default_path` is captured, regions inherit global/group values.
