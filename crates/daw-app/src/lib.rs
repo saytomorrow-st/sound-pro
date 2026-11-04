@@ -681,6 +681,24 @@ pub fn load_session_cached_with(
     cache: &mut dyn ClipCache,
     interpolation: audio_core::Interpolation,
 ) -> Result<SessionJob, LoadError> {
+    load_session_reporting(session, base, output, cache, interpolation).map(|(job, _)| job)
+}
+
+/// [`load_session_cached_with`] that also returns user-facing warnings, one
+/// per sampler track whose bank could not be loaded and was replaced by the
+/// built-in piano.
+///
+/// # Errors
+///
+/// As [`load_session`].
+pub fn load_session_reporting(
+    session: audio_core::Session,
+    base: &std::path::Path,
+    output: PathBuf,
+    cache: &mut dyn ClipCache,
+    interpolation: audio_core::Interpolation,
+) -> Result<(SessionJob, Vec<String>), LoadError> {
+    let mut warnings: Vec<String> = Vec::new();
     let rate = session.sample_rate;
     let mut tracks = Vec::with_capacity(session.tracks.len());
     for (track_index, track) in session.tracks.iter().enumerate() {
@@ -698,8 +716,12 @@ pub fn load_session_cached_with(
                 let (instrument_key, instrument) = match &mut instrument {
                     Some((key, ready)) => (key.as_str(), ready),
                     None => {
-                        let built = build_instrument(&track.instrument, interpolation);
-                        instrument = Some(built);
+                        let (key, ready, warning) =
+                            build_instrument(&track.instrument, interpolation);
+                        if let Some(msg) = warning {
+                            warnings.push(msg);
+                        }
+                        instrument = Some((key, ready));
                         let (key, ready) = instrument.as_mut().expect("just set");
                         (key.as_str(), ready)
                     }
@@ -769,14 +791,15 @@ pub fn load_session_cached_with(
             clips,
         });
     }
-    Ok(SessionJob {
+    let job = SessionJob {
         sample_rate: session.sample_rate,
         session,
         tracks,
         block_frames: BLOCK_FRAMES,
         frames: None,
         output,
-    })
+    };
+    Ok((job, warnings))
 }
 
 /// Builds the [`instrument::Instrument`] for a track's [`TrackInstrument`]
@@ -790,20 +813,35 @@ pub fn load_session_cached_with(
 /// resolved or loaded falls back to the built-in piano (SPEC-065 redesign), so
 /// a deleted or corrupt bank never blocks playback; the note cache key is then
 /// `"piano"` to match the fallback timbre.
+///
+/// A fallback is reported as a string reason that the caller may surface as a
+/// warning (the diagnostic includes the bank id and the reason, e.g. 'folder
+/// missing' or 'no .sfz').
 fn build_instrument(
     instrument: &audio_core::TrackInstrument,
     interpolation: audio_core::Interpolation,
-) -> (String, Box<dyn instrument::Instrument>) {
+) -> (String, Box<dyn instrument::Instrument>, Option<String>) {
     match instrument {
-        audio_core::TrackInstrument::BuiltinPiano => {
-            ("piano".to_owned(), Box::new(instrument::PianoInstrument))
-        }
+        audio_core::TrackInstrument::BuiltinPiano => (
+            "piano".to_owned(),
+            Box::new(instrument::PianoInstrument),
+            None,
+        ),
         audio_core::TrackInstrument::Sampler { bank_id } => {
-            let loaded = crate::bank_library::resolve_bank_dir(bank_id).and_then(|dir| {
-                crate::sample_bank::load_bank(&dir, crate::sample_bank::DEFAULT_RAM_BUDGET_MIB).ok()
-            });
+            let loaded = match crate::bank_library::resolve_bank_dir(bank_id) {
+                None => Err("папка банка не найдена".to_owned()),
+                Some(dir) => {
+                    let hint = crate::bank_library::find_catalog_sfz(bank_id);
+                    crate::sample_bank::load_bank_with_hint(
+                        &dir,
+                        crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
+                        hint.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                }
+            };
             match loaded {
-                Some(bank) => {
+                Ok(bank) => {
                     let key = match interpolation {
                         audio_core::Interpolation::Linear => format!("sampler:{bank_id}"),
                         other => format!(
@@ -813,9 +851,15 @@ fn build_instrument(
                     };
                     let sampler =
                         instrument::SamplerInstrument::new(&bank).with_interpolation(interpolation);
-                    (key, Box::new(sampler))
+                    (key, Box::new(sampler), None)
                 }
-                None => ("piano".to_owned(), Box::new(instrument::PianoInstrument)),
+                Err(reason) => (
+                    "piano".to_owned(),
+                    Box::new(instrument::PianoInstrument),
+                    Some(format!(
+                        "Банк {bank_id} не загружен: {reason}, используется встроенное пианино"
+                    )),
+                ),
             }
         }
     }

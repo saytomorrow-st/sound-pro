@@ -313,6 +313,8 @@ pub struct Editor {
     pcm_cache: Option<daw_app::pcm_cache::PcmCache>,
     /// Rendered MIDI clips of the last playback or export (SPEC-035).
     rendered: Mutex<RenderedNotes>,
+    /// Sampler banks that fell back to the built-in piano in the last load.
+    bank_warnings: Mutex<Vec<String>>,
     undo: Vec<Session>,
     redo: Vec<Session>,
     /// The session as last opened or saved.
@@ -378,6 +380,7 @@ impl Editor {
             stereo_waves: HashMap::new(),
             pcm_cache: daw_app::pcm_cache::PcmCache::default_location(),
             rendered: Mutex::default(),
+            bank_warnings: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             saved: session,
@@ -467,6 +470,7 @@ impl Editor {
             stereo_waves,
             pcm_cache: self.pcm_cache.clone(),
             rendered: Mutex::default(),
+            bank_warnings: Mutex::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             pre_pin: None,
@@ -887,7 +891,7 @@ impl Editor {
             rendered: &mut rendered,
             used: HashMap::new(),
         };
-        let job = daw_app::load_session_cached_with(
+        let (job, warnings) = daw_app::load_session_reporting(
             self.project.session.clone(),
             Path::new(""),
             output,
@@ -896,7 +900,22 @@ impl Editor {
         )?;
         let used = cache.used;
         rendered.0 = used;
+        *self
+            .bank_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = warnings;
         Ok(job)
+    }
+
+    /// Takes the warnings of the last load: one per sampler bank that could
+    /// not be loaded and was replaced by the built-in piano.
+    pub fn take_bank_warnings(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .bank_warnings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Builds a stopped playback pair for the current project, positioned

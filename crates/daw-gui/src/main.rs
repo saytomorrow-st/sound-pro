@@ -1116,6 +1116,14 @@ impl App {
         app
     }
 
+    /// Shows why a sampler bank was replaced by the built-in piano.
+    fn show_bank_warnings(&mut self) {
+        let warnings = self.editor.take_bank_warnings();
+        if !warnings.is_empty() {
+            self.status = warnings.join("; ");
+        }
+    }
+
     fn report<T, E: std::fmt::Display>(&mut self, result: Result<T, E>, ok: &str) -> Option<T> {
         match result {
             Ok(value) => {
@@ -1496,6 +1504,7 @@ impl App {
             return;
         };
         self.playhead = control.position();
+        self.show_bank_warnings();
         #[cfg(feature = "audio")]
         {
             let rate = control.sample_rate();
@@ -1813,6 +1822,7 @@ impl App {
                 if player.control.replace_graph(graph).is_ok() {
                     player.played = session;
                     player.changed = None;
+                    self.show_bank_warnings();
                 } else {
                     ctx.request_repaint_after(REFRESH_DELAY);
                 }
@@ -6618,6 +6628,8 @@ impl App {
                                         .cancel
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
+                            } else if self.installed_banks.iter().any(|b| b.id == entry.id) {
+                                ui.label("Установлен");
                             } else {
                                 let download = egui::Button::new("Скачать");
                                 if downloadable {

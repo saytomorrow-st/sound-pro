@@ -122,8 +122,8 @@ pub struct CatalogEntry {
     /// downloadable.
     #[serde(default)]
     pub download: Option<Download>,
-    /// Path to the main `.sfz` inside the archive (`/` separators), or `None`
-    /// to use the first `.sfz` found in the installed bank root.
+    /// Path to the main `.sfz` inside the bank folder (`/` separators), or
+    /// `None` to use a breadth-first search (loader fallback).
     #[serde(default)]
     pub sfz: Option<String>,
     /// Archive container: `"zip"` or `"tar.bz2"`.
@@ -526,7 +526,72 @@ pub fn list_installed() -> Result<Vec<InstalledBank>, LibraryError> {
             "no data directory".to_owned(),
         )
     })?;
-    Ok(InstalledRegistry::load(&path)?.banks)
+    let registry = InstalledRegistry::load(&path)?;
+    let Some(banks) = banks_dir() else {
+        return Ok(registry.banks);
+    };
+    let catalog = catalog().unwrap_or_default();
+    let (banks, adopted) = reconcile_installed(&banks, registry.banks, &catalog);
+    for bank in &adopted {
+        // Best effort: the in-memory list is already correct if this fails.
+        let _ = record_installed_bank(&path, bank);
+    }
+    Ok(banks)
+}
+
+/// Reconciles the registry with the banks folder. Never touches the disk.
+///
+/// * A catalog bank whose folder has no loadable sfz is not installed (it is
+///   dropped from the list, so the picker offers the download again).
+/// * A catalog bank missing from the registry whose folder (named like the
+///   catalog id) holds a loadable sfz is adopted: returned in the list and as
+///   the second value, so the caller can persist it.
+///
+/// Banks that are not in the catalog are passed through unchanged.
+#[must_use]
+pub fn reconcile_installed(
+    banks_root: &Path,
+    installed: Vec<InstalledBank>,
+    catalog: &[CatalogEntry],
+) -> (Vec<InstalledBank>, Vec<InstalledBank>) {
+    let hint_of = |id: &str| {
+        catalog
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.sfz.clone())
+    };
+    let mut out: Vec<InstalledBank> = installed
+        .into_iter()
+        .filter(|b| {
+            !catalog.iter().any(|e| e.id == b.id)
+                || crate::sample_bank::has_loadable_sfz(
+                    Path::new(&b.path),
+                    hint_of(&b.id).as_deref(),
+                )
+        })
+        .collect();
+    let mut adopted = Vec::new();
+    for entry in catalog {
+        if out.iter().any(|b| b.id == entry.id) {
+            continue;
+        }
+        let dir = banks_root.join(&entry.id);
+        if dir.is_dir() && crate::sample_bank::has_loadable_sfz(&dir, entry.sfz.as_deref()) {
+            let bank = InstalledBank {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                family: entry.family.clone(),
+                path: dir.to_string_lossy().into_owned(),
+                license_spdx: entry.license.spdx.clone(),
+                attribution: entry.attribution.clone(),
+                license_acknowledged: false,
+                installed_at: timestamp(),
+            };
+            out.push(bank.clone());
+            adopted.push(bank);
+        }
+    }
+    (out, adopted)
 }
 
 /// One item in the track instrument picker list (SPEC-065 redesign): the
@@ -631,6 +696,15 @@ pub fn resolve_bank_dir(bank_id: &str) -> Option<PathBuf> {
         return Some(legacy.to_path_buf());
     }
     None
+}
+
+/// Retrieves the catalog's `sfz` hint for a bank id, if one exists and is
+/// valid. Used by the loader to prefer the catalog path before searching.
+///
+/// Control thread only.
+#[must_use]
+pub fn find_catalog_sfz(bank_id: &str) -> Option<String> {
+    catalog().ok()?.into_iter().find(|e| e.id == bank_id)?.sfz
 }
 
 /// Installs a local SFZ folder as a bank and records it in the registry.
@@ -839,7 +913,8 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), LibraryError> {
     Ok(())
 }
 
-/// Current UTC time as a minimal ISO-8601-ish string (install timestamps).
+/// Current UTC time as an RFC 3339 string, e.g. `2026-11-04T10:04:14Z`
+/// (install timestamps).
 #[must_use]
 pub fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -847,12 +922,24 @@ pub fn timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let days = secs / 86_400;
+    rfc3339_utc(secs)
+}
+
+/// Formats Unix seconds as RFC 3339 UTC (civil-from-days, proleptic Gregorian).
+#[must_use]
+pub fn rfc3339_utc(secs: u64) -> String {
     let rem = secs % 86_400;
-    let h = rem / 3_600;
-    let m = (rem % 3_600) / 60;
-    let s = rem % 60;
-    format!("{days}T{h:02}:{m:02}:{s:02}Z")
+    let z = i64::try_from(secs / 86_400).unwrap_or(0) + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (h, m, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 /// The built-in piano credit (the single source is `piano::PIANO_CREDIT`).
