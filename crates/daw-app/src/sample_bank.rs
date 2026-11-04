@@ -15,7 +15,7 @@ use audio_core::sampler::region::resolve;
 use audio_core::sampler::sfz::{IncludeResolver, parse};
 
 /// Default RAM budget for one bank, in MiB (RFC-001 §3.3).
-pub const DEFAULT_RAM_BUDGET_MIB: u64 = 512;
+pub const DEFAULT_RAM_BUDGET_MIB: u64 = 2048;
 
 /// Why a bank could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -114,10 +114,40 @@ pub fn load_bank(dir: &Path, budget_mib: u64) -> Result<LoadedBank, BankLoadErro
 /// `dir`, `/`-separated). A hint that is unsafe or names no file falls back to
 /// the recursive search, so a bank installed by an older version still loads.
 ///
+/// Logs one line to stderr per load attempt (success or failure) for
+/// diagnostics.
+///
 /// # Errors
 ///
 /// [`BankLoadError`].
 pub fn load_bank_with_hint(
+    dir: &Path,
+    budget_mib: u64,
+    hint: Option<&str>,
+) -> Result<LoadedBank, BankLoadError> {
+    let bank_id = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+    match load_bank_with_hint_impl(dir, budget_mib, hint) {
+        Ok(bank) => {
+            let ram_mib = bank.ram_bytes.div_ceil(1024 * 1024);
+            eprintln!(
+                "Loaded bank {bank_id}: {} regions, {ram_mib} MiB",
+                bank.regions.len()
+            );
+            Ok(bank)
+        }
+        Err(e) => {
+            eprintln!("Failed to load {bank_id}: {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Actual bank loading logic for [`load_bank_with_hint`]; the public wrapper
+/// adds the stderr diagnostics line.
+fn load_bank_with_hint_impl(
     dir: &Path,
     budget_mib: u64,
     hint: Option<&str>,
