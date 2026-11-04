@@ -14,6 +14,7 @@ use audio_core::midi::{MidiEvent, MidiMessage};
 use audio_core::sampler::engine::{SamplerEngine, playback_ratio};
 use audio_core::sampler::region::{AmpEnvelope, RegionTable, SampleRegion};
 use audio_core::sampler::sfz::{LoopMode, OffMode};
+use audio_core::sampler::source::SampleSource;
 use audio_core::sampler::voice::{Interpolation, STEAL_FADE_SAMPLES, SamplerVoice};
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 
@@ -103,8 +104,8 @@ fn dc_region(note: u8) -> SampleRegion {
 }
 
 /// A 1-sample bank of constant DC, which makes peak measurements exact.
-fn dc_bank(len: usize) -> Vec<Arc<[i16]>> {
-    vec![Arc::from(vec![10_000_i16; len])]
+fn dc_bank(len: usize) -> Vec<SampleSource> {
+    vec![SampleSource::resident(Arc::from(vec![10_000_i16; len]))]
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +141,13 @@ fn rendered_sine_has_expected_frequency() {
         ..SampleRegion::default()
     };
 
-    let mut engine = SamplerEngine::new(SR, vec![reg], vec![Arc::from(sample)], 8).unwrap();
+    let mut engine = SamplerEngine::new(
+        SR,
+        vec![reg],
+        vec![SampleSource::resident(Arc::from(sample))],
+        8,
+    )
+    .unwrap();
     let sched = schedule(vec![note_on(0, 60, 100)]);
     let out = render(&mut engine, &sched, SR as u64, QUANTUM);
 
@@ -327,8 +334,8 @@ fn stolen_voice_fades_out_instead_of_clicking() {
     let mut reg_b = dc_region(61);
     reg_b.sample_index = 1; // silence
     let bank = vec![
-        Arc::from(vec![10_000_i16; 8192]),
-        Arc::from(vec![0_i16; 8192]),
+        SampleSource::resident(Arc::from(vec![10_000_i16; 8192])),
+        SampleSource::resident(Arc::from(vec![0_i16; 8192])),
     ];
     let mut engine = SamplerEngine::new(SR, vec![reg_a, reg_b], bank, 1).unwrap();
 
@@ -433,7 +440,7 @@ fn held_one_shot_is_freed_at_sample_end() {
             ..SampleRegion::default()
         },
     ];
-    let short = vec![Arc::from(vec![10_000_i16; 256])];
+    let short = vec![SampleSource::resident(Arc::from(vec![10_000_i16; 256]))];
     let mut engine = SamplerEngine::new(SR, regs, short, 1).unwrap();
 
     // note 61 (at 1000, a later block after note 60's sample end at ~256 has
@@ -504,7 +511,7 @@ fn zero_level_voice_still_advances_playhead() {
         loop_mode: LoopMode::NoLoop,
         ..SampleRegion::default()
     };
-    let short = vec![Arc::from(vec![10_000_i16; 256])];
+    let short = vec![SampleSource::resident(Arc::from(vec![10_000_i16; 256]))];
     let mut engine = SamplerEngine::new(SR, vec![reg, reg61], short, 1).unwrap();
 
     // note 61 (at 1000, a later block after note 60's sample end has rendered
@@ -561,9 +568,14 @@ fn render_with_interpolation(
     frames: u64,
     quantum: usize,
 ) -> Vec<f32> {
-    let mut engine =
-        SamplerEngine::new_with(SR, vec![region], vec![Arc::from(sample)], 8, interpolation)
-            .unwrap();
+    let mut engine = SamplerEngine::new_with(
+        SR,
+        vec![region],
+        vec![SampleSource::resident(Arc::from(sample))],
+        8,
+        interpolation,
+    )
+    .unwrap();
     let sched = schedule(vec![note_on(0, 60, 127)]);
     let mut left = vec![0.0_f32; frames as usize];
     let mut right = vec![0.0_f32; frames as usize];
@@ -721,7 +733,7 @@ fn rendered_amplitude_is_normalised_and_velocity_dependent() {
         let mut reg = dc_region(60);
         reg.vel_track = 1.0;
         reg.gain = 1.0;
-        let bank = vec![Arc::from(vec![i16::MAX; 4096])];
+        let bank = vec![SampleSource::resident(Arc::from(vec![i16::MAX; 4096]))];
         let mut engine = SamplerEngine::new(SR, vec![reg], bank, 8).unwrap();
         let sched = schedule(vec![note_on(0, 60, velocity)]);
         let out = render(&mut engine, &sched, 1024, QUANTUM);

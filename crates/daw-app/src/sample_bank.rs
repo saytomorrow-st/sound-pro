@@ -3,7 +3,7 @@
 //! This is PR 3 of the sampler slice: it reads the `.sfz` text, resolves and
 //! decodes each region's sample (FLAC/WAV/OGG/MP3 through the SPEC-053
 //! symphonia decoder), converts it to interleaved `i16`, and produces the
-//! [`audio_core::SampleRegion`] list plus the `Arc<[i16]>` sample data that
+//! [`audio_core::SampleRegion`] list plus the resident `SampleSource` data that
 //! [`audio_core::SamplerEngine`] consumes. Loading and decoding happen on the
 //! control thread only (I/O and allocation are allowed here); nothing here is
 //! ever called from the audio callback.
@@ -63,9 +63,9 @@ pub struct LoadedBank {
     /// Resolved, playable regions (regions with missing samples are omitted).
     pub regions: Vec<audio_core::SampleRegion>,
     /// Decoded samples, indexed by [`audio_core::SampleRegion::sample_index`].
-    /// Mono samples are one `Arc<[i16]>`; stereo samples are interleaved
-    /// `[L, R, L, R, …]`.
-    pub samples: Vec<Arc<[i16]>>,
+    /// Mono samples are one resident `i16` buffer; stereo samples are
+    /// interleaved `[L, R, L, R, …]`.
+    pub samples: Vec<audio_core::SampleSource>,
     /// Non-fatal warnings: parser warnings plus loader notes (extra `.sfz`,
     /// truncated regions, …).
     pub warnings: Vec<String>,
@@ -205,7 +205,7 @@ fn load_bank_with_hint_impl(
 
     let budget_bytes = budget_mib.saturating_mul(1024 * 1024);
     let mut regions: Vec<audio_core::SampleRegion> = Vec::new();
-    let mut samples: Vec<Arc<[i16]>> = Vec::new();
+    let mut samples: Vec<audio_core::SampleSource> = Vec::new();
     let mut decode_failures: Vec<RegionFailure> = Vec::new();
     let mut ram_bytes: u64 = 0;
 
@@ -271,7 +271,7 @@ fn load_bank_with_hint_impl(
                     }
                     ram_bytes += bytes;
                     slot_of[idx] = Some((samples.len(), channels));
-                    samples.push(Arc::from(data));
+                    samples.push(audio_core::SampleSource::resident(Arc::from(data)));
                 }
                 Some(Ok(_)) => slot_failure[idx] = Some("sample is empty".to_owned()),
                 Some(Err(reason)) => slot_failure[idx] = Some(reason),

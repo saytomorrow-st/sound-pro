@@ -27,6 +27,7 @@ use audio_core::midi::{MidiEvent, MidiMessage};
 use audio_core::sampler::engine::{DEFAULT_VOICES, SamplerEngine};
 use audio_core::sampler::region::SampleRegion;
 use audio_core::sampler::sfz::{LoopMode, OffMode};
+use audio_core::sampler::source::SampleSource;
 use audio_core::sampler::voice::Interpolation;
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 
@@ -106,7 +107,11 @@ fn render_allocates_nothing_across_the_full_voice_lifecycle() {
     // Sample 2: long looped mono DC so its voice never exhausts.
     let looped: Vec<i16> = vec![8000_i16; 4096];
 
-    let samples = vec![Arc::from(mono), Arc::from(stereo), Arc::from(looped)];
+    let samples = vec![
+        SampleSource::resident(Arc::from(mono)),
+        SampleSource::resident(Arc::from(stereo)),
+        SampleSource::resident(Arc::from(looped)),
+    ];
 
     // One region per note. Notes 69/70 form an off_by choke pair; note 71 is
     // stereo; note 72 loops. The rest are short mono one-shots.
@@ -197,7 +202,11 @@ fn render_allocates_nothing_with_hermite4() {
         .map(|i| if i % 2 == 0 { 9000 } else { 7000 })
         .collect();
     let looped: Vec<i16> = vec![8000_i16; 4096];
-    let samples = vec![Arc::from(mono), Arc::from(stereo), Arc::from(looped)];
+    let samples = vec![
+        SampleSource::resident(Arc::from(mono)),
+        SampleSource::resident(Arc::from(stereo)),
+        SampleSource::resident(Arc::from(looped)),
+    ];
 
     let mut regions: Vec<SampleRegion> = (0..=127)
         .map(|n| SampleRegion {

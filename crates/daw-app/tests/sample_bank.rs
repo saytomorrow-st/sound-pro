@@ -68,7 +68,7 @@ fn loads_a_single_region_bank() {
     assert_eq!(region.key_hi, 127);
     assert_eq!(region.sample_index, 0);
     // Constant 0.5 → 16384 in i16.
-    assert_eq!(bank.samples[0][0], 16384);
+    assert_eq!(bank.samples[0].as_i16()[0], 16384);
 }
 
 #[test]

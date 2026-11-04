@@ -8,4 +8,5 @@
 pub mod engine;
 pub mod region;
 pub mod sfz;
+pub mod source;
 pub mod voice;

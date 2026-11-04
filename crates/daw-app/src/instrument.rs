@@ -6,11 +6,11 @@
 //! (the existing fallback, kept bit-identical), and [`SamplerInstrument`], a
 //! loaded SFZ bank rendered through [`audio_core::SamplerEngine`].
 
-use std::sync::Arc;
-
 use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 use audio_core::synth::SynthError;
-use audio_core::{Interpolation, MidiEvent, MidiMessage, Note, SampleRegion, SamplerEngine};
+use audio_core::{
+    Interpolation, MidiEvent, MidiMessage, Note, SampleRegion, SampleSource, SamplerEngine,
+};
 
 use crate::sample_bank::LoadedBank;
 
@@ -66,7 +66,7 @@ impl Instrument for PianoInstrument {
 /// path as the future realtime node. Control thread only.
 pub struct SamplerInstrument {
     regions: Vec<SampleRegion>,
-    samples: Vec<Arc<[i16]>>,
+    samples: Vec<SampleSource>,
     interpolation: Interpolation,
 }
 
@@ -103,7 +103,7 @@ impl SamplerInstrument {
 
     /// The decoded samples the instrument plays.
     #[must_use]
-    pub fn samples(&self) -> &[Arc<[i16]>] {
+    pub fn samples(&self) -> &[SampleSource] {
         &self.samples
     }
 

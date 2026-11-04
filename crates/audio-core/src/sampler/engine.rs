@@ -9,11 +9,11 @@
 //! in a later PR, the realtime `SamplerNode`. Nothing here allocates, locks,
 //! blocks, touches I/O, or uses `unsafe` after construction.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::midi::MidiMessage;
 use crate::sampler::region::{RegionTable, SampleRegion};
+use crate::sampler::source::SampleSource;
 use crate::sampler::voice::{
     Interpolation, NO_REGION, SamplerVoice, read_hermite_i16, read_hermite_stereo, read_linear_i16,
     read_linear_stereo,
@@ -53,7 +53,7 @@ impl std::error::Error for SamplerError {}
 ///
 /// All buffers (the voice pool) are allocated in [`SamplerEngine::new`]; the
 /// render path performs no allocation, locking, I/O, or `unsafe`. Sample data
-/// is supplied as already-decoded `Arc<[i16]>` slices (RFC-001 §3.3); file
+/// is supplied as already-decoded `SampleSource::Resident` slices (RFC-001 §3.3); file
 /// loading, decoding and bank management are out of scope for this module.
 pub struct SamplerEngine {
     voices: Vec<SamplerVoice>,
@@ -64,7 +64,7 @@ pub struct SamplerEngine {
     tails: Vec<SamplerVoice>,
     table: RegionTable,
     regions: Vec<SampleRegion>,
-    samples: Vec<Arc<[i16]>>,
+    samples: Vec<SampleSource>,
     sample_rate: u32,
     interpolation: Interpolation,
     started: AtomicU32,
@@ -86,7 +86,7 @@ impl SamplerEngine {
     pub fn new(
         sample_rate: u32,
         regions: Vec<SampleRegion>,
-        samples: Vec<Arc<[i16]>>,
+        samples: Vec<SampleSource>,
         num_voices: usize,
     ) -> Result<Self, SamplerError> {
         Self::new_with(
@@ -113,7 +113,7 @@ impl SamplerEngine {
     pub fn new_with(
         sample_rate: u32,
         regions: Vec<SampleRegion>,
-        samples: Vec<Arc<[i16]>>,
+        samples: Vec<SampleSource>,
         num_voices: usize,
         interpolation: Interpolation,
     ) -> Result<Self, SamplerError> {
@@ -282,10 +282,11 @@ impl SamplerEngine {
         };
         let region = &self.regions[region_index];
         let sample = &self.samples[region.sample_index];
+        let sample_data = sample.as_i16();
         let frames = if region.channels == 1 {
-            sample.len()
+            sample_data.len()
         } else {
-            sample.len() / 2
+            sample_data.len() / 2
         };
         if frames == 0 || region.offset as usize >= frames {
             self.dropped_starts.fetch_add(1, Ordering::Relaxed);
@@ -486,7 +487,7 @@ impl SamplerEngine {
 fn render_voice(
     voice: &mut SamplerVoice,
     regions: &[SampleRegion],
-    samples: &[Arc<[i16]>],
+    samples: &[SampleSource],
     interpolation: Interpolation,
     position: u64,
     end: u64,
@@ -499,8 +500,9 @@ fn render_voice(
     }
     let region = &regions[voice.region as usize];
     let sample = &samples[region.sample_index];
+    let sample_data = sample.as_i16();
     let stereo = region.channels == 2;
-    let mono_frames = sample.len();
+    let mono_frames = sample_data.len();
     let frames_count = if stereo { mono_frames / 2 } else { mono_frames };
 
     let mut exhausted = false;
@@ -519,17 +521,17 @@ fn render_voice(
             let (sample_l, sample_r) = match interpolation {
                 Interpolation::Linear => {
                     if stereo {
-                        read_linear_stereo(sample, voice.pos, frames_count)
+                        read_linear_stereo(sample_data, voice.pos, frames_count)
                     } else {
-                        let m = read_linear_i16(sample, voice.pos, mono_frames);
+                        let m = read_linear_i16(sample_data, voice.pos, mono_frames);
                         (m, m)
                     }
                 }
                 Interpolation::Hermite4 => {
                     if stereo {
-                        read_hermite_stereo(sample, voice.pos, frames_count)
+                        read_hermite_stereo(sample_data, voice.pos, frames_count)
                     } else {
-                        let m = read_hermite_i16(sample, voice.pos, mono_frames);
+                        let m = read_hermite_i16(sample_data, voice.pos, mono_frames);
                         (m, m)
                     }
                 }
