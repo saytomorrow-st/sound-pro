@@ -140,6 +140,12 @@ pub struct ManifestEntry {
     /// Optional blake3 of the `.pcm` payload, lowercase hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blake3: Option<String>,
+    /// xxh3-64 of the first/middle/last 64 KiB blocks of the `.pcm` payload,
+    /// lowercase hex, used by the L1 sampled integrity check. Optional so
+    /// manifests written before this field existed still parse (L1 then only
+    /// checks the source `mtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_xxh3: Option<String>,
     /// Sample rate in Hz.
     pub sample_rate: u32,
     /// Channel count (`1` or `2`).
@@ -223,6 +229,79 @@ pub fn xxh3_64_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+/// The block size used by the L1 sampled integrity check.
+pub const SAMPLE_BLOCK_LEN: usize = 64 * 1024;
+
+/// xxh3-64 of three representative 64 KiB blocks of a `.pcm` payload — the
+/// first, the middle and the last — as lowercase hex. This is the reference
+/// value stored in [`ManifestEntry::sampled_xxh3`] and recomputed by the L1
+/// check. Short payloads fall back to hashing the whole buffer once.
+#[must_use]
+pub fn sample_blocks_xxh3_64(bytes: &[u8]) -> String {
+    use xxhash_rust::xxh3::Xxh3;
+    if bytes.len() <= SAMPLE_BLOCK_LEN {
+        return xxh3_64_hex(bytes);
+    }
+    let mut h = Xxh3::new();
+    h.update(&bytes[..SAMPLE_BLOCK_LEN]);
+    let mid = bytes.len() / 2;
+    let mid_start = mid
+        .saturating_sub(SAMPLE_BLOCK_LEN / 2)
+        .min(bytes.len() - SAMPLE_BLOCK_LEN);
+    h.update(&bytes[mid_start..mid_start + SAMPLE_BLOCK_LEN]);
+    h.update(&bytes[bytes.len() - SAMPLE_BLOCK_LEN..]);
+    format!("{:016x}", h.digest())
+}
+
+/// Recomputes the sampled-block xxh3-64 of a `.pcm` file on disk, streaming
+/// only the three 64 KiB blocks (never the whole file), for the L1 check.
+/// Returns the hash and the file's total length.
+///
+/// # Errors
+///
+/// A human-readable reason if the file cannot be opened or read.
+pub fn sample_blocks_xxh3_64_file(path: &Path) -> Result<(String, u64), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use xxhash_rust::xxh3::Xxh3;
+
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = f
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    let read_block = |f: &mut std::fs::File, offset: u64| -> Result<Vec<u8>, String> {
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("seek {}: {e}", path.display()))?;
+        let mut buf = vec![0u8; SAMPLE_BLOCK_LEN];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let n = f
+                .read(&mut buf[filled..])
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    };
+
+    if len <= SAMPLE_BLOCK_LEN as u64 {
+        let whole = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        return Ok((xxh3_64_hex(&whole), len));
+    }
+
+    let mut h = Xxh3::new();
+    h.update(&read_block(&mut f, 0)?);
+    let mid_start = (len / 2)
+        .saturating_sub(SAMPLE_BLOCK_LEN as u64 / 2)
+        .min(len - SAMPLE_BLOCK_LEN as u64);
+    h.update(&read_block(&mut f, mid_start)?);
+    h.update(&read_block(&mut f, len - SAMPLE_BLOCK_LEN as u64)?);
+    Ok((format!("{:016x}", h.digest()), len))
+}
+
 /// blake3 of `bytes`, as lowercase hex (the optional strong hash).
 #[must_use]
 pub fn blake3_hex(bytes: &[u8]) -> String {
@@ -257,6 +336,9 @@ pub struct WrittenPcm {
     /// blake3 of the `.pcm` payload (header + data), lowercase hex, when
     /// requested.
     pub blake3: Option<String>,
+    /// xxh3-64 of the first/middle/last 64 KiB blocks of the payload, lowercase
+    /// hex, stored as [`ManifestEntry::sampled_xxh3`] for the L1 check.
+    pub sampled_xxh3: String,
 }
 
 /// Serializes one decoded sample to `<cache_dir>/<name>` atomically (`.tmp`
@@ -291,6 +373,7 @@ pub fn write_pcm_file(
 
     let xxh3_128 = xxh3_128_hex(&payload);
     let blake3 = compute_blake3.then(|| blake3_hex(&payload));
+    let sampled_xxh3 = sample_blocks_xxh3_64(&payload);
 
     let path = cache_dir.join(name);
     let tmp = temp_path(&path);
@@ -302,6 +385,7 @@ pub fn write_pcm_file(
         size: payload.len() as u64,
         xxh3_128,
         blake3,
+        sampled_xxh3,
     })
 }
 
@@ -443,6 +527,7 @@ mod tests {
                 size: 64 + 4,
                 xxh3_128: "0".repeat(32),
                 blake3: None,
+                sampled_xxh3: None,
                 sample_rate: 48_000,
                 channels: 2,
                 frames: 1,
@@ -513,6 +598,7 @@ mod tests {
         assert_eq!(written.size, 64 + 6 * 2);
         assert_eq!(written.xxh3_128.len(), 32);
         assert_eq!(written.blake3.as_deref().map(str::len), Some(64));
+        assert_eq!(written.sampled_xxh3.len(), 16);
 
         // The file on disk parses back to the same header and payload.
         let on_disk = std::fs::read(dir.join("000001.pcm")).expect("file exists");
@@ -542,6 +628,7 @@ mod tests {
         let written = write_pcm_file(&dir, "000000.pcm", &header, &[0], false).unwrap();
         assert_eq!(written.blake3, None);
         assert_eq!(written.xxh3_128.len(), 32);
+        assert_eq!(written.sampled_xxh3.len(), 16);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
