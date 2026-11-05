@@ -550,14 +550,32 @@ impl<'a> Parser<'a> {
             self.region_open = false;
         }
         self.section = Section::from_name(name);
-        if self.section == Some(Section::Region) {
-            // A new region starts from the inherited group+master+global
-            // base; it is lazily pushed on the first opcode.
-            self.current = merge(&self.global, &self.master, &self.group);
-            self.region_open = true;
-        } else {
-            self.current = Region::default();
-            self.region_open = false;
+        match self.section {
+            Some(Section::Region) => {
+                // A new region starts from the inherited group+master+global
+                // base; it is lazily pushed on the first opcode.
+                self.current = merge(&self.global, &self.master, &self.group);
+                self.region_open = true;
+            }
+            // A new `<master>` inherits only from `<global>`; a new `<group>`
+            // inherits only from `<global>` + `<master>`. Sibling headers must
+            // not leak opcodes into each other, so the scope is reset here
+            // (SFZ inheritance is `control → global → master → group → region`,
+            // never across sibling blocks).
+            Some(Section::Master) => {
+                self.master = Region::default();
+                self.current = Region::default();
+                self.region_open = false;
+            }
+            Some(Section::Group) => {
+                self.group = Region::default();
+                self.current = Region::default();
+                self.region_open = false;
+            }
+            _ => {
+                self.current = Region::default();
+                self.region_open = false;
+            }
         }
     }
 
