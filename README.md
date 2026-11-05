@@ -153,7 +153,7 @@ cargo build -p daw-app --features realtime
 
 ## Лицензия
 
-MIT OR Apache-2.0 (код): `LICENSE-MIT`, `LICENSE-APACHE`. Название и юридическая проверка — до публичного релиза.
+Apache-2.0 (код): `LICENSE`. Название и юридическая проверка — до публичного релиза.
 
 Сэмплы пианино: **Salamander Grand Piano** — Alexander Holm,
 [CC-BY 3.0](https://creativecommons.org/licenses/by/3.0/); подробности в
