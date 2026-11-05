@@ -46,6 +46,11 @@ pub enum BankLoadError {
     /// The RAM budget was zero.
     #[error("RAM budget must be positive")]
     InvalidBudget,
+    /// The bank has no usable PCM cache (`cache/manifest.json` is missing or
+    /// its format version is incompatible). The caller should build the cache
+    /// (or fall back to on-demand FLAC decoding).
+    #[error("no usable PCM cache: {0}")]
+    NoCache(String),
 }
 
 /// A sample the loader could not decode, reported without aborting the bank.
@@ -55,6 +60,23 @@ pub struct RegionFailure {
     pub sample: String,
     /// Why it could not be loaded or decoded.
     pub reason: String,
+}
+
+/// A handle describing the on-disk PCM cache a [`LoadedBank`] was read from
+/// (RFC-002 §8). The cache lives outside RAM; the handle is only metadata so
+/// the caller can report it and the loader can re-open files lazily later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheHandle {
+    /// The bank id (e.g. `"osiris"`).
+    pub bank_id: String,
+    /// Absolute path to the `cache/` directory.
+    pub cache_dir: PathBuf,
+    /// `Σ entries[].size` — the total `.pcm` bytes on disk.
+    pub total_bytes: u64,
+    /// Number of cached samples.
+    pub samples: usize,
+    /// The manifest `format_version`.
+    pub format_version: u32,
 }
 
 /// A fully loaded bank: resolved regions plus their decoded `i16` samples,
@@ -72,8 +94,11 @@ pub struct LoadedBank {
     pub warnings: Vec<String>,
     /// Regions whose sample could not be loaded or decoded.
     pub decode_failures: Vec<RegionFailure>,
-    /// Actual bytes of sample data held in RAM.
+    /// Actual bytes of sample data held in RAM (resident data only).
     pub ram_bytes: u64,
+    /// The PCM cache this bank was read from, when it was loaded from cache
+    /// rather than decoded from FLAC/WAV.
+    pub cache: Option<CacheHandle>,
 }
 
 /// A filesystem-backed [`IncludeResolver`] rooted at the bank directory.
@@ -275,7 +300,301 @@ fn load_bank_with_hint_impl(
         warnings,
         decode_failures,
         ram_bytes,
+        cache: None,
     })
+}
+
+/// Loads a bank from its prebuilt PCM cache (RFC-002 §8 step 2), reading each
+/// `cache/*.pcm` into [`audio_core::SampleSource::Resident`] without decoding
+/// FLAC. This is the fast, low-RAM path: only the resident `i16` data is held
+/// in memory (Salamander ~1.1 GiB, Osiris ~2.6 GiB), and the loader honours the
+/// RAM budget.
+///
+/// Before reading, the cache is verified at **L0** (RFC-002 §6): manifest
+/// `format_version`, file existence, exact size, and the `SPCM` header. Any
+/// failing entry is quarantined and re-decoded from its source via
+/// [`crate::bank_integrity::recover_bank_cache`]; an entry whose source is
+/// missing is skipped into [`LoadedBank::decode_failures`]. L1/L2 run in the
+/// background, started by the caller ([`spawn_background_verify`]).
+///
+/// Control thread only: this reads files and allocates.
+///
+/// # Errors
+///
+/// [`BankLoadError::NoCache`] when there is no cache to load (missing manifest
+/// or incompatible `format_version`); [`BankLoadError::RamBudgetExceeded`] when
+/// the resident data exceeds `budget_mib`; other [`BankLoadError`] on SFZ or
+/// decode problems.
+pub fn load_bank_from_cache(
+    dir: &Path,
+    hint: Option<&str>,
+    budget_mib: u64,
+) -> Result<LoadedBank, BankLoadError> {
+    if budget_mib == 0 {
+        return Err(BankLoadError::InvalidBudget);
+    }
+    let bank_id = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+
+    // L0: verify the cache synchronously. A missing/incompatible manifest is a
+    // "no cache" condition the caller turns into a background build.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let report = crate::bank_integrity::verify_bank_cache(
+        dir,
+        crate::bank_integrity::IntegrityLevel::L0,
+        &cancel,
+    )
+    .map_err(BankLoadError::NoCache)?;
+    if !report.issues.is_empty() {
+        crate::log_warn!(
+            "bank {bank_id}: {}/{} cached samples failed L0, rebuilding",
+            report.issues.len(),
+            report.checked
+        );
+        let recover = crate::bank_integrity::recover_bank_cache(dir, &report.issues, &cancel)
+            .map_err(|e| BankLoadError::NoCache(format!("recover failed: {e}")))?;
+        if recover.unrecoverable > 0 {
+            crate::log_warn!(
+                "bank {bank_id}: {} cached samples unrecoverable (source missing)",
+                recover.unrecoverable
+            );
+        }
+    }
+
+    // Re-read the manifest and resolve the SFZ/regions exactly as the FLAC
+    // loader does, so `sample_index` and ordering match bit-for-bit.
+    let manifest = crate::bank_cache::read_manifest(&crate::bank_cache::manifest_path(dir))
+        .map_err(|e| BankLoadError::NoCache(format!("manifest unreadable after verify: {e}")))?;
+
+    let sfz = find_sfz(dir, hint)?;
+    let base = sfz
+        .parent()
+        .and_then(|p| p.strip_prefix(dir).ok())
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default();
+    let text = std::fs::read_to_string(&sfz)
+        .map_err(|e| BankLoadError::ReadSfz(sfz.clone(), e.to_string()))?;
+    let mut resolver = DirResolver {
+        root: dir.to_path_buf(),
+        base: base.clone(),
+    };
+    let doc =
+        parse(&text, &mut resolver).map_err(|e| BankLoadError::Sfz(sfz.clone(), e.to_string()))?;
+
+    let warnings: Vec<String> = doc
+        .warnings
+        .iter()
+        .map(|w| format!("byte {}: {}", w.at, w.message))
+        .collect();
+
+    let (unique, plan, mut decode_failures) = resolve_unique_samples(dir, &doc, &base);
+
+    // Map each manifest entry by its stable `src` key (RFC-002 §5.2), so a
+    // changed `sample_id` ordering still resolves by path.
+    let entry_by_src: HashMap<String, crate::bank_cache::ManifestEntry> = manifest
+        .entries
+        .into_iter()
+        .map(|e| (e.src.clone(), e))
+        .collect();
+
+    let budget_bytes = budget_mib.saturating_mul(1024 * 1024);
+    let cdir = crate::bank_cache::cache_dir(dir);
+    let mut regions: Vec<audio_core::SampleRegion> = Vec::new();
+    let mut samples: Vec<audio_core::SampleSource> = Vec::new();
+    let mut ram_bytes: u64 = 0;
+    let mut slot_of: Vec<Option<(usize, u8)>> = vec![None; unique.len()];
+    let mut slot_failure: Vec<Option<String>> = vec![None; unique.len()];
+
+    for (region, idx) in doc.regions.iter().zip(&plan) {
+        let Some(idx) = *idx else { continue };
+        let sample_path = region.sample.as_deref().unwrap_or_default();
+        if slot_of[idx].is_none() && slot_failure[idx].is_none() {
+            let src = unique[idx].to_string_lossy().into_owned();
+            match entry_by_src.get(&src) {
+                Some(entry) => {
+                    let pcm_path = cdir.join(&entry.cache);
+                    match crate::bank_cache::read_pcm_file(&pcm_path) {
+                        Ok((_, data)) if !data.is_empty() => {
+                            let bytes = (data.len() as u64).saturating_mul(2);
+                            if ram_bytes.saturating_add(bytes) > budget_bytes {
+                                let needed_mib =
+                                    ram_bytes.saturating_add(bytes).div_ceil(1024 * 1024);
+                                return Err(BankLoadError::RamBudgetExceeded {
+                                    budget_mib,
+                                    needed_mib,
+                                });
+                            }
+                            ram_bytes += bytes;
+                            let channels = entry.channels as u8;
+                            slot_of[idx] = Some((samples.len(), channels));
+                            samples.push(audio_core::SampleSource::resident(Arc::from(data)));
+                        }
+                        Ok(_) => slot_failure[idx] = Some("sample is empty".to_owned()),
+                        Err(e) => slot_failure[idx] = Some(e),
+                    }
+                }
+                None => slot_failure[idx] = Some("no cache entry".to_owned()),
+            }
+        }
+        if let Some((sample_index, channels)) = slot_of[idx] {
+            if let Some(r) = resolve(region, 48_000, sample_index, channels) {
+                regions.push(r);
+            }
+        } else if let Some(reason) = &slot_failure[idx] {
+            decode_failures.push(RegionFailure {
+                sample: sample_path.to_owned(),
+                reason: reason.clone(),
+            });
+        }
+    }
+
+    let cache = Some(CacheHandle {
+        bank_id: bank_id.clone(),
+        cache_dir: cdir,
+        total_bytes: manifest.total_bytes,
+        samples: samples.len(),
+        format_version: manifest.format_version,
+    });
+
+    Ok(LoadedBank {
+        regions,
+        samples,
+        warnings,
+        decode_failures,
+        ram_bytes,
+        cache,
+    })
+}
+
+/// Loads a bank preferring its PCM cache, transparently building the cache in
+/// the background when it is missing (a bank installed by an older version) and
+/// falling back to on-demand FLAC decoding if the cache cannot be used
+/// (RFC-002 §8 step 5/6).
+///
+/// This is the convenience entry used by the app: it computes the effective RAM
+/// budget from [`crate::meminfo::effective_budget_mib`], logs RSS before/after,
+/// and starts the background L1/L2 integrity check.
+///
+/// Control thread only.
+///
+/// # Errors
+///
+/// [`BankLoadError`] when the bank cannot be loaded from cache or FLAC.
+pub fn load_bank_auto(dir: &Path, hint: Option<&str>) -> Result<LoadedBank, BankLoadError> {
+    let budget_mib = crate::meminfo::effective_budget_mib(DEFAULT_RAM_BUDGET_MIB);
+    load_bank_auto_with_budget(dir, hint, budget_mib)
+}
+
+/// [`load_bank_auto`] with an explicit budget, so tests can force a low budget.
+pub fn load_bank_auto_with_budget(
+    dir: &Path,
+    hint: Option<&str>,
+    budget_mib: u64,
+) -> Result<LoadedBank, BankLoadError> {
+    let bank_id = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+    let rss_before = crate::meminfo::current_rss_mib();
+    crate::log_info!(
+        "bank {bank_id}: auto-load, budget {budget_mib} MiB, RSS before {} MiB",
+        rss_before.map_or("?".to_owned(), |m| m.to_string())
+    );
+
+    let result = match load_bank_from_cache(dir, hint, budget_mib) {
+        Ok(bank) => Ok(bank),
+        Err(BankLoadError::NoCache(reason)) => {
+            crate::log_info!(
+                "bank {bank_id}: no usable cache ({reason}); building cache in background"
+            );
+            let cancel = Arc::new(AtomicBool::new(false));
+            let progress_bank = bank_id.clone();
+            let progress = std::sync::Mutex::new(move |done: u64, total: u64, bytes: u64| {
+                if done % 100 == 0 || done == total {
+                    crate::log_info!(
+                        "bank {progress_bank}: building cache {done}/{total} samples, {} MiB",
+                        bytes.div_ceil(1024 * 1024)
+                    );
+                }
+            });
+            match build_bank_cache(dir, hint, &progress, &cancel) {
+                Ok(_) => load_bank_from_cache(dir, hint, budget_mib),
+                Err(e) => {
+                    crate::log_warn!(
+                        "bank {bank_id}: cache build failed ({e}); falling back to FLAC decode"
+                    );
+                    load_bank_with_hint(dir, budget_mib, hint)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    };
+
+    let rss_after = crate::meminfo::current_rss_mib();
+    match (&result, rss_after) {
+        (Ok(bank), Some(after)) => crate::log_info!(
+            "bank {bank_id}: loaded {} MiB resident, RSS after {} MiB",
+            bank.ram_bytes.div_ceil(1024 * 1024),
+            after
+        ),
+        (Err(_), Some(after)) => {
+            crate::log_warn!("bank {bank_id}: load failed, RSS after {} MiB", after)
+        }
+        _ => {}
+    }
+
+    result
+}
+
+/// Starts the background L1 (always) and L2 (once per session, or after a crash
+/// via `cache/.dirty`) integrity check of a loaded cache (RFC-002 §6.2). Any
+/// entry that fails is quarantined and re-decoded from its source; the outcome
+/// is logged. Detached, low-priority work — never the audio path.
+pub fn spawn_background_verify(dir: PathBuf) {
+    std::thread::Builder::new()
+        .name("bank-integrity-verify".to_owned())
+        .spawn(move || {
+            let bank_id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let level = if crate::bank_integrity::is_dirty(&dir) {
+                crate::bank_integrity::IntegrityLevel::L2
+            } else {
+                crate::bank_integrity::IntegrityLevel::L1
+            };
+            match crate::bank_integrity::verify_bank_cache(&dir, level, &cancel) {
+                Ok(report) if report.is_clean() => {
+                    crate::log_info!(
+                        "bank {bank_id}: background integrity {:?} clean ({}/{} samples)",
+                        level,
+                        report.ok,
+                        report.checked
+                    );
+                }
+                Ok(report) => {
+                    crate::log_warn!(
+                        "bank {bank_id}: background integrity found {} issues, rebuilding",
+                        report.issues.len()
+                    );
+                    if let Err(e) =
+                        crate::bank_integrity::recover_bank_cache(&dir, &report.issues, &cancel)
+                    {
+                        crate::log_error!("bank {bank_id}: background rebuild failed: {e}");
+                    }
+                }
+                Err(e) => crate::log_warn!("bank {bank_id}: background verify skipped: {e}"),
+            }
+        })
+        .ok();
 }
 
 /// Deepest folder level searched for a `.sfz` below the bank root.
