@@ -383,6 +383,7 @@ pub fn build_bank_cache(
         .unwrap_or_else(|| dir.display().to_string());
     let t_start = std::time::Instant::now();
     crate::log_info!("bank {bank_id}: building PCM cache in {}", dir.display());
+    crate::bank_integrity::mark_dirty(dir);
 
     let sfz = find_sfz(dir, hint).map_err(CacheBuildError::Load)?;
     let base = sfz
@@ -505,6 +506,7 @@ pub fn build_bank_cache(
         entries: manifest_entries,
     };
     crate::bank_cache::write_manifest(&mpath, &manifest).map_err(CacheBuildError::Io)?;
+    crate::bank_integrity::clear_dirty(dir);
 
     crate::log_info!(
         "bank {bank_id}: cache built in {} ms: {} samples, {} bytes, {} failures",
@@ -534,7 +536,7 @@ fn estimate_cache_bytes(paths: &[PathBuf]) -> u64 {
 
 /// Decodes one source sample and writes its `.pcm`, returning its manifest
 /// entry. `sample_id` is the index in the unique list; the stable key is `src`.
-fn build_one_pcm(
+pub(crate) fn build_one_pcm(
     src: &Path,
     sample_id: usize,
     cache_dir: &Path,
@@ -570,6 +572,7 @@ fn build_one_pcm(
         size: written.size,
         xxh3_128: written.xxh3_128,
         blake3: written.blake3,
+        sampled_xxh3: Some(written.sampled_xxh3),
         sample_rate: rate,
         channels,
         frames,
@@ -678,7 +681,7 @@ fn resolve_sample_path(
 /// Joins `path` onto `root`, normalising `\` → `/` and rejecting any path that
 /// escapes `root` (absolute, drive-letter, or `..` that climbs above `root`).
 /// A leading `..` or an empty path yields `None`.
-fn confine_path(root: &Path, path: &str) -> Option<PathBuf> {
+pub(crate) fn confine_path(root: &Path, path: &str) -> Option<PathBuf> {
     let normalized = path.replace('\\', "/");
     // Absolute (POSIX or Windows-style) and drive letters are never allowed.
     if normalized.starts_with('/') || (normalized.len() >= 2 && normalized.as_bytes()[1] == b':') {

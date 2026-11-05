@@ -32,6 +32,7 @@ pub mod audio_file;
 pub mod audio_settings;
 pub mod bank_cache;
 pub mod bank_download;
+pub mod bank_integrity;
 pub mod bank_library;
 pub mod instrument;
 pub mod logging;
