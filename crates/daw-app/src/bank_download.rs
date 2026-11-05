@@ -397,6 +397,58 @@ fn download_bank_into_inner(
     // Success: drop any backed-up previous install.
     let old = banks.join(format!(".{}.old.tmp", entry.id));
     let _ = std::fs::remove_dir_all(&old);
+
+    // 5. Build the PCM cache now that the bank is installed (RFC-002 §5.3).
+    //    Decoding runs on this worker thread (never the audio thread) and holds
+    //    at most one decoded file per worker, so it cannot OOM. The cache is
+    //    derived data; a failure here leaves the bank installed and playable
+    //    (falling back to on-demand FLAC decode), so it is logged, not fatal.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DownloadError::Cancelled);
+    }
+    let bank_id = entry.id.clone();
+    let last_logged = std::sync::atomic::AtomicU64::new(0);
+    let progress_cb = std::sync::Mutex::new(move |done: u64, total: u64, bytes: u64| {
+        let d = done
+            .saturating_mul(10)
+            .checked_div(total.max(1))
+            .unwrap_or(0);
+        let prev = last_logged.swap(d, Ordering::Relaxed);
+        if d > prev {
+            crate::log_info!(
+                "bank {bank_id}: cache build {done}/{total} samples, {} MiB written",
+                bytes.div_ceil(1024 * 1024)
+            );
+        }
+    });
+    match crate::sample_bank::build_bank_cache(
+        &final_dir,
+        entry.sfz.as_deref(),
+        &progress_cb,
+        cancel,
+    ) {
+        Ok(outcome) => {
+            crate::log_info!(
+                "bank {}: cache ready: {} samples, {} bytes, {} failures",
+                entry.id,
+                outcome.samples,
+                outcome.total_bytes,
+                outcome.failures
+            );
+        }
+        Err(e) => {
+            // Cancelled must still surface as cancellation; otherwise the
+            // install is complete and the missing cache is non-fatal.
+            if matches!(e, crate::sample_bank::CacheBuildError::Cancelled) {
+                return Err(DownloadError::Cancelled);
+            }
+            crate::log_warn!(
+                "bank {}: cache build skipped (will decode on demand): {e}",
+                entry.id
+            );
+        }
+    }
+
     Ok(bank)
 }
 

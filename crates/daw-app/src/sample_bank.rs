@@ -3,7 +3,7 @@
 //! This is PR 3 of the sampler slice: it reads the `.sfz` text, resolves and
 //! decodes each region's sample (FLAC/WAV/OGG/MP3 through the SPEC-053
 //! symphonia decoder), converts it to interleaved `i16`, and produces the
-//! [`audio_core::SampleRegion`] list plus the `Arc<[i16]>` sample data that
+//! [`audio_core::SampleRegion`] list plus the resident `SampleSource` data that
 //! [`audio_core::SamplerEngine`] consumes. Loading and decoding happen on the
 //! control thread only (I/O and allocation are allowed here); nothing here is
 //! ever called from the audio callback.
@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use audio_core::sampler::region::resolve;
 use audio_core::sampler::sfz::{IncludeResolver, parse};
@@ -63,9 +64,9 @@ pub struct LoadedBank {
     /// Resolved, playable regions (regions with missing samples are omitted).
     pub regions: Vec<audio_core::SampleRegion>,
     /// Decoded samples, indexed by [`audio_core::SampleRegion::sample_index`].
-    /// Mono samples are one `Arc<[i16]>`; stereo samples are interleaved
-    /// `[L, R, L, R, …]`.
-    pub samples: Vec<Arc<[i16]>>,
+    /// Mono samples are one resident `i16` buffer; stereo samples are
+    /// interleaved `[L, R, L, R, …]`.
+    pub samples: Vec<audio_core::SampleSource>,
     /// Non-fatal warnings: parser warnings plus loader notes (extra `.sfz`,
     /// truncated regions, …).
     pub warnings: Vec<String>,
@@ -205,39 +206,12 @@ fn load_bank_with_hint_impl(
 
     let budget_bytes = budget_mib.saturating_mul(1024 * 1024);
     let mut regions: Vec<audio_core::SampleRegion> = Vec::new();
-    let mut samples: Vec<Arc<[i16]>> = Vec::new();
-    let mut decode_failures: Vec<RegionFailure> = Vec::new();
+    let mut samples: Vec<audio_core::SampleSource> = Vec::new();
     let mut ram_bytes: u64 = 0;
 
     // Resolve every region's path; unique files are decoded once (velocity
     // layers, round robins and release groups share files), in first-seen order.
-    let mut unique: Vec<PathBuf> = Vec::new();
-    let mut index_of: HashMap<PathBuf, usize> = HashMap::new();
-    let mut plan: Vec<Option<usize>> = Vec::with_capacity(doc.regions.len());
-    for region in &doc.regions {
-        let Some(sample_path) = region.sample.as_deref() else {
-            decode_failures.push(RegionFailure {
-                sample: String::new(),
-                reason: "region has no sample".to_owned(),
-            });
-            plan.push(None);
-            continue;
-        };
-        let Some(full) = resolve_sample_path(dir, &base, doc.default_path.as_deref(), sample_path)
-        else {
-            decode_failures.push(RegionFailure {
-                sample: sample_path.to_owned(),
-                reason: format!("sample path escapes the bank root: {sample_path}"),
-            });
-            plan.push(None);
-            continue;
-        };
-        let idx = *index_of.entry(full.clone()).or_insert_with(|| {
-            unique.push(full);
-            unique.len() - 1
-        });
-        plan.push(Some(idx));
-    }
+    let (unique, plan, mut decode_failures) = resolve_unique_samples(dir, &doc, &base);
     crate::log_info!(
         "bank {bank_id}: sfz read+parse {} ms ({} regions, {} unique samples)",
         t_start.elapsed().as_millis(),
@@ -271,7 +245,7 @@ fn load_bank_with_hint_impl(
                     }
                     ram_bytes += bytes;
                     slot_of[idx] = Some((samples.len(), channels));
-                    samples.push(Arc::from(data));
+                    samples.push(audio_core::SampleSource::resident(Arc::from(data)));
                 }
                 Some(Ok(_)) => slot_failure[idx] = Some("sample is empty".to_owned()),
                 Some(Err(reason)) => slot_failure[idx] = Some(reason),
@@ -306,6 +280,304 @@ fn load_bank_with_hint_impl(
 
 /// Deepest folder level searched for a `.sfz` below the bank root.
 const MAX_SFZ_DEPTH: usize = 4;
+
+/// Resolves every region's `sample` path against the bank root, returning the
+/// unique files in first-seen order (`velocity` layers, round-robins and
+/// release groups share files), a per-region index into `unique` (`None` for a
+/// region whose path could not be resolved), and the corresponding failures.
+fn resolve_unique_samples(
+    dir: &Path,
+    doc: &audio_core::sampler::sfz::SfzDocument,
+    base: &str,
+) -> (Vec<PathBuf>, Vec<Option<usize>>, Vec<RegionFailure>) {
+    let mut unique: Vec<PathBuf> = Vec::new();
+    let mut index_of: HashMap<PathBuf, usize> = HashMap::new();
+    let mut plan: Vec<Option<usize>> = Vec::with_capacity(doc.regions.len());
+    let mut failures: Vec<RegionFailure> = Vec::new();
+    for region in &doc.regions {
+        let Some(sample_path) = region.sample.as_deref() else {
+            failures.push(RegionFailure {
+                sample: String::new(),
+                reason: "region has no sample".to_owned(),
+            });
+            plan.push(None);
+            continue;
+        };
+        let Some(full) = resolve_sample_path(dir, base, doc.default_path.as_deref(), sample_path)
+        else {
+            failures.push(RegionFailure {
+                sample: sample_path.to_owned(),
+                reason: format!("sample path escapes the bank root: {sample_path}"),
+            });
+            plan.push(None);
+            continue;
+        };
+        let idx = *index_of.entry(full.clone()).or_insert_with(|| {
+            unique.push(full);
+            unique.len() - 1
+        });
+        plan.push(Some(idx));
+    }
+    (unique, plan, failures)
+}
+
+/// Cache-build progress callback: `(done, total, bytes_written)`, called from
+/// the worker threads. The closure must be `Send` because it is invoked from
+/// multiple threads; it is held behind a `Mutex` so callers pass a plain
+/// `&Mutex<impl FnMut(u64, u64, u64) + Send>`.
+pub type CacheProgress<'a> = &'a std::sync::Mutex<dyn FnMut(u64, u64, u64) + Send>;
+
+/// Why building a bank's PCM cache failed.
+#[derive(Debug, thiserror::Error)]
+pub enum CacheBuildError {
+    /// The bank has no `.sfz` (or it could not be read/parsed).
+    #[error("{0}")]
+    Load(#[from] BankLoadError),
+    /// Not enough free disk space for the decoded cache.
+    #[error("not enough disk space: need {needed_mib} MiB, {free_mib} MiB available")]
+    NoSpace {
+        /// Cache size in MiB.
+        needed_mib: u64,
+        /// Free space in MiB.
+        free_mib: u64,
+    },
+    /// A sample could not be decoded or its cache file written.
+    #[error("cannot build cache: {0}")]
+    Io(String),
+    /// The build was cancelled.
+    #[error("cache build cancelled")]
+    Cancelled,
+}
+
+/// Outcome of a successful [`build_bank_cache`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheBuildOutcome {
+    /// Number of samples written.
+    pub samples: usize,
+    /// Total bytes of `.pcm` payload written (including the 64-byte headers).
+    pub total_bytes: u64,
+    /// Number of regions whose sample could not be resolved/decoded.
+    pub failures: usize,
+}
+
+/// Decodes every unique sample of `dir`'s bank to `cache/*.pcm` and writes
+/// `cache/manifest.json` (RFC-002 §5.3).
+///
+/// One decoded file is held per worker thread (never the whole bank), matching
+/// [`decode_all`]. The source FLACs are the source of truth; the cache is
+/// derived data and safe to delete. This runs on the control/loader threads
+/// only and reports progress via `progress`.
+///
+/// # Errors
+///
+/// [`CacheBuildError`].
+pub fn build_bank_cache(
+    dir: &Path,
+    hint: Option<&str>,
+    progress: CacheProgress<'_>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<CacheBuildOutcome, CacheBuildError> {
+    let bank_id = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+    let t_start = std::time::Instant::now();
+    crate::log_info!("bank {bank_id}: building PCM cache in {}", dir.display());
+
+    let sfz = find_sfz(dir, hint).map_err(CacheBuildError::Load)?;
+    let base = sfz
+        .parent()
+        .and_then(|p| p.strip_prefix(dir).ok())
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default();
+    let text = std::fs::read_to_string(&sfz)
+        .map_err(|e| CacheBuildError::Load(BankLoadError::ReadSfz(sfz.clone(), e.to_string())))?;
+    let mut resolver = DirResolver {
+        root: dir.to_path_buf(),
+        base: base.clone(),
+    };
+    let doc = parse(&text, &mut resolver)
+        .map_err(|e| CacheBuildError::Load(BankLoadError::Sfz(sfz.clone(), e.to_string())))?;
+
+    let (unique, _plan, failures) = resolve_unique_samples(dir, &doc, &base);
+    if unique.is_empty() {
+        return Err(CacheBuildError::Load(BankLoadError::NoSfz(
+            dir.to_path_buf(),
+        )));
+    }
+
+    let cdir = crate::bank_cache::cache_dir(dir);
+    let mpath = crate::bank_cache::manifest_path(dir);
+
+    // Free-space pre-check (RFC-002 §5.3): estimate the decoded size from each
+    // file's frame count (probed without decoding) assuming the worst case of
+    // two channels, add 5% + the 64-byte headers, and refuse up front if the
+    // filesystem cannot hold it. A conservative over-estimate is safe: it only
+    // ever refuses a build that would have run out of disk mid-way.
+    let needed = estimate_cache_bytes(&unique);
+    if let Ok(avail) = fs2::available_space(dir) {
+        let needed_plus = needed.saturating_mul(105).div_ceil(100);
+        if avail < needed_plus {
+            crate::log_error!(
+                "bank {bank_id}: not enough disk space for cache (need {} MiB, {} MiB free)",
+                needed_plus.div_ceil(1024 * 1024),
+                avail.div_ceil(1024 * 1024)
+            );
+            return Err(CacheBuildError::NoSpace {
+                needed_mib: needed_plus.div_ceil(1024 * 1024),
+                free_mib: avail.div_ceil(1024 * 1024),
+            });
+        }
+    }
+
+    // Decode on up to `available_parallelism` threads; each worker writes its
+    // own `.pcm` and records its manifest entry in a shared, index-ordered vec.
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let written_bytes = AtomicU64::new(0);
+    let failed = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(unique.len().max(1));
+    let entries: Vec<std::sync::Mutex<Option<crate::bank_cache::ManifestEntry>>> =
+        unique.iter().map(|_| std::sync::Mutex::new(None)).collect();
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(src) = unique.get(i) else { return };
+                    match build_one_pcm(src, i, &cdir) {
+                        Ok(entry) => {
+                            written_bytes.fetch_add(entry.size, Ordering::Relaxed);
+                            if let Ok(mut slot) = entries[i].lock() {
+                                *slot = Some(entry);
+                            }
+                        }
+                        Err(e) => {
+                            // A single un-decodable source must not abort the
+                            // whole cache; count it and move on (RFC-002 §5.3).
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            crate::log_warn!("bank {bank_id}: skipping {}: {e}", src.display());
+                        }
+                    }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let total = unique.len();
+                    if let Ok(mut cb) = progress.lock() {
+                        cb(
+                            (n.min(total)) as u64,
+                            total as u64,
+                            written_bytes.load(Ordering::Relaxed),
+                        );
+                    }
+                }
+            });
+        }
+    });
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CacheBuildError::Cancelled);
+    }
+
+    // Assemble the manifest in sample_id order, skipping failures.
+    let mut manifest_entries = Vec::with_capacity(unique.len());
+    for slot in entries {
+        if let Some(entry) = slot.into_inner().unwrap_or(None) {
+            manifest_entries.push(entry);
+        }
+    }
+    let total_bytes = manifest_entries.iter().map(|e| e.size).sum();
+    let manifest = crate::bank_cache::Manifest {
+        format_version: crate::bank_cache::MANIFEST_FORMAT_VERSION,
+        bank_id: bank_id.clone(),
+        created: crate::bank_library::timestamp(),
+        total_bytes,
+        entries: manifest_entries,
+    };
+    crate::bank_cache::write_manifest(&mpath, &manifest).map_err(CacheBuildError::Io)?;
+
+    crate::log_info!(
+        "bank {bank_id}: cache built in {} ms: {} samples, {} bytes, {} failures",
+        t_start.elapsed().as_millis(),
+        unique.len(),
+        total_bytes,
+        failed.load(Ordering::Relaxed)
+    );
+    Ok(CacheBuildOutcome {
+        samples: unique.len() - failed.load(Ordering::Relaxed),
+        total_bytes,
+        failures: failures.len() + failed.load(Ordering::Relaxed),
+    })
+}
+
+/// Estimates the decoded `.pcm` size for `paths` in bytes, probing each file's
+/// frame count without decoding and assuming the worst case of two channels
+/// (`frames × 2 × 2` bytes plus the 64-byte header). Files that cannot be
+/// probed are skipped (they will be counted as decode failures later).
+fn estimate_cache_bytes(paths: &[PathBuf]) -> u64 {
+    paths.iter().fold(0u64, |acc, p| {
+        let frames = crate::audio_file::probe_len_at(p, 48_000).unwrap_or(0);
+        acc.saturating_add(crate::bank_cache::PCM_HEADER_LEN as u64)
+            .saturating_add(frames.saturating_mul(4))
+    })
+}
+
+/// Decodes one source sample and writes its `.pcm`, returning its manifest
+/// entry. `sample_id` is the index in the unique list; the stable key is `src`.
+fn build_one_pcm(
+    src: &Path,
+    sample_id: usize,
+    cache_dir: &Path,
+) -> Result<crate::bank_cache::ManifestEntry, String> {
+    let (data, channels, rate) = decode_sample_with_rate(src)?;
+    let channels = u16::from(channels);
+    let frames = (data.len() as u64).div_ceil(u64::from(channels).max(1));
+    let src_meta = crate::bank_cache::source_meta(src);
+    let src_size = src_meta.map(|m| m.size).unwrap_or(0);
+    let src_xxh3 = crate::bank_cache::xxh3_64_file(src)?;
+    let mtime_ns = src_meta.map(|m| m.mtime_ns).unwrap_or(0);
+    let is_flac = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("flac"));
+    let header = crate::bank_cache::PcmHeader {
+        channels,
+        sample_rate: rate,
+        frames,
+        src_flac_size: if is_flac { src_size } else { 0 },
+        src_flac_xxh3: if is_flac {
+            u64::from_str_radix(&src_xxh3, 16).unwrap_or(0)
+        } else {
+            0
+        },
+    };
+    let name = format!("{sample_id:06}.pcm");
+    let written = crate::bank_cache::write_pcm_file(cache_dir, &name, &header, &data, true)?;
+    Ok(crate::bank_cache::ManifestEntry {
+        sample_id: sample_id as u32,
+        src: src.to_string_lossy().into_owned(),
+        cache: name,
+        size: written.size,
+        xxh3_128: written.xxh3_128,
+        blake3: written.blake3,
+        sample_rate: rate,
+        channels,
+        frames,
+        src_size,
+        src_xxh3,
+        mtime_ns,
+    })
+}
 
 /// Whether `dir` holds an `.sfz` that [`load_bank_with_hint`] would pick.
 #[must_use]
@@ -494,6 +766,12 @@ fn decode_all(paths: &[PathBuf], budget_bytes: u64, bank_id: &str) -> Vec<Option
 }
 
 fn decode_sample(path: &Path) -> Result<(Vec<i16>, u8), String> {
+    decode_sample_with_rate(path).map(|(data, channels, _rate)| (data, channels))
+}
+
+/// [`decode_sample`] plus the decoded sample rate, needed to write the `.pcm`
+/// header (`sample_rate`) during cache generation (RFC-002 §5.3).
+fn decode_sample_with_rate(path: &Path) -> Result<(Vec<i16>, u8, u32), String> {
     let (spec, buffer) = crate::audio_file::read_audio(path).map_err(|e| e.to_string())?;
     let channels = usize::from(spec.channels).max(1);
     let frames = buffer.frames();
@@ -504,7 +782,7 @@ fn decode_sample(path: &Path) -> Result<(Vec<i16>, u8), String> {
         for s in buffer.channel(0) {
             out.push(to_i16(*s));
         }
-        return Ok((out, 1));
+        return Ok((out, 1, spec.sample_rate));
     }
 
     // Stereo (or more, mixed down to stereo): interleave left and right.
@@ -526,7 +804,7 @@ fn decode_sample(path: &Path) -> Result<(Vec<i16>, u8), String> {
         out.push(to_i16(left));
         out.push(to_i16(right));
     }
-    Ok((out, 2))
+    Ok((out, 2, spec.sample_rate))
 }
 
 #[inline]
