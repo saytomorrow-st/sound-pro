@@ -919,10 +919,21 @@ fn build_instrument(
 ///
 /// A [`String`] describing why the bank could not be resolved or loaded.
 pub fn preload_bank(bank_id: &str) -> Result<std::sync::Arc<sample_bank::LoadedBank>, String> {
+    preload_bank_with_progress(bank_id, None)
+}
+
+/// [`preload_bank`], additionally reporting cache-build progress through
+/// `progress` (when `Some`) so a GUI can show a live indicator while the
+/// background PCM cache is built (SPEC-075). `progress` may be shared across
+/// threads and is only ever written via lock-free atomic stores.
+pub fn preload_bank_with_progress(
+    bank_id: &str,
+    progress: Option<&sample_bank::CacheBuildProgress>,
+) -> Result<std::sync::Arc<sample_bank::LoadedBank>, String> {
     let dir = crate::bank_library::resolve_bank_dir(bank_id)
         .ok_or_else(|| "папка банка не найдена".to_owned())?;
     let hint = crate::bank_library::find_catalog_sfz(bank_id);
-    let loaded = crate::sample_bank::load_bank_auto(&dir, hint.as_deref())
+    let loaded = crate::sample_bank::load_bank_auto_with_progress(&dir, hint.as_deref(), progress)
         .map(std::sync::Arc::new)
         .map_err(|e| e.to_string());
     // Start the background L1/L2 cache check (no-op if loaded from FLAC).

@@ -714,10 +714,14 @@ struct Probe {
 }
 
 /// A bank being decoded on a background thread for the inspector (SPEC-066).
+/// The third element is the receiver that delivers the decoded bank; the fourth
+/// is the shared cache-build progress polled by the loading indicator
+/// (SPEC-075).
 type PendingBankLoad = (
     usize,
     String,
     std::sync::mpsc::Receiver<Result<std::sync::Arc<daw_app::sample_bank::LoadedBank>, String>>,
+    daw_app::sample_bank::CacheBuildProgress,
 );
 
 struct App {
@@ -6657,25 +6661,27 @@ impl App {
     /// or the `.sfz` search.
     fn start_bank_load(&mut self, track: usize, bank_id: String) {
         // Cancel any in-flight load for this track by dropping its receiver.
-        if let Some((t, _, _)) = &self.pending_bank_load {
+        if let Some((t, _, _, _)) = &self.pending_bank_load {
             if *t == track {
                 self.pending_bank_load = None;
             }
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let id = bank_id.clone();
+        let progress = daw_app::sample_bank::CacheBuildProgress::new();
+        let worker_progress = progress.clone();
         std::thread::spawn(move || {
-            let result = daw_app::preload_bank(&id);
+            let result = daw_app::preload_bank_with_progress(&id, Some(&worker_progress));
             let _ = tx.send(result);
         });
-        self.pending_bank_load = Some((track, bank_id, rx));
+        self.pending_bank_load = Some((track, bank_id, rx, progress));
     }
 
     /// Applies a finished background bank load and repaints while one is in
     /// flight (SPEC-066).
     fn poll_bank_load(&mut self, ctx: &egui::Context) {
         let completed = match &self.pending_bank_load {
-            Some((track, bank_id, rx)) => match rx.try_recv() {
+            Some((track, bank_id, rx, _)) => match rx.try_recv() {
                 Ok(result) => Some((*track, bank_id.clone(), result)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {

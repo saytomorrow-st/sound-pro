@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use audio_core::sampler::region::resolve;
 use audio_core::sampler::sfz::{IncludeResolver, parse};
@@ -579,11 +579,35 @@ pub fn load_bank_auto(dir: &Path, hint: Option<&str>) -> Result<LoadedBank, Bank
     load_bank_auto_with_budget(dir, hint, budget_mib)
 }
 
+/// [`load_bank_auto`], additionally reporting cache-build progress through
+/// `progress` (when `Some`) so a UI can show a live indicator while the
+/// background cache is built (SPEC-075). `progress` may be shared across
+/// threads and is only ever written via lock-free atomic stores.
+pub fn load_bank_auto_with_progress(
+    dir: &Path,
+    hint: Option<&str>,
+    progress: Option<&CacheBuildProgress>,
+) -> Result<LoadedBank, BankLoadError> {
+    let budget_mib = crate::meminfo::effective_budget_mib(DEFAULT_RAM_BUDGET_MIB);
+    load_bank_auto_with_budget_and_progress(dir, hint, budget_mib, progress)
+}
+
 /// [`load_bank_auto`] with an explicit budget, so tests can force a low budget.
 pub fn load_bank_auto_with_budget(
     dir: &Path,
     hint: Option<&str>,
     budget_mib: u64,
+) -> Result<LoadedBank, BankLoadError> {
+    load_bank_auto_with_budget_and_progress(dir, hint, budget_mib, None)
+}
+
+/// [`load_bank_auto_with_budget`], optionally reporting cache-build progress
+/// through `progress` (see [`load_bank_auto_with_progress`]).
+fn load_bank_auto_with_budget_and_progress(
+    dir: &Path,
+    hint: Option<&str>,
+    budget_mib: u64,
+    progress: Option<&CacheBuildProgress>,
 ) -> Result<LoadedBank, BankLoadError> {
     let bank_id = dir
         .file_name()
@@ -603,7 +627,11 @@ pub fn load_bank_auto_with_budget(
             );
             let cancel = Arc::new(AtomicBool::new(false));
             let progress_bank = bank_id.clone();
+            let progress_shared = progress.cloned();
             let progress = std::sync::Mutex::new(move |done: u64, total: u64, bytes: u64| {
+                if let Some(shared) = &progress_shared {
+                    shared.report(done, total);
+                }
                 if done % 100 == 0 || done == total {
                     crate::log_info!(
                         "bank {progress_bank}: building cache {done}/{total} samples, {} MiB",
@@ -757,6 +785,59 @@ fn resolve_unique_samples(
 /// multiple threads; it is held behind a `Mutex` so callers pass a plain
 /// `&Mutex<impl FnMut(u64, u64, u64) + Send>`.
 pub type CacheProgress<'a> = &'a std::sync::Mutex<dyn FnMut(u64, u64, u64) + Send>;
+
+/// Shared, non-blocking cache-build progress, read by the GUI while a bank's
+/// PCM cache is built on a worker thread (SPEC-075).
+///
+/// `done` counts decoded samples and `total` the unique samples to decode;
+/// both are [`Arc`]`<`[`AtomicU64`]`>`s so the struct is cheaply cloneable and
+/// can be handed across threads while the UI thread polls [`fraction`] without
+/// ever locking or touching the audio path. `fraction()` is `0.0` until `total`
+/// is known and `1.0` when every sample has been decoded.
+///
+/// [`fraction`]: CacheBuildProgress::fraction
+#[derive(Debug, Clone, Default)]
+pub struct CacheBuildProgress {
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+}
+
+impl CacheBuildProgress {
+    /// An empty progress tracker (everything zero).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Samples decoded so far.
+    #[must_use]
+    pub fn done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    /// Total unique samples to decode (set once the build plan is known).
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// `0.0..=1.0`, or `0.0` when `total` is not yet known / zero.
+    #[must_use]
+    pub fn fraction(&self) -> f32 {
+        let total = self.total();
+        if total == 0 {
+            0.0
+        } else {
+            (self.done() as f64 / total as f64).clamp(0.0, 1.0) as f32
+        }
+    }
+
+    /// Records a `(done, total)` progress pair from the worker threads.
+    fn report(&self, done: u64, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+        self.done.store(done, Ordering::Relaxed);
+    }
+}
 
 /// Why building a bank's PCM cache failed.
 #[derive(Debug, thiserror::Error)]
@@ -1318,5 +1399,35 @@ mod tests {
             Some(PathBuf::from("/bank/root/samples/tone.wav"))
         );
         assert_eq!(confine_path(root, ""), Some(root.to_path_buf()));
+    }
+
+    #[test]
+    fn cache_build_progress_reports_fraction() {
+        let p = CacheBuildProgress::new();
+        // Total unknown → 0.0, no division by zero.
+        assert_eq!(p.fraction(), 0.0);
+        assert_eq!(p.done(), 0);
+        assert_eq!(p.total(), 0);
+
+        // Mid-build: 2 of 5 samples decoded.
+        p.report(2, 5);
+        assert_eq!(p.done(), 2);
+        assert_eq!(p.total(), 5);
+        assert!((p.fraction() - 0.4).abs() < 1e-6);
+
+        // Completion clamps to 1.0.
+        p.report(5, 5);
+        assert_eq!(p.fraction(), 1.0);
+    }
+
+    #[test]
+    fn cache_build_progress_is_shared_across_clones() {
+        let p = CacheBuildProgress::new();
+        let clone = p.clone();
+        clone.report(3, 10);
+        // Both handles observe the same atomics.
+        assert_eq!(p.done(), 3);
+        assert_eq!(p.total(), 10);
+        assert!((p.fraction() - 0.3).abs() < 1e-6);
     }
 }
