@@ -1,4 +1,4 @@
-//! The source of a decoded `i16` sample (RFC-002 §3.1, stages 0 and 5).
+//! The source of a decoded `i16` sample (RFC-002 §3.1, stages 0, 5 and 6).
 //!
 //! A [`SampleSource`] abstracts where a sample's `i16` PCM lives:
 //!
@@ -6,9 +6,10 @@
 //!   bit-for-bit the same as the previous `Vec<Arc<[i16]>>` representation.
 //! - [`SampleSource::Streaming`] keeps only the resident head
 //!   ([`SampleHead`]); the tail is delivered by a
-//!   [`VoiceStream`](super::stream::VoiceStream). Wiring streamed sources into
-//!   the engine is RFC-002 stage 6; until then [`SampleSource::as_i16`] exposes
-//!   just the head.
+//!   [`VoiceStream`](super::stream::VoiceStream). The engine streams the tail
+//!   once [`SamplerEngine::enable_streaming`](super::engine::SamplerEngine::enable_streaming)
+//!   is called (stage 6); otherwise, and for regions that cannot stream, it
+//!   plays just the head exposed by [`SampleSource::as_i16`].
 
 use std::sync::Arc;
 

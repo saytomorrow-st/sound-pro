@@ -435,6 +435,33 @@ impl VoiceStream {
         true
     }
 
+    /// Loop wrap: jumps back to `pos`, which must lie inside the head
+    /// (`pos < head_frames`). Bumps the generation (blocks in flight for the
+    /// previous pass become stale) and re-requests the tail from the seam, so
+    /// the next pass is streamed again. Returns `false` (and does nothing)
+    /// unless the voice is playing and `pos` is inside the head.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn rewind(&mut self, pos: f64, requests: &mut StreamRequests) -> bool {
+        if self.state != State::Playing || pos.is_nan() || pos < 0.0 {
+            return false;
+        }
+        if pos >= self.head_frames as f64 {
+            return false;
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        // The rest of the block being read is already behind its popped header.
+        self.skip_samples(self.block_left as usize * usize::from(self.channels));
+        self.drain_stale();
+        self.pos = pos;
+        self.block_left = 0;
+        self.consumed_end = self.head_frames;
+        self.requested_end = self.head_frames;
+        self.received_end = self.head_frames;
+        self.window = [[0; 2]; WINDOW];
+        self.maybe_request(requests);
+        true
+    }
+
     /// Stops the voice immediately and invalidates any data in flight
     /// (note-off end, steal, sample end).
     pub fn cancel(&mut self) {
