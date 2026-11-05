@@ -389,6 +389,34 @@ pub fn write_pcm_file(
     })
 }
 
+/// Reads a `.pcm` file back into its header and interleaved `i16` payload.
+///
+/// The header is validated (magic / version / CRC) and the payload is read as
+/// `frames × channels` little-endian `i16` values. This runs on the
+/// control/loader threads only, never the audio path.
+///
+/// # Errors
+///
+/// A human-readable reason when the file is missing, too short, or its header
+/// is corrupt.
+pub fn read_pcm_file(path: &Path) -> Result<(PcmHeader, Vec<i16>), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let header = PcmHeader::decode(&bytes)
+        .ok_or_else(|| format!("{}: corrupt or truncated SPCM header", path.display()))?;
+    let data_len = header
+        .frames
+        .saturating_mul(u64::from(header.channels))
+        .saturating_mul(2) as usize;
+    let payload = bytes
+        .get(PCM_HEADER_LEN..PCM_HEADER_LEN + data_len)
+        .ok_or_else(|| format!("{}: payload too short", path.display()))?;
+    let mut out = Vec::with_capacity(payload.len() / 2);
+    for chunk in payload.chunks_exact(2) {
+        out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    Ok((header, out))
+}
+
 /// The source-file metadata recorded in a manifest entry, read with a single
 /// `stat` for the mtime and size (the xxh3-64 source hash is computed by the
 /// caller, which already streams the file).
@@ -611,6 +639,45 @@ mod tests {
         }
         // No `.tmp` leftover.
         assert!(!temp_path(&dir.join("000001.pcm")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pcm_file_round_trips() {
+        let dir = std::env::temp_dir().join(format!("bank-cache-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let header = PcmHeader {
+            channels: 2,
+            sample_rate: 48_000,
+            frames: 3,
+            src_flac_size: 10,
+            src_flac_xxh3: 0x1234_5678,
+        };
+        let data: [i16; 6] = [0, 1, -2, 3, 32767, -32768];
+        write_pcm_file(&dir, "000001.pcm", &header, &data, false).unwrap();
+        let (got_header, got_data) = read_pcm_file(&dir.join("000001.pcm")).unwrap();
+        assert_eq!(got_header, header);
+        assert_eq!(got_data, data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pcm_file_rejects_corrupt_header() {
+        let dir = std::env::temp_dir().join(format!("bank-cache-readbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let header = PcmHeader {
+            channels: 1,
+            sample_rate: 48_000,
+            frames: 1,
+            src_flac_size: 0,
+            src_flac_xxh3: 0,
+        };
+        write_pcm_file(&dir, "000000.pcm", &header, &[0], false).unwrap();
+        let path = dir.join("000000.pcm");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] = b'X';
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_pcm_file(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -36,6 +36,7 @@ pub mod bank_integrity;
 pub mod bank_library;
 pub mod instrument;
 pub mod logging;
+pub mod meminfo;
 pub mod meters;
 pub mod nodes;
 pub mod pcm_cache;
@@ -868,13 +869,15 @@ fn build_instrument(
                     None => Err("папка банка не найдена".to_owned()),
                     Some(dir) => {
                         let hint = crate::bank_library::find_catalog_sfz(bank_id);
-                        crate::sample_bank::load_bank_with_hint(
-                            &dir,
-                            crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
-                            hint.as_deref(),
-                        )
-                        .map(std::sync::Arc::new)
-                        .map_err(|e| e.to_string())
+                        let loaded = crate::sample_bank::load_bank_auto(&dir, hint.as_deref())
+                            .map(std::sync::Arc::new)
+                            .map_err(|e| e.to_string());
+                        // Start the background L1/L2 cache check when the bank
+                        // came from cache; harmless if it decoded from FLAC.
+                        if loaded.is_ok() {
+                            crate::sample_bank::spawn_background_verify(dir);
+                        }
+                        loaded
                     }
                 }
             };
@@ -918,13 +921,14 @@ pub fn preload_bank(bank_id: &str) -> Result<std::sync::Arc<sample_bank::LoadedB
     let dir = crate::bank_library::resolve_bank_dir(bank_id)
         .ok_or_else(|| "папка банка не найдена".to_owned())?;
     let hint = crate::bank_library::find_catalog_sfz(bank_id);
-    crate::sample_bank::load_bank_with_hint(
-        &dir,
-        crate::sample_bank::DEFAULT_RAM_BUDGET_MIB,
-        hint.as_deref(),
-    )
-    .map(std::sync::Arc::new)
-    .map_err(|e| e.to_string())
+    let loaded = crate::sample_bank::load_bank_auto(&dir, hint.as_deref())
+        .map(std::sync::Arc::new)
+        .map_err(|e| e.to_string());
+    // Start the background L1/L2 cache check (no-op if loaded from FLAC).
+    if loaded.is_ok() {
+        crate::sample_bank::spawn_background_verify(dir);
+    }
+    loaded
 }
 
 fn audio_file_error(path: &std::path::Path, e: audio_file::AudioFileError) -> LoadError {
