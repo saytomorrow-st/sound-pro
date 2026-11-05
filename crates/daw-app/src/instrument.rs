@@ -10,6 +10,7 @@ use audio_core::schedule::{Schedule, ScheduleSpec, ScheduledEvent};
 use audio_core::synth::SynthError;
 use audio_core::{
     Interpolation, MidiEvent, MidiMessage, Note, SampleRegion, SampleSource, SamplerEngine,
+    playback_ratio,
 };
 
 use std::path::PathBuf;
@@ -21,10 +22,30 @@ use crate::stream_loader::StreamLoader;
 /// Per-voice ring of a streaming render, in frames (RFC-002 §7).
 const STREAM_RING_FRAMES: usize = audio_core::RING_FRAMES;
 
-/// Render sub-chunk of a streaming render: the loader is pumped before each
-/// one, so a voice never consumes more than a fraction of its ring between
-/// refills and the offline render never underruns.
+/// Longest render sub-chunk of a streaming render (SyncStream, SPEC-074).
 const STREAM_CHUNK: usize = 1024;
+
+/// SyncStream chunk for `notes` (SPEC-074): the loader is pumped
+/// synchronously before every chunk, and a voice re-requests once half its
+/// ring is left, so it must not consume more than a quarter ring per chunk.
+/// A voice playing at ratio `r` eats `chunk · r` frames, so the chunk shrinks
+/// with the highest ratio any note can reach in this bank.
+fn sync_stream_chunk(regions: &[SampleRegion], notes: &[Note]) -> usize {
+    let max_ratio = notes
+        .iter()
+        .flat_map(|note| {
+            regions
+                .iter()
+                .filter(move |r| (r.key_lo..=r.key_hi).contains(&note.pitch))
+                .map(move |r| playback_ratio(note.pitch, r.root, r.tune_cents, 0))
+        })
+        .fold(1.0_f64, f64::max);
+    let budget = (STREAM_RING_FRAMES / 4) as f64 / max_ratio;
+    // Truncation is the intent: the chunk must stay below the budget.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let chunk = budget.floor() as usize;
+    chunk.clamp(1, STREAM_CHUNK)
+}
 
 /// Renders a set of MIDI notes to a mono buffer, offline.
 ///
@@ -207,7 +228,11 @@ impl Instrument for SamplerInstrument {
                 Arc::clone(files),
             )
         });
-        let chunk_len = if loader.is_some() { STREAM_CHUNK } else { 4096 };
+        let chunk_len = if loader.is_some() {
+            sync_stream_chunk(&self.regions, notes)
+        } else {
+            4096
+        };
         let mut cursor = schedule.cursor();
         let total = usize::try_from(frames).unwrap_or(usize::MAX);
         let mut out = vec![0.0_f32; total];

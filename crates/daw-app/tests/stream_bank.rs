@@ -283,3 +283,40 @@ fn loader_thread_stops_on_drop() {
     let out = render(&mut engine, None, &sched, 4096);
     assert!(out.iter().any(|s| s.abs() > 0.01));
 }
+
+/// SyncStream (RFC-002 §9, SPEC-074): the offline render serves every
+/// request synchronously, so even dense high-pitched polyphony — voices that
+/// eat their ring several times faster than real time — never underruns and
+/// stays bit-identical to the resident render.
+#[test]
+fn sync_stream_render_never_underruns_under_polyphony() {
+    let dir = build_bank("sync-poly", 200_000);
+    let resident = SamplerInstrument::new(&load_bank_from_cache(&dir.0, None, 128).unwrap());
+    let streaming =
+        SamplerInstrument::new(&load_bank_from_cache_streaming(&dir.0, None, 128).unwrap());
+    assert!(streaming.is_streaming());
+
+    let mut notes = Vec::new();
+    for (i, pitch) in [48_u8, 60, 67, 72, 79, 84, 91, 96, 103, 108, 115, 120]
+        .into_iter()
+        .enumerate()
+    {
+        for repeat in 0..3_u64 {
+            notes.push(audio_core::Note {
+                pitch,
+                start: i as u64 * 700 + repeat * 40_000,
+                length: 35_000,
+                velocity: 40 + (i as u8 * 7),
+            });
+        }
+    }
+    let frames = 160_000;
+    let a = resident.render_notes(&notes, RATE, frames).unwrap();
+    let b = streaming.render_notes(&notes, RATE, frames).unwrap();
+    assert!(a.iter().any(|s| s.abs() > 1e-3));
+    let first_diff = a
+        .iter()
+        .zip(&b)
+        .position(|(x, y)| x.to_bits() != y.to_bits());
+    assert_eq!(first_diff, None);
+}

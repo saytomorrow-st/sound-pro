@@ -467,6 +467,9 @@ impl VoiceStream {
     pub fn cancel(&mut self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.state = State::Idle;
+        // The unread rest of the current block is already behind its popped
+        // header; leaving it in the ring would shift every later block.
+        self.skip_samples(self.block_left as usize * usize::from(self.channels));
         self.block_left = 0;
     }
 
@@ -1055,6 +1058,45 @@ mod tests {
         }
         assert_eq!(n, total);
         assert_eq!(pool.stats.stale_blocks(), 1);
+        assert_eq!(pool.stats.underruns(), 0);
+    }
+
+    #[test]
+    fn cancel_mid_block_drops_its_unread_samples() {
+        // Regression (stage 7): cancelling while a block is half read left
+        // its remaining samples in the ring, so the next start saw a full
+        // ring and every later block was shifted.
+        let total = 200;
+        let data = pcm(total, 2);
+        let head = SampleHead::from_pcm(&data, 2, 0, 8);
+        let mut pool = StreamPool::with_ring_frames(1, 2, 32);
+        let mut requests = std::mem::replace(
+            &mut pool.requests,
+            StreamPool::with_ring_frames(0, 1, 1).requests,
+        );
+        assert!(pool.voices[0].start(&head, 0, &mut requests));
+        serve(&mut pool, &data, 2);
+        for _ in 0..12 {
+            pool.voices[0].next_frame(&head, 1.0, Interpolation::Linear, &mut requests);
+        }
+        pool.voices[0].cancel();
+        assert_eq!(pool.feeders[0].free_samples(), 32 * 2, "ring emptied");
+        assert!(pool.voices[0].start(&head, 0, &mut requests));
+        let mut n = 0;
+        loop {
+            serve(&mut pool, &data, 2);
+            let pos = pool.voices[0].position();
+            let Some(got) =
+                pool.voices[0].next_frame(&head, 1.0, Interpolation::Linear, &mut requests)
+            else {
+                break;
+            };
+            let want = read_linear_stereo(&data, pos, total);
+            assert_eq!(got.0.to_bits(), want.0.to_bits(), "pos={pos}");
+            assert_eq!(got.1.to_bits(), want.1.to_bits(), "pos={pos}");
+            n += 1;
+        }
+        assert_eq!(n, total);
         assert_eq!(pool.stats.underruns(), 0);
     }
 
