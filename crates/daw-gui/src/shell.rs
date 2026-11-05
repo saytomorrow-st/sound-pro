@@ -1648,21 +1648,28 @@ impl App {
 
         let mut changed_to: Option<TrackInstrument> = None;
         let mut open_library = false;
-        // The bank being loaded for this track, if any (SPEC-066).
-        let loading_name = self
+        // The bank being loaded for this track, if any (SPEC-066). Cache-build
+        // progress is polled for the loading indicator (SPEC-075).
+        let loading = self
             .pending_bank_load
             .as_ref()
-            .filter(|(i, _, _)| *i == index)
-            .map(|(_, id, _)| self.bank_display_name(id));
+            .filter(|(i, _, _, _)| *i == index)
+            .map(|(_, id, _, progress)| (self.bank_display_name(id), progress.fraction()));
         ui.horizontal(|ui| {
             let text = if broken {
                 RichText::new(&current_label).color(Color32::from_rgb(220, 90, 90))
             } else {
                 RichText::new(&current_label)
             };
-            if let Some(name) = &loading_name {
+            if let Some((name, fraction)) = &loading {
                 ui.spinner();
-                ui.label(RichText::new(format!("Загрузка {name}…")).italics());
+                if *fraction > 0.0 && *fraction < 1.0 {
+                    ui.label(
+                        RichText::new(format!("Кэш {name}: {:.0}%…", fraction * 100.0)).italics(),
+                    );
+                } else {
+                    ui.label(RichText::new(format!("Загрузка {name}…")).italics());
+                }
             } else {
                 egui::ComboBox::from_id_salt(("instrument", index))
                     .selected_text(text)
