@@ -343,3 +343,63 @@ fn region_fields_exist() {
         r.hirand,
     );
 }
+
+/// A sibling `<group>` must not leak its opcodes into the next `<group>`.
+///
+/// Regression test for the Osiris piano bank: velocity layers are laid out as
+/// `<group> hivel=63` (vl1) followed by `<group> lovel=64` (vl2). Before the
+/// fix, `hivel=63` leaked into the second group, so every vl2 region got the
+/// inverted range `lovel=64, hivel=63` and was dropped at resolve time, leaving
+/// velocity >= 64 silent.
+#[test]
+fn sibling_groups_do_not_leak_opcodes() {
+    let text = "\
+<group>
+hivel=63
+<region>
+sample=vl1.wav
+key=60
+<group>
+lovel=64
+<region>
+sample=vl2.wav
+key=60
+";
+    let doc = parse_text(text).expect("parse sibling groups");
+    assert_eq!(doc.regions.len(), 2);
+    // vl1: hivel=63, no lovel (defaults to 1).
+    assert_eq!(doc.regions[0].hivel, Some(63));
+    assert_eq!(doc.regions[0].lovel, None);
+    // vl2: lovel=64, no hivel (defaults to 127) — must NOT inherit hivel=63.
+    assert_eq!(doc.regions[1].lovel, Some(64));
+    assert_eq!(doc.regions[1].hivel, None);
+}
+
+/// A sibling `<master>` must not leak its opcodes into the next `<master>`.
+#[test]
+fn sibling_masters_do_not_leak_opcodes() {
+    let text = "\
+<master>
+volume=-6
+<group>
+group=11
+<region>
+sample=a.wav
+key=60
+<master>
+<group>
+group=12
+<region>
+sample=b.wav
+key=61
+";
+    let doc = parse_text(text).expect("parse sibling masters");
+    assert_eq!(doc.regions.len(), 2);
+    // First master's volume=-6 applies to region a.
+    assert_eq!(doc.regions[0].volume, Some(-6.0));
+    assert_eq!(doc.regions[0].group, Some(11));
+    // Second master has no volume opcode; it must not inherit -6 from the
+    // previous sibling master.
+    assert_eq!(doc.regions[1].volume, None);
+    assert_eq!(doc.regions[1].group, Some(12));
+}
