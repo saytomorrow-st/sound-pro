@@ -33,6 +33,10 @@ pub enum Interpolation {
 /// Sentinel for "no region assigned": the voice is idle.
 pub const NO_REGION: u16 = u16::MAX;
 
+/// Sentinel for "no stream slot": the voice reads resident data only
+/// (RFC-002 stage 6).
+pub const NO_SLOT: u16 = u16::MAX;
+
 /// One sample-playback voice.
 ///
 /// `pos` is a `f64` read position in source frames; `ratio` is the number of
@@ -80,6 +84,9 @@ pub struct SamplerVoice {
     pub envelope: AmpEnvelope,
     /// Level at the last rendered sample, for stealing order.
     pub last_gain: f32,
+    /// Engine stream slot reading this voice's tail from disk, or
+    /// [`NO_SLOT`] for a resident voice (RFC-002 stage 6).
+    pub stream_slot: u16,
 }
 
 impl SamplerVoice {
@@ -113,6 +120,7 @@ impl SamplerVoice {
                 release_samples: 0,
             },
             last_gain: 0.0,
+            stream_slot: NO_SLOT,
         }
     }
 
@@ -171,6 +179,7 @@ impl SamplerVoice {
         self.end_frame = end_frame;
         self.envelope = envelope;
         self.last_gain = 0.0;
+        self.stream_slot = NO_SLOT;
     }
 
     /// Marks the note released from `at`.

@@ -99,7 +99,23 @@ pub struct LoadedBank {
     /// The PCM cache this bank was read from, when it was loaded from cache
     /// rather than decoded from FLAC/WAV.
     pub cache: Option<CacheHandle>,
+    /// For each sample (same index as [`Self::samples`]), the `.pcm` file its
+    /// streamed tail is read from (RFC-002 stage 6); `None` for resident
+    /// samples. Empty when nothing streams.
+    pub stream_files: Vec<Option<PathBuf>>,
 }
+
+impl LoadedBank {
+    /// Whether any sample is [`audio_core::SampleSource::Streaming`].
+    #[must_use]
+    pub fn is_streaming(&self) -> bool {
+        self.stream_files.iter().any(Option::is_some)
+    }
+}
+
+/// Frames of each streamed sample kept resident as its head in Streaming
+/// mode (RFC-002 §7): 32 768 frames ≈ 0.68 s at 48 kHz, ~155 MiB for Osiris.
+pub const STREAM_HEAD_FRAMES: u64 = 32_768;
 
 /// A filesystem-backed [`IncludeResolver`] rooted at the bank directory.
 ///
@@ -301,6 +317,7 @@ fn load_bank_with_hint_impl(
         decode_failures,
         ram_bytes,
         cache: None,
+        stream_files: Vec::new(),
     })
 }
 
@@ -329,6 +346,36 @@ pub fn load_bank_from_cache(
     dir: &Path,
     hint: Option<&str>,
     budget_mib: u64,
+) -> Result<LoadedBank, BankLoadError> {
+    load_bank_from_cache_mode(dir, hint, budget_mib, false)
+}
+
+/// Loads a bank from its PCM cache in **Streaming** mode (RFC-002 §3, stage
+/// 6): every stereo sample longer than [`STREAM_HEAD_FRAMES`] keeps only its
+/// head resident ([`audio_core::SampleSource::Streaming`]) and records its
+/// `.pcm` in [`LoadedBank::stream_files`]; the tail is read by
+/// [`crate::stream_loader::StreamLoader`]. Mono and short samples stay
+/// resident. `budget_mib` bounds the resident data (heads included).
+///
+/// Control thread only.
+///
+/// # Errors
+///
+/// As [`load_bank_from_cache`].
+pub fn load_bank_from_cache_streaming(
+    dir: &Path,
+    hint: Option<&str>,
+    budget_mib: u64,
+) -> Result<LoadedBank, BankLoadError> {
+    load_bank_from_cache_mode(dir, hint, budget_mib, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn load_bank_from_cache_mode(
+    dir: &Path,
+    hint: Option<&str>,
+    budget_mib: u64,
+    streaming: bool,
 ) -> Result<LoadedBank, BankLoadError> {
     if budget_mib == 0 {
         return Err(BankLoadError::InvalidBudget);
@@ -411,6 +458,7 @@ pub fn load_bank_from_cache(
     let mut ram_bytes: u64 = 0;
     let mut slot_of: Vec<Option<(usize, u8)>> = vec![None; unique.len()];
     let mut slot_failure: Vec<Option<String>> = vec![None; unique.len()];
+    let mut stream_files: Vec<Option<PathBuf>> = Vec::new();
 
     for (region, idx) in doc.regions.iter().zip(&plan) {
         let Some(idx) = *idx else { continue };
@@ -420,7 +468,38 @@ pub fn load_bank_from_cache(
             match entry_by_src.get(&src) {
                 Some(entry) => {
                     let pcm_path = cdir.join(&entry.cache);
-                    match crate::bank_cache::read_pcm_file(&pcm_path) {
+                    let stream =
+                        streaming && entry.channels == 2 && entry.frames > STREAM_HEAD_FRAMES;
+                    let read = if stream {
+                        crate::bank_cache::read_pcm_head(&pcm_path, STREAM_HEAD_FRAMES)
+                    } else {
+                        crate::bank_cache::read_pcm_file(&pcm_path)
+                    };
+                    match read {
+                        Ok((header, data)) if stream && !data.is_empty() => {
+                            let bytes = (data.len() as u64).saturating_mul(2);
+                            if ram_bytes.saturating_add(bytes) > budget_bytes {
+                                let needed_mib =
+                                    ram_bytes.saturating_add(bytes).div_ceil(1024 * 1024);
+                                return Err(BankLoadError::RamBudgetExceeded {
+                                    budget_mib,
+                                    needed_mib,
+                                });
+                            }
+                            ram_bytes += bytes;
+                            let sample_index = samples.len();
+                            slot_of[idx] = Some((sample_index, 2));
+                            let file_id = u32::try_from(sample_index).unwrap_or(u32::MAX);
+                            let head = audio_core::SampleHead::new(
+                                Arc::from(data),
+                                header.frames,
+                                2,
+                                file_id,
+                            );
+                            samples.push(audio_core::SampleSource::streaming(head));
+                            stream_files.resize(sample_index, None);
+                            stream_files.push(Some(pcm_path));
+                        }
                         Ok((_, data)) if !data.is_empty() => {
                             let bytes = (data.len() as u64).saturating_mul(2);
                             if ram_bytes.saturating_add(bytes) > budget_bytes {
@@ -462,6 +541,9 @@ pub fn load_bank_from_cache(
         samples: samples.len(),
         format_version: manifest.format_version,
     });
+    if !stream_files.is_empty() {
+        stream_files.resize(samples.len(), None);
+    }
 
     Ok(LoadedBank {
         regions,
@@ -470,6 +552,7 @@ pub fn load_bank_from_cache(
         decode_failures,
         ram_bytes,
         cache,
+        stream_files,
     })
 }
 
@@ -477,6 +560,10 @@ pub fn load_bank_from_cache(
 /// the background when it is missing (a bank installed by an older version) and
 /// falling back to on-demand FLAC decoding if the cache cannot be used
 /// (RFC-002 §8 step 5/6).
+///
+/// A cached bank whose resident data exceeds the budget is reloaded in
+/// Streaming mode ([`load_bank_from_cache_streaming`], RFC-002 stage 6):
+/// heads in RAM, tails from disk.
 ///
 /// This is the convenience entry used by the app: it computes the effective RAM
 /// budget from [`crate::meminfo::effective_budget_mib`], logs RSS before/after,
@@ -508,7 +595,7 @@ pub fn load_bank_auto_with_budget(
         rss_before.map_or("?".to_owned(), |m| m.to_string())
     );
 
-    let result = match load_bank_from_cache(dir, hint, budget_mib) {
+    let result = match load_cache_or_stream(&bank_id, dir, hint, budget_mib) {
         Ok(bank) => Ok(bank),
         Err(BankLoadError::NoCache(reason)) => {
             crate::log_info!(
@@ -525,7 +612,7 @@ pub fn load_bank_auto_with_budget(
                 }
             });
             match build_bank_cache(dir, hint, &progress, &cancel) {
-                Ok(_) => load_bank_from_cache(dir, hint, budget_mib),
+                Ok(_) => load_cache_or_stream(&bank_id, dir, hint, budget_mib),
                 Err(e) => {
                     crate::log_warn!(
                         "bank {bank_id}: cache build failed ({e}); falling back to FLAC decode"
@@ -540,8 +627,13 @@ pub fn load_bank_auto_with_budget(
     let rss_after = crate::meminfo::current_rss_mib();
     match (&result, rss_after) {
         (Ok(bank), Some(after)) => crate::log_info!(
-            "bank {bank_id}: loaded {} MiB resident, RSS after {} MiB",
+            "bank {bank_id}: loaded {} MiB resident{}, RSS after {} MiB",
             bank.ram_bytes.div_ceil(1024 * 1024),
+            if bank.is_streaming() {
+                " (streaming)"
+            } else {
+                ""
+            },
             after
         ),
         (Err(_), Some(after)) => {
@@ -551,6 +643,26 @@ pub fn load_bank_auto_with_budget(
     }
 
     result
+}
+
+/// [`load_bank_from_cache`], retried in Streaming mode when the resident data
+/// exceeds `budget_mib`.
+fn load_cache_or_stream(
+    bank_id: &str,
+    dir: &Path,
+    hint: Option<&str>,
+    budget_mib: u64,
+) -> Result<LoadedBank, BankLoadError> {
+    match load_bank_from_cache(dir, hint, budget_mib) {
+        Err(BankLoadError::RamBudgetExceeded { needed_mib, .. }) => {
+            crate::log_info!(
+                "bank {bank_id}: resident needs >{needed_mib} MiB of {budget_mib} MiB budget; \
+                 loading in streaming mode"
+            );
+            load_bank_from_cache_streaming(dir, hint, budget_mib)
+        }
+        other => other,
+    }
 }
 
 /// Starts the background L1 (always) and L2 (once per session, or after a crash

@@ -50,7 +50,8 @@ pub use resample::{
     ResampleError, resample, resample_fast, resample_range, resample_range_fast, resampled_len,
 };
 pub use sampler::engine::{
-    DEFAULT_VOICES, MAX_SAMPLER_VOICES, SamplerEngine, SamplerError, playback_ratio,
+    DEFAULT_VOICES, MAX_SAMPLER_VOICES, SamplerEngine, SamplerError, StreamLoaderEnds,
+    playback_ratio,
 };
 pub use sampler::region::{
     AmpEnvelope, MAX_PER_KEY, MIDI_NOTES, RegionTable, SampleRegion, resolve,
@@ -63,7 +64,7 @@ pub use sampler::stream::{
     BlockHeader, FeedError, HEAD_FRAMES, LoadRequest, RING_FRAMES, RequestReceiver, SampleHead,
     StreamFeeder, StreamPool, StreamRequests, StreamStats, VoiceStream, stream_budget_bytes,
 };
-pub use sampler::voice::{Interpolation, NO_REGION, STEAL_FADE_SAMPLES, SamplerVoice};
+pub use sampler::voice::{Interpolation, NO_REGION, NO_SLOT, STEAL_FADE_SAMPLES, SamplerVoice};
 pub use schedule::{Schedule, ScheduleCursor, ScheduleError, ScheduleSpec, ScheduledEvent};
 pub use session::{
     AutoPoint, Automation, Bus, BusSend, CROSSFADE_SAMPLES, Clip, DIM_GAIN, EffectLane, Lane,

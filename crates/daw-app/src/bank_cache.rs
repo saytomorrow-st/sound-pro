@@ -417,6 +417,37 @@ pub fn read_pcm_file(path: &Path) -> Result<(PcmHeader, Vec<i16>), String> {
     Ok((header, out))
 }
 
+/// Reads only a `.pcm` file's header and its first `max_frames` frames.
+///
+/// Used by the streaming loader (RFC-002 stage 6) to keep a sample's head in
+/// RAM without reading the tail. Control/loader threads only.
+///
+/// # Errors
+///
+/// A human-readable reason when the file is missing, too short, or its header
+/// is corrupt.
+pub fn read_pcm_head(path: &Path, max_frames: u64) -> Result<(PcmHeader, Vec<i16>), String> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut head = [0u8; PCM_HEADER_LEN];
+    file.read_exact(&mut head)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let header = PcmHeader::decode(&head)
+        .ok_or_else(|| format!("{}: corrupt or truncated SPCM header", path.display()))?;
+    let frames = header.frames.min(max_frames);
+    let data_len = usize::try_from(frames.saturating_mul(u64::from(header.channels)) * 2)
+        .map_err(|_| format!("{}: head too large", path.display()))?;
+    let mut bytes = vec![0u8; data_len];
+    file.read_exact(&mut bytes)
+        .map_err(|e| format!("{}: payload too short: {e}", path.display()))?;
+    let out = bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Ok((header, out))
+}
+
 /// The source-file metadata recorded in a manifest entry, read with a single
 /// `stat` for the mtime and size (the xxh3-64 source hash is computed by the
 /// caller, which already streams the file).

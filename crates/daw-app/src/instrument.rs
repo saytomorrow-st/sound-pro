@@ -12,7 +12,19 @@ use audio_core::{
     Interpolation, MidiEvent, MidiMessage, Note, SampleRegion, SampleSource, SamplerEngine,
 };
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use crate::sample_bank::LoadedBank;
+use crate::stream_loader::StreamLoader;
+
+/// Per-voice ring of a streaming render, in frames (RFC-002 §7).
+const STREAM_RING_FRAMES: usize = audio_core::RING_FRAMES;
+
+/// Render sub-chunk of a streaming render: the loader is pumped before each
+/// one, so a voice never consumes more than a fraction of its ring between
+/// refills and the offline render never underruns.
+const STREAM_CHUNK: usize = 1024;
 
 /// Renders a set of MIDI notes to a mono buffer, offline.
 ///
@@ -67,6 +79,7 @@ impl Instrument for PianoInstrument {
 pub struct SamplerInstrument {
     regions: Vec<SampleRegion>,
     samples: Vec<SampleSource>,
+    stream_files: Option<Arc<[Option<PathBuf>]>>,
     interpolation: Interpolation,
 }
 
@@ -84,6 +97,9 @@ impl SamplerInstrument {
         Self {
             regions: bank.regions.clone(),
             samples: bank.samples.clone(),
+            stream_files: bank
+                .is_streaming()
+                .then(|| Arc::from(bank.stream_files.clone())),
             interpolation: Interpolation::default(),
         }
     }
@@ -105,6 +121,13 @@ impl SamplerInstrument {
     #[must_use]
     pub fn samples(&self) -> &[SampleSource] {
         &self.samples
+    }
+
+    /// Whether the instrument streams sample tails from disk (the bank was
+    /// loaded in Streaming mode).
+    #[must_use]
+    pub const fn is_streaming(&self) -> bool {
+        self.stream_files.is_some()
     }
 
     fn build_engine(&self) -> Result<SamplerEngine, SynthError> {
@@ -178,14 +201,24 @@ impl Instrument for SamplerInstrument {
 
         // The engine renders stereo; mix down to mono `(L + R) · 0.5`.
         let mut engine = self.build_engine()?;
+        let mut loader = self.stream_files.as_ref().map(|files| {
+            StreamLoader::new(
+                engine.enable_streaming(STREAM_RING_FRAMES),
+                Arc::clone(files),
+            )
+        });
+        let chunk_len = if loader.is_some() { STREAM_CHUNK } else { 4096 };
         let mut cursor = schedule.cursor();
         let total = usize::try_from(frames).unwrap_or(usize::MAX);
         let mut out = vec![0.0_f32; total];
-        let mut l = vec![0.0_f32; 4096];
-        let mut r = vec![0.0_f32; 4096];
+        let mut l = vec![0.0_f32; chunk_len];
+        let mut r = vec![0.0_f32; chunk_len];
         let mut position = 0_u64;
-        for chunk in out.chunks_mut(4096) {
+        for chunk in out.chunks_mut(chunk_len) {
             let len = chunk.len();
+            if let Some(loader) = loader.as_mut() {
+                loader.pump();
+            }
             engine.render(
                 &schedule,
                 &mut cursor,

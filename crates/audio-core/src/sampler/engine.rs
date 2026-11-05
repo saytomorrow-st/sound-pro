@@ -9,14 +9,18 @@
 //! in a later PR, the realtime `SamplerNode`. Nothing here allocates, locks,
 //! blocks, touches I/O, or uses `unsafe` after construction.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::midi::MidiMessage;
 use crate::sampler::region::{RegionTable, SampleRegion};
 use crate::sampler::source::SampleSource;
+use crate::sampler::stream::{
+    RequestReceiver, SampleHead, StreamFeeder, StreamPool, StreamRequests, StreamStats, VoiceStream,
+};
 use crate::sampler::voice::{
-    Interpolation, NO_REGION, SamplerVoice, read_hermite_i16, read_hermite_stereo, read_linear_i16,
-    read_linear_stereo,
+    Interpolation, NO_REGION, NO_SLOT, SamplerVoice, read_hermite_i16, read_hermite_stereo,
+    read_linear_i16, read_linear_stereo,
 };
 use crate::schedule::{Schedule, ScheduleCursor};
 use crate::session::pan_law;
@@ -49,6 +53,58 @@ impl std::fmt::Display for SamplerError {
 
 impl std::error::Error for SamplerError {}
 
+/// Loader-side ends of the engine's stream pool (RFC-002 §3, stage 6),
+/// returned by [`SamplerEngine::enable_streaming`] and moved to the disk
+/// thread.
+#[derive(Debug)]
+pub struct StreamLoaderEnds {
+    /// One feeder per stream slot; `LoadRequest::voice` indexes this.
+    pub feeders: Vec<StreamFeeder>,
+    /// Consumer of the engine's block requests.
+    pub receiver: RequestReceiver,
+    /// Counters shared with the engine.
+    pub stats: Arc<StreamStats>,
+}
+
+/// Audio-thread side of streaming: one [`VoiceStream`] per slot, the request
+/// producer, and the slot ownership flags. Preallocated in
+/// [`SamplerEngine::enable_streaming`].
+struct EngineStream {
+    voices: Vec<VoiceStream>,
+    requests: StreamRequests,
+    stats: Arc<StreamStats>,
+    /// `used[s]` while a voice or fade tail owns slot `s`.
+    used: Vec<bool>,
+}
+
+impl EngineStream {
+    /// Releases slot `slot`, bumping its generation so any data in flight is
+    /// discarded. A no-op for [`NO_SLOT`].
+    fn free(&mut self, slot: u16) {
+        if let Some(stream) = self.voices.get_mut(usize::from(slot)) {
+            stream.cancel();
+            self.used[usize::from(slot)] = false;
+        }
+    }
+
+    /// Takes the first unowned slot, if any.
+    fn alloc(&mut self) -> Option<usize> {
+        let slot = self.used.iter().position(|u| !u)?;
+        self.used[slot] = true;
+        Some(slot)
+    }
+}
+
+/// Frees the stream slot of `voice` (if any) and idles the voice.
+fn idle_voice(voice: &mut SamplerVoice, stream: Option<&mut EngineStream>) {
+    if voice.stream_slot != NO_SLOT
+        && let Some(stream) = stream
+    {
+        stream.free(voice.stream_slot);
+    }
+    *voice = SamplerVoice::idle();
+}
+
 /// The sampler engine: fixed voice pool plus immutable bank data.
 ///
 /// All buffers (the voice pool) are allocated in [`SamplerEngine::new`]; the
@@ -70,6 +126,8 @@ pub struct SamplerEngine {
     started: AtomicU32,
     stolen: AtomicU32,
     dropped_starts: AtomicU32,
+    /// Disk streaming state; `None` until [`Self::enable_streaming`].
+    stream: Option<EngineStream>,
 }
 
 impl SamplerEngine {
@@ -135,7 +193,61 @@ impl SamplerEngine {
             started: AtomicU32::new(0),
             stolen: AtomicU32::new(0),
             dropped_starts: AtomicU32::new(0),
+            stream: None,
         })
+    }
+
+    /// Enables disk streaming of [`SampleSource::Streaming`] tails
+    /// (RFC-002 stage 6) and returns the loader-side ends.
+    ///
+    /// Allocates `2 * voice_count()` stereo stream slots (one per voice and
+    /// per fade tail) with `ring_frames`-frame rings. Control thread only;
+    /// calling it again cancels every sounding stream and replaces the pool,
+    /// so the previous loader ends go stale.
+    ///
+    /// Without streaming enabled, or for a region that cannot stream (mono,
+    /// non-zero `offset`, loop, or `end` inside the sample), a streamed
+    /// sample plays only its resident head.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ring_frames` is zero.
+    pub fn enable_streaming(&mut self, ring_frames: usize) -> StreamLoaderEnds {
+        self.reset();
+        let slots = 2 * self.voices.len();
+        let pool = StreamPool::with_ring_frames(slots, 2, ring_frames);
+        self.stream = Some(EngineStream {
+            voices: pool.voices,
+            requests: pool.requests,
+            stats: Arc::clone(&pool.stats),
+            used: vec![false; slots],
+        });
+        StreamLoaderEnds {
+            feeders: pool.feeders,
+            receiver: pool.receiver,
+            stats: pool.stats,
+        }
+    }
+
+    /// Whether [`Self::enable_streaming`] was called.
+    #[must_use]
+    pub const fn is_streaming(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// Streaming counters (underruns, dropped requests, stale blocks), if
+    /// streaming is enabled.
+    #[must_use]
+    pub fn stream_stats(&self) -> Option<&StreamStats> {
+        self.stream.as_ref().map(|s| s.stats.as_ref())
+    }
+
+    /// Stream slots currently owned by a voice or fade tail.
+    #[must_use]
+    pub fn active_streams(&self) -> usize {
+        self.stream
+            .as_ref()
+            .map_or(0, |s| s.used.iter().filter(|u| **u).count())
     }
 
     /// The interpolation mode used by the render path.
@@ -186,13 +298,12 @@ impl SamplerEngine {
     ///
     /// Call after a backward seek so notes started before the new position do
     /// not ring on.
+    /// Cancels every stream (bumping its generation), so blocks in flight
+    /// are discarded.
     pub fn reset(&mut self) {
-        self.voices
-            .iter_mut()
-            .for_each(|v| *v = SamplerVoice::idle());
-        self.tails
-            .iter_mut()
-            .for_each(|v| *v = SamplerVoice::idle());
+        for v in self.voices.iter_mut().chain(self.tails.iter_mut()) {
+            idle_voice(v, self.stream.as_mut());
+        }
     }
 
     /// Resets the diagnostic counters (`started`, `stolen`, `dropped_starts`).
@@ -282,12 +393,21 @@ impl SamplerEngine {
         };
         let region = &self.regions[region_index];
         let sample = &self.samples[region.sample_index];
+        let stream_head = match sample {
+            SampleSource::Streaming(head) if self.stream.is_some() && can_stream(region, head) => {
+                Some(head)
+            }
+            _ => None,
+        };
         let sample_data = sample.as_i16();
-        let frames = if region.channels == 1 {
+        let frames = if let Some(head) = stream_head {
+            usize::try_from(head.total_frames()).unwrap_or(usize::MAX)
+        } else if region.channels == 1 {
             sample_data.len()
         } else {
             sample_data.len() / 2
         };
+        let stream_sample = stream_head.map(|_| region.sample_index);
         if frames == 0 || region.offset as usize >= frames {
             self.dropped_starts.fetch_add(1, Ordering::Relaxed);
             return;
@@ -336,6 +456,9 @@ impl SamplerEngine {
             // ringing while the new note takes its former slot.
             self.stolen.fetch_add(1, Ordering::Relaxed);
             let tail = self.pick_tail();
+            // The overwritten tail's stream (if any) is cancelled; the
+            // victim's stream slot moves with it to the tail.
+            idle_voice(&mut self.tails[tail], self.stream.as_mut());
             self.tails[tail] = victim;
             self.tails[tail].fast_fade(at);
         }
@@ -355,6 +478,16 @@ impl SamplerEngine {
             end_frame,
             envelope,
         );
+        if let (Some(sample_index), Some(stream)) = (stream_sample, self.stream.as_mut()) {
+            self.voices[index].stream_slot =
+                start_stream(stream, &self.samples, sample_index).unwrap_or(NO_SLOT);
+            if self.voices[index].stream_slot == NO_SLOT {
+                // No slot or the stream refused the head: play the resident
+                // head only, never blocking the audio thread.
+                let head_frames = self.samples[sample_index].as_i16().len() / 2;
+                self.voices[index].end_frame = head_frames as f64;
+            }
+        }
         self.started.fetch_add(1, Ordering::Relaxed);
 
         // off_by: cut every voice in the target group (RFC-001 §3.1), except
@@ -445,6 +578,7 @@ impl SamplerEngine {
                 &mut self.voices[i],
                 &self.regions,
                 &self.samples,
+                self.stream.as_mut(),
                 self.interpolation,
                 position,
                 end,
@@ -453,7 +587,7 @@ impl SamplerEngine {
                 out_r,
             );
             if finished {
-                self.voices[i] = SamplerVoice::idle();
+                idle_voice(&mut self.voices[i], self.stream.as_mut());
             }
         }
         for i in 0..self.tails.len() {
@@ -464,6 +598,7 @@ impl SamplerEngine {
                 &mut self.tails[i],
                 &self.regions,
                 &self.samples,
+                self.stream.as_mut(),
                 self.interpolation,
                 position,
                 end,
@@ -472,22 +607,65 @@ impl SamplerEngine {
                 out_r,
             );
             if finished {
-                self.tails[i] = SamplerVoice::idle();
+                idle_voice(&mut self.tails[i], self.stream.as_mut());
             }
         }
+    }
+}
+
+/// Whether `region` can play `head` through a disk stream: stereo, starting
+/// at frame 0, no loop, and no `end` inside the sample. Other regions play
+/// the resident head only.
+fn can_stream(region: &SampleRegion, head: &SampleHead) -> bool {
+    region.channels == 2
+        && head.channels() == 2
+        && head.has_tail()
+        && region.offset == 0
+        && (region.end == 0 || u64::from(region.end) >= head.total_frames())
+        && match region.loop_mode {
+            crate::sampler::sfz::LoopMode::NoLoop | crate::sampler::sfz::LoopMode::OneShot => true,
+            // A loop wrap rewinds the stream into the head
+            // (`VoiceStream::rewind`), so the loop start must be resident with
+            // room for the overshoot of one step past the loop end. A loop
+            // that ends inside the head needs no tail and plays resident.
+            crate::sampler::sfz::LoopMode::LoopContinuous
+            | crate::sampler::sfz::LoopMode::LoopSustain => {
+                (region.loop_start as usize) < head.head_frames() / 2
+                    && (region.loop_end == 0 || region.loop_end as usize > head.head_frames())
+            }
+        }
+}
+
+/// Takes a free slot and starts streaming sample `sample_index` on it.
+/// Returns the slot, or `None` (slot released) if none is free or the stream
+/// refused the head.
+fn start_stream(
+    stream: &mut EngineStream,
+    samples: &[SampleSource],
+    sample_index: usize,
+) -> Option<u16> {
+    let head = samples.get(sample_index)?.head()?;
+    let slot = stream.alloc()?;
+    let index = u32::try_from(sample_index).unwrap_or(u32::MAX);
+    if stream.voices[slot].start(head, index, &mut stream.requests) {
+        u16::try_from(slot).ok()
+    } else {
+        stream.used[slot] = false;
+        None
     }
 }
 
 /// Renders one voice over `[position, end)` into the stereo buffers.
 ///
 /// Returns `true` when the voice is exhausted and can be returned to the idle
-/// pool: its playhead ran past the sample end, or its fade (release or fast
-/// fade) reached zero.
+/// pool: its playhead ran past the sample end, its stream ended (sample end
+/// or underrun fade-out), or its fade (release or fast fade) reached zero.
 #[allow(clippy::too_many_arguments)]
 fn render_voice(
     voice: &mut SamplerVoice,
     regions: &[SampleRegion],
     samples: &[SampleSource],
+    stream: Option<&mut EngineStream>,
     interpolation: Interpolation,
     position: u64,
     end: u64,
@@ -504,6 +682,23 @@ fn render_voice(
     let stereo = region.channels == 2;
     let mono_frames = sample_data.len();
     let frames_count = if stereo { mono_frames / 2 } else { mono_frames };
+    let streamed = match (voice.stream_slot, stream, sample.head()) {
+        (NO_SLOT, _, _) | (_, None, _) | (_, _, None) => None,
+        (slot, Some(stream), Some(head)) => Some((slot, stream, head)),
+    };
+    if let Some((slot, stream, head)) = streamed {
+        return render_streamed(
+            voice,
+            stream,
+            usize::from(slot),
+            head,
+            interpolation,
+            position,
+            frames,
+            out_l,
+            out_r,
+        );
+    }
 
     let mut exhausted = false;
     for (k, (sl, sr)) in out_l[..frames]
@@ -550,6 +745,63 @@ fn render_voice(
     // A voice is finished when its playhead ran out, or its level reached zero
     // while it was released or fading (a held sustain that decays to zero but
     // is not released keeps its slot).
+    exhausted || (voice.last_gain <= 0.0 && (voice.released_at.is_some() || voice.fading))
+}
+
+/// [`render_voice`] for a voice whose sample is read through stream slot
+/// `slot`. The stream is advanced on every frame after `started_at` (even at
+/// zero gain) so it stays in step with `voice.pos`.
+#[allow(clippy::too_many_arguments)]
+fn render_streamed(
+    voice: &mut SamplerVoice,
+    stream: &mut EngineStream,
+    slot: usize,
+    head: &SampleHead,
+    interpolation: Interpolation,
+    position: u64,
+    frames: usize,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) -> bool {
+    let EngineStream {
+        voices, requests, ..
+    } = stream;
+    let Some(vs) = voices.get_mut(slot) else {
+        return true;
+    };
+    let mut exhausted = false;
+    for (k, (sl, sr)) in out_l[..frames]
+        .iter_mut()
+        .zip(out_r[..frames].iter_mut())
+        .enumerate()
+    {
+        let at = position + k as u64;
+        if at < voice.started_at {
+            continue;
+        }
+        let gain = voice.gain_at(at);
+        voice.last_gain = gain;
+        let Some((sample_l, sample_r)) = vs.next_frame(head, voice.ratio, interpolation, requests)
+        else {
+            exhausted = true;
+            break;
+        };
+        if gain > 0.0 {
+            *sl += sample_l * gain * voice.pan_l;
+            *sr += sample_r * gain * voice.pan_r;
+        }
+        let before = voice.pos;
+        if !voice.advance() {
+            exhausted = true;
+            break;
+        }
+        // Loop wrap: the stream jumps back into the head and re-requests the
+        // tail. If it cannot (underrun fade in progress), the fade finishes
+        // and the voice ends.
+        if voice.pos < before {
+            let _ = vs.rewind(voice.pos, requests);
+        }
+    }
     exhausted || (voice.last_gain <= 0.0 && (voice.released_at.is_some() || voice.fading))
 }
 
