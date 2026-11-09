@@ -517,9 +517,12 @@ mod tests {
         assert_eq!(packs.children.len(), 23);
         assert!(packs.children.iter().all(|c| c.bank.is_none()));
 
-        // Drum Kit nests two levels: Drum Kit -> Стерео-ударные -> Наборы «Рок».
+        // Drum Kit has four catalog bank leaves plus two subgroups
+        // (Стерео-ударные, Многоканальные ударные) that nest further.
         let drums = lib.find("drum-kit").expect("drum-kit group");
-        assert_eq!(drums.children.len(), 2);
+        assert_eq!(drums.children.len(), 6);
+        assert!(drums.children.iter().any(|c| c.id == "virtuosity-drums"));
+        assert!(drums.children.iter().any(|c| c.id == "swirly-drums"));
         let stereo = drums
             .children
             .iter()
@@ -547,10 +550,10 @@ mod tests {
     #[test]
     fn empty_groups_are_coming_soon_with_zero_size() {
         let lib = library();
-        let bass = lib.find("bass").expect("bass group");
-        assert!(bass.children.is_empty());
-        assert_eq!(bass.download_bytes, 0);
-        assert_eq!(lib.status("bass"), Status::ComingSoon);
+        let mallets = lib.find("mallets").expect("mallets group");
+        assert!(mallets.children.is_empty());
+        assert_eq!(mallets.download_bytes, 0);
+        assert_eq!(lib.status("mallets"), Status::ComingSoon);
     }
 
     #[test]
@@ -609,9 +612,10 @@ mod tests {
     fn select_all_uninstalled_picks_only_real_uninstalled_leaves() {
         let mut lib = library();
         let added = lib.select_all_uninstalled();
-        assert_eq!(added, 2); // the two piano banks
+        assert_eq!(added, 21); // all catalog banks are uninstalled leaves
         assert!(lib.is_selected("salamander-grand-v3"));
         assert!(lib.is_selected("osiris-piano"));
+        assert!(lib.is_selected("virtuosity-drums"));
         assert_eq!(lib.tri_state("piano"), TriState::Checked);
     }
 
@@ -619,7 +623,7 @@ mod tests {
     fn select_all_uninstalled_skips_installed() {
         let mut lib = SoundLibrary::new(["salamander-grand-v3".to_owned()]).expect("library");
         let added = lib.select_all_uninstalled();
-        assert_eq!(added, 1); // only osiris-piano
+        assert_eq!(added, 20); // all but the already-installed salamander
         assert!(!lib.is_selected("salamander-grand-v3"));
         assert!(lib.is_selected("osiris-piano"));
     }
@@ -635,7 +639,7 @@ mod tests {
     #[test]
     fn toggle_ignores_coming_soon_group() {
         let mut lib = library();
-        assert_eq!(lib.toggle("bass"), TriState::Unchecked);
+        assert_eq!(lib.toggle("mallets"), TriState::Unchecked);
         assert_eq!(lib.download_bytes(), 0);
     }
 
@@ -644,7 +648,7 @@ mod tests {
         let mut lib = library();
         let _ = lib.select_all_uninstalled();
         let banks = lib.selected_downloadable_banks();
-        assert_eq!(banks.len(), 2);
+        assert_eq!(banks.len(), 21);
         assert!(banks.iter().all(bank_library::is_downloadable));
     }
 

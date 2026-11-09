@@ -33,13 +33,13 @@ fn valid_entry_json() -> String {
 }
 
 #[test]
-fn catalog_has_exactly_two_known_entries() {
+fn catalog_has_exactly_21_known_entries() {
     let entries = catalog().expect("embedded catalog parses");
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 21);
     let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
     assert!(ids.contains(&"salamander-grand-v3"));
     assert!(ids.contains(&"osiris-piano"));
-    // SPEC-067: both entries are now fully verified and downloadable.
+    // SPEC-067: all entries are now fully verified and downloadable.
     assert!(entries.iter().all(is_downloadable));
     assert!(entries.iter().all(|e| e.verified));
 }

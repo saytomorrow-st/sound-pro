@@ -537,9 +537,28 @@ pub fn is_sha256(s: &str) -> bool {
 ///
 /// [`CatalogError`].
 pub fn catalog() -> Result<Vec<CatalogEntry>, CatalogError> {
-    const FILES: [&str; 2] = [
+    const FILES: [&str; 21] = [
         include_str!("../../../catalog/banks/salamander-grand-v3.json"),
         include_str!("../../../catalog/banks/osiris-piano.json"),
+        include_str!("../../../catalog/banks/virtuosity-drums.json"),
+        include_str!("../../../catalog/banks/shinyguitar.json"),
+        include_str!("../../../catalog/banks/black-and-green-guitars.json"),
+        include_str!("../../../catalog/banks/emilyguitar.json"),
+        include_str!("../../../catalog/banks/meatbass.json"),
+        include_str!("../../../catalog/banks/fashionbass.json"),
+        include_str!("../../../catalog/banks/sneakybass.json"),
+        include_str!("../../../catalog/banks/ergo-eub.json"),
+        include_str!("../../../catalog/banks/string-cyborgs.json"),
+        include_str!("../../../catalog/banks/dsmolken-double-bass.json"),
+        include_str!("../../../catalog/banks/bigcat-cello.json"),
+        include_str!("../../../catalog/banks/bear-sax.json"),
+        include_str!("../../../catalog/banks/weresax.json"),
+        include_str!("../../../catalog/banks/swirly-drums.json"),
+        include_str!("../../../catalog/banks/unruly-drums.json"),
+        include_str!("../../../catalog/banks/big-rusty-drums.json"),
+        include_str!("../../../catalog/banks/caveman-cosmonaut.json"),
+        include_str!("../../../catalog/banks/cowsynth.json"),
+        include_str!("../../../catalog/banks/merry-orks.json"),
     ];
     FILES.iter().map(|text| parse_catalog_entry(text)).collect()
 }
@@ -1216,13 +1235,41 @@ mod tests {
     #[test]
     fn embedded_catalog_parses_and_is_valid() {
         let entries = catalog().expect("catalog must parse");
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 21);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"salamander-grand-v3"));
         assert!(ids.contains(&"osiris-piano"));
         // SPEC-067 filled both entries with verified upstream hashes/sizes.
         assert!(entries.iter().all(|e| e.verified));
         assert!(entries.iter().all(is_downloadable));
+    }
+
+    #[test]
+    fn catalog_ids_are_unique_and_hashes_present() {
+        let entries = catalog().expect("catalog must parse");
+        // Every entry has a non-empty pinned SHA-256 in both the top-level
+        // field and the download block, and a non-zero size.
+        for e in &entries {
+            assert!(
+                e.sha256.as_deref().is_some_and(is_sha256),
+                "{}: missing/invalid top-level sha256",
+                e.id
+            );
+            let dl = e.download.as_ref().expect("download must be present");
+            assert!(is_sha256(&dl.sha256), "{}: invalid download sha256", e.id);
+            assert!(dl.size_bytes > 0, "{}: zero download size", e.id);
+            assert_eq!(
+                e.sha256.as_deref(),
+                Some(dl.sha256.as_str()),
+                "{}: top-level and download sha256 disagree",
+                e.id
+            );
+        }
+        // Catalog ids are unique.
+        let mut seen = std::collections::HashSet::new();
+        for e in &entries {
+            assert!(seen.insert(&e.id), "duplicate catalog id: {}", e.id);
+        }
     }
 
     #[test]
