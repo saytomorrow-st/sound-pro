@@ -31,6 +31,15 @@ enum Action {
     Duplicate,
     Library,
     Credits,
+    // Sound Library submenu.
+    SoundLoadCore,
+    SoundLoadAll,
+    SoundReinstall,
+    SoundOpenManager,
+    SoundMoveLibrary,
+    // App-menu extras matching the Logic Pro reference.
+    KeyCommands,
+    Feedback,
 }
 
 pub struct NativeMenu {
@@ -66,10 +75,45 @@ impl NativeMenu {
         };
 
         let app = Submenu::new("Sound Pro", true);
+
+        // «Библиотека звуков» submenu, matching the Logic Pro reference:
+        // load core sounds, load all, reinstall, open the manager, then move.
+        let sound_library = Submenu::new("Библиотека звуков", true);
+        let _ = sound_library.append_items(&[
+            &item("Загрузить основные звуки", Action::SoundLoadCore, None),
+            &item("Загрузить все доступные звуки", Action::SoundLoadAll, None),
+            &item(
+                "Переустановить библиотеку звуков",
+                Action::SoundReinstall,
+                None,
+            ),
+            &PredefinedMenuItem::separator(),
+            &item(
+                "Открыть менеджер библиотеки звуков…",
+                Action::SoundOpenManager,
+                None,
+            ),
+            &PredefinedMenuItem::separator(),
+            &item(
+                "Переместить библиотеку звуков…",
+                Action::SoundMoveLibrary,
+                None,
+            ),
+        ]);
+
+        // «Комбинации клавиш» submenu (placeholder; the key-command editor is
+        // not implemented yet, so its item opens the «Скоро» notice).
+        let key_commands = Submenu::new("Комбинации клавиш", true);
+        let _ =
+            key_commands.append_items(&[&item("Правка комбинаций…", Action::KeyCommands, None)]);
+
         let _ = app.append_items(&[
             &item("О программе", Action::About, None),
             &PredefinedMenuItem::separator(),
             &item("Настройки звука…", Action::Settings, cmd(Code::Comma)),
+            &sound_library,
+            &key_commands,
+            &item("Оставить отзыв…", Action::Feedback, None),
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::services(None),
             &PredefinedMenuItem::separator(),
@@ -209,6 +253,20 @@ impl App {
             Action::Duplicate => self.duplicate_clip(),
             Action::Library => self.open_library(),
             Action::Credits => self.credits_open = true,
+            Action::SoundOpenManager => self.open_library_manager(),
+            Action::SoundLoadCore | Action::SoundLoadAll => {
+                // Core sounds have no real downloader yet; «Загрузить все
+                // доступные звуки» opens the manager so the user can pick.
+                self.open_library_manager();
+            }
+            Action::SoundReinstall | Action::SoundMoveLibrary => {
+                // Backend for reinstall/move is not implemented yet.
+                self.library_status = "Эта возможность появится позже".to_owned();
+                self.soon_notice_open = true;
+            }
+            Action::KeyCommands | Action::Feedback => {
+                self.soon_notice_open = true;
+            }
         }
     }
 }

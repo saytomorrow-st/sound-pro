@@ -98,6 +98,19 @@ const WELCOME_ICON_GRADIENT_TL: Color32 = Color32::from_rgb(255, 154, 74);
 const WELCOME_ICON_GRADIENT_C: Color32 = Color32::from_rgb(242, 104, 110);
 const WELCOME_ICON_GRADIENT_BR: Color32 = Color32::from_rgb(107, 181, 216);
 
+// --- Sound Library Manager window (SPEC-…). Colours and layout named in one
+// place so the window can be tuned against the Logic Pro reference.
+/// Alternating row background (even rows).
+const MANAGER_ROW_A: Color32 = Color32::from_rgb(40, 40, 43);
+/// Alternating row background (odd rows).
+const MANAGER_ROW_B: Color32 = Color32::from_rgb(34, 34, 37);
+/// Selected-row highlight (blue).
+const MANAGER_SELECTED: Color32 = Color32::from_rgb(10, 108, 224);
+/// Text colour inside the tree.
+const MANAGER_TEXT: Color32 = Color32::from_rgb(230, 230, 230);
+/// Muted text for statuses and the «Скоро» suffix.
+const MANAGER_MUTED: Color32 = Color32::from_rgb(150, 150, 155);
+
 /// A user action on the welcome dialog. The pure transition in
 /// [`welcome_transition`] maps each action to the next step, so the UI and the
 /// tests share one source of truth.
@@ -111,6 +124,8 @@ enum WelcomeAction {
     Details,
     /// «Закрыть» / «Загрузить позже» — finish the flow.
     Close,
+    /// «Загрузить больше звуков…» — open the library manager and finish.
+    OpenLibraryManager,
 }
 
 /// The result of applying a welcome action: the next step and whether the
@@ -123,8 +138,9 @@ struct WelcomeTransition {
 
 /// Pure welcome-flow state machine. «Упрощённый режим» and «Подробнее…» leave
 /// the step unchanged and ask for the «Скоро» notice; «Полный режим» advances
-/// to the download step; any close action on the download step completes the
-/// flow.
+/// to the download step; any close action on the download step advances to the
+/// «Доступно больше звуков» step; any close action there (or «Загрузить
+/// больше звуков…», which also opens the manager) completes the flow.
 #[must_use]
 fn welcome_transition(step: WelcomeStep, action: WelcomeAction) -> WelcomeTransition {
     match action {
@@ -135,10 +151,11 @@ fn welcome_transition(step: WelcomeStep, action: WelcomeAction) -> WelcomeTransi
         WelcomeAction::SimplifiedMode | WelcomeAction::Details => {
             WelcomeTransition { step, soon: true }
         }
-        WelcomeAction::Close => WelcomeTransition {
+        WelcomeAction::Close | WelcomeAction::OpenLibraryManager => WelcomeTransition {
             step: match step {
                 WelcomeStep::Welcome => WelcomeStep::Welcome,
-                WelcomeStep::Download | WelcomeStep::Done => WelcomeStep::Done,
+                WelcomeStep::Download => WelcomeStep::MoreSounds,
+                WelcomeStep::MoreSounds | WelcomeStep::Done => WelcomeStep::Done,
             },
             soon: false,
         },
@@ -560,14 +577,15 @@ fn main() -> eframe::Result {
     let start = std::env::args_os().nth(1).map(PathBuf::from);
     // First-run welcome: shown only when the persisted step is not Done. Tests
     // build `App::new` directly, which leaves `welcome_open` off. For the
-    // screenshot self-test, `SOUND_PRO_SHOW_WELCOME=1|2` forces the dialog open
-    // at the requested step regardless of the saved state.
+    // screenshot self-test, `SOUND_PRO_SHOW_WELCOME=1|2|3` forces the dialog
+    // open at the requested step regardless of the saved state.
     let welcome_override =
         std::env::var("SOUND_PRO_SHOW_WELCOME")
             .ok()
             .and_then(|v| match v.as_str() {
                 "1" => Some(WelcomeStep::Welcome),
                 "2" => Some(WelcomeStep::Download),
+                "3" => Some(WelcomeStep::MoreSounds),
                 _ => None,
             });
     eframe::run_native(
@@ -579,6 +597,12 @@ fn main() -> eframe::Result {
             let step = welcome_override.unwrap_or(app.audio.welcome);
             app.welcome_open = !step.is_done();
             app.welcome_step = step;
+            // Screenshot self-test: `SOUND_PRO_SHOW_MANAGER=1` opens the library
+            // manager window at start for the visual self-check.
+            if std::env::var_os("SOUND_PRO_SHOW_MANAGER").is_some() {
+                app.open_library_manager();
+                app.welcome_open = false;
+            }
             #[cfg(target_os = "macos")]
             {
                 app.native_menu = Some(macos_menu::NativeMenu::install(&_cc.egui_ctx));
@@ -1073,6 +1097,12 @@ struct App {
     about_open: bool,
     /// The sound library window is open (SPEC-066).
     library_open: bool,
+    /// The Sound Library Manager window is open (SPEC-…).
+    library_manager_open: bool,
+    /// The manager's data model, rebuilt when the window opens.
+    sound_library: Option<daw_app::sound_library::SoundLibrary>,
+    /// Ids of manager tree nodes whose children are expanded (SPEC-…).
+    library_expanded: std::collections::BTreeSet<String>,
     /// The credits window is open (SPEC-066).
     credits_open: bool,
     /// The first-run dialog is open (SPEC-066).
@@ -1087,6 +1117,9 @@ struct App {
     welcome_icon: Option<egui::TextureHandle>,
     /// «Скоро» notice is showing inside the welcome dialog.
     welcome_soon: bool,
+    /// A generic «Скоро» notice dialog, opened from menu items whose backend
+    /// is not implemented yet (reinstall / move library / key commands).
+    soon_notice_open: bool,
     /// Installed banks from the registry, refreshed when the window opens.
     installed_banks: Vec<daw_app::bank_library::InstalledBank>,
     /// A bank being loaded on a background thread after the user picked it in
@@ -1323,12 +1356,16 @@ impl App {
             audio_open: false,
             about_open: false,
             library_open: false,
+            library_manager_open: false,
+            sound_library: None,
+            library_expanded: std::collections::BTreeSet::new(),
             credits_open: false,
             first_run_open: false,
             welcome_open: false,
             welcome_step: WelcomeStep::Welcome,
             welcome_icon: None,
             welcome_soon: false,
+            soon_notice_open: false,
             installed_banks: Vec::new(),
             pending_bank_load: None,
             library_status: String::new(),
@@ -2894,11 +2931,39 @@ impl App {
                     self.duplicate_clip();
                 }
             });
-            ui.menu_button("Справка", |ui| {
-                if ui.button("Библиотека звуков…").clicked() {
-                    self.open_library();
+            ui.menu_button("Библиотека звуков", |ui| {
+                if ui
+                    .add_enabled(
+                        !self.core_sounds_installed(),
+                        egui::Button::new("Загрузить основные звуки"),
+                    )
+                    .clicked()
+                {
+                    self.soon_notice_open = true;
                     ui.close();
                 }
+                if ui.button("Загрузить все доступные звуки").clicked() {
+                    self.open_library_manager();
+                    ui.close();
+                }
+                if ui.button("Переустановить библиотеку звуков").clicked()
+                {
+                    self.soon_notice_open = true;
+                    ui.close();
+                }
+                if ui.button("Открыть менеджер библиотеки звуков…").clicked()
+                {
+                    self.open_library_manager();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Переместить библиотеку звуков…").clicked()
+                {
+                    self.soon_notice_open = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button("Справка", |ui| {
                 if ui.button("Авторы…").clicked() {
                     self.credits_open = true;
                     ui.close();
@@ -6846,10 +6911,64 @@ impl App {
             });
     }
 
+    /// A generic «Скоро» notice, opened from menu items whose backend is not
+    /// implemented yet (reinstall / move library / key commands / feedback).
+    fn soon_notice_window(&mut self, ctx: &egui::Context) {
+        if !self.soon_notice_open {
+            return;
+        }
+        let mut open = self.soon_notice_open;
+        let mut should_close = false;
+        egui::Window::new("Скоро")
+            .id(egui::Id::new("soon-notice"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label("Эта возможность появится в одной из следующих версий.");
+                if ui.button("Хорошо").clicked() {
+                    should_close = true;
+                }
+            });
+        self.soon_notice_open = open && !should_close;
+    }
+
+    /// Whether the core sounds have been installed. There is no real
+    /// "core sounds" downloader yet, so this is always false; the menu item
+    /// stays enabled and routes to the «Скоро» notice.
+    #[cfg(not(target_os = "macos"))]
+    fn core_sounds_installed(&self) -> bool {
+        false
+    }
+
     /// Opens the sound library window, refreshing the installed list (SPEC-066).
     fn open_library(&mut self) {
         self.library_open = true;
         self.refresh_installed_banks();
+    }
+
+    /// Opens the Sound Library Manager, rebuilding its model from the installed
+    /// banks (SPEC-…).
+    fn open_library_manager(&mut self) {
+        self.refresh_installed_banks();
+        let installed: Vec<String> = self.installed_banks.iter().map(|b| b.id.clone()).collect();
+        self.sound_library = Some(
+            daw_app::sound_library::SoundLibrary::new(installed).unwrap_or_else(|e| {
+                self.library_status = e.to_string();
+                daw_app::sound_library::SoundLibrary::new(std::iter::empty::<String>())
+                    .expect("sound library always builds from the embedded file")
+            }),
+        );
+        // Default-expand every top-level group so the tree is browsable; nested
+        // subgroups start collapsed.
+        self.library_expanded.clear();
+        if let Some(lib) = self.sound_library.as_ref() {
+            for group in lib.groups() {
+                self.library_expanded.insert(group.id.clone());
+            }
+        }
+        self.library_manager_open = true;
     }
 
     /// Reloads the installed-bank list into `installed_banks` (SPEC-066).
@@ -6949,6 +7068,321 @@ impl App {
         if !open {
             self.library_open = false;
         }
+    }
+
+    /// The Sound Library Manager window (SPEC-…): a tree of content packages
+    /// with tri-state checkboxes, a status column, and a bottom summary panel.
+    fn library_manager_window(&mut self, ctx: &egui::Context) {
+        if !self.library_manager_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Менеджер библиотеки звуков")
+            .id(egui::Id::new("library-manager"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(640.0)
+            .default_height(520.0)
+            .show(ctx, |ui| self.library_manager_ui(ui));
+        if !open {
+            self.library_manager_open = false;
+        }
+    }
+
+    fn library_manager_ui(&mut self, ui: &mut egui::Ui) {
+        // Rebuild the model if it is missing (e.g. after a test opened the flag).
+        if self.sound_library.is_none() {
+            let installed: Vec<String> =
+                self.installed_banks.iter().map(|b| b.id.clone()).collect();
+            self.sound_library = Some(
+                daw_app::sound_library::SoundLibrary::new(installed).unwrap_or_else(|e| {
+                    self.library_status = e.to_string();
+                    daw_app::sound_library::SoundLibrary::new(std::iter::empty::<String>())
+                        .expect("sound library always builds")
+                }),
+            );
+        }
+
+        // Column headers.
+        ui.horizontal(|ui| {
+            ui.strong("Дополнительные пакеты контента");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.strong("Статус");
+            });
+        });
+        ui.separator();
+
+        // Tree body. Row index drives the stripe pattern and the selected-row
+        // highlight. We collect the toggle/expand actions to apply after the
+        // borrow ends (egui closures borrow `ui` immutably, but toggling mutates
+        // `self.sound_library`).
+        let mut toggled: Option<String> = None;
+        let mut expand_toggled: Option<String> = None;
+        let mut row = 0_usize;
+        let mut select_all = false;
+        let mut install = false;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let groups = self
+                    .sound_library
+                    .as_ref()
+                    .expect("model built above")
+                    .groups()
+                    .to_vec();
+                for group in &groups {
+                    row = self.manager_row(ui, group, 0, row, &mut toggled, &mut expand_toggled);
+                }
+            });
+
+        ui.add_space(8.0);
+        ui.separator();
+
+        // Bottom summary: sizes and action buttons.
+        let (dl, inst) = {
+            let lib = self.sound_library.as_ref().expect("model built above");
+            (lib.download_bytes(), lib.installed_bytes())
+        };
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} загрузка / для установки требуется {}",
+                welcome::format_gigabytes(dl),
+                welcome::format_gigabytes(inst),
+            ));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let primary = egui::Button::new("Установить")
+                    .fill(MANAGER_SELECTED)
+                    .stroke(egui::Stroke::NONE);
+                if ui.add(primary).clicked() {
+                    install = true;
+                }
+                if ui.button("Отмена").clicked() {
+                    self.library_manager_open = false;
+                }
+                if ui.button("Выбрать все неустановленные").clicked() {
+                    select_all = true;
+                }
+            });
+        });
+
+        if !self.library_status.is_empty() {
+            ui.add_space(4.0);
+            ui.label(&self.library_status);
+        }
+
+        // Apply deferred mutations.
+        if select_all {
+            if let Some(lib) = self.sound_library.as_mut() {
+                let _ = lib.select_all_uninstalled();
+            }
+        }
+        if let Some(id) = toggled {
+            if let Some(lib) = self.sound_library.as_mut() {
+                lib.toggle(&id);
+            }
+        }
+        if let Some(id) = expand_toggled {
+            if self.library_expanded.contains(&id) {
+                self.library_expanded.remove(&id);
+            } else {
+                self.library_expanded.insert(id);
+            }
+        }
+        if install {
+            self.install_selected_library();
+        }
+    }
+
+    /// Renders one row of the manager tree and returns the next row index.
+    fn manager_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &daw_app::sound_library::Package,
+        depth: usize,
+        mut row: usize,
+        toggled: &mut Option<String>,
+        expand_toggled: &mut Option<String>,
+    ) -> usize {
+        let lib = self.sound_library.as_ref().expect("model built");
+        let tri = lib.tri_state(&node.id);
+        let status = lib.status(&node.id);
+        let has_children = !node.children.is_empty();
+        let expanded = self.library_expanded.contains(&node.id);
+
+        let stripe = if row % 2 == 0 {
+            MANAGER_ROW_A
+        } else {
+            MANAGER_ROW_B
+        };
+        let selected = tri == daw_app::sound_library::TriState::Checked
+            || tri == daw_app::sound_library::TriState::Partial;
+
+        // Row background.
+        let row_rect = ui.available_rect_before_wrap();
+        let row_h = 22.0;
+        let rect = Rect::from_min_size(row_rect.min, Vec2::new(row_rect.width(), row_h));
+        let bg = if selected { MANAGER_SELECTED } else { stripe };
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
+
+        let indent = depth as f32 * 18.0;
+        // Disclosure arrow for nodes with children, placed before the checkbox.
+        let arrow_w = if has_children { 14.0 } else { 0.0 };
+        let checkbox_rect = Rect::from_min_size(
+            Pos2::new(rect.min.x + indent + arrow_w + 6.0, rect.center().y - 7.0),
+            Vec2::splat(14.0),
+        );
+
+        // Disclosure arrow.
+        if has_children {
+            let arrow_pos = Pos2::new(rect.min.x + indent + 4.0, rect.center().y);
+            ui.painter().text(
+                arrow_pos,
+                egui::Align2::LEFT_CENTER,
+                if expanded { "▾" } else { "▸" },
+                FontId::proportional(13.0),
+                if selected {
+                    Color32::WHITE
+                } else {
+                    MANAGER_MUTED
+                },
+            );
+        }
+
+        // Checkbox (click toggles).
+        let (rect_checked, partial) = match tri {
+            daw_app::sound_library::TriState::Checked => (true, false),
+            daw_app::sound_library::TriState::Partial => (true, true),
+            daw_app::sound_library::TriState::Unchecked => (false, false),
+        };
+        ui.painter().rect_stroke(
+            checkbox_rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0_f32, Color32::from_rgb(180, 180, 185)),
+            egui::StrokeKind::Inside,
+        );
+        if rect_checked {
+            let inner = checkbox_rect.shrink(3.0);
+            ui.painter()
+                .rect_filled(inner, CornerRadius::same(1), Color32::WHITE);
+        } else if partial {
+            // Dash in the middle for the partial state.
+            let y = checkbox_rect.center().y;
+            ui.painter().line_segment(
+                [
+                    Pos2::new(checkbox_rect.min.x + 3.0, y),
+                    Pos2::new(checkbox_rect.max.x - 3.0, y),
+                ],
+                Stroke::new(2.0_f32, Color32::WHITE),
+            );
+        }
+
+        // Title text, with the «Скоро» suffix for groups that are ComingSoon.
+        let text_pos = Pos2::new(checkbox_rect.max.x + 8.0, rect.center().y);
+        let title_color = if selected {
+            Color32::WHITE
+        } else {
+            MANAGER_TEXT
+        };
+        ui.painter().text(
+            text_pos,
+            egui::Align2::LEFT_CENTER,
+            &node.title,
+            FontId::proportional(14.0),
+            title_color,
+        );
+        let title_w = ui
+            .painter()
+            .layout_no_wrap(node.title.clone(), FontId::proportional(14.0), title_color)
+            .size()
+            .x;
+        if status == daw_app::sound_library::Status::ComingSoon && !has_children {
+            ui.painter().text(
+                Pos2::new(text_pos.x + title_w + 8.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "— Скоро",
+                FontId::proportional(12.0),
+                MANAGER_MUTED,
+            );
+        }
+
+        // Status column, right-aligned.
+        let status_color = if selected {
+            Color32::WHITE
+        } else {
+            MANAGER_MUTED
+        };
+        ui.painter().text(
+            Pos2::new(rect.max.x - 10.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            status.label(),
+            FontId::proportional(13.0),
+            status_color,
+        );
+
+        // Interaction: clicking the disclosure arrow toggles expansion; clicking
+        // the row toggles selection.
+        if has_children {
+            let arrow_rect = Rect::from_min_size(
+                Pos2::new(rect.min.x + indent, rect.center().y - 10.0),
+                Vec2::new(arrow_w + 4.0, 20.0),
+            );
+            let arrow_resp = ui.interact(
+                arrow_rect,
+                ui.id().with(("manager-arrow", &node.id)),
+                egui::Sense::click(),
+            );
+            if arrow_resp.clicked() {
+                *expand_toggled = Some(node.id.clone());
+            }
+        }
+        let response = ui.interact(
+            rect,
+            ui.id().with(("manager-row", &node.id)),
+            egui::Sense::click(),
+        );
+        if response.clicked() {
+            *toggled = Some(node.id.clone());
+        }
+
+        // Allocate the row's vertical space and advance.
+        ui.advance_cursor_after_rect(rect);
+        row += 1;
+
+        if has_children && expanded {
+            for child in &node.children {
+                row = self.manager_row(ui, child, depth + 1, row, toggled, expand_toggled);
+            }
+        }
+        row
+    }
+
+    /// Queues the real bank downloader for every selected, downloadable bank;
+    /// skips «Скоро» items with a message. Downloads run in the background and
+    /// their progress is polled by [`Self::poll_downloads`].
+    fn install_selected_library(&mut self) {
+        let banks = self
+            .sound_library
+            .as_ref()
+            .expect("model built")
+            .selected_downloadable_banks();
+        if banks.is_empty() {
+            self.library_status = "Выбранные пункты ещё недоступны для загрузки".to_owned();
+            return;
+        }
+        let mut started = 0_usize;
+        for entry in banks {
+            if self.downloads.contains_key(&entry.id) {
+                continue;
+            }
+            self.start_download(entry);
+            started += 1;
+        }
+        self.library_status = if started == 0 {
+            "Выбранные банки уже загружаются".to_owned()
+        } else {
+            format!("Загрузка начата: {started} шт.")
+        };
     }
 
     fn library_ui(&mut self, ui: &mut egui::Ui) {
@@ -7371,6 +7805,40 @@ impl App {
                     WELCOME_BODY,
                 );
             }
+            WelcomeStep::MoreSounds => {
+                // App icon (same texture as the welcome step).
+                if self.welcome_icon.is_none() {
+                    self.welcome_icon = Some(load_welcome_icon(ui.ctx()));
+                }
+                if let Some(tex) = &self.welcome_icon {
+                    ui.painter().image(
+                        tex.id(),
+                        icon_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                ui.painter().text(
+                    Pos2::new(text_left, content.min.y),
+                    egui::Align2::LEFT_TOP,
+                    "Доступно больше звуков",
+                    FontId::proportional(WELCOME_TITLE_SIZE),
+                    WELCOME_TITLE,
+                );
+                let body = "Вы можете загрузить дополнительные звуки, инструменты и лупы, выбрав Sound Pro > Библиотека звуков > Открыть менеджер библиотеки звуков…, затем отметив нужные пункты.";
+                let max_width = content.max.x - text_left;
+                let galley = ui.painter().layout(
+                    body.to_owned(),
+                    FontId::proportional(WELCOME_BODY_SIZE),
+                    WELCOME_BODY,
+                    max_width,
+                );
+                ui.painter().galley(
+                    Pos2::new(text_left, content.min.y + WELCOME_TITLE_SIZE + 12.0),
+                    galley,
+                    WELCOME_BODY,
+                );
+            }
             WelcomeStep::Done => {}
         }
 
@@ -7511,6 +7979,46 @@ impl App {
                     *action = Some(WelcomeAction::Close);
                 }
             }
+            WelcomeStep::MoreSounds => {
+                // Right-aligned: «Загрузить позже» (grey) then «Загрузить больше
+                // звуков…» (primary, opens the library manager).
+                let primary_w = 200.0;
+                let later_w = 140.0;
+                let gap = 12.0;
+                let btn_h = 28.0;
+                let y = footer.center().y - btn_h / 2.0;
+                let primary_rect = Rect::from_min_size(
+                    Pos2::new(footer.max.x - primary_w, y),
+                    Vec2::new(primary_w, btn_h),
+                );
+                let later_rect = Rect::from_min_size(
+                    Pos2::new(primary_rect.min.x - gap - later_w, y),
+                    Vec2::new(later_w, btn_h),
+                );
+                welcome_button(
+                    ui,
+                    later_rect,
+                    WELCOME_BUTTON_BG,
+                    WELCOME_BUTTON_TEXT,
+                    "Загрузить позже",
+                );
+                welcome_button(
+                    ui,
+                    primary_rect,
+                    WELCOME_PRIMARY,
+                    WELCOME_BUTTON_TEXT,
+                    "Загрузить больше звуков…",
+                );
+                if ui.rect_contains_pointer(later_rect) && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::Close);
+                }
+                if ui.rect_contains_pointer(primary_rect)
+                    && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::OpenLibraryManager);
+                }
+            }
             WelcomeStep::Done => {}
         }
     }
@@ -7542,6 +8050,9 @@ impl App {
             {
                 self.status = format!("Не удалось сохранить настройки: {e}");
             }
+        }
+        if action == WelcomeAction::OpenLibraryManager {
+            self.open_library_manager();
         }
         if t.step.is_done() {
             self.welcome_open = false;
@@ -7992,10 +8503,12 @@ impl eframe::App for App {
         self.audio_window(ctx);
         self.about_window(ctx);
         self.library_window(ctx);
+        self.library_manager_window(ctx);
         self.credits_window(ctx);
         self.install_license_window(ctx);
         self.first_run_window(ctx);
         self.welcome_window(ctx);
+        self.soon_notice_window(ctx);
         self.download_accept_window(ctx);
         self.new_track_window(ctx);
         self.export_window(ctx);
@@ -9113,6 +9626,27 @@ mod sound_library_tests {
         app.open_library();
         assert!(app.library_open);
     }
+
+    #[test]
+    fn library_manager_window_renders_headlessly() {
+        let mut app = App::new(None);
+        app.open_library_manager();
+        assert!(app.library_manager_open);
+        assert!(app.sound_library.is_some());
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.library_manager_window(ctx);
+        });
+        // The model built with all 20 groups; the top-level groups were
+        // default-expanded for browsing.
+        let lib = app.sound_library.as_ref().expect("model");
+        assert_eq!(lib.groups().len(), 20);
+        assert!(app.library_expanded.contains("sound-packs"));
+    }
 }
 
 #[cfg(test)]
@@ -9143,8 +9677,16 @@ mod welcome_tests {
     }
 
     #[test]
-    fn close_on_download_completes_flow() {
+    fn close_on_download_advances_to_more_sounds() {
         let t = welcome_transition(WelcomeStep::Download, WelcomeAction::Close);
+        assert_eq!(t.step, WelcomeStep::MoreSounds);
+        assert!(!t.soon);
+        assert!(!t.step.is_done());
+    }
+
+    #[test]
+    fn close_on_more_sounds_completes_flow() {
+        let t = welcome_transition(WelcomeStep::MoreSounds, WelcomeAction::Close);
         assert_eq!(t.step, WelcomeStep::Done);
         assert!(!t.soon);
         assert!(t.step.is_done());
