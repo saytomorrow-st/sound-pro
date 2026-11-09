@@ -973,6 +973,8 @@ struct App {
     export_normalize: bool,
     export_target_db: f32,
     export_pending: bool,
+    /// Pending license-restriction warning before export, when non-empty.
+    export_restriction: Option<daw_app::bank_library::ExportRestrictions>,
     /// File lengths read from headers while files hover (SPEC-050 §2).
     probes: HashMap<PathBuf, Result<u64, String>>,
     /// Waveforms of hovered files, filling in as they decode.
@@ -1297,6 +1299,7 @@ impl App {
             export_normalize: false,
             export_target_db: -1.0,
             export_pending: false,
+            export_restriction: None,
             probes: HashMap::new(),
             hover_peaks: HashMap::new(),
             hover_tx,
@@ -2845,7 +2848,99 @@ impl App {
     /// the UI stays responsive (SPEC-052). The file dialog itself is also shown
     /// off the UI thread; the picked path comes back through [`Self::poll_dialog`].
     fn start_export(&mut self) {
-        self.request_dialog(DialogKind::ExportMix);
+        if self.begin_export_request() {
+            self.request_dialog(DialogKind::ExportMix);
+        }
+    }
+
+    /// Collects the distinct sampler bank ids used by the project's instrument
+    /// tracks (SPEC-052 §6), skipping the built-in piano and legacy paths that
+    /// are not registry ids.
+    fn project_bank_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for track in &self.editor.session().tracks {
+            if let audio_core::TrackInstrument::Sampler { bank_id } = &track.instrument {
+                if !ids.iter().any(|id| id == bank_id) {
+                    ids.push(bank_id.clone());
+                }
+            }
+        }
+        ids
+    }
+
+    /// Intercepts the export before the file dialog: if any sampler bank in the
+    /// project carries a license restriction, show the warning dialog instead of
+    /// opening the file picker. Returns `true` when export may proceed.
+    fn begin_export_request(&mut self) -> bool {
+        let requirements = daw_app::bank_library::requirements_for_banks(self.project_bank_ids());
+        let restrictions = daw_app::bank_library::export_restrictions(&requirements);
+        if restrictions.is_empty() {
+            return true;
+        }
+        self.export_restriction = Some(restrictions);
+        false
+    }
+
+    /// The license-restriction warning shown before export (SPEC-052 §6). Lists
+    /// non-commercial banks with the «нельзя монетизировать» warning and the
+    /// ready attribution text for CC-BY banks, with «Скопировать». Buttons are
+    /// «Отмена» and «Экспортировать».
+    fn export_restriction_window(&mut self, ctx: &egui::Context) {
+        let Some(restrictions) = self.export_restriction.as_ref() else {
+            return;
+        };
+        let mut proceed = false;
+        let mut cancel = false;
+        let mut open = true;
+        let attribution = restrictions.attribution_text.clone();
+        let nc_names = restrictions.non_commercial_names.clone();
+        egui::Window::new("Ограничения лицензий")
+            .id(egui::Id::new("export-restriction"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                if !nc_names.is_empty() {
+                    ui.label(
+                        "Музыку с этим звуком нельзя монетизировать \
+                         (только некоммерческое использование)",
+                    );
+                    for name in &nc_names {
+                        ui.label(format!("• {name}"));
+                    }
+                    ui.add_space(6.0);
+                }
+                if !attribution.trim().is_empty() {
+                    ui.label("Нужно указать автора:");
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&attribution);
+                        });
+                    ui.add_space(4.0);
+                    if ui.button("Скопировать").clicked() {
+                        ui.ctx().copy_text(attribution.clone());
+                    }
+                    ui.add_space(6.0);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Отмена").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Экспортировать").clicked() {
+                        proceed = true;
+                    }
+                });
+            });
+        if proceed || cancel || !open {
+            self.export_restriction = None;
+        }
+        if proceed {
+            self.request_dialog(DialogKind::ExportMix);
+        }
     }
 
     /// Collects a finished export and reports its result.
@@ -7370,15 +7465,26 @@ impl App {
         } else {
             MANAGER_MUTED
         };
+        let status_text = status.label();
         ui.painter().text(
             Pos2::new(rect.max.x - 10.0, rect.center().y),
             egui::Align2::RIGHT_CENTER,
-            status.label(),
+            status_text,
             FontId::proportional(13.0),
             status_color,
         );
+        let status_width = ui
+            .painter()
+            .layout_no_wrap(
+                status_text.to_owned(),
+                FontId::proportional(13.0),
+                status_color,
+            )
+            .size()
+            .x;
 
-        // License badge for a leaf bank, drawn to the left of the status.
+        // License badge for a leaf bank, drawn in its own right-aligned column
+        // to the left of the status text, so it never overlaps the status.
         // A non-commercial bank is emphasised so the user sees it before the
         // install warning.
         if let Some(label) = node.license_label() {
@@ -7394,14 +7500,11 @@ impl App {
             } else {
                 MANAGER_MUTED
             };
-            let badge_size = ui
-                .painter()
-                .layout_no_wrap(badge_text.clone(), FontId::proportional(11.0), badge_color)
-                .size()
-                .x;
+            // Right-aligned badge just left of the status, with a fixed gutter.
+            let badge_right = rect.max.x - 10.0 - status_width - 10.0;
             ui.painter().text(
-                Pos2::new(rect.max.x - badge_size - 92.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
+                Pos2::new(badge_right, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
                 badge_text,
                 FontId::proportional(11.0),
                 badge_color,
@@ -8620,6 +8723,7 @@ impl eframe::App for App {
         self.download_accept_window(ctx);
         self.new_track_window(ctx);
         self.export_window(ctx);
+        self.export_restriction_window(ctx);
 
         if let Some(folder) = self.delete_folder {
             let name = self
