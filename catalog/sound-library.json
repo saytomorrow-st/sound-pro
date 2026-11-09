@@ -1,0 +1,624 @@
+{
+  "schema": 1,
+  "groups": [
+    {
+      "id": "core",
+      "title": "Основные звуки и инструменты",
+      "installed": true
+    },
+    {
+      "id": "sound-packs",
+      "title": "Звуковые наборы",
+      "sub": [
+        {
+          "id": "soundpack-8-bit-legends",
+          "title": "8-битные легенды (Чиптюн)"
+        },
+        {
+          "id": "soundpack-alpha-waves",
+          "title": "Альфа-волны (Современный эмбиент)"
+        },
+        {
+          "id": "soundpack-backlight-bounce",
+          "title": "Backlight Bounce (Slap House)"
+        },
+        {
+          "id": "soundpack-beat-tape",
+          "title": "Beat Tape (Хип-хоп)"
+        },
+        {
+          "id": "soundpack-chromium-fray",
+          "title": "Chromium Fray (Bass House)"
+        },
+        {
+          "id": "soundpack-dancefloor-rush",
+          "title": "Dancefloor Rush (Драм-н-бейс)"
+        },
+        {
+          "id": "soundpack-edges-and-angles",
+          "title": "Edges and Angles (Future Bass)"
+        },
+        {
+          "id": "soundpack-flex-and-flow",
+          "title": "Flex and Flow (Chill Hip Hop)"
+        },
+        {
+          "id": "soundpack-gozadera-latina",
+          "title": "Gozadera Latina (Реггетон-поп)"
+        },
+        {
+          "id": "soundpack-hybrid-textures",
+          "title": "Гибридные текстуры (Sample Alchemy)"
+        },
+        {
+          "id": "soundpack-keyboard-collection",
+          "title": "Коллекция клавишных"
+        },
+        {
+          "id": "soundpack-magnetic-imperfections",
+          "title": "Magnetic Imperfections"
+        },
+        {
+          "id": "soundpack-modular-melodies",
+          "title": "Модульные мелодии (Синтезаторы)"
+        },
+        {
+          "id": "soundpack-modular-rhythms",
+          "title": "Модульные ритмы (Синтезаторные ударные)"
+        },
+        {
+          "id": "soundpack-oblique-structures",
+          "title": "Oblique Structures (Техно)"
+        },
+        {
+          "id": "soundpack-prismatica",
+          "title": "Prismatica (Ню-диско)"
+        },
+        {
+          "id": "soundpack-skyline-heat",
+          "title": "Skyline Heat (Хип-хоп)"
+        },
+        {
+          "id": "soundpack-toy-box",
+          "title": "Коробка игрушек (Звуковые эффекты)"
+        },
+        {
+          "id": "soundpack-transition-effects",
+          "title": "Эффекты переходов"
+        },
+        {
+          "id": "soundpack-ultimate-808s",
+          "title": "Ultimate 808s"
+        },
+        {
+          "id": "soundpack-vintage-drum-machines",
+          "title": "Винтажные драм-машины"
+        },
+        {
+          "id": "soundpack-vision-and-verse",
+          "title": "Vision and Verse (Boom Bap Hip Hop)"
+        },
+        {
+          "id": "soundpack-vox-melodics",
+          "title": "Vox Melodics (Вокальные лупы)"
+        }
+      ]
+    },
+    {
+      "id": "producer-packs",
+      "title": "Продюсерские наборы",
+      "sub": [
+        {
+          "id": "producerpack-boys-noize",
+          "title": "Boys Noize"
+        },
+        {
+          "id": "producerpack-cory-wong",
+          "title": "Cory Wong"
+        },
+        {
+          "id": "producerpack-hardwell",
+          "title": "Hardwell"
+        },
+        {
+          "id": "producerpack-the-kount",
+          "title": "The Kount"
+        },
+        {
+          "id": "producerpack-mark-lettieri",
+          "title": "Mark Lettieri"
+        },
+        {
+          "id": "producerpack-oak-felder",
+          "title": "Oak Felder"
+        },
+        {
+          "id": "producerpack-pompom",
+          "title": "PomPom"
+        },
+        {
+          "id": "producerpack-soulection",
+          "title": "Soulection"
+        },
+        {
+          "id": "producerpack-take-a-daytrip",
+          "title": "Take A Daytrip"
+        },
+        {
+          "id": "producerpack-tom-misch",
+          "title": "Tom Misch"
+        },
+        {
+          "id": "producerpack-tosin-abasi",
+          "title": "Tosin Abasi"
+        },
+        {
+          "id": "producerpack-trakgirl",
+          "title": "TRAKGIRL"
+        },
+        {
+          "id": "producerpack-watch-the-sound",
+          "title": "Watch the Sound With Mark Ronson"
+        }
+      ]
+    },
+    {
+      "id": "alchemy",
+      "title": "Библиотеки Alchemy",
+      "sub": [
+        {
+          "id": "atmospheric",
+          "title": "Атмосферные"
+        },
+        {
+          "id": "basic-additions",
+          "title": "Базовые дополнения"
+        },
+        {
+          "id": "cinematic",
+          "title": "Кинематографичные"
+        },
+        {
+          "id": "dance",
+          "title": "Танцевальные"
+        },
+        {
+          "id": "modern-songwriter",
+          "title": "Современный автор"
+        },
+        {
+          "id": "modern-synth",
+          "title": "Современный синтезатор"
+        },
+        {
+          "id": "textures-and-effects",
+          "title": "Текстуры и эффекты"
+        },
+        {
+          "id": "vintage-synth",
+          "title": "Винтажный синтезатор"
+        },
+        {
+          "id": "visions",
+          "title": "Видения"
+        }
+      ]
+    },
+    {
+      "id": "bass",
+      "title": "Бас"
+    },
+    {
+      "id": "cinematic",
+      "title": "Кинематографичные"
+    },
+    {
+      "id": "drum-kit",
+      "title": "Ударная установка",
+      "sub": [
+        {
+          "id": "acousticdrums",
+          "title": "Стерео-ударные",
+          "sub": [
+            {
+              "id": "stereodrumkitssongwriter",
+              "title": "Наборы «Автор»"
+            },
+            {
+              "id": "stereodrumkitsalternative",
+              "title": "Наборы «Альтернатива»"
+            },
+            {
+              "id": "stereodrumkitsrock",
+              "title": "Наборы «Рок»"
+            },
+            {
+              "id": "stereodrumkitsrnb",
+              "title": "Наборы «R&B»"
+            }
+          ]
+        },
+        {
+          "id": "producerdrumkits",
+          "title": "Многоканальные ударные",
+          "sub": [
+            {
+              "id": "producerclassicsixtieskit",
+              "title": "Набор «Шестидесятые»"
+            },
+            {
+              "id": "producerpawnshopkit",
+              "title": "Набор «Ломбард»"
+            },
+            {
+              "id": "producerbirchkit",
+              "title": "Набор «Берёза»"
+            },
+            {
+              "id": "producerstadiumkit",
+              "title": "Набор «Стадион»"
+            },
+            {
+              "id": "producerseventiesplexikit",
+              "title": "Набор «Семидесятые Plexi»"
+            },
+            {
+              "id": "producertightmaplekit",
+              "title": "Набор «Плотный клён»"
+            },
+            {
+              "id": "producerstudiokit",
+              "title": "Набор «Студия»"
+            },
+            {
+              "id": "producermodernmaplekit",
+              "title": "Набор «Современный клён»"
+            },
+            {
+              "id": "producervintagebrushkit",
+              "title": "Набор «Винтажные щётки»"
+            },
+            {
+              "id": "producervintagerodskit",
+              "title": "Набор «Винтажные прутья»"
+            },
+            {
+              "id": "producervintagestickskit",
+              "title": "Набор «Винтажные палочки»"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "electronic-drum-kit",
+      "title": "Электронная ударная установка"
+    },
+    {
+      "id": "guitar",
+      "title": "Гитара"
+    },
+    {
+      "id": "mallets",
+      "title": "Мэллеты"
+    },
+    {
+      "id": "orchestral",
+      "title": "Оркестровые",
+      "sub": [
+        {
+          "id": "instrumentsorchestralbrass",
+          "title": "Медные духовые"
+        },
+        {
+          "id": "instrumentsorchestralchoir",
+          "title": "Хор"
+        },
+        {
+          "id": "instrumentsorchestralharp",
+          "title": "Арфа"
+        },
+        {
+          "id": "instrumentsorchestralkeyboard",
+          "title": "Клавишные"
+        },
+        {
+          "id": "instrumentsorchestralpercussion",
+          "title": "Ударные"
+        },
+        {
+          "id": "instrumentsorchestralpipeorgan",
+          "title": "Орган"
+        },
+        {
+          "id": "instrumentsorchestralstrings",
+          "title": "Струнные"
+        },
+        {
+          "id": "instrumentsorchestralwoodwinds",
+          "title": "Деревянные духовые"
+        }
+      ]
+    },
+    {
+      "id": "percussion",
+      "title": "Перкуссия"
+    },
+    {
+      "id": "piano",
+      "title": "Фортепиано",
+      "banks": [
+        "salamander-grand-v3",
+        "osiris-piano"
+      ]
+    },
+    {
+      "id": "studio-horns",
+      "title": "Студийные духовые"
+    },
+    {
+      "id": "studio-strings",
+      "title": "Студийные струнные"
+    },
+    {
+      "id": "vintage-mellotron",
+      "title": "Винтажный меллотрон"
+    },
+    {
+      "id": "world",
+      "title": "Мир",
+      "sub": [
+        {
+          "id": "instrumentsworldkeyboards",
+          "title": "Клавишные"
+        },
+        {
+          "id": "instrumentsworldpercussion",
+          "title": "Ударные"
+        },
+        {
+          "id": "instrumentsworldstringed",
+          "title": "Струнные"
+        },
+        {
+          "id": "instrumentsworldvoice",
+          "title": "Вокал"
+        },
+        {
+          "id": "instrumentsworldwoodwind",
+          "title": "Духовые"
+        }
+      ]
+    },
+    {
+      "id": "loops",
+      "title": "Лупы",
+      "sub": [
+        {
+          "id": "appleloops8-bitlegends",
+          "title": "8-битные легенды"
+        },
+        {
+          "id": "appleloopsbassplayer",
+          "title": "Бас-гитарист"
+        },
+        {
+          "id": "appleloopsbluesgarage",
+          "title": "Блюз-гараж"
+        },
+        {
+          "id": "appleloopschillwave",
+          "title": "Чиллвейв"
+        },
+        {
+          "id": "appleloopschinesetraditional",
+          "title": "Китайская традиционная"
+        },
+        {
+          "id": "appleloopsdeephouse",
+          "title": "Дип-хаус"
+        },
+        {
+          "id": "appleloopsdiscofunk",
+          "title": "Диско-фанк"
+        },
+        {
+          "id": "appleloopsdrummer",
+          "title": "Ударник"
+        },
+        {
+          "id": "appleloopsdubstep",
+          "title": "Дабстеп"
+        },
+        {
+          "id": "appleloopselectrohouse",
+          "title": "Электро-хаус"
+        },
+        {
+          "id": "appleloopshiphop",
+          "title": "Хип-хоп"
+        },
+        {
+          "id": "appleloopsindiedisco",
+          "title": "Инди-диско"
+        },
+        {
+          "id": "appleloopskeyboardplayer",
+          "title": "Клавишник"
+        },
+        {
+          "id": "appleloopsmodernrnb",
+          "title": "Современный R&B"
+        },
+        {
+          "id": "appleloopsstepsequencer",
+          "title": "Степ-секвенсор"
+        },
+        {
+          "id": "appleloopsstudiohorns",
+          "title": "Студийные духовые"
+        },
+        {
+          "id": "appleloopsstudiostrings",
+          "title": "Студийные струнные"
+        },
+        {
+          "id": "appleloopstechhouse",
+          "title": "Тех-хаус"
+        },
+        {
+          "id": "appleloopsvintagebreaks",
+          "title": "Винтажные брейки"
+        }
+      ]
+    },
+    {
+      "id": "reverbs",
+      "title": "Реверберации",
+      "sub": [
+        {
+          "id": "stereoirs",
+          "title": "Стерео"
+        },
+        {
+          "id": "surroundirs",
+          "title": "Объёмный звук"
+        }
+      ]
+    },
+    {
+      "id": "legacy",
+      "title": "Устаревшее и совместимость",
+      "sub": [
+        {
+          "id": "logicpro10legacycontent",
+          "title": "Звуки и инструменты совместимости Logic Pro 10",
+          "sub": [
+            {
+              "id": "logicpro10instrumentsbass",
+              "title": "Бас"
+            },
+            {
+              "id": "logicpro10acousticdrums",
+              "title": "Стерео-ударные",
+              "sub": [
+                {
+                  "id": "logicpro10stereodrumkitssongwriter",
+                  "title": "Наборы «Автор»"
+                },
+                {
+                  "id": "logicpro10stereodrumkitsalternative",
+                  "title": "Наборы «Альтернатива»"
+                },
+                {
+                  "id": "logicpro10stereodrumkitsrock",
+                  "title": "Наборы «Рок»"
+                },
+                {
+                  "id": "logicpro10stereodrumkitsrnb",
+                  "title": "Наборы «R&B»"
+                }
+              ]
+            },
+            {
+              "id": "logicpro10instrumentspiano",
+              "title": "Фортепиано"
+            }
+          ]
+        },
+        {
+          "id": "logic9legacycontent",
+          "title": "Звуки и инструменты совместимости Logic Studio 2"
+        },
+        {
+          "id": "garageband11content",
+          "title": "Звуки и инструменты GarageBand 11"
+        },
+        {
+          "id": "jampack1",
+          "title": "Jam Pack 1",
+          "sub": [
+            {
+              "id": "jampack1instruments",
+              "title": "Инструменты"
+            },
+            {
+              "id": "jampack1appleloops",
+              "title": "Apple Loops"
+            }
+          ]
+        },
+        {
+          "id": "jampackremixtools",
+          "title": "Jam Pack Remix Tools",
+          "sub": [
+            {
+              "id": "jampackremixtoolsinstruments",
+              "title": "Инструменты"
+            },
+            {
+              "id": "jampackremixtoolsappleloops",
+              "title": "Apple Loops"
+            }
+          ]
+        },
+        {
+          "id": "jampackrhythmsection",
+          "title": "Jam Pack Rhythm Section",
+          "sub": [
+            {
+              "id": "jampackrhythmsectioninstruments",
+              "title": "Инструменты"
+            },
+            {
+              "id": "jampackrhythmsectionappleloops",
+              "title": "Apple Loops"
+            }
+          ]
+        },
+        {
+          "id": "jampacksymphonyorchestra",
+          "title": "Jam Pack Symphony Orchestra",
+          "sub": [
+            {
+              "id": "jampacksymphonyorchestrainstruments",
+              "title": "Инструменты"
+            },
+            {
+              "id": "jampacksymphonyorchestraappleloops",
+              "title": "Apple Loops"
+            }
+          ]
+        },
+        {
+          "id": "jampackworldmusic",
+          "title": "Jam Pack WorldMusic",
+          "sub": [
+            {
+              "id": "jampackworldmusicinstruments",
+              "title": "Инструменты"
+            },
+            {
+              "id": "jampackworldmusicappleloops",
+              "title": "Apple Loops"
+            }
+          ]
+        },
+        {
+          "id": "jampackvoices",
+          "title": "Jam Pack Voices",
+          "sub": [
+            {
+              "id": "jampackvoicesinstruments",
+              "title": "Инструменты"
+            },
+            {
+              "id": "jampackvoicesappleloops",
+              "title": "Apple Loops"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

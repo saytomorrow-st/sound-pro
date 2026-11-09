@@ -42,6 +42,7 @@ pub mod nodes;
 pub mod pcm_cache;
 pub mod piano;
 pub mod sample_bank;
+pub mod sound_library;
 pub mod stream_loader;
 pub mod welcome;
 
