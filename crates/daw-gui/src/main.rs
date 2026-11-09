@@ -6,6 +6,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio_editor;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod shell;
 #[cfg(target_os = "linux")]
 mod x11_cursor;
@@ -462,15 +464,30 @@ fn main() -> eframe::Result {
             .with_title("Sound Pro")
             .with_inner_size([1200.0, 700.0])
             .with_min_inner_size([640.0, 360.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(app_icon()),
         ..Default::default()
     };
     let start = std::env::args_os().nth(1).map(PathBuf::from);
     eframe::run_native(
         "Sound Pro",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(start)))),
+        Box::new(move |_cc| {
+            #[allow(unused_mut)]
+            let mut app = App::new(start);
+            #[cfg(target_os = "macos")]
+            {
+                app.native_menu = Some(macos_menu::NativeMenu::install(&_cc.egui_ctx));
+            }
+            Ok(Box::new(app))
+        }),
     )
+}
+
+/// Window and Dock icon; without it eframe falls back to its own placeholder.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../packaging/sound-pro.png"))
+        .unwrap_or_default()
 }
 
 /// Whether a text field has the keyboard (SPEC-037). Any widget that was
@@ -725,6 +742,8 @@ type PendingBankLoad = (
 );
 
 struct App {
+    #[cfg(target_os = "macos")]
+    native_menu: Option<macos_menu::NativeMenu>,
     editor: Editor,
     /// Frames drawn so far; used by the `SOUND_PRO_SCREENSHOT` self-snapshot.
     frames: u32,
@@ -1020,6 +1039,8 @@ impl App {
         let (download_tx, download_rx) = std::sync::mpsc::channel();
         let (dialog_tx, dialog_rx) = std::sync::mpsc::channel();
         let mut app = Self {
+            #[cfg(target_os = "macos")]
+            native_menu: None,
             editor: Editor::new(),
             #[cfg(feature = "audio")]
             recorder: None,
@@ -2604,6 +2625,7 @@ impl App {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Файл", |ui| {
@@ -7378,6 +7400,9 @@ impl eframe::App for App {
             self.confirm_quit = true;
         }
 
+        #[cfg(target_os = "macos")]
+        self.poll_native_menu(ctx);
+        #[cfg(not(target_os = "macos"))]
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu(ui));
         egui::TopBottomPanel::top("transport")
             .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(6.0))
