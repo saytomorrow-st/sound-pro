@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "bear-sax",
+  "name": "Bear Sax",
+  "family": "winds",
+  "version": "1.004",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Bear Sax by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.bear-sax",
+  "sha256": "66c28ea361c86943b2e2bcda6ca48cf105fec4f60a8f40e7c6bbf584be45c654",
+  "size_bytes": 131505201,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.bear-sax/license?ref=v1.004",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.bear-sax/releases/download/v1.004/Karoryfer.Bear_Sax.v1.004.zip",
+    "sha256": "66c28ea361c86943b2e2bcda6ca48cf105fec4f60a8f40e7c6bbf584be45c654",
+    "size_bytes": 131505201,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Bear_Sax/Programs/1-solo-mono.sfz",
+  "format": "zip",
+  "verified": true
+}

@@ -14,6 +14,35 @@
   атрибуции. Прочее («не в SPDX») каталог не принимает без решения владельца.
 - Пометка «не подтверждено» — текст не найден или не прочитан.
 
+## Подтверждено (SHA-256 реальной загрузкой, 2026-11-09)
+
+Ниже — 19 банков Karoryfer (все CC0-1.0), добавленные в каталог. Для каждого
+скачан архив, посчитан SHA-256, проверено содержимое (`.sfz` + WAV/FLAC), а
+текст лицензии прочитан из первоисточника (`LICENSE` → «Creative Commons Legal
+Code»). Индивидуальные отчёты — `catalog/audit/<bank_id>.md`.
+
+| Банк (id) | Категория | size_bytes | SHA-256 (первые 16) | Формат сэмплов |
+|---|---|---|---|---|
+| virtuosity-drums | Drums | 1 227 151 376 | c6c5d0fe11a394e9 | wav, flac |
+| shinyguitar | Guitar | 368 411 844 | 23cf4030cbf9ce9e | wav |
+| black-and-green-guitars | Guitar | 481 838 512 | ba95221d32fb6386 | wav |
+| emilyguitar | Guitar | 103 484 350 | ffef3b2897276382 | wav |
+| meatbass | Bass | 255 425 351 | bc053061d4f39fb7 | wav |
+| fashionbass | Bass | 316 328 061 | 3beaa956b8ff97d9 | wav |
+| sneakybass | Bass | 340 462 855 | df57ef935f2d006d | wav |
+| ergo-eub | Bass | 200 612 492 | 21202ec315d0f2cf | wav |
+| dsmolken-double-bass | Bass | 265 232 156 | 380986bb52ee6b64 | wav |
+| string-cyborgs | Strings | 63 765 812 | 92974bfef97c7dfc | wav |
+| bigcat-cello | Strings | 132 605 500 | f340e2afc161de70 | wav |
+| bear-sax | Winds | 131 505 201 | 66c28ea361c86943 | wav |
+| weresax | Winds | 197 565 664 | 916dcb44b2ec8f03 | wav |
+| swirly-drums | Drums | 868 594 745 | dbeb1ad04052da1b | wav |
+| unruly-drums | Drums | 676 343 466 | 8d8d807557008865 | wav, flac |
+| big-rusty-drums | Drums | 619 600 370 | d4a9990acd19376d | wav, flac |
+| caveman-cosmonaut | Synth | 97 546 345 | e494eb1656b9d637 | wav |
+| cowsynth | Synth | 14 072 509 | 2c80a928db69280d | wav |
+| merry-orks | Voice | 40 439 723 | c5151c24a57fddfc | wav |
+
 ## Сводная таблица
 
 | Банк | Первоисточник текста лицензии | SPDX | В каталог | Атрибуция |

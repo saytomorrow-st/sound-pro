@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "emilyguitar",
+  "name": "Emilyguitar",
+  "family": "guitar",
+  "version": "1.001",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Emilyguitar by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.emilyguitar",
+  "sha256": "ffef3b28972763820bee73660a25cf47ea6e13b184342fd5d325a5631598cacb",
+  "size_bytes": 103484350,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.emilyguitar/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.emilyguitar/releases/download/v1.001/Karoryfer.Emilyguitar.v1.001.zip",
+    "sha256": "ffef3b28972763820bee73660a25cf47ea6e13b184342fd5d325a5631598cacb",
+    "size_bytes": 103484350,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Emilyguitar/emily_basic.sfz",
+  "format": "zip",
+  "verified": true
+}

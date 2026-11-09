@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "ergo-eub",
+  "name": "Ergo EUB",
+  "family": "bass",
+  "version": "1.001",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Ergo EUB by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.ergo",
+  "sha256": "21202ec315d0f2cffabc7453dafed24451d27657929d4d90860c85f55e42e049",
+  "size_bytes": 200612492,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.ergo/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.ergo/releases/download/v1.001/Karoryfer.Ergo_EUB.v1.001.zip",
+    "sha256": "21202ec315d0f2cffabc7453dafed24451d27657929d4d90860c85f55e42e049",
+    "size_bytes": 200612492,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Ergo_EUB/ergo_arco.sfz",
+  "format": "zip",
+  "verified": true
+}

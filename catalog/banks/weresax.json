@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "weresax",
+  "name": "Weresax",
+  "family": "winds",
+  "version": "1.003",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Weresax by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.weresax",
+  "sha256": "916dcb44b2ec8f03a3578c374dd1f1fdaa43e9e0264d921f65da2a339539d2ba",
+  "size_bytes": 197565664,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.weresax/license?ref=v1.003",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.weresax/releases/download/v1.003/Karoryfer.Weresax.v.1.003.zip",
+    "sha256": "916dcb44b2ec8f03a3578c374dd1f1fdaa43e9e0264d921f65da2a339539d2ba",
+    "size_bytes": 197565664,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Weresax/Programs/Sax.sfz",
+  "format": "zip",
+  "verified": true
+}

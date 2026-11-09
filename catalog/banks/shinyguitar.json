@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "shinyguitar",
+  "name": "Shinyguitar",
+  "family": "guitar",
+  "version": "1.002",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Shinyguitar by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.shinyguitar",
+  "sha256": "23cf4030cbf9ce9e2c84d7cbb1c022fbca124bfff0ad118a14eda7cf6c921d7b",
+  "size_bytes": 368411844,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.shinyguitar/license?ref=v1.002",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.shinyguitar/releases/download/v1.002/Karoryfer.Shinyguitar.v1.002.zip",
+    "sha256": "23cf4030cbf9ce9e2c84d7cbb1c022fbca124bfff0ad118a14eda7cf6c921d7b",
+    "size_bytes": 368411844,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Shinyguitar/Programs/acoustic.sfz",
+  "format": "zip",
+  "verified": true
+}

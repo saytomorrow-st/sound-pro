@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "unruly-drums",
+  "name": "Unruly Drums",
+  "family": "drums",
+  "version": "1.100",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Unruly Drums by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.unruly-drums",
+  "sha256": "8d8d8075570088658cfce5de6cc6df1fa1340cac9ec808da130e19b1463b1f90",
+  "size_bytes": 676343466,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.unruly-drums/license?ref=v1.100",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.unruly-drums/releases/download/v1.100/Unruly_Drums_1100.zip",
+    "sha256": "8d8d8075570088658cfce5de6cc6df1fa1340cac9ec808da130e19b1463b1f90",
+    "size_bytes": 676343466,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Programs/01-kit-sticks.sfz",
+  "format": "zip",
+  "verified": true
+}

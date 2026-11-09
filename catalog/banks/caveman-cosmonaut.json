@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "caveman-cosmonaut",
+  "name": "Caveman Cosmonaut",
+  "family": "synth",
+  "version": "1.001",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Caveman Cosmonaut by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.caveman-cosmonaut",
+  "sha256": "e494eb1656b9d637473a9782b68dacc33ea7edc535369965d333c4db5fb3fe21",
+  "size_bytes": 97546345,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.caveman-cosmonaut/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.caveman-cosmonaut/releases/download/v1.001/Karoryfer.Caveman_Cosmonaut.v1.001.zip",
+    "sha256": "e494eb1656b9d637473a9782b68dacc33ea7edc535369965d333c4db5fb3fe21",
+    "size_bytes": 97546345,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Caveman_Cosmonaut/Programs/main.sfz",
+  "format": "zip",
+  "verified": true
+}
