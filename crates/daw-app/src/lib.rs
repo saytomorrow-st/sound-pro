@@ -43,6 +43,7 @@ pub mod pcm_cache;
 pub mod piano;
 pub mod sample_bank;
 pub mod stream_loader;
+pub mod welcome;
 
 /// Errors from assembling a session graph (SPEC-010).
 ///

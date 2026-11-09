@@ -21,6 +21,7 @@ use audio_core::{
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
+use daw_app::welcome::{self, WelcomeStep};
 use daw_gui::layout::{Bottom, Layout, MeterState};
 use daw_gui::quantize::{Division, QuantizeMode, QuantizeParams};
 use daw_gui::timeline::{self, CycleHit};
@@ -55,6 +56,94 @@ const PIANO_HEIGHT: f32 = 280.0;
 const VELOCITY_LANE_HEIGHT: f32 = 80.0;
 /// Strength of notes drawn with the mouse.
 const NEW_VELOCITY: u8 = 100;
+
+// --- First-run welcome dialog (SPEC-…). Colours and sizes are named in one
+// place so the window can be tuned against the Logic Pro reference without
+// hunting through the draw code. ---
+
+/// Welcome dialog: warm dark background (the macOS-dialog brown).
+const WELCOME_BG: Color32 = Color32::from_rgb(46, 31, 28);
+/// Welcome dialog: dim backdrop behind the window.
+const WELCOME_BACKDROP: Color32 = Color32::from_black_alpha(120);
+/// Nearly-white title text.
+const WELCOME_TITLE: Color32 = Color32::from_rgb(237, 230, 228);
+/// Light-grey body text.
+const WELCOME_BODY: Color32 = Color32::from_rgb(220, 211, 208);
+/// Thin horizontal separator above the bottom panel.
+const WELCOME_SEPARATOR: Color32 = Color32::from_rgb(74, 63, 61);
+/// Secondary (grey) button fill.
+const WELCOME_BUTTON_BG: Color32 = Color32::from_rgb(92, 83, 82);
+/// Button label colour.
+const WELCOME_BUTTON_TEXT: Color32 = Color32::from_rgb(237, 230, 228);
+/// Primary (blue) button fill and progress-bar fill.
+const WELCOME_PRIMARY: Color32 = Color32::from_rgb(10, 108, 224);
+/// Progress-bar track.
+const WELCOME_TRACK: Color32 = Color32::from_rgb(74, 63, 61);
+/// Dialog width and height in points.
+const WELCOME_SIZE: Vec2 = Vec2::new(654.0, 387.0);
+/// App icon side in points.
+const WELCOME_ICON: f32 = 120.0;
+/// Left margin of the icon / text block.
+const WELCOME_MARGIN: f32 = 48.0;
+/// Title font size in points.
+const WELCOME_TITLE_SIZE: f32 = 28.0;
+/// Body font size in points.
+const WELCOME_BODY_SIZE: f32 = 12.0;
+/// Corner radius of the dialog and of buttons.
+const WELCOME_CORNER: u8 = 5;
+/// Height of the bottom panel (buttons / progress bar) below the separator.
+const WELCOME_FOOTER_H: f32 = 56.0;
+/// Download-icon gradient stops (top-left -> centre -> bottom-right).
+const WELCOME_ICON_GRADIENT_TL: Color32 = Color32::from_rgb(255, 154, 74);
+const WELCOME_ICON_GRADIENT_C: Color32 = Color32::from_rgb(242, 104, 110);
+const WELCOME_ICON_GRADIENT_BR: Color32 = Color32::from_rgb(107, 181, 216);
+
+/// A user action on the welcome dialog. The pure transition in
+/// [`welcome_transition`] maps each action to the next step, so the UI and the
+/// tests share one source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WelcomeAction {
+    /// «Полный режим» — proceed to the download step.
+    FullMode,
+    /// «Упрощённый режим» — show the «Скоро» notice, keep the window open.
+    SimplifiedMode,
+    /// «Подробнее…» — show the «Скоро» notice, keep the window open.
+    Details,
+    /// «Закрыть» / «Загрузить позже» — finish the flow.
+    Close,
+}
+
+/// The result of applying a welcome action: the next step and whether the
+/// «Скоро» notice should be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WelcomeTransition {
+    step: WelcomeStep,
+    soon: bool,
+}
+
+/// Pure welcome-flow state machine. «Упрощённый режим» and «Подробнее…» leave
+/// the step unchanged and ask for the «Скоро» notice; «Полный режим» advances
+/// to the download step; any close action on the download step completes the
+/// flow.
+#[must_use]
+fn welcome_transition(step: WelcomeStep, action: WelcomeAction) -> WelcomeTransition {
+    match action {
+        WelcomeAction::FullMode => WelcomeTransition {
+            step: WelcomeStep::Download,
+            soon: false,
+        },
+        WelcomeAction::SimplifiedMode | WelcomeAction::Details => {
+            WelcomeTransition { step, soon: true }
+        }
+        WelcomeAction::Close => WelcomeTransition {
+            step: match step {
+                WelcomeStep::Welcome => WelcomeStep::Welcome,
+                WelcomeStep::Download | WelcomeStep::Done => WelcomeStep::Done,
+            },
+            soon: false,
+        },
+    }
+}
 
 /// A note being dragged in the piano roll.
 #[derive(Clone, Copy)]
@@ -469,12 +558,27 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     let start = std::env::args_os().nth(1).map(PathBuf::from);
+    // First-run welcome: shown only when the persisted step is not Done. Tests
+    // build `App::new` directly, which leaves `welcome_open` off. For the
+    // screenshot self-test, `SOUND_PRO_SHOW_WELCOME=1|2` forces the dialog open
+    // at the requested step regardless of the saved state.
+    let welcome_override =
+        std::env::var("SOUND_PRO_SHOW_WELCOME")
+            .ok()
+            .and_then(|v| match v.as_str() {
+                "1" => Some(WelcomeStep::Welcome),
+                "2" => Some(WelcomeStep::Download),
+                _ => None,
+            });
     eframe::run_native(
         "Sound Pro",
         options,
         Box::new(move |_cc| {
             #[allow(unused_mut)]
             let mut app = App::new(start);
+            let step = welcome_override.unwrap_or(app.audio.welcome);
+            app.welcome_open = !step.is_done();
+            app.welcome_step = step;
             #[cfg(target_os = "macos")]
             {
                 app.native_menu = Some(macos_menu::NativeMenu::install(&_cc.egui_ctx));
@@ -488,6 +592,86 @@ fn main() -> eframe::Result {
 fn app_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../../../packaging/sound-pro.png"))
         .unwrap_or_default()
+}
+
+/// Loads the app icon (an RGBA PNG with rounded corners baked in) as an egui
+/// texture, once.
+fn load_welcome_icon(ctx: &egui::Context) -> egui::TextureHandle {
+    let icon = app_icon();
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    ctx.load_texture("welcome-app-icon", image, egui::TextureOptions::LINEAR)
+}
+
+/// Draws a rounded, borderless button with `bg` fill and `text` colour. Button
+/// hits are checked by the caller via `rect_contains_pointer`.
+fn welcome_button(ui: &egui::Ui, rect: Rect, bg: Color32, text_color: Color32, label: &str) {
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(WELCOME_CORNER), bg);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(WELCOME_BODY_SIZE),
+        text_color,
+    );
+}
+
+/// Paints the download-step icon: a rounded square with a diagonal gradient
+/// (orange top-left → pink centre → blue bottom-right) and a white ring with a
+/// downward arrow in the middle, all drawn programmatically (no images).
+fn draw_download_icon(painter: &egui::Painter, rect: Rect) {
+    // Round the square by clipping to a rounded-rect mask, then draw the
+    // diagonal gradient as two triangles across the square.
+    // Round the square by clipping to a rounded-rect mask, then draw the
+    // diagonal gradient as two triangles across the square.
+    let rounded = painter.with_clip_rect(rect);
+    rounded.rect_filled(rect, CornerRadius::same(14), WELCOME_TRACK);
+    let tl = rect.left_top();
+    let tr = rect.right_top();
+    let bl = rect.left_bottom();
+    let br = rect.right_bottom();
+    let mut mesh = egui::Mesh::default();
+    let idx = mesh.vertices.len() as u32;
+    mesh.colored_vertex(tl, WELCOME_ICON_GRADIENT_TL);
+    mesh.colored_vertex(tr, WELCOME_ICON_GRADIENT_C);
+    mesh.colored_vertex(bl, WELCOME_ICON_GRADIENT_C);
+    mesh.colored_vertex(br, WELCOME_ICON_GRADIENT_BR);
+    // Two triangles: TL-TR-BL (orange→pink→pink) and TR-BL-BR (pink→pink→blue).
+    mesh.add_triangle(idx, idx + 1, idx + 2);
+    mesh.add_triangle(idx + 1, idx + 2, idx + 3);
+    rounded.add(egui::Shape::mesh(std::sync::Arc::new(mesh)));
+
+    // White ring + downward arrow, centred.
+    let c = rect.center();
+    let r = rect.width() * 0.24;
+    rounded.circle_stroke(c, r, Stroke::new(3.0_f32, Color32::WHITE));
+    let arrow_y_top = c.y - r * 0.5;
+    let arrow_y_bottom = c.y + r * 0.5;
+    let shaft_x = c.x;
+    rounded.line_segment(
+        [
+            Pos2::new(shaft_x, arrow_y_top),
+            Pos2::new(shaft_x, arrow_y_bottom),
+        ],
+        Stroke::new(3.0_f32, Color32::WHITE),
+    );
+    rounded.line_segment(
+        [
+            Pos2::new(shaft_x, arrow_y_bottom),
+            Pos2::new(shaft_x - r * 0.35, arrow_y_bottom - r * 0.35),
+        ],
+        Stroke::new(3.0_f32, Color32::WHITE),
+    );
+    rounded.line_segment(
+        [
+            Pos2::new(shaft_x, arrow_y_bottom),
+            Pos2::new(shaft_x + r * 0.35, arrow_y_bottom - r * 0.35),
+        ],
+        Stroke::new(3.0_f32, Color32::WHITE),
+    );
 }
 
 /// Whether a text field has the keyboard (SPEC-037). Any widget that was
@@ -893,6 +1077,16 @@ struct App {
     credits_open: bool,
     /// The first-run dialog is open (SPEC-066).
     first_run_open: bool,
+    /// The welcome dialog flow is open, and its current step. Defaults to
+    /// closed; only `main()` turns it on, so `App::new` in tests never shows it.
+    welcome_open: bool,
+    /// Current step of the welcome flow, mirroring `self.audio.welcome` while
+    /// the dialog is open.
+    welcome_step: WelcomeStep,
+    /// App icon as a texture, loaded lazily once for the welcome dialog.
+    welcome_icon: Option<egui::TextureHandle>,
+    /// «Скоро» notice is showing inside the welcome dialog.
+    welcome_soon: bool,
     /// Installed banks from the registry, refreshed when the window opens.
     installed_banks: Vec<daw_app::bank_library::InstalledBank>,
     /// A bank being loaded on a background thread after the user picked it in
@@ -1131,6 +1325,10 @@ impl App {
             library_open: false,
             credits_open: false,
             first_run_open: false,
+            welcome_open: false,
+            welcome_step: WelcomeStep::Welcome,
+            welcome_icon: None,
+            welcome_soon: false,
             installed_banks: Vec::new(),
             pending_bank_load: None,
             library_status: String::new(),
@@ -7029,6 +7227,327 @@ impl App {
         }
     }
 
+    /// The first-run welcome flow (SPEC-…): a modal-ish, borderless window
+    /// modelled on Logic Pro's «Welcome to Logic Pro». Step `Welcome` shows the
+    /// choice («Упрощённый режим» / «Полный режим»); step `Download` shows the
+    /// «Загрузка основных звуков» step after «Полный режим».
+    fn welcome_window(&mut self, ctx: &egui::Context) {
+        if !self.welcome_open {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let mut action = None;
+
+        // Dim the app behind the dialog.
+        egui::Area::new(egui::Id::new("welcome-backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, CornerRadius::ZERO, WELCOME_BACKDROP);
+            });
+
+        let dialog_rect = Rect::from_center_size(screen.center(), WELCOME_SIZE);
+        egui::Area::new(egui::Id::new("welcome-dialog"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(dialog_rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(WELCOME_SIZE);
+                let painter = ui.painter();
+                painter.rect_filled(dialog_rect, CornerRadius::same(WELCOME_CORNER), WELCOME_BG);
+                let content = dialog_rect.shrink2(Vec2::new(WELCOME_MARGIN, WELCOME_MARGIN));
+                self.welcome_body(ui, content, &mut action);
+                self.welcome_footer(ui, content, &mut action);
+            });
+
+        if let Some(a) = action {
+            self.apply_welcome_action(a);
+        }
+    }
+
+    /// The icon + title + paragraphs for the current welcome step, laid out in
+    /// `content`. Pushes a [`WelcomeAction`] into `action` when a button is
+    /// clicked.
+    fn welcome_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        content: Rect,
+        action: &mut Option<WelcomeAction>,
+    ) {
+        let icon_size = Vec2::splat(WELCOME_ICON);
+        let icon_rect = Rect::from_min_size(content.min, icon_size);
+        let text_left = icon_rect.max.x + WELCOME_MARGIN;
+
+        match self.welcome_step {
+            WelcomeStep::Welcome => {
+                // App icon (rounded square, alpha baked into the PNG).
+                if self.welcome_icon.is_none() {
+                    self.welcome_icon = Some(load_welcome_icon(ui.ctx()));
+                }
+                if let Some(tex) = &self.welcome_icon {
+                    ui.painter().image(
+                        tex.id(),
+                        icon_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                let title_rect = Rect::from_min_max(
+                    Pos2::new(text_left, content.min.y),
+                    Pos2::new(content.max.x, content.min.y + WELCOME_TITLE_SIZE),
+                );
+                ui.painter().text(
+                    title_rect.left_top(),
+                    egui::Align2::LEFT_TOP,
+                    "Добро пожаловать в Sound Pro",
+                    FontId::proportional(WELCOME_TITLE_SIZE),
+                    WELCOME_TITLE,
+                );
+                let body = [
+                    "Выберите, как вы хотите пользоваться приложением.",
+                    "Опытным пользователям подойдёт полный режим: он включает весь набор профессиональных инструментов.",
+                    "Новичкам подойдёт упрощённый режим: он оставляет только основные возможности для создания музыки.",
+                ];
+                let mut y = title_rect.max.y + 12.0;
+                for line in body {
+                    let galley = ui.painter().layout_no_wrap(
+                        line.to_owned(),
+                        FontId::proportional(WELCOME_BODY_SIZE),
+                        WELCOME_BODY,
+                    );
+                    let max_width = content.max.x - text_left;
+                    let galley = if galley.size().x > max_width {
+                        ui.painter().layout(
+                            line.to_owned(),
+                            FontId::proportional(WELCOME_BODY_SIZE),
+                            WELCOME_BODY,
+                            max_width,
+                        )
+                    } else {
+                        galley
+                    };
+                    let pos = Pos2::new(text_left, y);
+                    y += galley.size().y + 6.0;
+                    ui.painter().galley(pos, galley, WELCOME_BODY);
+                    if line != body[0] {
+                        y += 6.0;
+                    }
+                }
+                // «Подробнее…» — left-aligned grey button under the text.
+                let btn_rect =
+                    Rect::from_min_size(Pos2::new(text_left, y + 6.0), Vec2::new(120.0, 28.0));
+                welcome_button(
+                    ui,
+                    btn_rect,
+                    WELCOME_BUTTON_BG,
+                    WELCOME_BUTTON_TEXT,
+                    "Подробнее…",
+                );
+                if ui.rect_contains_pointer(btn_rect) && ui.input(|i| i.pointer.primary_clicked()) {
+                    *action = Some(WelcomeAction::Details);
+                }
+            }
+            WelcomeStep::Download => {
+                draw_download_icon(ui.painter(), icon_rect);
+                ui.painter().text(
+                    Pos2::new(text_left, content.min.y),
+                    egui::Align2::LEFT_TOP,
+                    "Загрузка основных звуков",
+                    FontId::proportional(WELCOME_TITLE_SIZE),
+                    WELCOME_TITLE,
+                );
+                let body = "Для начала работы Sound Pro загружает основной набор инструментов и лупов. Это может занять до часа в зависимости от скорости вашего интернета.";
+                let max_width = content.max.x - text_left;
+                let galley = ui.painter().layout(
+                    body.to_owned(),
+                    FontId::proportional(WELCOME_BODY_SIZE),
+                    WELCOME_BODY,
+                    max_width,
+                );
+                ui.painter().galley(
+                    Pos2::new(text_left, content.min.y + WELCOME_TITLE_SIZE + 12.0),
+                    galley,
+                    WELCOME_BODY,
+                );
+            }
+            WelcomeStep::Done => {}
+        }
+
+        if self.welcome_soon {
+            ui.painter().text(
+                Pos2::new(content.min.x, content.max.y - WELCOME_FOOTER_H),
+                egui::Align2::LEFT_BOTTOM,
+                "Скоро",
+                FontId::proportional(WELCOME_BODY_SIZE),
+                WELCOME_BODY,
+            );
+        }
+    }
+
+    /// The bottom panel: a thin full-width separator above a footer with the
+    /// step-specific buttons. Pushes a [`WelcomeAction`] on click.
+    fn welcome_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+        content: Rect,
+        action: &mut Option<WelcomeAction>,
+    ) {
+        // Separator across the full dialog width.
+        let sep_y = content.max.y - WELCOME_FOOTER_H - 1.0;
+        ui.painter().line_segment(
+            [
+                Pos2::new(content.min.x, sep_y),
+                Pos2::new(content.max.x, sep_y),
+            ],
+            Stroke::new(1.0_f32, WELCOME_SEPARATOR),
+        );
+
+        let footer = Rect::from_min_max(
+            Pos2::new(content.min.x, sep_y + 1.0),
+            Pos2::new(content.max.x, content.max.y),
+        );
+
+        match self.welcome_step {
+            WelcomeStep::Welcome => {
+                // Right-aligned: «Упрощённый режим» then «Полный режим» (primary).
+                let full_w = 130.0;
+                let simple_w = 150.0;
+                let gap = 12.0;
+                let btn_h = 28.0;
+                let y = footer.center().y - btn_h / 2.0;
+                let full_rect = Rect::from_min_size(
+                    Pos2::new(footer.max.x - full_w, y),
+                    Vec2::new(full_w, btn_h),
+                );
+                let simple_rect = Rect::from_min_size(
+                    Pos2::new(full_rect.min.x - gap - simple_w, y),
+                    Vec2::new(simple_w, btn_h),
+                );
+                welcome_button(
+                    ui,
+                    simple_rect,
+                    WELCOME_BUTTON_BG,
+                    WELCOME_BUTTON_TEXT,
+                    "Упрощённый режим",
+                );
+                welcome_button(
+                    ui,
+                    full_rect,
+                    WELCOME_PRIMARY,
+                    WELCOME_BUTTON_TEXT,
+                    "Полный режим",
+                );
+                if ui.rect_contains_pointer(simple_rect)
+                    && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::SimplifiedMode);
+                }
+                if ui.rect_contains_pointer(full_rect) && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::FullMode);
+                }
+            }
+            WelcomeStep::Download => {
+                // Left: thin progress bar (~57% width) + caption; right: two buttons.
+                let (received, total) = self.welcome_download_progress();
+                let bar_w = footer.width() * 0.57;
+                let bar_h = 6.0;
+                let bar_rect = Rect::from_min_size(
+                    Pos2::new(footer.min.x, footer.center().y - bar_h / 2.0 - 8.0),
+                    Vec2::new(bar_w, bar_h),
+                );
+                let fraction = welcome::progress_fraction(received, total);
+                ui.painter()
+                    .rect_filled(bar_rect, CornerRadius::same(3), WELCOME_TRACK);
+                if fraction > 0.0 {
+                    let fill =
+                        Rect::from_min_size(bar_rect.min, Vec2::new(bar_w * fraction, bar_h));
+                    ui.painter()
+                        .rect_filled(fill, CornerRadius::same(3), WELCOME_PRIMARY);
+                }
+                let caption = welcome::download_progress_text(received, total);
+                ui.painter().text(
+                    Pos2::new(footer.min.x, bar_rect.max.y + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    caption,
+                    FontId::proportional(WELCOME_BODY_SIZE),
+                    WELCOME_BODY,
+                );
+
+                let close_w = 110.0;
+                let later_w = 150.0;
+                let gap = 12.0;
+                let btn_h = 28.0;
+                let y = footer.center().y - btn_h / 2.0;
+                let close_rect = Rect::from_min_size(
+                    Pos2::new(footer.max.x - close_w, y),
+                    Vec2::new(close_w, btn_h),
+                );
+                let later_rect = Rect::from_min_size(
+                    Pos2::new(close_rect.min.x - gap - later_w, y),
+                    Vec2::new(later_w, btn_h),
+                );
+                welcome_button(
+                    ui,
+                    later_rect,
+                    WELCOME_BUTTON_BG,
+                    WELCOME_BUTTON_TEXT,
+                    "Загрузить позже",
+                );
+                welcome_button(
+                    ui,
+                    close_rect,
+                    WELCOME_PRIMARY,
+                    WELCOME_BUTTON_TEXT,
+                    "Закрыть",
+                );
+                if ui.rect_contains_pointer(later_rect) && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::Close);
+                }
+                if ui.rect_contains_pointer(close_rect) && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::Close);
+                }
+            }
+            WelcomeStep::Done => {}
+        }
+    }
+
+    /// The bytes downloaded / total for the download step. Wired to the live
+    /// bank-download state (the only downloader the app has); empty when no
+    /// download is running, so by default this step shows a stub at `0 МБ из
+    /// 0,00 ГБ` until a real «основной набор» downloader is added.
+    fn welcome_download_progress(&self) -> (u64, u64) {
+        let mut received = 0_u64;
+        let mut total = 0_u64;
+        for state in self.downloads.values() {
+            received += state.progress.bytes();
+            total += state.progress.total();
+        }
+        (received, total)
+    }
+
+    /// Applies a welcome action, advancing the pure state machine and
+    /// persisting the step outside any realtime path.
+    fn apply_welcome_action(&mut self, action: WelcomeAction) {
+        let t = welcome_transition(self.welcome_step, action);
+        self.welcome_soon = t.soon;
+        if t.step != self.welcome_step {
+            self.welcome_step = t.step;
+            self.audio.welcome = t.step;
+            if let Some(path) = &self.audio_path
+                && let Err(e) = self.audio.save(path)
+            {
+                self.status = format!("Не удалось сохранить настройки: {e}");
+            }
+        }
+        if t.step.is_done() {
+            self.welcome_open = false;
+        }
+    }
+
     /// The audio settings window (SPEC-033): output, input, buffer size.
     fn audio_window(&mut self, ctx: &egui::Context) {
         if !self.audio_open {
@@ -7476,6 +7995,7 @@ impl eframe::App for App {
         self.credits_window(ctx);
         self.install_license_window(ctx);
         self.first_run_window(ctx);
+        self.welcome_window(ctx);
         self.download_accept_window(ctx);
         self.new_track_window(ctx);
         self.export_window(ctx);
@@ -8592,6 +9112,92 @@ mod sound_library_tests {
         let mut app = App::new(None);
         app.open_library();
         assert!(app.library_open);
+    }
+}
+
+#[cfg(test)]
+mod welcome_tests {
+    use super::*;
+
+    #[test]
+    fn simplified_keeps_welcome_and_shows_soon() {
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::SimplifiedMode);
+        assert_eq!(t.step, WelcomeStep::Welcome);
+        assert!(t.soon);
+        assert!(!t.step.is_done());
+    }
+
+    #[test]
+    fn details_keeps_step_and_shows_soon() {
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::Details);
+        assert_eq!(t.step, WelcomeStep::Welcome);
+        assert!(t.soon);
+    }
+
+    #[test]
+    fn full_mode_advances_to_download() {
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::FullMode);
+        assert_eq!(t.step, WelcomeStep::Download);
+        assert!(!t.soon);
+        assert!(!t.step.is_done());
+    }
+
+    #[test]
+    fn close_on_download_completes_flow() {
+        let t = welcome_transition(WelcomeStep::Download, WelcomeAction::Close);
+        assert_eq!(t.step, WelcomeStep::Done);
+        assert!(!t.soon);
+        assert!(t.step.is_done());
+    }
+
+    #[test]
+    fn close_on_welcome_stays_welcome() {
+        // «Загрузить позже»/«Закрыть» on the choice step should not occur via
+        // the UI, but the pure function stays total and idempotent.
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::Close);
+        assert_eq!(t.step, WelcomeStep::Welcome);
+        assert!(!t.soon);
+    }
+
+    #[test]
+    fn welcome_window_renders_headlessly() {
+        let mut app = App::new(None);
+        app.welcome_open = true;
+        app.welcome_step = WelcomeStep::Welcome;
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.welcome_window(ctx);
+        });
+        assert!(app.welcome_open);
+        assert_eq!(app.welcome_step, WelcomeStep::Welcome);
+    }
+
+    #[test]
+    fn download_step_renders_headlessly() {
+        let mut app = App::new(None);
+        app.welcome_open = true;
+        app.welcome_step = WelcomeStep::Download;
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.welcome_window(ctx);
+        });
+        assert!(app.welcome_open);
+        assert_eq!(app.welcome_step, WelcomeStep::Download);
+    }
+
+    #[test]
+    fn app_new_defaults_welcome_closed() {
+        let app = App::new(None);
+        assert!(!app.welcome_open);
+        assert_eq!(app.welcome_step, WelcomeStep::Welcome);
     }
 }
 

@@ -10,6 +10,7 @@ fn full() -> AudioSettings {
         buffer_frames: Some(256),
         interpolation: audio_core::Interpolation::Hermite4,
         log_level: LogLevel::default(),
+        welcome: daw_app::welcome::WelcomeStep::Done,
     }
 }
 
