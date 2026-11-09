@@ -608,6 +608,7 @@ dependencies = [
  "bzip2",
  "cpal",
  "crc32fast",
+ "flate2",
  "fs2",
  "hound",
  "rtrb",

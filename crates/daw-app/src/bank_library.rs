@@ -127,7 +127,7 @@ pub struct CatalogEntry {
     /// `None` to use a breadth-first search (loader fallback).
     #[serde(default)]
     pub sfz: Option<String>,
-    /// Archive container: `"zip"` or `"tar.bz2"`.
+    /// Archive container: `"zip"`, `"tar.bz2"`, or `"tar.gz"`.
     #[serde(default)]
     pub format: String,
 }
@@ -415,7 +415,7 @@ fn validate_download(entry: &CatalogEntry) -> Result<(), CatalogError> {
         }
     }
     match entry.format.as_str() {
-        "zip" | "tar.bz2" => {}
+        "zip" | "tar.bz2" | "tar.gz" => {}
         other => return Err(CatalogError::BadFormat(other.to_owned(), entry.id.clone())),
     }
     Ok(())
@@ -1493,6 +1493,18 @@ mod tests {
             validate_catalog_entry(&e),
             Err(CatalogError::BadFormat(_, _))
         ));
+    }
+
+    #[test]
+    fn tar_gz_format_is_accepted() {
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
+        for fmt in ["zip", "tar.bz2", "tar.gz"] {
+            e.format = fmt.to_owned();
+            assert!(
+                validate_catalog_entry(&e).is_ok(),
+                "format {fmt:?} should be accepted"
+            );
+        }
     }
 
     #[test]

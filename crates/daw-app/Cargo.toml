@@ -42,6 +42,9 @@ sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 bzip2 = "0.5"
+# SPEC-076: tar.gz support (gzip decoder). Pure-Rust `rust_backend` (miniz_oxide)
+# so no `unsafe` reaches `audio-core`; already in the tree via `ureq`.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # RFC-002 §5–6: sample-bank PCM cache integrity. xxh3-128 is the fast
 # non-cryptographic hash for routine corruption checks; blake3 is the optional
 # strong hash computed at cache build time and on demand (L3). crc32fast
@@ -61,6 +64,7 @@ fs2 = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 bzip2 = "0.5"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sha2 = "0.10"
 # Scoped temp dirs for integration tests (no reliance on /tmp naming).
 tempfile = "3"

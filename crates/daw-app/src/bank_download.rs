@@ -699,7 +699,12 @@ fn unpack_archive(
 ) -> Result<(), DownloadError> {
     match format {
         "zip" => unpack_zip(archive, dest, cancel, limits, None),
-        "tar.bz2" => unpack_tar_bz2(archive, dest, cancel, limits),
+        "tar.bz2" => unpack_tar(archive, dest, cancel, limits, |file| {
+            Box::new(bzip2::read::BzDecoder::new(file))
+        }),
+        "tar.gz" => unpack_tar(archive, dest, cancel, limits, |file| {
+            Box::new(flate2::read::GzDecoder::new(file))
+        }),
         other => Err(DownloadError::UnsupportedFormat(other.to_owned())),
     }
 }
@@ -861,15 +866,16 @@ fn is_non_regular_zip<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     }
 }
 
-fn unpack_tar_bz2(
+fn unpack_tar(
     archive: &Path,
     dest: &Path,
     cancel: &Arc<AtomicBool>,
     limits: &Limits,
+    wrap: impl FnOnce(std::fs::File) -> Box<dyn Read>,
 ) -> Result<(), DownloadError> {
     let file = std::fs::File::open(archive)
         .map_err(|e| DownloadError::Io(archive.to_path_buf(), e.to_string()))?;
-    let decoder = bzip2::read::BzDecoder::new(file);
+    let decoder = wrap(file);
     let mut tar = tar::Archive::new(decoder);
 
     let mut state = UnpackState::new();
@@ -2037,6 +2043,35 @@ mod http_tests {
         out
     }
 
+    /// Build a `.tar.gz` archive (gzip-compressed tar), used to exercise the
+    /// `tar.gz` unpack path (SPEC-076).
+    fn make_tar_gz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut builder = tar::Builder::new(&mut cursor);
+            for (name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, *name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        gzip_bytes(&cursor.into_inner())
+    }
+
+    fn gzip_bytes(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut out, flate2::Compression::default());
+            enc.write_all(raw).unwrap();
+            enc.finish().unwrap();
+        }
+        out
+    }
+
     /// Rewrites the first central-directory entry's `uncompressed_size` field
     /// (offset +24 within the central header) to `forged`, so `ZipFile::size()`
     /// understates the actual stored bytes. This models an archive that lies
@@ -2773,6 +2808,66 @@ mod http_tests {
             hash,
         );
         let banks = temp_banks_dir("dup");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+    }
+
+    #[test]
+    fn tar_gz_archive_unpacks() {
+        let archive = make_tar_gz_bytes(&[
+            ("bank/bank.sfz", b"<region> sample=bank.wav"),
+            ("bank/bank.wav", b"RIFFfake"),
+        ]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.gz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-gz");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        let bank = result.expect("tar.gz download succeeds");
+        assert_eq!(bank.id, "test-bank");
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+        let leftover = std::fs::read_dir(&banks)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+    }
+
+    #[test]
+    fn tar_gz_duplicate_entry_is_rejected() {
+        let archive = make_tar_gz_bytes(&[("bank/bank.sfz", b"one"), ("bank/bank.sfz", b"two")]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.gz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-gz-dup");
         let result =
             download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
         assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
