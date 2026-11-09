@@ -93,6 +93,15 @@ impl Package {
     pub fn is_leaf(&self) -> bool {
         self.bank.is_some() && self.children.is_empty()
     }
+
+    /// The license class label for a leaf bank, or `None` for a group.
+    /// Shown as a small badge next to the «Статус» column.
+    #[must_use]
+    pub fn license_label(&self) -> Option<&'static str> {
+        self.bank
+            .as_ref()
+            .map(|b| bank_library::license_class(&b.license.spdx).label())
+    }
 }
 
 /// The raw, on-disk sound-library data file (embedded via `include_str!`).
@@ -457,6 +466,16 @@ impl SoundLibrary {
             self.collect_selected_leaves(child, out);
         }
     }
+
+    /// Whether any currently-selected downloadable bank has a non-commercial
+    /// (`NC`) license, which requires a warning before install (SPEC-076 §9).
+    #[must_use]
+    pub fn selected_has_non_commercial(&self) -> bool {
+        self.selected_downloadable_banks().iter().any(|b| {
+            bank_library::license_class(&b.license.spdx)
+                == bank_library::LicenseClass::NonCommercial
+        })
+    }
 }
 
 fn find_in<'a>(nodes: &'a [Package], id: &str) -> Option<&'a Package> {
@@ -640,5 +659,24 @@ mod tests {
             SoundLibraryError::UnknownBank("nope".to_owned(), "x".to_owned()),
             SoundLibraryError::UnknownBank(_, _)
         ));
+    }
+
+    #[test]
+    fn leaf_license_label_matches_catalog_class() {
+        let lib = library();
+        let salamander = lib.find("salamander-grand-v3").expect("leaf");
+        assert_eq!(salamander.license_label(), Some("Нужно указать автора"));
+        let osiris = lib.find("osiris-piano").expect("leaf");
+        assert_eq!(osiris.license_label(), Some("Свободно"));
+        let piano = lib.find("piano").expect("group");
+        assert_eq!(piano.license_label(), None);
+    }
+
+    #[test]
+    fn selected_has_non_commercial_is_false_without_nc_banks() {
+        let mut lib = library();
+        let _ = lib.select_all_uninstalled();
+        // The current catalog has no NC banks.
+        assert!(!lib.selected_has_non_commercial());
     }
 }

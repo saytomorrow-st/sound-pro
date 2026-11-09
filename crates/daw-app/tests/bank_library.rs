@@ -46,11 +46,14 @@ fn catalog_has_exactly_two_known_entries() {
 
 #[test]
 fn catalog_rejects_forbidden_licenses() {
+    // Only GPL and share-alike (CC-BY-SA etc.) are forbidden. Non-commercial
+    // (NC) is allowed with a label, and ND is not forbidden either.
     for spdx in [
-        "CC-BY-NC-4.0",
-        "CC-BY-ND-4.0",
         "CC-BY-SA-4.0",
+        "CC-BY-SA-3.0",
         "GPL-3.0-only",
+        "LGPL-3.0-only",
+        "AGPL-3.0-only",
     ] {
         let mut value: serde_json::Value = serde_json::from_str(&valid_entry_json()).unwrap();
         value["license"]["spdx"] = serde_json::Value::String(spdx.to_owned());
@@ -60,6 +63,21 @@ fn catalog_rejects_forbidden_licenses() {
             "{spdx} must be rejected from the catalog"
         );
     }
+}
+
+#[test]
+fn catalog_allows_non_commercial_license() {
+    // NC is now permitted (SPEC-076 policy change) and classified as
+    // NonCommercial rather than rejected.
+    let mut value: serde_json::Value = serde_json::from_str(&valid_entry_json()).unwrap();
+    value["license"]["spdx"] = serde_json::Value::String("CC-BY-NC-4.0".to_owned());
+    value["attribution"] = serde_json::Value::String("Test Author".to_owned());
+    let entry = parse_catalog_entry(&value.to_string()).expect("NC must be accepted");
+    assert_eq!(entry.license.spdx, "CC-BY-NC-4.0");
+    assert_eq!(
+        daw_app::bank_library::license_class(&entry.license.spdx),
+        daw_app::bank_library::LicenseClass::NonCommercial
+    );
 }
 
 #[test]

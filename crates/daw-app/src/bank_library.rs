@@ -33,7 +33,8 @@ pub enum CatalogError {
     /// A required field is missing or empty.
     #[error("missing or empty field {0:?} in catalog entry {1:?}")]
     MissingField(&'static str, String),
-    /// The SPDX license identifier is not recognised or not allowed.
+    /// The SPDX license identifier is share-alike or GPL-like, which the
+    /// catalog never hosts (non-commercial `NC` is allowed with a warning).
     #[error("license {0:?} is not allowed in the catalog")]
     ForbiddenLicense(String),
     /// A CC-BY entry is missing its mandatory attribution.
@@ -258,18 +259,65 @@ fn requires_attribution(spdx: &str) -> bool {
     spdx == "CC-BY-3.0" || spdx == "CC-BY-4.0"
 }
 
+/// Three-way license classification shown in the catalog and library UI
+/// (owner decision): free to use, must credit the author, or non-commercial
+/// only. Derived purely from the SPDX identifier so it needs no extra field in
+/// the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LicenseClass {
+    /// CC0 / Public Domain — no obligation.
+    Free,
+    /// CC-BY / MIT and similar — the author must be credited.
+    Attribution,
+    /// CC-*-NC — non-commercial use only (allowed, with a warning label).
+    NonCommercial,
+}
+
+impl LicenseClass {
+    /// The Russian label shown next to a bank in the catalog/library UI.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Free => "Свободно",
+            Self::Attribution => "Нужно указать автора",
+            Self::NonCommercial => "Только некоммерческое",
+        }
+    }
+}
+
+/// Classifies an SPDX identifier into one of the three license classes.
+///
+/// * `NC` → [`LicenseClass::NonCommercial`];
+/// * CC0/Unlicense/WTFPL/0BSD/Public Domain → [`LicenseClass::Free`];
+/// * everything else (CC-BY, MIT, BSD, …) → [`LicenseClass::Attribution`].
+#[must_use]
+pub fn license_class(spdx: &str) -> LicenseClass {
+    if spdx.contains("NC") {
+        LicenseClass::NonCommercial
+    } else if is_free_license(spdx) {
+        LicenseClass::Free
+    } else {
+        LicenseClass::Attribution
+    }
+}
+
+/// SPDX identifiers with no obligations (CC0 / Public Domain and close kin).
+fn is_free_license(spdx: &str) -> bool {
+    spdx.starts_with("CC0")
+        || spdx.starts_with("Unlicense")
+        || spdx.starts_with("WTFPL")
+        || spdx.starts_with("0BSD")
+        || spdx.contains("Public")
+}
+
 /// SPDX identifiers that are share-alike or GPL-like: only allowed as a local
-/// import with an acknowledgement, never in the catalog.
+/// import with an acknowledgement, never in the catalog. This is the complete
+/// set of forbidden licenses (owner decision); non-commercial `NC` is allowed.
 pub fn is_share_alike(spdx: &str) -> bool {
     spdx.starts_with("CC-BY-SA")
         || spdx.starts_with("GPL-")
         || spdx.starts_with("AGPL-")
         || spdx.starts_with("LGPL-")
-}
-
-/// SPDX identifiers that are outright forbidden everywhere.
-fn is_forbidden(spdx: &str) -> bool {
-    spdx.contains("NC") || spdx.contains("ND")
 }
 
 /// Validates and parses one embedded manifest's JSON text.
@@ -320,7 +368,7 @@ pub fn validate_catalog_entry(entry: &CatalogEntry) -> Result<(), CatalogError> 
             return Err(CatalogError::MissingField("sfz", entry.id.clone()));
         }
     }
-    if is_forbidden(spdx) || is_share_alike(spdx) {
+    if is_share_alike(spdx) {
         return Err(CatalogError::ForbiddenLicense(spdx.to_owned()));
     }
     if requires_attribution(spdx)
@@ -995,6 +1043,172 @@ pub fn credits_text(installed: &[InstalledBank]) -> String {
     text
 }
 
+/// A single bank's usage requirement, derived from its license class. Used to
+/// warn before export (SPEC-052) and to build release notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankRequirement {
+    /// Catalog or registry bank id.
+    pub bank_id: String,
+    /// Human-readable bank name.
+    pub name: String,
+    /// License class (never [`LicenseClass::Free`]; free banks need nothing).
+    pub class: LicenseClass,
+    /// Mandatory attribution text (may be empty when the class is `NC`).
+    pub attribution: String,
+    /// Upstream source URL, for the credits window.
+    pub source_url: String,
+}
+
+impl BankRequirement {
+    /// The Russian warning for a single restricted bank (SPEC-052 §6).
+    #[must_use]
+    pub fn warning(&self) -> String {
+        match self.class {
+            LicenseClass::NonCommercial => {
+                format!("«{}» — нельзя монетизировать", self.name)
+            }
+            LicenseClass::Attribution => {
+                format!("«{}» — требуется указать автора", self.name)
+            }
+            LicenseClass::Free => String::new(),
+        }
+    }
+}
+
+/// Resolves the usage requirements for a list of bank ids (SPEC-052 §6).
+///
+/// Only banks with a restriction (non-commercial or attribution-required) are
+/// returned; free banks contribute nothing. Each id is looked up in the catalog
+/// first and, failing that, in the installed registry (a purely-local bank).
+/// An unknown id is skipped rather than failing the whole list.
+///
+/// UI-independent: the caller passes the bank ids (e.g. the sampler banks used
+/// by a project's tracks) and renders the result. Connecting this to the export
+/// flow is deferred until the track→bank list is surfaced at export time.
+#[must_use]
+pub fn requirements_for_banks(bank_ids: impl IntoIterator<Item = String>) -> Vec<BankRequirement> {
+    let catalog = catalog().unwrap_or_default();
+    let installed = list_installed().unwrap_or_default();
+    let mut out = Vec::new();
+    for id in bank_ids {
+        let entry = catalog.iter().find(|e| e.id == id);
+        if let Some(entry) = entry {
+            let class = license_class(&entry.license.spdx);
+            if class == LicenseClass::Free {
+                continue;
+            }
+            out.push(BankRequirement {
+                bank_id: id.clone(),
+                name: entry.name.clone(),
+                class,
+                attribution: entry.attribution.clone(),
+                source_url: entry.source_url.clone(),
+            });
+            continue;
+        }
+        if let Some(bank) = installed.iter().find(|b| b.id == id) {
+            let class = license_class(&bank.license_spdx);
+            if class == LicenseClass::Free {
+                continue;
+            }
+            out.push(BankRequirement {
+                bank_id: id.clone(),
+                name: bank.name.clone(),
+                class,
+                attribution: bank.attribution.clone(),
+                source_url: String::new(),
+            });
+        }
+    }
+    out
+}
+
+/// Builds the release-notes attribution text for the installed banks that
+/// require author credit ([`LicenseClass::Attribution`]), joined with the
+/// catalog so each line carries name, author, license and source URL.
+///
+/// This is the copyable «описание релиза» for a Credits window (SPEC-076 §9).
+/// A bank whose author or source is unknown still contributes name + license.
+#[must_use]
+pub fn release_attribution_text(installed: &[InstalledBank], catalog: &[CatalogEntry]) -> String {
+    let mut text = String::new();
+    for bank in installed {
+        let class = license_class(&bank.license_spdx);
+        if class != LicenseClass::Attribution {
+            continue;
+        }
+        let entry = catalog.iter().find(|e| e.id == bank.id);
+        text.push_str(&bank.name);
+        if let Some(entry) = entry {
+            if !entry.author.trim().is_empty() {
+                text.push_str(" — ");
+                text.push_str(&entry.author);
+            }
+            if !entry.source_url.trim().is_empty() {
+                text.push_str(" (");
+                text.push_str(&entry.source_url);
+                text.push(')');
+            }
+        }
+        text.push_str(", ");
+        text.push_str(&bank.license_spdx);
+        text.push('\n');
+        if !bank.attribution.trim().is_empty() {
+            text.push_str(&bank.attribution);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// Generates the multi-line credits text for the Credits window, joining each
+/// installed bank with its catalog entry so the author and source link are
+/// shown (SPEC-076 §9). Falls back to name + license when a bank is not in the
+/// catalog (a purely-local import).
+#[must_use]
+pub fn credits_text_with_sources(installed: &[InstalledBank], catalog: &[CatalogEntry]) -> String {
+    let mut text = String::new();
+    text.push_str(BUILTIN_PIANO_CREDIT);
+    text.push('\n');
+    for bank in installed {
+        let entry = catalog.iter().find(|e| e.id == bank.id);
+        text.push_str(&bank.name);
+        if bank.family.trim().is_empty() {
+            text.push('\n');
+        } else {
+            text.push_str(" (");
+            text.push_str(&bank.family);
+            text.push_str(")\n");
+        }
+        if let Some(entry) = entry {
+            if !entry.author.trim().is_empty() {
+                text.push_str("Автор: ");
+                text.push_str(&entry.author);
+                text.push('\n');
+            }
+            if !entry.source_url.trim().is_empty() {
+                text.push_str("Источник: ");
+                text.push_str(&entry.source_url);
+                text.push('\n');
+            }
+        }
+        if !bank.attribution.trim().is_empty() {
+            text.push_str(&bank.attribution);
+            text.push('\n');
+        }
+        text.push_str("Лицензия: ");
+        text.push_str(&bank.license_spdx);
+        text.push_str(" (");
+        text.push_str(license_class(&bank.license_spdx).label());
+        text.push(')');
+        text.push('\n');
+    }
+    while text.ends_with("\n\n") {
+        text.pop();
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,16 +1260,31 @@ mod tests {
     #[test]
     fn forbidden_licenses_are_rejected() {
         let mut e = catalog().unwrap().into_iter().next().unwrap();
+        e.license.spdx = "CC-BY-SA-4.0".to_owned();
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::ForbiddenLicense(_))
+        ));
+        e.license.spdx = "GPL-3.0".to_owned();
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::ForbiddenLicense(_))
+        ));
+        e.license.spdx = "LGPL-2.1".to_owned();
+        assert!(matches!(
+            validate_catalog_entry(&e),
+            Err(CatalogError::ForbiddenLicense(_))
+        ));
+    }
+
+    #[test]
+    fn non_commercial_is_allowed_with_class() {
+        // NC is no longer forbidden (owner decision): it parses and classifies
+        // as NonCommercial.
+        let mut e = catalog().unwrap().into_iter().next().unwrap();
         e.license.spdx = "CC-BY-NC-4.0".to_owned();
-        assert!(matches!(
-            validate_catalog_entry(&e),
-            Err(CatalogError::ForbiddenLicense(_))
-        ));
-        e.license.spdx = "CC-BY-ND-4.0".to_owned();
-        assert!(matches!(
-            validate_catalog_entry(&e),
-            Err(CatalogError::ForbiddenLicense(_))
-        ));
+        assert!(validate_catalog_entry(&e).is_ok());
+        assert_eq!(license_class(&e.license.spdx), LicenseClass::NonCommercial);
     }
 
     #[test]
@@ -1246,6 +1475,100 @@ mod tests {
         }];
         let text = credits_text(&installed);
         assert!(text.contains("(attribution required)"));
+    }
+
+    #[test]
+    fn license_class_maps_spdx_to_three_classes() {
+        assert_eq!(license_class("CC0-1.0"), LicenseClass::Free);
+        assert_eq!(license_class("Unlicense"), LicenseClass::Free);
+        assert_eq!(license_class("CC-BY-3.0"), LicenseClass::Attribution);
+        assert_eq!(license_class("MIT"), LicenseClass::Attribution);
+        assert_eq!(license_class("BSD-3-Clause"), LicenseClass::Attribution);
+        assert_eq!(license_class("CC-BY-NC-4.0"), LicenseClass::NonCommercial);
+        assert_eq!(
+            license_class("CC-BY-NC-SA-4.0"),
+            LicenseClass::NonCommercial
+        );
+    }
+
+    #[test]
+    fn requirements_for_banks_reports_only_restricted() {
+        // salamander = CC-BY (attribution), osiris = CC0 (free).
+        let reqs = requirements_for_banks(["salamander-grand-v3".to_owned()]);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].bank_id, "salamander-grand-v3");
+        assert_eq!(reqs[0].class, LicenseClass::Attribution);
+        assert!(!reqs[0].attribution.is_empty());
+        assert!(reqs[0].warning().contains("указать автора"));
+
+        // A free bank yields nothing.
+        assert!(requirements_for_banks(["osiris-piano".to_owned()]).is_empty());
+        // An unknown id is skipped, not an error.
+        assert!(requirements_for_banks(["nope".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn requirements_for_banks_warns_non_commercial() {
+        // `requirements_for_banks` reads the embedded catalog, so exercise the
+        // warning text directly instead of rebuilding the catalog.
+        let req = BankRequirement {
+            bank_id: "x".to_owned(),
+            name: "X".to_owned(),
+            class: LicenseClass::NonCommercial,
+            attribution: String::new(),
+            source_url: String::new(),
+        };
+        assert!(req.warning().contains("нельзя монетизировать"));
+    }
+
+    #[test]
+    fn release_attribution_text_lists_only_cc_by_banks() {
+        let catalog = catalog().unwrap();
+        let installed = vec![
+            InstalledBank {
+                id: "salamander-grand-v3".to_owned(),
+                name: "Salamander Grand Piano V3".to_owned(),
+                family: "piano".to_owned(),
+                path: "/tmp/banks/salamander".to_owned(),
+                license_spdx: "CC-BY-3.0".to_owned(),
+                attribution: "Salamander Grand Piano by Alexander Holm".to_owned(),
+                license_acknowledged: false,
+                installed_at: "0T00:00:00Z".to_owned(),
+            },
+            InstalledBank {
+                id: "osiris-piano".to_owned(),
+                name: "Osiris Piano".to_owned(),
+                family: "piano".to_owned(),
+                path: "/tmp/banks/osiris".to_owned(),
+                license_spdx: "CC0-1.0".to_owned(),
+                attribution: String::new(),
+                license_acknowledged: false,
+                installed_at: "0T00:00:00Z".to_owned(),
+            },
+        ];
+        let text = release_attribution_text(&installed, &catalog);
+        assert!(text.contains("Salamander Grand Piano V3"));
+        assert!(text.contains("Alexander Holm"));
+        assert!(!text.contains("Osiris Piano")); // CC0 needs no credit
+    }
+
+    #[test]
+    fn credits_with_sources_includes_author_and_source() {
+        let catalog = catalog().unwrap();
+        let installed = vec![InstalledBank {
+            id: "salamander-grand-v3".to_owned(),
+            name: "Salamander Grand Piano V3".to_owned(),
+            family: "piano".to_owned(),
+            path: "/tmp/banks/salamander".to_owned(),
+            license_spdx: "CC-BY-3.0".to_owned(),
+            attribution: "Salamander Grand Piano by Alexander Holm".to_owned(),
+            license_acknowledged: false,
+            installed_at: "0T00:00:00Z".to_owned(),
+        }];
+        let text = credits_text_with_sources(&installed, &catalog);
+        assert!(text.contains("Автор: Alexander Holm"));
+        assert!(text.contains("Источник:"));
+        assert!(text.contains("Нужно указать автора"));
     }
 
     #[test]
