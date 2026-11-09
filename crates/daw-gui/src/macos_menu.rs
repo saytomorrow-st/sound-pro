@@ -94,6 +94,8 @@ impl NativeMenu {
                 None,
             ),
             &PredefinedMenuItem::separator(),
+            &item("Авторство и лицензии…", Action::Credits, None),
+            &PredefinedMenuItem::separator(),
             &item(
                 "Переместить библиотеку звуков…",
                 Action::SoundMoveLibrary,

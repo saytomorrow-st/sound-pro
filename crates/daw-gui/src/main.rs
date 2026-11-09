@@ -1143,6 +1143,11 @@ struct App {
     download_accept: Option<DownloadAccept>,
     /// The «Новая дорожка» dialog, when open (SPEC-049).
     new_track: Option<shell::NewTrack>,
+    /// True once the non-commercial install warning has been shown this install
+    /// session; the warning is shown at most once per session.
+    nc_warning_shown: bool,
+    /// The non-commercial install warning dialog is currently open.
+    pending_install_nc: bool,
     outputs: Vec<String>,
     inputs: Vec<String>,
     /// Visible panels of the main window (SPEC-034).
@@ -1378,6 +1383,8 @@ impl App {
             dialog_rx,
             dialog_guard: daw_gui::dialog::DialogGuard::default(),
             new_track: None,
+            nc_warning_shown: false,
+            pending_install_nc: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
             layout: Layout::default(),
@@ -2957,6 +2964,10 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Авторство и лицензии…").clicked() {
+                    self.credits_open = true;
+                    ui.close();
+                }
                 if ui.button("Переместить библиотеку звуков…").clicked()
                 {
                     self.soon_notice_open = true;
@@ -7190,7 +7201,54 @@ impl App {
             }
         }
         if install {
+            let has_nc = self
+                .sound_library
+                .as_ref()
+                .is_some_and(|lib| lib.selected_has_non_commercial());
+            if has_nc && !self.nc_warning_shown {
+                self.nc_warning_shown = true;
+                self.pending_install_nc = true;
+            } else {
+                self.install_selected_library();
+            }
+        }
+    }
+
+    /// Renders the one-time non-commercial install warning and acts on it.
+    /// Called from the manager window while `pending_install_nc` is set.
+    fn nc_install_warning_window(&mut self, ctx: &egui::Context) {
+        if !self.pending_install_nc {
+            return;
+        }
+        let mut proceed = false;
+        let mut cancel = false;
+        egui::Window::new("Только некоммерческое использование")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    "Музыку с этим звуком нельзя монетизировать (только некоммерческое использование)",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Отмена").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .button("Всё равно установить")
+                        .clicked()
+                    {
+                        proceed = true;
+                    }
+                });
+            });
+        if proceed {
+            self.pending_install_nc = false;
             self.install_selected_library();
+        } else if cancel {
+            self.pending_install_nc = false;
         }
     }
 
@@ -7319,6 +7377,36 @@ impl App {
             FontId::proportional(13.0),
             status_color,
         );
+
+        // License badge for a leaf bank, drawn to the left of the status.
+        // A non-commercial bank is emphasised so the user sees it before the
+        // install warning.
+        if let Some(label) = node.license_label() {
+            let is_nc = node.bank.as_ref().is_some_and(|b| {
+                daw_app::bank_library::license_class(&b.license.spdx)
+                    == daw_app::bank_library::LicenseClass::NonCommercial
+            });
+            let badge_text = format!("[{label}]");
+            let badge_color = if selected {
+                Color32::from_rgb(255, 220, 130)
+            } else if is_nc {
+                Color32::from_rgb(230, 180, 90)
+            } else {
+                MANAGER_MUTED
+            };
+            let badge_size = ui
+                .painter()
+                .layout_no_wrap(badge_text.clone(), FontId::proportional(11.0), badge_color)
+                .size()
+                .x;
+            ui.painter().text(
+                Pos2::new(rect.max.x - badge_size - 92.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                badge_text,
+                FontId::proportional(11.0),
+                badge_color,
+            );
+        }
 
         // Interaction: clicking the disclosure arrow toggles expansion; clicking
         // the row toggles selection.
@@ -7589,13 +7677,19 @@ impl App {
     }
 
     /// The credits window: built-in piano plus installed banks (SPEC-066 §4).
+    /// Shows author and source link per bank, and offers a copyable release
+    /// description for banks that require attribution (SPEC-076 §9).
     fn credits_window(&mut self, ctx: &egui::Context) {
         if !self.credits_open {
             return;
         }
         let mut open = true;
-        let text = daw_app::bank_library::credits_text(&self.installed_banks);
-        egui::Window::new("Авторы")
+        let catalog = daw_app::bank_library::catalog().unwrap_or_default();
+        let text =
+            daw_app::bank_library::credits_text_with_sources(&self.installed_banks, &catalog);
+        let release_text =
+            daw_app::bank_library::release_attribution_text(&self.installed_banks, &catalog);
+        egui::Window::new("Авторство и лицензии")
             .id(egui::Id::new("credits"))
             .open(&mut open)
             .resizable(true)
@@ -7609,10 +7703,23 @@ impl App {
                         ui.monospace(&text);
                     });
                 ui.add_space(6.0);
-                if ui.button("Скопировать авторов").clicked() {
-                    ui.ctx().copy_text(text.clone());
-                    self.library_status = "Список авторов скопирован".to_owned();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Скопировать авторов").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                        self.library_status = "Список авторов скопирован".to_owned();
+                    }
+                    let can_copy_release = !release_text.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            can_copy_release,
+                            egui::Button::new("Скопировать описание релиза"),
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(release_text.clone());
+                        self.library_status = "Описание релиза скопировано".to_owned();
+                    }
+                });
             });
         if !open {
             self.credits_open = false;
@@ -8504,6 +8611,7 @@ impl eframe::App for App {
         self.about_window(ctx);
         self.library_window(ctx);
         self.library_manager_window(ctx);
+        self.nc_install_warning_window(ctx);
         self.credits_window(ctx);
         self.install_license_window(ctx);
         self.first_run_window(ctx);
