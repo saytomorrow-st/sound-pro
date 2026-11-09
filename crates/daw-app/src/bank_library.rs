@@ -1142,6 +1142,60 @@ pub fn requirements_for_banks(bank_ids: impl IntoIterator<Item = String>) -> Vec
     out
 }
 
+/// A project's export-time license restrictions, split so the GUI can render
+/// the non-commercial warning and the copyable attribution text separately
+/// (SPEC-052 §6). `is_empty()` is false only when at least one bank needs a
+/// warning.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExportRestrictions {
+    /// Names of the non-commercial banks: each requires the «нельзя
+    /// монетизировать» warning.
+    pub non_commercial_names: Vec<String>,
+    /// Ready-to-copy attribution text for the CC-BY banks (name, source and
+    /// attribution per line), mirroring [`release_attribution_text`].
+    pub attribution_text: String,
+}
+
+impl ExportRestrictions {
+    /// Whether the project has any license restriction at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.non_commercial_names.is_empty() && self.attribution_text.trim().is_empty()
+    }
+}
+
+/// Builds the export-restriction report from already-resolved
+/// [`BankRequirement`]s. Pure and UI-independent: the GUI passes the project's
+/// bank ids through [`requirements_for_banks`] and feeds the result here.
+#[must_use]
+pub fn export_restrictions(requirements: &[BankRequirement]) -> ExportRestrictions {
+    let mut non_commercial_names = Vec::new();
+    let mut attribution_text = String::new();
+    for req in requirements {
+        match req.class {
+            LicenseClass::NonCommercial => non_commercial_names.push(req.name.clone()),
+            LicenseClass::Attribution => {
+                attribution_text.push_str(&req.name);
+                if !req.source_url.trim().is_empty() {
+                    attribution_text.push_str(" (");
+                    attribution_text.push_str(&req.source_url);
+                    attribution_text.push(')');
+                }
+                attribution_text.push('\n');
+                if !req.attribution.trim().is_empty() {
+                    attribution_text.push_str(&req.attribution);
+                    attribution_text.push('\n');
+                }
+            }
+            LicenseClass::Free => {}
+        }
+    }
+    ExportRestrictions {
+        non_commercial_names,
+        attribution_text,
+    }
+}
+
 /// Builds the release-notes attribution text for the installed banks that
 /// require author credit ([`LicenseClass::Attribution`]), joined with the
 /// catalog so each line carries name, author, license and source URL.
@@ -1597,6 +1651,54 @@ mod tests {
         assert!(text.contains("Salamander Grand Piano V3"));
         assert!(text.contains("Alexander Holm"));
         assert!(!text.contains("Osiris Piano")); // CC0 needs no credit
+    }
+
+    #[test]
+    fn export_restrictions_splits_nc_and_attribution() {
+        let reqs = vec![
+            BankRequirement {
+                bank_id: "nc".to_owned(),
+                name: "NonCommercial Bank".to_owned(),
+                class: LicenseClass::NonCommercial,
+                attribution: String::new(),
+                source_url: String::new(),
+            },
+            BankRequirement {
+                bank_id: "by".to_owned(),
+                name: "Attribution Bank".to_owned(),
+                class: LicenseClass::Attribution,
+                attribution: "by Someone".to_owned(),
+                source_url: "https://example.com/bank".to_owned(),
+            },
+        ];
+        let r = export_restrictions(&reqs);
+        assert!(!r.is_empty());
+        assert_eq!(
+            r.non_commercial_names,
+            vec!["NonCommercial Bank".to_owned()]
+        );
+        assert!(r.attribution_text.contains("Attribution Bank"));
+        assert!(r.attribution_text.contains("https://example.com/bank"));
+        assert!(r.attribution_text.contains("by Someone"));
+    }
+
+    #[test]
+    fn export_restrictions_is_empty_without_restrictions() {
+        let r = export_restrictions(&[]);
+        assert!(r.is_empty());
+        assert!(r.non_commercial_names.is_empty());
+        assert!(r.attribution_text.is_empty());
+
+        // Free banks (never produced by requirements_for_banks, but defensive)
+        // contribute nothing.
+        let r = export_restrictions(&[BankRequirement {
+            bank_id: "free".to_owned(),
+            name: "Free Bank".to_owned(),
+            class: LicenseClass::Free,
+            attribution: String::new(),
+            source_url: String::new(),
+        }]);
+        assert!(r.is_empty());
     }
 
     #[test]
