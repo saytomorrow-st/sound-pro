@@ -188,7 +188,11 @@
         },
         {
           "id": "modern-synth",
-          "title": "Современный синтезатор"
+          "title": "Современный синтезатор",
+          "banks": [
+            "caveman-cosmonaut",
+            "cowsynth"
+          ]
         },
         {
           "id": "textures-and-effects",
@@ -206,7 +210,14 @@
     },
     {
       "id": "bass",
-      "title": "Бас"
+      "title": "Бас",
+      "banks": [
+        "meatbass",
+        "fashionbass",
+        "sneakybass",
+        "ergo-eub",
+        "dsmolken-double-bass"
+      ]
     },
     {
       "id": "cinematic",
@@ -215,6 +226,12 @@
     {
       "id": "drum-kit",
       "title": "Ударная установка",
+      "banks": [
+        "virtuosity-drums",
+        "swirly-drums",
+        "unruly-drums",
+        "big-rusty-drums"
+      ],
       "sub": [
         {
           "id": "acousticdrums",
@@ -296,7 +313,12 @@
     },
     {
       "id": "guitar",
-      "title": "Гитара"
+      "title": "Гитара",
+      "banks": [
+        "shinyguitar",
+        "black-and-green-guitars",
+        "emilyguitar"
+      ]
     },
     {
       "id": "mallets",
@@ -332,11 +354,19 @@
         },
         {
           "id": "instrumentsorchestralstrings",
-          "title": "Струнные"
+          "title": "Струнные",
+          "banks": [
+            "string-cyborgs",
+            "bigcat-cello"
+          ]
         },
         {
           "id": "instrumentsorchestralwoodwinds",
-          "title": "Деревянные духовые"
+          "title": "Деревянные духовые",
+          "banks": [
+            "bear-sax",
+            "weresax"
+          ]
         }
       ]
     },
@@ -382,7 +412,10 @@
         },
         {
           "id": "instrumentsworldvoice",
-          "title": "Вокал"
+          "title": "Вокал",
+          "banks": [
+            "merry-orks"
+          ]
         },
         {
           "id": "instrumentsworldwoodwind",

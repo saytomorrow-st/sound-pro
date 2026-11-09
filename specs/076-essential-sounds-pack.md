@@ -28,6 +28,20 @@
 Запрещены только GPL и share-alike (CC-BY-SA и т. п.). Некоммерческие (NC)
 лицензии разрешены с меткой и предупреждением.
 
+## Статус аудита (2026-11-09)
+
+19 банков Karoryfer (все CC0-1.0) **подтверждены** реальной загрузкой: скачан
+архив, посчитан SHA-256, проверено содержимое (`.sfz` + WAV/FLAC), текст
+лицензии прочитан из первоисточника. Записи добавлены в `catalog/banks/*.json`,
+индивидуальные отчёты — `catalog/audit/<bank_id>.md`. Эти банки покрывают
+категории «Гитары» (Shinyguitar, Black and Green Guitars, Emilyguitar), «Бас»
+(Meatbass, Fashionbass, Sneakybass, Ergo EUB, DSmolken Double Bass), «Струнные»
+(String Cyborgs, Bigcat Cello), «Дерево» (Bear Sax, Weresax), «Барабаны»
+(Virtuosity, Swirly, Unruly, Big Rusty Drums), «Синты/пэды» (Caveman Cosmonaut,
+Cowsynth) и «Голос» (272 Merry Orks). Остальные кандидаты (VSCO-2-CE, VCSL,
+FreePats, Greg Sullivan, Ixox Flute, Muldjord Kit) по-прежнему ждут аудита с
+реальным SHA-256.
+
 ## Поведение
 
 1. **Мета-пакет** — файл `catalog/packs/essential-sounds.json` (отдельный от

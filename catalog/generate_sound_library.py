@@ -166,6 +166,45 @@ SUB_TITLES = {
 # Sound Pro bank ids attached to the piano group (from our own bank catalog).
 PIANO_BANKS = ["salamander-grand-v3", "osiris-piano"]
 
+# Sound Pro bank ids attached to other groups (from our own bank catalog).
+# Keyed by Sound Pro group id; banks become the group's leaf children with
+# real sizes from the catalog. Subgroup keys use the node's Sound Pro id.
+GROUP_BANKS = {
+    "bass": [
+        "meatbass",
+        "fashionbass",
+        "sneakybass",
+        "ergo-eub",
+        "dsmolken-double-bass",
+    ],
+    "drum-kit": [
+        "virtuosity-drums",
+        "swirly-drums",
+        "unruly-drums",
+        "big-rusty-drums",
+    ],
+    "guitar": [
+        "shinyguitar",
+        "black-and-green-guitars",
+        "emilyguitar",
+    ],
+    "modern-synth": [
+        "caveman-cosmonaut",
+        "cowsynth",
+    ],
+    "instrumentsorchestralstrings": [
+        "string-cyborgs",
+        "bigcat-cello",
+    ],
+    "instrumentsorchestralwoodwinds": [
+        "bear-sax",
+        "weresax",
+    ],
+    "instrumentsworldvoice": [
+        "merry-orks",
+    ],
+}
+
 def slugify(name):
     out = []
     for ch in name:
@@ -179,6 +218,8 @@ def slugify(name):
 def build_node(group):
     title = SUB_TITLES.get(group["name"], group["title"])
     node = {"id": slugify(group["name"]), "title": title}
+    if slugify(group["name"]) in GROUP_BANKS:
+        node["banks"] = GROUP_BANKS[slugify(group["name"])]
     subs = group.get("sub", [])
     if subs:
         node["sub"] = [build_node(s) for s in subs]
