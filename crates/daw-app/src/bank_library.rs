@@ -496,15 +496,24 @@ pub fn catalog() -> Result<Vec<CatalogEntry>, CatalogError> {
     FILES.iter().map(|text| parse_catalog_entry(text)).collect()
 }
 
+/// Home-relative data base when neither `XDG_DATA_HOME` nor `LOCALAPPDATA` is set.
+const HOME_DATA_SUBDIR: &str = if cfg!(target_os = "macos") {
+    "Library/Application Support"
+} else {
+    ".local/share"
+};
+
 /// Default banks directory: `$XDG_DATA_HOME/sound-pro/banks`,
-/// `~/.local/share/sound-pro/banks`, or `%LOCALAPPDATA%\sound-pro\banks`.
+/// `%LOCALAPPDATA%\sound-pro\banks`, else
+/// `~/Library/Application Support/sound-pro/banks` (macOS) or
+/// `~/.local/share/sound-pro/banks`.
 #[must_use]
 pub fn banks_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(HOME_DATA_SUBDIR)))?;
     Some(base.join("sound-pro").join("banks"))
 }
 

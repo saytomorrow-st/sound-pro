@@ -119,15 +119,23 @@ fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
-/// The config directory: `$XDG_CONFIG_HOME/sound-pro`,
-/// `~/.config/sound-pro`, or `%APPDATA%\sound-pro`.
+/// Home-relative config base when neither `XDG_CONFIG_HOME` nor `APPDATA` is set.
+const HOME_CONFIG_SUBDIR: &str = if cfg!(target_os = "macos") {
+    "Library/Application Support"
+} else {
+    ".config"
+};
+
+/// The config directory: `$XDG_CONFIG_HOME/sound-pro`, `%APPDATA%\sound-pro`,
+/// else `~/Library/Application Support/sound-pro` (macOS) or
+/// `~/.config/sound-pro`.
 #[must_use]
 pub fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(HOME_CONFIG_SUBDIR)))?;
     Some(base.join("sound-pro"))
 }
 

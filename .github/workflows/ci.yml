@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,8 +64,9 @@ jobs:
           fi
         shell: bash
 
-  # Realtime backend compiles and links on both platforms. Linux needs the
-  # ALSA dev package; Windows uses the system WASAPI headers.
+  # Realtime backend compiles and links on all platforms. Linux needs the
+  # ALSA dev package; Windows uses the system WASAPI headers; macOS uses
+  # CoreAudio from the system SDK.
   realtime-build:
     name: realtime backend build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -73,7 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

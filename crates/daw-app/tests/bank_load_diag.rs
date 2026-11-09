@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use daw_app::sample_bank::load_bank_with_hint;
 
 fn banks_root() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME")).join(".local/share/sound-pro/banks")
+    daw_app::bank_library::banks_dir().expect("banks dir")
 }
 
 fn probe(label: &str, dir: PathBuf, hint: &str) {

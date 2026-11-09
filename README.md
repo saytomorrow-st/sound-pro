@@ -1,6 +1,6 @@
 # Sound Pro
 
-Каркас открытой DAW на Rust для Linux и Windows, спроектированный так, чтобы с
+Каркас открытой DAW на Rust для Linux, Windows и macOS, спроектированный так, чтобы с
 ним могли продуктивно работать ИИ-агенты: движок тестируется полностью без
 звуковой карты, правила для агентов явно записаны, а эталоны звука защищены от
 случайной перегенерации.
@@ -17,6 +17,9 @@
   требуется, `alsa-lib-devel` не нужен).
 - **Windows** — `Sound-Pro-<версия>-windows-x86_64.zip`: распакуйте и
   запустите `sound-pro.exe`.
+- **macOS** — `Sound-Pro-<версия>-macos-<arch>.dmg`: перетащите Sound Pro в
+  «Программы». Приложение подписано ad-hoc (без Apple Developer ID), поэтому
+  при первом запуске откройте его через правый клик → «Открыть».
 
 ### Получить и запустить одной командой
 
@@ -77,7 +80,7 @@ cargo run -q --bin daw -- bounce tone.wav 1.0
 cargo run -q --bin daw -- bounce take.wav 30.0 --split 48000   # части по 1 с
 ```
 
-Реальный аудиовыход (CPAL; Linux: `libasound2-dev`, Windows: без зависимостей):
+Реальный аудиовыход (CPAL; Linux: `libasound2-dev`, Windows и macOS: без зависимостей):
 
 ```bash
 cargo build -p daw-app --features realtime

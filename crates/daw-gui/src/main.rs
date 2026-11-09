@@ -7139,7 +7139,14 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Логи:");
                 if ui.button("Открыть папку").clicked() {
-                    if let Err(e) = std::process::Command::new("xdg-open").arg(dir).spawn() {
+                    let opener = if cfg!(target_os = "macos") {
+                        "open"
+                    } else if cfg!(windows) {
+                        "explorer"
+                    } else {
+                        "xdg-open"
+                    };
+                    if let Err(e) = std::process::Command::new(opener).arg(dir).spawn() {
                         self.status = format!("Не удалось открыть папку логов: {e}");
                     }
                 }

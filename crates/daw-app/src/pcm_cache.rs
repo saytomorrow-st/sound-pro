@@ -11,6 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::audio_file::Channels;
 
+/// Home-relative cache base when `XDG_CACHE_HOME` is not set.
+const HOME_CACHE_SUBDIR: &str = if cfg!(target_os = "macos") {
+    "Library/Caches"
+} else {
+    ".cache"
+};
+
 const MAGIC: &[u8; 8] = b"SPPCM001";
 /// Entries kept; the least recently written ones are removed first.
 const MAX_ENTRIES: usize = 16;
@@ -51,13 +58,16 @@ impl PcmCache {
         Self { dir }
     }
 
-    /// `$XDG_CACHE_HOME/sound-pro/pcm`, else `~/.cache/sound-pro/pcm`.
+    /// `$XDG_CACHE_HOME/sound-pro/pcm`, else `~/Library/Caches/sound-pro/pcm`
+    /// (macOS) or `~/.cache/sound-pro/pcm`.
     #[must_use]
     pub fn default_location() -> Option<Self> {
         let base = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(HOME_CACHE_SUBDIR))
+            })?;
         Some(Self::new(base.join("sound-pro").join("pcm")))
     }
 
