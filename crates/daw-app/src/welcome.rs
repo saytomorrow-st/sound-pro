@@ -5,9 +5,10 @@
 /// The first-run welcome flow, persisted in the settings file.
 ///
 /// [`WelcomeStep::Welcome`] shows the choice dialog, [`WelcomeStep::Download`]
-/// shows the "loading core sounds" step (after «Полный режим»), and
+/// shows the "loading core sounds" step (after «Полный режим»),
+/// [`WelcomeStep::MoreSounds`] shows the «Доступно больше звуков» step, and
 /// [`WelcomeStep::Done`] means the flow never appears again. The wire value is
-/// the stage's ordinal (`welcome = 0|1|2`); a missing or unrecognised key
+/// the stage's ordinal (`welcome = 0|1|2|3`); a missing or unrecognised key
 /// defaults to [`WelcomeStep::Welcome`], so an existing settings file shows the
 /// dialog exactly once after upgrading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -17,6 +18,8 @@ pub enum WelcomeStep {
     Welcome,
     /// «Полный режим» was chosen; show the download step.
     Download,
+    /// «Загрузка основных звуков» finished; show «Доступно больше звуков».
+    MoreSounds,
     /// Completed; do not show the flow again.
     Done,
 }
@@ -27,7 +30,8 @@ impl WelcomeStep {
     pub const fn next(self) -> Self {
         match self {
             Self::Welcome => Self::Download,
-            Self::Download | Self::Done => Self::Done,
+            Self::Download => Self::MoreSounds,
+            Self::MoreSounds | Self::Done => Self::Done,
         }
     }
 
@@ -37,23 +41,30 @@ impl WelcomeStep {
         matches!(self, Self::Done)
     }
 
-    /// The settings-file word for this stage (`0`, `1`, or `2`).
+    /// The settings-file word for this stage (`0`, `1`, `2`, or `3`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Welcome => "0",
             Self::Download => "1",
-            Self::Done => "2",
+            Self::MoreSounds => "2",
+            Self::Done => "3",
         }
     }
 
     /// Parses a settings-file value, defaulting unknown input to
     /// [`WelcomeStep::Welcome`].
+    ///
+    /// The wire value is the stage's ordinal. `2` («MoreSounds») is new; a
+    /// settings file from an older build of this unreleased flow that had
+    /// already reached «Done» would store `2` and re-show the new step exactly
+    /// once — acceptable here because the flow has never shipped.
     #[must_use]
     pub fn parse(text: &str) -> Self {
         match text.trim() {
             "1" => Self::Download,
-            "2" => Self::Done,
+            "2" => Self::MoreSounds,
+            "3" => Self::Done,
             _ => Self::Welcome,
         }
     }
@@ -114,12 +125,14 @@ mod tests {
     }
 
     #[test]
-    fn step_advances_welcome_to_download_to_done() {
+    fn step_advances_welcome_to_download_to_more_to_done() {
         assert_eq!(WelcomeStep::Welcome.next(), WelcomeStep::Download);
-        assert_eq!(WelcomeStep::Download.next(), WelcomeStep::Done);
+        assert_eq!(WelcomeStep::Download.next(), WelcomeStep::MoreSounds);
+        assert_eq!(WelcomeStep::MoreSounds.next(), WelcomeStep::Done);
         assert_eq!(WelcomeStep::Done.next(), WelcomeStep::Done);
         assert!(!WelcomeStep::Welcome.is_done());
         assert!(!WelcomeStep::Download.is_done());
+        assert!(!WelcomeStep::MoreSounds.is_done());
         assert!(WelcomeStep::Done.is_done());
     }
 
@@ -128,6 +141,7 @@ mod tests {
         for step in [
             WelcomeStep::Welcome,
             WelcomeStep::Download,
+            WelcomeStep::MoreSounds,
             WelcomeStep::Done,
         ] {
             assert_eq!(WelcomeStep::parse(step.name()), step);

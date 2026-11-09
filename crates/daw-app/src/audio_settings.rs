@@ -228,6 +228,7 @@ mod tests {
         for step in [
             WelcomeStep::Welcome,
             WelcomeStep::Download,
+            WelcomeStep::MoreSounds,
             WelcomeStep::Done,
         ] {
             let settings = AudioSettings {
