@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "freepats-percussive-organ",
+  "name": "FreePats Percussive Organ Emulation",
+  "family": "synth",
+  "version": "2019-07-15",
+  "author": "Strix SoundFont Team (via FreePats)",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Percussive Organ Emulation by Strix SoundFont Team (via FreePats), CC0 1.0",
+  "source_url": "https://freepats.zenvoid.org/Organ/electric-organ.html",
+  "sha256": "c4841f2e7f352692cf14a85a96bd1f40a9ea7a9e2a9ce3512606885d000978c8",
+  "size_bytes": 12423412,
+  "license_check": {
+    "url": "https://freepats.zenvoid.org/Organ/electric-organ.html",
+    "sha256": "96dcffa82af2b1656aa076ed230f2e9d6d53b0a60cde2e322333febcc6c2d6d3",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://freepats.zenvoid.org/Organ/PercussiveOrganEmulation/PercussiveOrganEmulation-SFZ-20190715.tar.xz",
+    "sha256": "c4841f2e7f352692cf14a85a96bd1f40a9ea7a9e2a9ce3512606885d000978c8",
+    "size_bytes": 12423412,
+    "redirect_hosts": []
+  },
+  "sfz": "PercussiveOrganEmulation-SFZ-20190715/PercussiveOrganEmulation-20190715.sfz",
+  "format": "tar.xz",
+  "verified": true
+}

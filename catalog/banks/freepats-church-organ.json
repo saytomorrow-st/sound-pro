@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "freepats-church-organ",
+  "name": "FreePats Church Organ Emulation",
+  "family": "orchestral",
+  "version": "2019-09-24",
+  "author": "FreePats (Roberto <roberto@zenvoid.org>)",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Church Organ Emulation by FreePats (Roberto <roberto@zenvoid.org>), CC0 1.0",
+  "source_url": "https://freepats.zenvoid.org/Organ/pipe-organ.html",
+  "sha256": "1f0b70a2c2af14cdf051ef2d256b3bb652e7d64c0fdc8bed06642ad2af916db9",
+  "size_bytes": 13033856,
+  "license_check": {
+    "url": "https://freepats.zenvoid.org/Organ/pipe-organ.html",
+    "sha256": "25398ab9e3d3a26bcce2d37cb27fd2c4c1bc6c9c6119d2153594c43ee0fe4f40",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://freepats.zenvoid.org/Organ/ChurchOrganEmulation/ChurchOrganEmulation-SFZ-20190924.tar.xz",
+    "sha256": "1f0b70a2c2af14cdf051ef2d256b3bb652e7d64c0fdc8bed06642ad2af916db9",
+    "size_bytes": 13033856,
+    "redirect_hosts": []
+  },
+  "sfz": "ChurchOrganEmulation-SFZ-20190924/ChurchOrganEmulation-20190924.sfz",
+  "format": "tar.xz",
+  "verified": true
+}

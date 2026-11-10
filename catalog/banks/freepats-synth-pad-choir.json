@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "freepats-synth-pad-choir",
+  "name": "FreePats Synth Pad Choir",
+  "family": "synth",
+  "version": "2020-05-16",
+  "author": "FreePats (快乐爱的小精灵)",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Synth Pad Choir by FreePats (快乐爱的小精灵), CC0 1.0",
+  "source_url": "https://github.com/freepats/synth-pad-choir",
+  "sha256": "703ef30fad4861f85b319f8d549fbeeb0af0860929165c7066410dcbb03da0a3",
+  "size_bytes": 6815491,
+  "license_check": {
+    "url": "https://api.github.com/repos/freepats/synth-pad-choir/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/freepats/synth-pad-choir/releases/download/2020-05-16/SynthPadChoir-SFZ%2BFLAC-20200516.7z",
+    "sha256": "703ef30fad4861f85b319f8d549fbeeb0af0860929165c7066410dcbb03da0a3",
+    "size_bytes": 6815491,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "SynthPadChoir SFZ+FLAC-20200516/SynthPadChoir 20200516.sfz",
+  "format": "7z",
+  "verified": true
+}

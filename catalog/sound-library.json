@@ -191,7 +191,11 @@
           "title": "Современный синтезатор",
           "banks": [
             "caveman-cosmonaut",
-            "cowsynth"
+            "cowsynth",
+            "freepats-synth-pad-choir",
+            "freepats-synth-strings-1",
+            "freepats-synth-strings-2",
+            "freepats-synthesizer-percussion"
           ]
         },
         {
@@ -339,7 +343,10 @@
         },
         {
           "id": "instrumentsorchestralharp",
-          "title": "Арфа"
+          "title": "Арфа",
+          "banks": [
+            "freepats-harp"
+          ]
         },
         {
           "id": "instrumentsorchestralkeyboard",
@@ -347,11 +354,20 @@
         },
         {
           "id": "instrumentsorchestralpercussion",
-          "title": "Ударные"
+          "title": "Ударные",
+          "banks": [
+            "freepats-timpani"
+          ]
         },
         {
           "id": "instrumentsorchestralpipeorgan",
-          "title": "Орган"
+          "title": "Орган",
+          "banks": [
+            "freepats-church-organ",
+            "freepats-drawbar-organ",
+            "freepats-rock-organ",
+            "freepats-percussive-organ"
+          ]
         },
         {
           "id": "instrumentsorchestralstrings",

@@ -192,6 +192,10 @@ GROUP_BANKS = {
     "modern-synth": [
         "caveman-cosmonaut",
         "cowsynth",
+        "freepats-synth-pad-choir",
+        "freepats-synth-strings-1",
+        "freepats-synth-strings-2",
+        "freepats-synthesizer-percussion",
     ],
     "percussion": [
         "gtownchurch",
@@ -202,6 +206,18 @@ GROUP_BANKS = {
         "vsco-2-ce",
         "vcsl",
         "sonatina-symphonic-orchestra",
+    ],
+    "instrumentsorchestralharp": [
+        "freepats-harp",
+    ],
+    "instrumentsorchestralpercussion": [
+        "freepats-timpani",
+    ],
+    "instrumentsorchestralpipeorgan": [
+        "freepats-church-organ",
+        "freepats-drawbar-organ",
+        "freepats-rock-organ",
+        "freepats-percussive-organ",
     ],
     "instrumentsorchestralwoodwinds": [
         "bear-sax",

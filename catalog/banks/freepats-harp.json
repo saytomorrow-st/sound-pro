@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "freepats-harp",
+  "name": "FreePats Concert Harp",
+  "family": "strings",
+  "version": "2020-07-02",
+  "author": "FreePats (Roberto <roberto@zenvoid.org>)",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Concert Harp by FreePats (Roberto <roberto@zenvoid.org>), CC0 1.0",
+  "source_url": "https://freepats.zenvoid.org/OrchestralStrings/harp.html",
+  "sha256": "e7dacbb92ff11bbb2eff97fe837e370341ef175e6b401309f05b623da87e3a1e",
+  "size_bytes": 9502812,
+  "license_check": {
+    "url": "https://freepats.zenvoid.org/OrchestralStrings/harp.html",
+    "sha256": "06b9f775dda375165d81b8eec0e80134ac5d69d0a94d075ff77afb0a9f8af1b9",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://freepats.zenvoid.org/OrchestralStrings/ConcertHarp/ConcertHarp-SFZ-20200702.tar.xz",
+    "sha256": "e7dacbb92ff11bbb2eff97fe837e370341ef175e6b401309f05b623da87e3a1e",
+    "size_bytes": 9502812,
+    "redirect_hosts": []
+  },
+  "sfz": "ConcertHarp-SFZ-20200702/ConcertHarp-20200702.sfz",
+  "format": "tar.xz",
+  "verified": true
+}
