@@ -3170,12 +3170,13 @@ impl App {
                     ui.close();
                 }
                 if ui.button("Загрузить все доступные звуки").clicked() {
+                    self.start_all_queue();
                     self.open_library_manager();
                     ui.close();
                 }
                 if ui.button("Переустановить библиотеку звуков").clicked()
                 {
-                    self.soon_notice_open = true;
+                    self.reinstall_library();
                     ui.close();
                 }
                 if ui.button("Открыть менеджер библиотеки звуков…").clicked()
@@ -3190,7 +3191,7 @@ impl App {
                 }
                 if ui.button("Переместить библиотеку звуков…").clicked()
                 {
-                    self.soon_notice_open = true;
+                    self.move_library_dialog();
                     ui.close();
                 }
             });
