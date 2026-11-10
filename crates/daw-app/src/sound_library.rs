@@ -616,7 +616,7 @@ mod tests {
     fn select_all_uninstalled_picks_only_real_uninstalled_leaves() {
         let mut lib = library();
         let added = lib.select_all_uninstalled();
-        assert_eq!(added, 30); // all catalog banks are uninstalled leaves
+        assert_eq!(added, 40); // all catalog banks are uninstalled leaves
         assert!(lib.is_selected("salamander-grand-v3"));
         assert!(lib.is_selected("osiris-piano"));
         assert!(lib.is_selected("virtuosity-drums"));
@@ -627,7 +627,7 @@ mod tests {
     fn select_all_uninstalled_skips_installed() {
         let mut lib = SoundLibrary::new(["salamander-grand-v3".to_owned()]).expect("library");
         let added = lib.select_all_uninstalled();
-        assert_eq!(added, 29); // all but the already-installed salamander
+        assert_eq!(added, 39); // all but the already-installed salamander
         assert!(!lib.is_selected("salamander-grand-v3"));
         assert!(lib.is_selected("osiris-piano"));
     }
@@ -652,7 +652,7 @@ mod tests {
         let mut lib = library();
         let _ = lib.select_all_uninstalled();
         let banks = lib.selected_downloadable_banks();
-        assert_eq!(banks.len(), 30);
+        assert_eq!(banks.len(), 40);
         assert!(banks.iter().all(bank_library::is_downloadable));
     }
 

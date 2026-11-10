@@ -127,7 +127,8 @@ pub struct CatalogEntry {
     /// `None` to use a breadth-first search (loader fallback).
     #[serde(default)]
     pub sfz: Option<String>,
-    /// Archive container: `"zip"`, `"tar.bz2"`, or `"tar.gz"`.
+    /// Archive container: `"zip"`, `"tar.bz2"`, `"tar.gz"`, `"tar.xz"`, or
+    /// `"7z"`.
     #[serde(default)]
     pub format: String,
 }
@@ -418,7 +419,7 @@ fn validate_download(entry: &CatalogEntry) -> Result<(), CatalogError> {
         }
     }
     match entry.format.as_str() {
-        "zip" | "tar.bz2" | "tar.gz" => {}
+        "zip" | "tar.bz2" | "tar.gz" | "tar.xz" | "7z" => {}
         other => return Err(CatalogError::BadFormat(other.to_owned(), entry.id.clone())),
     }
     Ok(())
@@ -540,7 +541,7 @@ pub fn is_sha256(s: &str) -> bool {
 ///
 /// [`CatalogError`].
 pub fn catalog() -> Result<Vec<CatalogEntry>, CatalogError> {
-    const FILES: [&str; 30] = [
+    const FILES: [&str; 40] = [
         include_str!("../../../catalog/banks/salamander-grand-v3.json"),
         include_str!("../../../catalog/banks/osiris-piano.json"),
         include_str!("../../../catalog/banks/virtuosity-drums.json"),
@@ -571,6 +572,16 @@ pub fn catalog() -> Result<Vec<CatalogEntry>, CatalogError> {
         include_str!("../../../catalog/banks/sonatina-symphonic-orchestra.json"),
         include_str!("../../../catalog/banks/akg-r20e-ir.json"),
         include_str!("../../../catalog/banks/mellotron-sfz.json"),
+        include_str!("../../../catalog/banks/freepats-harp.json"),
+        include_str!("../../../catalog/banks/freepats-timpani.json"),
+        include_str!("../../../catalog/banks/freepats-church-organ.json"),
+        include_str!("../../../catalog/banks/freepats-drawbar-organ.json"),
+        include_str!("../../../catalog/banks/freepats-rock-organ.json"),
+        include_str!("../../../catalog/banks/freepats-percussive-organ.json"),
+        include_str!("../../../catalog/banks/freepats-synth-pad-choir.json"),
+        include_str!("../../../catalog/banks/freepats-synth-strings-1.json"),
+        include_str!("../../../catalog/banks/freepats-synth-strings-2.json"),
+        include_str!("../../../catalog/banks/freepats-synthesizer-percussion.json"),
     ];
     FILES.iter().map(|text| parse_catalog_entry(text)).collect()
 }
@@ -1301,7 +1312,7 @@ mod tests {
     #[test]
     fn embedded_catalog_parses_and_is_valid() {
         let entries = catalog().expect("catalog must parse");
-        assert_eq!(entries.len(), 30);
+        assert_eq!(entries.len(), 40);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"salamander-grand-v3"));
         assert!(ids.contains(&"osiris-piano"));
@@ -1510,7 +1521,7 @@ mod tests {
     #[test]
     fn tar_gz_format_is_accepted() {
         let mut e = catalog().unwrap().into_iter().next().unwrap();
-        for fmt in ["zip", "tar.bz2", "tar.gz"] {
+        for fmt in ["zip", "tar.bz2", "tar.gz", "tar.xz", "7z"] {
             e.format = fmt.to_owned();
             assert!(
                 validate_catalog_entry(&e).is_ok(),
