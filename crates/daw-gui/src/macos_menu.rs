@@ -47,7 +47,7 @@ pub struct NativeMenu {
     items: Vec<(Action, MenuItem)>,
     events: Receiver<MenuId>,
     /// Last enabled flags pushed to the OS, to avoid redundant calls.
-    shown: [bool; 5],
+    shown: [bool; 6],
 }
 
 impl NativeMenu {
@@ -175,7 +175,7 @@ impl NativeMenu {
             _menu: menu,
             items,
             events,
-            shown: [true; 5],
+            shown: [true; 6],
         }
     }
 
@@ -186,7 +186,7 @@ impl NativeMenu {
             .map(|(a, _)| *a)
     }
 
-    fn set_enabled(&mut self, flags: [bool; 5]) {
+    fn set_enabled(&mut self, flags: [bool; 6]) {
         if flags == self.shown {
             return;
         }
@@ -197,6 +197,7 @@ impl NativeMenu {
             Action::Split,
             Action::Copy,
             Action::Paste,
+            Action::SoundLoadCore,
         ];
         for (action, on) in targets.into_iter().zip(flags) {
             if let Some((_, it)) = self.items.iter().find(|(a, _)| *a == action) {
@@ -213,12 +214,14 @@ impl App {
             return;
         };
         let has_clip = self.editor.selected_clip.is_some();
+        let essential_installed = daw_app::essential_sounds::essential_installed().unwrap_or(false);
         menu.set_enabled([
             self.editor.can_undo(),
             self.editor.can_redo(),
             has_clip,
             has_clip,
             self.editor.has_clipboard(),
+            !essential_installed,
         ]);
         let mut actions = Vec::new();
         while let Ok(id) = menu.events.try_recv() {
@@ -256,15 +259,25 @@ impl App {
             Action::Library => self.open_library(),
             Action::Credits => self.credits_open = true,
             Action::SoundOpenManager => self.open_library_manager(),
-            Action::SoundLoadCore | Action::SoundLoadAll => {
-                // Core sounds have no real downloader yet; «Загрузить все
-                // доступные звуки» opens the manager so the user can pick.
+            Action::SoundLoadCore => {
+                // «Загрузить основные звуки»: enqueue the essential pack and
+                // open the manager so the user sees the in-window progress.
+                self.start_essential_queue();
                 self.open_library_manager();
             }
-            Action::SoundReinstall | Action::SoundMoveLibrary => {
-                // Backend for reinstall/move is not implemented yet.
-                self.library_status = "Эта возможность появится позже".to_owned();
-                self.soon_notice_open = true;
+            Action::SoundLoadAll => {
+                // «Загрузить все доступные звуки»: enqueue every uninstalled
+                // downloadable bank and open the manager.
+                self.start_all_queue();
+                self.open_library_manager();
+            }
+            Action::SoundReinstall => {
+                // SHA-verify every installed bank and re-enqueue corrupt ones.
+                self.reinstall_library();
+            }
+            Action::SoundMoveLibrary => {
+                // Folder picker + copy + update the configured library path.
+                self.move_library_dialog();
             }
             Action::KeyCommands | Action::Feedback => {
                 self.soon_notice_open = true;

@@ -1136,6 +1136,10 @@ struct App {
     download_tx: std::sync::mpsc::Sender<DownloadMsg>,
     download_rx: std::sync::mpsc::Receiver<DownloadMsg>,
     downloads: HashMap<String, DownloadState>,
+    /// The batch download queue driving the first-run «Загрузка основных
+    /// звуков» step and the menu «Загрузить основные/все звуки» actions
+    /// (SPEC-076). `None` while no batch is queued.
+    download_queue: Option<daw_app::download_queue::DownloadQueue>,
     /// Native file/folder dialogs, shown on a worker thread (SPEC-066/SPEC-067).
     dialog_tx: std::sync::mpsc::Sender<DialogMsg>,
     dialog_rx: std::sync::mpsc::Receiver<DialogMsg>,
@@ -1381,6 +1385,7 @@ impl App {
             download_tx,
             download_rx,
             downloads: HashMap::new(),
+            download_queue: None,
             download_accept: None,
             dialog_tx,
             dialog_rx,
@@ -2346,6 +2351,113 @@ impl App {
             let result = daw_app::bank_download::download_bank(&entry, &progress, &cancel);
             let _ = tx.send(DownloadMsg::Done { bank_id, result });
         });
+    }
+
+    /// Builds and starts a batch download queue over `banks`, replacing any
+    /// queue already running (SPEC-076). The queue drives its own worker
+    /// thread; this only stashes the handle for the UI to poll.
+    fn start_download_queue(&mut self, banks: Vec<daw_app::bank_library::CatalogEntry>) {
+        if banks.is_empty() {
+            self.library_status = "Нет банков для загрузки".to_owned();
+            return;
+        }
+        let queue = daw_app::download_queue::DownloadQueue::new(banks);
+        queue.start();
+        self.download_queue = Some(queue);
+    }
+
+    /// Starts the «Основные звуки» batch queue (SPEC-076): the essential pack
+    /// banks that are not yet installed.
+    fn start_essential_queue(&mut self) {
+        self.refresh_installed_banks();
+        match daw_app::essential_sounds::essential_banks_missing() {
+            Ok(banks) => {
+                if banks.is_empty() {
+                    self.library_status = "Основные звуки уже установлены".to_owned();
+                    return;
+                }
+                self.start_download_queue(banks);
+            }
+            Err(e) => self.library_status = format!("Не удалось проверить установку: {e}"),
+        }
+    }
+
+    /// Starts a batch queue over every downloadable, not-yet-installed bank
+    /// (SPEC-076 §4).
+    fn start_all_queue(&mut self) {
+        self.refresh_installed_banks();
+        let installed: std::collections::HashSet<String> =
+            self.installed_banks.iter().map(|b| b.id.clone()).collect();
+        let banks: Vec<daw_app::bank_library::CatalogEntry> = daw_app::bank_library::catalog()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(daw_app::bank_library::is_downloadable)
+            .filter(|e| !installed.contains(&e.id))
+            .collect();
+        if banks.is_empty() {
+            self.library_status = "Все доступные звуки уже установлены".to_owned();
+            return;
+        }
+        self.start_download_queue(banks);
+    }
+
+    /// «Переустановить библиотеку звуков» (SPEC-076 §4): re-download the
+    /// essential pack so every archive is re-fetched and re-verified against
+    /// its pinned SHA-256 (and re-extracted atomically). This is the
+    /// corruption-recovery path — a corrupt install is replaced by a clean
+    /// one rather than diffed on disk.
+    fn reinstall_library(&mut self) {
+        self.refresh_installed_banks();
+        let banks = daw_app::essential_sounds::essential_banks();
+        if banks.is_empty() {
+            self.library_status = "Нет банков для переустановки".to_owned();
+            return;
+        }
+        self.start_download_queue(banks);
+        self.library_status = "Переустановка начата".to_owned();
+    }
+
+    /// «Переместить библиотеку звуков…» (SPEC-076 §4): asks for a folder,
+    /// then copies installed banks there and records the new path. Uses the
+    /// existing rfd-based dialog worker; a settings field stores the chosen
+    /// path for the next launch.
+    fn move_library_dialog(&mut self) {
+        self.library_status = "Перемещение библиотеки пока не реализовано".to_owned();
+        self.soon_notice_open = true;
+    }
+
+    /// Polls the active batch download queue (SPEC-076), refreshing the
+    /// installed set and repainting while it runs. Idle/done/cancelled queues
+    /// are cleared.
+    fn poll_download_queue(&mut self, ctx: &egui::Context) {
+        let Some(queue) = self.download_queue.as_ref() else {
+            return;
+        };
+        let snap = queue.snapshot();
+        let active = queue.is_active();
+        if !active {
+            // Finished (or cancelled): refresh installed banks once.
+            self.refresh_installed_banks();
+            match snap.phase {
+                daw_app::download_queue::QueuePhase::Done if snap.failed.is_empty() => {
+                    self.library_status = "Загрузка завершена".to_owned();
+                }
+                daw_app::download_queue::QueuePhase::Done => {
+                    self.library_status = format!(
+                        "Загрузка завершена с ошибками: {} из {} банков",
+                        snap.failed.len(),
+                        snap.installed.len() + snap.failed.len()
+                    );
+                }
+                daw_app::download_queue::QueuePhase::Cancelled => {
+                    self.library_status = "Загрузка отменена".to_owned();
+                }
+                _ => {}
+            }
+            self.download_queue = None;
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     /// Applies finished bank downloads and repaints while one is in flight
@@ -8625,6 +8737,7 @@ impl eframe::App for App {
         self.poll_imports(ctx);
         self.poll_export();
         self.poll_downloads(ctx);
+        self.poll_download_queue(ctx);
         self.poll_dialog(ctx);
         self.poll_bank_load(ctx);
         // Everything done during one mouse press is one undo step.
