@@ -287,12 +287,15 @@ impl LicenseClass {
 
 /// Classifies an SPDX identifier into one of the three license classes.
 ///
-/// * `NC` → [`LicenseClass::NonCommercial`];
+/// * `NC` and `CC-Sampling+` → [`LicenseClass::NonCommercial`];
 /// * CC0/Unlicense/WTFPL/0BSD/Public Domain → [`LicenseClass::Free`];
 /// * everything else (CC-BY, MIT, BSD, …) → [`LicenseClass::Attribution`].
 #[must_use]
 pub fn license_class(spdx: &str) -> LicenseClass {
-    if spdx.contains("NC") {
+    // CC-Sampling+ permits only non-commercial redistribution of the whole
+    // work, so it belongs to the non-commercial class even though its SPDX id
+    // has no "NC" token.
+    if spdx.contains("NC") || spdx.starts_with("CC-Sampling+") {
         LicenseClass::NonCommercial
     } else if is_free_license(spdx) {
         LicenseClass::Free
@@ -537,7 +540,7 @@ pub fn is_sha256(s: &str) -> bool {
 ///
 /// [`CatalogError`].
 pub fn catalog() -> Result<Vec<CatalogEntry>, CatalogError> {
-    const FILES: [&str; 21] = [
+    const FILES: [&str; 30] = [
         include_str!("../../../catalog/banks/salamander-grand-v3.json"),
         include_str!("../../../catalog/banks/osiris-piano.json"),
         include_str!("../../../catalog/banks/virtuosity-drums.json"),
@@ -559,6 +562,15 @@ pub fn catalog() -> Result<Vec<CatalogEntry>, CatalogError> {
         include_str!("../../../catalog/banks/caveman-cosmonaut.json"),
         include_str!("../../../catalog/banks/cowsynth.json"),
         include_str!("../../../catalog/banks/merry-orks.json"),
+        include_str!("../../../catalog/banks/vcsl.json"),
+        include_str!("../../../catalog/banks/vsco-2-ce.json"),
+        include_str!("../../../catalog/banks/muldjord-kit.json"),
+        include_str!("../../../catalog/banks/ixox-flute.json"),
+        include_str!("../../../catalog/banks/greg-sullivan-e-pianos.json"),
+        include_str!("../../../catalog/banks/gtownchurch.json"),
+        include_str!("../../../catalog/banks/sonatina-symphonic-orchestra.json"),
+        include_str!("../../../catalog/banks/akg-r20e-ir.json"),
+        include_str!("../../../catalog/banks/mellotron-sfz.json"),
     ];
     FILES.iter().map(|text| parse_catalog_entry(text)).collect()
 }
@@ -1289,7 +1301,7 @@ mod tests {
     #[test]
     fn embedded_catalog_parses_and_is_valid() {
         let entries = catalog().expect("catalog must parse");
-        assert_eq!(entries.len(), 21);
+        assert_eq!(entries.len(), 30);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"salamander-grand-v3"));
         assert!(ids.contains(&"osiris-piano"));
@@ -1600,6 +1612,12 @@ mod tests {
         assert_eq!(license_class("CC-BY-NC-4.0"), LicenseClass::NonCommercial);
         assert_eq!(
             license_class("CC-BY-NC-SA-4.0"),
+            LicenseClass::NonCommercial
+        );
+        // Sampling Plus allows non-commercial redistribution of the whole
+        // work only, so it is non-commercial despite no "NC" token.
+        assert_eq!(
+            license_class("CC-Sampling+-1.0"),
             LicenseClass::NonCommercial
         );
     }

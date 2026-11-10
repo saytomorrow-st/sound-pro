@@ -33,9 +33,9 @@ fn valid_entry_json() -> String {
 }
 
 #[test]
-fn catalog_has_exactly_21_known_entries() {
+fn catalog_has_exactly_30_known_entries() {
     let entries = catalog().expect("embedded catalog parses");
-    assert_eq!(entries.len(), 21);
+    assert_eq!(entries.len(), 30);
     let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
     assert!(ids.contains(&"salamander-grand-v3"));
     assert!(ids.contains(&"osiris-piano"));

@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "mellotron-sfz",
+  "name": "Mellotron-SFZ",
+  "family": "synth",
+  "version": "1.0",
+  "author": "Leisureland samples (SFZ mappings by ExistentiaVirae)",
+  "license": {
+    "spdx": "LicenseRef-NC-Mellotron",
+    "url": "https://github.com/ExistentiaVirae/Mellotron-SFZ",
+    "attribution_required": false
+  },
+  "attribution": "Mellotron samples from Leisureland — «they are free to use, but cannot be used in any commercial, for profit software.»",
+  "source_url": "https://github.com/ExistentiaVirae/Mellotron-SFZ",
+  "sha256": "6eb52869300463a91957759f5ba729ae26e717456150efc02d7d6571a6d95521",
+  "size_bytes": 510946413,
+  "license_check": {
+    "url": "https://raw.githubusercontent.com/ExistentiaVirae/Mellotron-SFZ/e192f8a257901e1dc854016c1008522b363b15e2/README.md",
+    "sha256": "81b9d37f5995b0a23887b8295e893cf27a3aff11d500554a1bc33b27c4a8ea9e",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://codeload.github.com/ExistentiaVirae/Mellotron-SFZ/zip/e192f8a257901e1dc854016c1008522b363b15e2",
+    "sha256": "6eb52869300463a91957759f5ba729ae26e717456150efc02d7d6571a6d95521",
+    "size_bytes": 510946413,
+    "redirect_hosts": []
+  },
+  "sfz": "Mellotron-SFZ-main/Mellotron/Orchestra/Orchestra.sfz",
+  "format": "zip",
+  "verified": true
+}

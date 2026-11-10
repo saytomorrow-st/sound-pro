@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "gtownchurch",
+  "name": "G-Town Church Sampling Project",
+  "family": "percussion",
+  "version": "1.0",
+  "author": "Tobias Marberger (converted by S. Christian Collins)",
+  "license": {
+    "spdx": "CC-Sampling+-1.0",
+    "url": "https://creativecommons.org/licenses/sampling+/1.0/",
+    "attribution_required": true
+  },
+  "attribution": "G-Town Church Sampling Project by Tobias Marberger, CC Sampling Plus 1.0 (non-commercial)",
+  "source_url": "https://github.com/sfzinstruments/GTownChurchSamplingProject",
+  "sha256": "6347d07cd88ddb2f0119e546d2d3b66d9b7e4c7043ac3bc79a553124589b57b0",
+  "size_bytes": 457439813,
+  "license_check": {
+    "url": "https://raw.githubusercontent.com/sfzinstruments/GTownChurchSamplingProject/6a1454ad43c24a91b1a55ae053dd8b0e148969e4/README.md",
+    "sha256": "89bf8bd7798298555a3aeaa5189e1d6b926d0409272751a2e0f886144a83ad29",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://codeload.github.com/sfzinstruments/GTownChurchSamplingProject/zip/6a1454ad43c24a91b1a55ae053dd8b0e148969e4",
+    "sha256": "6347d07cd88ddb2f0119e546d2d3b66d9b7e4c7043ac3bc79a553124589b57b0",
+    "size_bytes": 457439813,
+    "redirect_hosts": []
+  },
+  "sfz": null,
+  "format": "zip",
+  "verified": true
+}
