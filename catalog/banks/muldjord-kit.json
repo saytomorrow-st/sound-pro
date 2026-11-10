@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "muldjord-kit",
+  "name": "Muldjord Kit",
+  "family": "drums",
+  "version": "4.0",
+  "author": "Muldjord (DrumGizmo)",
+  "license": {
+    "spdx": "CC-BY-4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0/",
+    "attribution_required": true
+  },
+  "attribution": "Muldjord Kit by Muldjord, CC-BY 4.0",
+  "source_url": "https://github.com/sfzinstruments/DrumGizmo.MuldjordKit",
+  "sha256": "90a1e2d8c749a67d84a7e7277217e45d704ba1d0297c7b13d4772fa4825397be",
+  "size_bytes": 345968791,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/DrumGizmo.MuldjordKit/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://codeload.github.com/sfzinstruments/DrumGizmo.MuldjordKit/zip/fc165714974aa843125ce88597f341b31376e1d5",
+    "sha256": "90a1e2d8c749a67d84a7e7277217e45d704ba1d0297c7b13d4772fa4825397be",
+    "size_bytes": 345968791,
+    "redirect_hosts": []
+  },
+  "sfz": "DrumGizmo.MuldjordKit-master/DrumGizmo/MuldjordKit/Stereo/DrumGizmo MuldjordKit.sfz",
+  "format": "zip",
+  "verified": true
+}

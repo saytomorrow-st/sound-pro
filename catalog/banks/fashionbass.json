@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "fashionbass",
+  "name": "Fashionbass",
+  "family": "bass",
+  "version": "1.001",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Fashionbass by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.fashionbass",
+  "sha256": "3beaa956b8ff97d9f0e7f31d263453fe113a2d07d4be99146b3590c8f5dd5442",
+  "size_bytes": 316328061,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.fashionbass/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.fashionbass/releases/download/v1.001/Karoryfer.Fashionbass.v1.001.zip",
+    "sha256": "3beaa956b8ff97d9f0e7f31d263453fe113a2d07d4be99146b3590c8f5dd5442",
+    "size_bytes": 316328061,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Fashionbass/fashionbass.sfz",
+  "format": "zip",
+  "verified": true
+}

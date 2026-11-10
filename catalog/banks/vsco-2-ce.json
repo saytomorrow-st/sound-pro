@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "vsco-2-ce",
+  "name": "VSCO-2 Community Edition",
+  "family": "orchestral",
+  "version": "1.1.0",
+  "author": "Versilian Studios",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "VSCO-2 Community Edition by Versilian Studios, CC0 1.0",
+  "source_url": "https://github.com/sgossner/VSCO-2-CE",
+  "sha256": "4a4446628df0e1a12aaee58e9f65f8fa7cde51971e961abb1b43083a6d3a8ab7",
+  "size_bytes": 2297598334,
+  "license_check": {
+    "url": "https://api.github.com/repos/sgossner/VSCO-2-CE/license?ref=1.1.0",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://codeload.github.com/sgossner/VSCO-2-CE/zip/28092772094b2d9f1148d84cea97f4545b8c687d",
+    "sha256": "4a4446628df0e1a12aaee58e9f65f8fa7cde51971e961abb1b43083a6d3a8ab7",
+    "size_bytes": 2297598334,
+    "redirect_hosts": []
+  },
+  "sfz": null,
+  "format": "zip",
+  "verified": true
+}

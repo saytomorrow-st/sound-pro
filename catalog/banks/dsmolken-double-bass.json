@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "dsmolken-double-bass",
+  "name": "DSmolken Double Bass",
+  "family": "bass",
+  "version": "1.001",
+  "author": "D. Smolken",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "DSmolken Double Bass by D. Smolken, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/dsmolken.double-bass",
+  "sha256": "380986bb52ee6b6469d28e9089792a3ed37cbd163fe5a19160bf4f98785e7ccb",
+  "size_bytes": 265232156,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/dsmolken.double-bass/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/dsmolken.double-bass/releases/download/v1.001/DSmolken.double_bass.v1.001.zip",
+    "sha256": "380986bb52ee6b6469d28e9089792a3ed37cbd163fe5a19160bf4f98785e7ccb",
+    "size_bytes": 265232156,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "dsmolken_double_bass/d_smolken_rubner_bass_switched.sfz",
+  "format": "zip",
+  "verified": true
+}

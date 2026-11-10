@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "virtuosity-drums",
+  "name": "Virtuosity Drums",
+  "family": "drums",
+  "version": "0.925",
+  "author": "Versilian Studios and Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Virtuosity Drums by Versilian Studios and Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/virtuosity_drums",
+  "sha256": "c6c5d0fe11a394e94be3146a950c3377ec102cb57d189d5a23cec26183d1963a",
+  "size_bytes": 1227151376,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/virtuosity_drums/license?ref=v0.925",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/virtuosity_drums/releases/download/v0.925/Virtuosity_Drums_v0.925.zip",
+    "sha256": "c6c5d0fe11a394e94be3146a950c3377ec102cb57d189d5a23cec26183d1963a",
+    "size_bytes": 1227151376,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Programs/01-basic-kit.sfz",
+  "format": "zip",
+  "verified": true
+}

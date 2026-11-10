@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "freepats-synth-strings-2",
+  "name": "FreePats Synth Strings 2",
+  "family": "synth",
+  "version": "2020-05-28",
+  "author": "FreePats",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Synth Strings 2 by FreePats, CC0 1.0",
+  "source_url": "https://github.com/freepats/synth-strings-2",
+  "sha256": "ceec5966314d9ed7dbd0ba83850d5537096c8eab127422880dc8815766ded7c2",
+  "size_bytes": 5703244,
+  "license_check": {
+    "url": "https://api.github.com/repos/freepats/synth-strings-2/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/freepats/synth-strings-2/releases/download/2020-05-28/SynthStrings2-SFZ%2BFLAC-20200528.7z",
+    "sha256": "ceec5966314d9ed7dbd0ba83850d5537096c8eab127422880dc8815766ded7c2",
+    "size_bytes": 5703244,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "SynthStrings2 SFZ+FLAC-20200528/SynthStrings2 20200528.sfz",
+  "format": "7z",
+  "verified": true
+}

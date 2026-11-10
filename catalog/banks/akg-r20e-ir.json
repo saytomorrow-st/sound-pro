@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "akg-r20e-ir",
+  "name": "AKG R 20 E Spring Reverb Impulse Responses",
+  "family": "impulse-response",
+  "version": "1.0",
+  "author": "Dom McSweeney",
+  "license": {
+    "spdx": "MIT",
+    "url": "https://opensource.org/licenses/MIT",
+    "attribution_required": true
+  },
+  "attribution": "AKG R 20 E Spring Reverb IRs by Dom McSweeney, MIT",
+  "source_url": "https://github.com/DomMcsweeney/AKG-R-20-E-Spring-Reverb-Impulse-Responses",
+  "sha256": "a4b08b094c006c1a6e3903515cf280439c97d10e64e9b3604f6a00b712284ce8",
+  "size_bytes": 7187061,
+  "license_check": {
+    "url": "https://api.github.com/repos/DomMcsweeney/AKG-R-20-E-Spring-Reverb-Impulse-Responses/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://codeload.github.com/DomMcsweeney/AKG-R-20-E-Spring-Reverb-Impulse-Responses/zip/1aea5f8b00e658e4f11e0f62b3b91f5128c2a4a8",
+    "sha256": "a4b08b094c006c1a6e3903515cf280439c97d10e64e9b3604f6a00b712284ce8",
+    "size_bytes": 7187061,
+    "redirect_hosts": []
+  },
+  "sfz": null,
+  "format": "zip",
+  "verified": true
+}

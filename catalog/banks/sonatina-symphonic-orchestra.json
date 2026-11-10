@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "sonatina-symphonic-orchestra",
+  "name": "Sonatina Symphonic Orchestra",
+  "family": "orchestral",
+  "version": "3.0",
+  "author": "Mattias Westlund",
+  "license": {
+    "spdx": "CC-Sampling+-1.0",
+    "url": "https://creativecommons.org/licenses/sampling+/1.0/",
+    "attribution_required": true
+  },
+  "attribution": "Sonatina Symphonic Orchestra by Mattias Westlund, CC Sampling Plus 1.0 (non-commercial)",
+  "source_url": "https://github.com/peastman/sso",
+  "sha256": "1791e3a5f8ceb6b7e105538401ebf8133540546b986dafc76d0d94cd26f73791",
+  "size_bytes": 1377249014,
+  "license_check": {
+    "url": "https://raw.githubusercontent.com/peastman/sso/32bbdb169aef636b8216029a2e056424ba7c2abb/LICENSE",
+    "sha256": "30fc40ccc5a8a1e32e7220519b185c9a46d2c5094ff15bde64556fb7021d73b3",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://codeload.github.com/peastman/sso/zip/32bbdb169aef636b8216029a2e056424ba7c2abb",
+    "sha256": "1791e3a5f8ceb6b7e105538401ebf8133540546b986dafc76d0d94cd26f73791",
+    "size_bytes": 1377249014,
+    "redirect_hosts": []
+  },
+  "sfz": null,
+  "format": "zip",
+  "verified": true
+}

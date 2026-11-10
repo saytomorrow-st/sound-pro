@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "vcsl",
+  "name": "Versilian Community Sample Library",
+  "family": "orchestral",
+  "version": "1.2.2",
+  "author": "Versilian Studios",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "VCSL by Versilian Studios, CC0 1.0",
+  "source_url": "https://github.com/sgossner/VCSL",
+  "sha256": "d7bd399a124ad36f40233a1288c1ec2499567d67ae34745b1c9c107fbe081698",
+  "size_bytes": 4047406738,
+  "license_check": {
+    "url": "https://api.github.com/repos/sgossner/VCSL/license?ref=v1.2.2-RC",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://codeload.github.com/sgossner/VCSL/zip/b6e6ac82d22248edee98a0bde185eb9ef6d439ad",
+    "sha256": "d7bd399a124ad36f40233a1288c1ec2499567d67ae34745b1c9c107fbe081698",
+    "size_bytes": 4047406738,
+    "redirect_hosts": []
+  },
+  "sfz": null,
+  "format": "zip",
+  "verified": true
+}

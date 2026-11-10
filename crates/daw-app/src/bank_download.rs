@@ -29,10 +29,12 @@
 //!   redirect aborts with [`DownloadError::RedirectToOtherHost`].
 //! - **TLS**: data and license URLs must be `https`; `http` is rejected with
 //!   [`DownloadError::InsecureUrl`]. TLS uses rustls (no OpenSSL).
-//! - **Partial downloads / resume**: the archive is streamed to a temporary
-//!   file and only renamed into place after hash verification; a truncated
-//!   body fails the size/hash check and the temp file is deleted. There is no
-//!   cross-session resume.
+//! - **Partial downloads / resume**: the archive is streamed to a partial file
+//!   and only renamed into place after hash verification; a truncated body
+//!   fails the size/hash check and the partial file is deleted. A network
+//!   failure mid-stream is retried (up to [`MAX_RETRIES`]) via HTTP `Range`
+//!   from the last byte written, so an interrupted download resumes rather
+//!   than restarting from zero.
 //! - **Concurrency / atomicity**: a per-bank lock file (created with
 //!   `create_new`) serialises concurrent downloads of the same bank; the
 //!   install uses a unique staging dir and a rename into place, and the
@@ -83,6 +85,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Overall deadline for the (small) license-source fetch.
 const LICENSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum number of retries for a network failure mid-download (SPEC-076).
+/// Each retry resumes from the bytes already written to the partial file via
+/// HTTP `Range`, so a flaky connection does not restart from zero.
+const MAX_RETRIES: u32 = 3;
+
 /// Why a download failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
@@ -104,6 +111,9 @@ pub enum DownloadError {
     /// A network or body I/O failure.
     #[error("network error: {0}")]
     Network(String),
+    /// A network failure persisted across every retry.
+    #[error("download failed after {0} attempts: {1}")]
+    RetriesExhausted(u32, String),
     /// There is not enough disk space to complete the download.
     #[error("not enough disk space to download {0}")]
     NoSpace(String),
@@ -336,11 +346,14 @@ fn download_bank_into_inner(
     // 1. Re-check the license before downloading anything.
     recheck_license(entry, license_check, cancel, https_required)?;
 
-    // 2. Stream the archive to a unique temp file, enforcing the size cap.
-    let tmp_archive = banks.join(format!(".{}.download.{}.tmp", entry.id, unique_token()));
-    let result = download_archive(download, &tmp_archive, progress, cancel, https_required);
+    // 2. Stream the archive to a deterministic partial file, enforcing the
+    //    size cap. The `.part` name (not swept as stale) lets a later run
+    //    resume an interrupted download via HTTP Range; it is removed once the
+    //    archive is verified and unpacked (or on a hard failure below).
+    let partial = banks.join(format!(".{}.download.part", entry.id));
+    let result = download_archive(download, &partial, progress, cancel, https_required);
     if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp_archive);
+        let _ = std::fs::remove_file(&partial);
         return Err(e);
     }
 
@@ -350,9 +363,9 @@ fn download_bank_into_inner(
     let unpack_result = (|| {
         std::fs::create_dir_all(&tmp_dir)
             .map_err(|e| DownloadError::Io(tmp_dir.clone(), e.to_string()))?;
-        unpack_archive(&tmp_archive, &entry.format, &tmp_dir, cancel, &limits)
+        unpack_archive(&partial, &entry.format, &tmp_dir, cancel, &limits)
     })();
-    let _ = std::fs::remove_file(&tmp_archive);
+    let _ = std::fs::remove_file(&partial);
     if let Err(e) = unpack_result {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(e);
@@ -622,6 +635,15 @@ fn recheck_license(
 /// Streams the archive to `out`, enforcing the manifest size cap, reporting
 /// progress, and honouring cancellation. On success the SHA-256 of the written
 /// bytes is verified against the pinned digest.
+/// Streams `download` to `out` (a deterministic partial file), enforcing the
+/// pinned size and SHA-256, and retrying network failures by resuming via HTTP
+/// `Range` from the last byte already on disk.
+///
+/// The SHA-256 is computed over the *entire* file (bytes already present from
+/// a previous attempt are re-hashed), so a resumption can never accept a
+/// corrupted prefix. On success the file holds exactly `download.size_bytes`
+/// bytes matching the pinned digest; on a hard failure (bad hash, truncation,
+/// cancellation, retries exhausted) the caller removes `out`.
 fn download_archive(
     download: &Download,
     out: &Path,
@@ -629,63 +651,162 @@ fn download_archive(
     cancel: &Arc<AtomicBool>,
     https_required: bool,
 ) -> Result<(), DownloadError> {
-    let file = std::fs::File::create(out).map_err(|e| io_err(out, e))?;
-    let mut writer = std::io::BufWriter::new(file);
-
-    let mut hasher = Sha256::new();
-    let mut received: u64 = 0;
-
-    let mut reader = http_open(
-        &download.url,
-        cancel,
-        https_required,
-        Some(&download.redirect_hosts),
-        None,
-    )?;
-    // Early size check: a lying `Content-Length` is rejected before we read.
-    if let Some(len) = reader.content_length() {
-        if len != download.size_bytes {
-            return Err(DownloadError::TooLarge {
-                expected: download.size_bytes,
-                actual: len,
-            });
-        }
+    // Bytes already on disk from a previous attempt; resume from here.
+    let mut received = existing_partial_size(out)?;
+    if received > download.size_bytes {
+        // A corrupt/larger-than-pinned leftover: discard and restart clean.
+        std::fs::remove_file(out).map_err(|e| io_err(out, e))?;
+        received = 0;
     }
-    let mut buf = vec![0u8; 64 * 1024];
+
+    let mut attempts: u32 = 0;
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(DownloadError::Cancelled);
         }
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| DownloadError::Network(e.to_string()))?;
-        if n == 0 {
-            break;
-        }
-        received += n as u64;
-        if received > download.size_bytes {
-            return Err(DownloadError::Truncated {
-                expected: download.size_bytes,
-                actual: received,
-            });
-        }
-        hasher.update(&buf[..n]);
-        writer.write_all(&buf[..n]).map_err(|e| io_err(out, e))?;
-        progress.received.store(received, Ordering::Relaxed);
-    }
-    writer.flush().map_err(|e| io_err(out, e))?;
+        attempts += 1;
 
-    if received != download.size_bytes {
-        return Err(DownloadError::Truncated {
-            expected: download.size_bytes,
-            actual: received,
-        });
+        // Open for append (resume) or create (fresh), without truncating.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(out)
+            .map_err(|e| io_err(out, e))?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        let range_start = (received > 0).then_some(received);
+        let mut reader = http_open(
+            &download.url,
+            cancel,
+            https_required,
+            Some(&download.redirect_hosts),
+            None,
+            range_start,
+        )?;
+
+        // If we asked for a range but the server ignored it and returned the
+        // whole body (200), restart from zero: truncate the partial file and
+        // re-hash from scratch.
+        if range_start.is_some() && reader.status() == 200 {
+            let _ = std::fs::remove_file(out);
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(out)
+                .map_err(|e| io_err(out, e))?;
+            writer = std::io::BufWriter::new(file);
+            received = 0;
+        }
+
+        // Early size check: a lying `Content-Length` is rejected before we
+        // read. For a ranged response the advertised length is the *remaining*
+        // bytes, so compare against `size_bytes - received`.
+        if let Some(len) = reader.content_length() {
+            let expected_remaining = download.size_bytes.saturating_sub(received);
+            if len != expected_remaining {
+                return Err(DownloadError::TooLarge {
+                    expected: download.size_bytes,
+                    actual: len.saturating_add(received),
+                });
+            }
+        }
+
+        // Stream the (remaining) body, appending to the partial file.
+        let mut buf = vec![0u8; 64 * 1024];
+        let stream_result: Result<(), DownloadError> = (|| {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(DownloadError::Cancelled);
+                }
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| DownloadError::Network(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                received += n as u64;
+                if received > download.size_bytes {
+                    return Err(DownloadError::Truncated {
+                        expected: download.size_bytes,
+                        actual: received,
+                    });
+                }
+                writer.write_all(&buf[..n]).map_err(|e| io_err(out, e))?;
+                progress.received.store(received, Ordering::Relaxed);
+            }
+            writer.flush().map_err(|e| io_err(out, e))?;
+            // A clean EOF before the pinned size is a truncated (resume-able)
+            // body: the server stopped sending early but we keep the partial
+            // file and retry with a Range from `received`.
+            if received != download.size_bytes {
+                return Err(DownloadError::Truncated {
+                    expected: download.size_bytes,
+                    actual: received,
+                });
+            }
+            Ok(())
+        })();
+
+        // Network failures and truncated bodies are retryable (resume from
+        // `received`); everything else is fatal and returned immediately.
+        match stream_result {
+            Ok(()) => break,
+            Err(e) => {
+                // `received` already counts the bytes written before the
+                // failure; the partial file is left in place for the retry.
+                let retryable = matches!(
+                    e,
+                    DownloadError::Network(_)
+                        | DownloadError::RateLimited(_)
+                        | DownloadError::Truncated { .. }
+                );
+                if retryable && attempts < MAX_RETRIES {
+                    crate::log_warn!("bank download attempt {attempts} failed, resuming: {e}");
+                    continue;
+                }
+                return Err(if retryable {
+                    DownloadError::RetriesExhausted(attempts, e.to_string())
+                } else {
+                    e
+                });
+            }
+        }
     }
-    let actual = hex(&hasher.finalize());
+
+    // Hash the *entire* file (including any bytes resumed from a prior run).
+    let actual = hash_file_sha256(out)?;
     if !constant_time_eq(actual.as_bytes(), download.sha256.as_bytes()) {
         return Err(DownloadError::HashMismatch);
     }
     Ok(())
+}
+
+/// The number of bytes already present in a partial download file, or `0` if
+/// it does not exist. Errors reading metadata surface as a [`DownloadError`].
+fn existing_partial_size(path: &Path) -> Result<u64, DownloadError> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(io_err(path, e)),
+    }
+}
+
+/// SHA-256 of a file's full contents, streamed (used to re-hash a resumed
+/// partial file that may contain bytes from a previous attempt).
+fn hash_file_sha256(path: &Path) -> Result<String, DownloadError> {
+    let file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
+    let mut hasher = Sha256::new();
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| io_err(path, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 /// Unpacks the archive into `dest`, rejecting unsafe entries and enforcing
@@ -699,7 +820,16 @@ fn unpack_archive(
 ) -> Result<(), DownloadError> {
     match format {
         "zip" => unpack_zip(archive, dest, cancel, limits, None),
-        "tar.bz2" => unpack_tar_bz2(archive, dest, cancel, limits),
+        "tar.bz2" => unpack_tar(archive, dest, cancel, limits, |file| {
+            Box::new(bzip2::read::BzDecoder::new(file))
+        }),
+        "tar.gz" => unpack_tar(archive, dest, cancel, limits, |file| {
+            Box::new(flate2::read::GzDecoder::new(file))
+        }),
+        "tar.xz" => unpack_tar(archive, dest, cancel, limits, |file| {
+            Box::new(xz2::read::XzDecoder::new(file))
+        }),
+        "7z" => unpack_7z(archive, dest, cancel, limits),
         other => Err(DownloadError::UnsupportedFormat(other.to_owned())),
     }
 }
@@ -861,15 +991,16 @@ fn is_non_regular_zip<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     }
 }
 
-fn unpack_tar_bz2(
+fn unpack_tar(
     archive: &Path,
     dest: &Path,
     cancel: &Arc<AtomicBool>,
     limits: &Limits,
+    wrap: impl FnOnce(std::fs::File) -> Box<dyn Read>,
 ) -> Result<(), DownloadError> {
     let file = std::fs::File::open(archive)
         .map_err(|e| DownloadError::Io(archive.to_path_buf(), e.to_string()))?;
-    let decoder = bzip2::read::BzDecoder::new(file);
+    let decoder = wrap(file);
     let mut tar = tar::Archive::new(decoder);
 
     let mut state = UnpackState::new();
@@ -938,6 +1069,149 @@ fn unpack_tar_bz2(
         }
     }
     Ok(())
+}
+
+/// Unpacks a 7z archive using `sevenz-rust`, applying the same safety checks
+/// as the tar/zip paths (zip-slip, size caps, duplicate detection, atomic
+/// `create_new` writes, cancellation).
+///
+/// Note: the 7z format does not encode symlinks the way tar/zip do — a 7z
+/// "symlink" entry is just a regular file whose contents are the link target.
+/// We therefore treat every non-directory entry as a regular file and write
+/// its bytes verbatim, which is both safe and the behavior users expect.
+fn unpack_7z(
+    archive: &Path,
+    dest: &Path,
+    cancel: &Arc<AtomicBool>,
+    limits: &Limits,
+) -> Result<(), DownloadError> {
+    let file = std::fs::File::open(archive)
+        .map_err(|e| DownloadError::Io(archive.to_path_buf(), e.to_string()))?;
+
+    let mut state = UnpackState::new();
+    let mut count = 0usize;
+    // The closure cannot return our structured `DownloadError` directly
+    // (`sevenz-rust` only accepts its own `Error`), so we stash the first
+    // error here and stop iteration immediately; it is returned below.
+    let mut first_err: Option<DownloadError> = None;
+
+    let result = sevenz_rust::decompress_with_extract_fn(
+        file,
+        dest,
+        |entry: &sevenz_rust::SevenZArchiveEntry,
+         reader: &mut dyn std::io::Read,
+         _dest_path: &std::path::PathBuf|
+         -> Result<bool, sevenz_rust::Error> {
+            // Cancellation and entry-count limits are enforced from within the
+            // closure because `sevenz-rust` does not expose the total entry
+            // count up front.
+            if cancel.load(Ordering::Relaxed) {
+                first_err = Some(DownloadError::Cancelled);
+                return Ok(false);
+            }
+            count += 1;
+            if count > limits.max_entries {
+                first_err = Some(DownloadError::TooManyEntries(count));
+                return Ok(false);
+            }
+
+            let name = entry.name().to_owned();
+            if entry.is_anti_item() {
+                first_err = Some(DownloadError::UnsafeEntry(format!(
+                    "7z anti-item (deletion marker) is not allowed: {name:?}"
+                )));
+                return Ok(false);
+            }
+
+            let out_path = match safe_join(dest, &name) {
+                Ok(p) => p,
+                Err(e) => {
+                    first_err = Some(e);
+                    return Ok(false);
+                }
+            };
+
+            if entry.is_directory() {
+                if let Err(e) = std::fs::create_dir_all(&out_path) {
+                    first_err = Some(DownloadError::Io(out_path, e.to_string()));
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+
+            let declared = entry.size();
+            if declared > limits.max_entry_bytes {
+                first_err = Some(DownloadError::UnsafeEntry(format!(
+                    "entry {name:?} is too large ({declared} bytes)"
+                )));
+                return Ok(false);
+            }
+            if let Err(e) = state.register(&name) {
+                first_err = Some(e);
+                return Ok(false);
+            }
+
+            if let Some(parent) = out_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    first_err = Some(DownloadError::Io(parent.to_path_buf(), e.to_string()));
+                    return Ok(false);
+                }
+            }
+
+            // `create_new` so a duplicate/collision can never overwrite a file.
+            let mut out = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    first_err = Some(io_err(&out_path, e));
+                    return Ok(false);
+                }
+            };
+
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut actual: u64 = 0;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    first_err = Some(DownloadError::Cancelled);
+                    return Ok(false);
+                }
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        first_err = Some(DownloadError::Unpack(e.to_string()));
+                        return Ok(false);
+                    }
+                };
+                actual = actual.saturating_add(n as u64);
+                if actual > declared {
+                    first_err = Some(DownloadError::UnsafeEntry(format!(
+                        "entry {name:?} has more bytes than its declared size ({declared})"
+                    )));
+                    return Ok(false);
+                }
+                if let Err(e) = state.add_bytes(n as u64, limits) {
+                    first_err = Some(e);
+                    return Ok(false);
+                }
+                if let Err(e) = out.write_all(&buf[..n]) {
+                    first_err = Some(io_err(&out_path, e));
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        },
+    );
+
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    // A genuine `sevenz-rust` failure (bad signature, unsupported compression
+    // method, truncated archive, ...) that our own checks did not catch.
+    result.map_err(|e| DownloadError::Unpack(e.to_string()))
 }
 
 /// Validates an archive entry name and returns it as clean, `/`-separated
@@ -1124,15 +1398,22 @@ fn fsync_dir_recursive(dir: &Path) -> Result<(), DownloadError> {
 // ---------------------------------------------------------------------------
 
 /// A streaming HTTP response reader that remembers its `Content-Length` for
-/// the early size check.
+/// the early size check. For a ranged (206) response, `content_length` is the
+/// remaining byte count (the full length is implied by the pinned manifest
+/// size); for an ordinary 200 response it is the whole body length.
 struct BodyReader {
     inner: Box<dyn Read>,
     content_length: Option<u64>,
+    status: u16,
 }
 
 impl BodyReader {
     fn content_length(&self) -> Option<u64> {
         self.content_length
+    }
+
+    fn status(&self) -> u16 {
+        self.status
     }
 }
 
@@ -1149,7 +1430,14 @@ fn http_get_license(
     cancel: &Arc<AtomicBool>,
     https_required: bool,
 ) -> Result<Vec<u8>, DownloadError> {
-    let mut reader = http_open(url, cancel, https_required, None, Some(LICENSE_TIMEOUT))?;
+    let mut reader = http_open(
+        url,
+        cancel,
+        https_required,
+        None,
+        Some(LICENSE_TIMEOUT),
+        None,
+    )?;
     let mut out = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -1179,12 +1467,18 @@ fn http_get_license(
 /// `allowed_hosts`, when `Some`, is the catalog `redirect_hosts` allow-list:
 /// the pinned URL's own host is always allowed, plus any listed exact host or
 /// `.`-suffixed suffix. When `None` (license fetch), redirects stay same-host.
+///
+/// `range_start`, when `Some`, sends `Range: bytes={start}-` and expects a 206
+/// response (used to resume a partial download). If the server ignores the
+/// range and answers 200 with the full body, the caller detects it via
+/// [`BodyReader::status`] and restarts from zero.
 fn http_open(
     url: &str,
     cancel: &Arc<AtomicBool>,
     https_required: bool,
     allowed_hosts: Option<&[String]>,
     global_timeout: Option<Duration>,
+    range_start: Option<u64>,
 ) -> Result<BodyReader, DownloadError> {
     if https_required {
         ensure_https(url)?;
@@ -1195,8 +1489,12 @@ fn http_open(
         if cancel.load(Ordering::Relaxed) {
             return Err(DownloadError::Cancelled);
         }
-        let response = agent
-            .get(&current)
+        let mut request = agent.get(&current);
+        if let Some(start) = range_start {
+            // Re-send the Range header on every redirect hop (SPEC-076 §7).
+            request = request.header("Range", &format!("bytes={start}-"));
+        }
+        let response = request
             .call()
             .map_err(|e| DownloadError::Network(e.to_string()))?;
         let status = response.status().as_u16();
@@ -1238,6 +1536,7 @@ fn http_open(
         return Ok(BodyReader {
             inner: Box::new(reader),
             content_length,
+            status,
         });
     }
     Err(DownloadError::TooManyRedirects(current))
@@ -1640,6 +1939,20 @@ mod http_tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
+    // The `Range: bytes=N-` start offset of the request currently being
+    // served on this worker thread, parsed from the request head. A handler
+    // closure reads it via `requested_range` to serve a partial body
+    // (resume test). It is thread-local because each connection is served on
+    // its own thread.
+    thread_local! {
+        static REQUESTED_RANGE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The `Range` start offset of the in-flight request, or `None`.
+    fn requested_range() -> Option<u64> {
+        REQUESTED_RANGE.with(|c| c.get())
+    }
+
     /// A small multi-threaded HTTP server: the accept loop runs on one thread
     /// and each connection is served on its own worker thread, so a handler
     /// that blocks (e.g. to hold a download's lock while the test races a
@@ -1698,6 +2011,16 @@ mod http_tests {
                             .next()
                             .and_then(|l| l.split_whitespace().nth(1))
                             .unwrap_or("/");
+                        // Parse `Range: bytes=N-` for the resume test.
+                        let range = req
+                            .lines()
+                            .find_map(|l| {
+                                let (name, rest) = l.split_once(':')?;
+                                name.eq_ignore_ascii_case("range")
+                                    .then_some(rest.trim().strip_prefix("bytes=")?)
+                            })
+                            .and_then(|v| v.trim_end_matches('-').parse::<u64>().ok());
+                        REQUESTED_RANGE.with(|c| c.set(range));
                         // Assign a monotonic request index; the handler uses it
                         // to distinguish the first vs. later license requests.
                         let idx = index.fetch_add(1, Ordering::Relaxed);
@@ -1755,6 +2078,7 @@ mod http_tests {
         body: Vec<u8>,
         location: Option<String>,
         content_length: Option<usize>,
+        content_range: Option<String>,
     }
 
     impl ServerResponse {
@@ -1764,6 +2088,7 @@ mod http_tests {
                 body,
                 location: None,
                 content_length: None,
+                content_range: None,
             }
         }
         fn not_found() -> Self {
@@ -1772,6 +2097,7 @@ mod http_tests {
                 body: b"not found".to_vec(),
                 location: None,
                 content_length: None,
+                content_range: None,
             }
         }
         fn redirect(location: String) -> Self {
@@ -1780,6 +2106,7 @@ mod http_tests {
                 body: Vec::new(),
                 location: Some(location),
                 content_length: None,
+                content_range: None,
             }
         }
         /// Omit the `Content-Length` header so the client must discover the
@@ -1789,11 +2116,20 @@ mod http_tests {
             self.content_length = Some(usize::MAX);
             self
         }
+        /// A partial (206) response starting at `from` within `body`, with the
+        /// total resource size `total` for the `Content-Range` header.
+        fn partial(mut self, from: usize, total: u64) -> Self {
+            self.status = 206;
+            self.body = self.body[from..].to_vec();
+            self.content_range = Some(format!("bytes {from}-{}/{total}", total - 1));
+            self
+        }
     }
 
     fn write_response(stream: &mut std::net::TcpStream, resp: &ServerResponse) {
         let reason = match resp.status {
             200 => "OK",
+            206 => "Partial Content",
             301 => "Moved Permanently",
             302 => "Found",
             404 => "Not Found",
@@ -1807,6 +2143,9 @@ mod http_tests {
             Some(usize::MAX) => {}
             Some(n) => head.push_str(&format!("Content-Length: {n}\r\n")),
             None => head.push_str(&format!("Content-Length: {}\r\n", resp.body.len())),
+        }
+        if let Some(cr) = &resp.content_range {
+            head.push_str(&format!("Content-Range: {cr}\r\n"));
         }
         if let Some(loc) = &resp.location {
             head.push_str(&format!("Location: {loc}\r\n"));
@@ -2035,6 +2374,86 @@ mod http_tests {
             enc.finish().unwrap();
         }
         out
+    }
+
+    /// Build a `.tar.gz` archive (gzip-compressed tar), used to exercise the
+    /// `tar.gz` unpack path (SPEC-076).
+    fn make_tar_gz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut builder = tar::Builder::new(&mut cursor);
+            for (name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, *name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        gzip_bytes(&cursor.into_inner())
+    }
+
+    fn gzip_bytes(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut out, flate2::Compression::default());
+            enc.write_all(raw).unwrap();
+            enc.finish().unwrap();
+        }
+        out
+    }
+
+    /// Build a `.tar.xz` archive (xz-compressed tar), used to exercise the
+    /// `tar.xz` unpack path (FreePats / Salamander Grand).
+    fn make_tar_xz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut builder = tar::Builder::new(&mut cursor);
+            for (name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, *name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        xz_bytes(&cursor.into_inner())
+    }
+
+    fn xz_bytes(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut enc = xz2::write::XzEncoder::new(&mut out, 6);
+            enc.write_all(raw).unwrap();
+            enc.finish().unwrap();
+        }
+        out
+    }
+
+    /// Build a `.7z` archive (solid LZMA2), used to exercise the `7z` unpack
+    /// path. `sevenz-rust` stores directory entries as stream-less entries and
+    /// regular files as streamed entries; we emit exactly the files given.
+    fn make_7z_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = sevenz_rust::SevenZWriter::new(&mut cursor).expect("7z writer");
+            for (name, data) in entries {
+                let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+                entry.name = (*name).to_owned();
+                entry.has_stream = true;
+                entry.is_directory = false;
+                writer
+                    .push_archive_entry(entry, Some(Cursor::new(*data)))
+                    .expect("push 7z entry");
+            }
+            let _ = writer.finish().expect("finish 7z");
+        }
+        cursor.into_inner()
     }
 
     /// Rewrites the first central-directory entry's `uncompressed_size` field
@@ -2307,6 +2726,8 @@ mod http_tests {
         let archive_arc = Arc::new(archive);
         // Serve the archive WITHOUT a Content-Length header so the client must
         // read to EOF and discover it got fewer bytes than the pinned size.
+        // With resume, a truncated body is retried (up to MAX_RETRIES) and the
+        // final failure is RetriesExhausted with the underlying truncation.
         let license_body: Vec<u8> = br#"{"license":{"spdx_id":"CC0-1.0"}}"#.to_vec();
         let server = TestServer::start(move |_idx, target| {
             if target == "/license" {
@@ -2335,9 +2756,70 @@ mod http_tests {
         );
         assert!(matches!(
             result,
-            Err(DownloadError::Truncated { expected, .. }) if expected == declared_size
+            Err(DownloadError::RetriesExhausted(_, msg)) if msg.contains("truncated")
         ));
         assert!(!banks.join("test-bank").exists());
+    }
+
+    #[test]
+    fn interrupted_download_resumes_via_range() {
+        let archive = make_zip_bytes(&[
+            ("bank/bank.sfz", b"<region> sample=bank.wav"),
+            ("bank/bank.wav", b"RIFFfake"),
+        ]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+
+        // First request serves only the first half of the archive (a truncated
+        // body); the retry requests a Range and is served the remaining bytes
+        // with a 206. The client must resume, not restart, and still verify
+        // the SHA-256 over the whole file.
+        let half = (size / 2) as usize;
+        let license_body: Vec<u8> = br#"{"license":{"spdx_id":"CC0-1.0"}}"#.to_vec();
+        let server = TestServer::start(move |_idx, target| {
+            if target == "/license" {
+                ServerResponse::ok(license_body.clone())
+            } else if target == "/archive" {
+                match requested_range() {
+                    None => {
+                        // Truncate: declare the full length but send only half.
+                        let mut resp = ServerResponse::ok((*archive_arc)[..half].to_vec());
+                        resp.content_length = Some((*archive_arc).len());
+                        resp
+                    }
+                    Some(start) => {
+                        ServerResponse::ok((*archive_arc).clone()).partial(start as usize, size)
+                    }
+                }
+            } else {
+                ServerResponse::not_found()
+            }
+        });
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "zip",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("resume");
+        let progress = Progress::new(size);
+        let bank = download_bank_into_with_https(&e, &banks, &progress, &cancel_flag(), false)
+            .expect("resumed download succeeds");
+
+        assert_eq!(bank.id, "test-bank");
+        assert_eq!(progress.bytes(), size);
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+        // The partial file is consumed, not left behind.
+        assert!(!banks.join(".test-bank.download.part").exists());
     }
 
     // ------------------------------------------------------------------
@@ -2776,6 +3258,195 @@ mod http_tests {
         let result =
             download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
         assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+    }
+
+    #[test]
+    fn tar_gz_archive_unpacks() {
+        let archive = make_tar_gz_bytes(&[
+            ("bank/bank.sfz", b"<region> sample=bank.wav"),
+            ("bank/bank.wav", b"RIFFfake"),
+        ]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.gz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-gz");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        let bank = result.expect("tar.gz download succeeds");
+        assert_eq!(bank.id, "test-bank");
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+        let leftover = std::fs::read_dir(&banks)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+    }
+
+    #[test]
+    fn tar_gz_duplicate_entry_is_rejected() {
+        let archive = make_tar_gz_bytes(&[("bank/bank.sfz", b"one"), ("bank/bank.sfz", b"two")]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.gz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-gz-dup");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // tar.xz archives (FreePats / Salamander Grand)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tar_xz_archive_unpacks() {
+        let archive = make_tar_xz_bytes(&[
+            ("bank/bank.sfz", b"<region> sample=bank.wav"),
+            ("bank/bank.wav", b"RIFFfake"),
+        ]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.xz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-xz");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        let bank = result.expect("tar.xz download succeeds");
+        assert_eq!(bank.id, "test-bank");
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+        let leftover = std::fs::read_dir(&banks)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+    }
+
+    #[test]
+    fn tar_xz_duplicate_entry_is_rejected() {
+        let archive = make_tar_xz_bytes(&[("bank/bank.sfz", b"one"), ("bank/bank.sfz", b"two")]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.xz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-xz-dup");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // 7z archives (FreePats)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sevenz_archive_unpacks() {
+        let archive = make_7z_bytes(&[
+            ("bank/bank.sfz", b"<region> sample=bank.wav"),
+            ("bank/bank.wav", b"RIFFfake"),
+        ]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "7z",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("sevenz");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        let bank = result.expect("7z download succeeds");
+        assert_eq!(bank.id, "test-bank");
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.wav")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn sevenz_zip_slip_is_rejected() {
+        let archive = make_7z_bytes(&[("../evil.txt", b"boom")]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "7z",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("sevenz-slip");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+        assert!(!banks.join("test-bank").exists());
     }
 
     #[test]

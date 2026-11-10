@@ -6,6 +6,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio_editor;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod shell;
 #[cfg(target_os = "linux")]
 mod x11_cursor;
@@ -19,6 +21,7 @@ use audio_core::{
 };
 use daw_app::audio_settings::{AudioSettings, BUFFER_SIZES};
 use daw_app::playback::PlaybackControl;
+use daw_app::welcome::{self, WelcomeStep};
 use daw_gui::layout::{Bottom, Layout, MeterState};
 use daw_gui::quantize::{Division, QuantizeMode, QuantizeParams};
 use daw_gui::timeline::{self, CycleHit};
@@ -53,6 +56,111 @@ const PIANO_HEIGHT: f32 = 280.0;
 const VELOCITY_LANE_HEIGHT: f32 = 80.0;
 /// Strength of notes drawn with the mouse.
 const NEW_VELOCITY: u8 = 100;
+
+// --- First-run welcome dialog (SPEC-…). Colours and sizes are named in one
+// place so the window can be tuned against the Logic Pro reference without
+// hunting through the draw code. ---
+
+/// Welcome dialog: warm dark background (the macOS-dialog brown).
+const WELCOME_BG: Color32 = Color32::from_rgb(46, 31, 28);
+/// Welcome dialog: dim backdrop behind the window.
+const WELCOME_BACKDROP: Color32 = Color32::from_black_alpha(120);
+/// Nearly-white title text.
+const WELCOME_TITLE: Color32 = Color32::from_rgb(237, 230, 228);
+/// Light-grey body text.
+const WELCOME_BODY: Color32 = Color32::from_rgb(220, 211, 208);
+/// Thin horizontal separator above the bottom panel.
+const WELCOME_SEPARATOR: Color32 = Color32::from_rgb(74, 63, 61);
+/// Secondary (grey) button fill.
+const WELCOME_BUTTON_BG: Color32 = Color32::from_rgb(92, 83, 82);
+/// Button label colour.
+const WELCOME_BUTTON_TEXT: Color32 = Color32::from_rgb(237, 230, 228);
+/// Primary (blue) button fill and progress-bar fill.
+const WELCOME_PRIMARY: Color32 = Color32::from_rgb(10, 108, 224);
+/// Progress-bar track.
+const WELCOME_TRACK: Color32 = Color32::from_rgb(74, 63, 61);
+/// Dialog width and height in points.
+const WELCOME_SIZE: Vec2 = Vec2::new(654.0, 387.0);
+/// App icon side in points.
+const WELCOME_ICON: f32 = 120.0;
+/// Left margin of the icon / text block.
+const WELCOME_MARGIN: f32 = 48.0;
+/// Title font size in points.
+const WELCOME_TITLE_SIZE: f32 = 28.0;
+/// Body font size in points.
+const WELCOME_BODY_SIZE: f32 = 12.0;
+/// Corner radius of the dialog and of buttons.
+const WELCOME_CORNER: u8 = 5;
+/// Height of the bottom panel (buttons / progress bar) below the separator.
+const WELCOME_FOOTER_H: f32 = 56.0;
+/// Download-icon gradient stops (top-left -> centre -> bottom-right).
+const WELCOME_ICON_GRADIENT_TL: Color32 = Color32::from_rgb(255, 154, 74);
+const WELCOME_ICON_GRADIENT_C: Color32 = Color32::from_rgb(242, 104, 110);
+const WELCOME_ICON_GRADIENT_BR: Color32 = Color32::from_rgb(107, 181, 216);
+
+// --- Sound Library Manager window (SPEC-…). Colours and layout named in one
+// place so the window can be tuned against the Logic Pro reference.
+/// Alternating row background (even rows).
+const MANAGER_ROW_A: Color32 = Color32::from_rgb(40, 40, 43);
+/// Alternating row background (odd rows).
+const MANAGER_ROW_B: Color32 = Color32::from_rgb(34, 34, 37);
+/// Selected-row highlight (blue).
+const MANAGER_SELECTED: Color32 = Color32::from_rgb(10, 108, 224);
+/// Text colour inside the tree.
+const MANAGER_TEXT: Color32 = Color32::from_rgb(230, 230, 230);
+/// Muted text for statuses and the «Скоро» suffix.
+const MANAGER_MUTED: Color32 = Color32::from_rgb(150, 150, 155);
+
+/// A user action on the welcome dialog. The pure transition in
+/// [`welcome_transition`] maps each action to the next step, so the UI and the
+/// tests share one source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WelcomeAction {
+    /// «Полный режим» — proceed to the download step.
+    FullMode,
+    /// «Упрощённый режим» — show the «Скоро» notice, keep the window open.
+    SimplifiedMode,
+    /// «Подробнее…» — show the «Скоро» notice, keep the window open.
+    Details,
+    /// «Закрыть» / «Загрузить позже» — finish the flow.
+    Close,
+    /// «Загрузить больше звуков…» — open the library manager and finish.
+    OpenLibraryManager,
+}
+
+/// The result of applying a welcome action: the next step and whether the
+/// «Скоро» notice should be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WelcomeTransition {
+    step: WelcomeStep,
+    soon: bool,
+}
+
+/// Pure welcome-flow state machine. «Упрощённый режим» and «Подробнее…» leave
+/// the step unchanged and ask for the «Скоро» notice; «Полный режим» advances
+/// to the download step; any close action on the download step advances to the
+/// «Доступно больше звуков» step; any close action there (or «Загрузить
+/// больше звуков…», which also opens the manager) completes the flow.
+#[must_use]
+fn welcome_transition(step: WelcomeStep, action: WelcomeAction) -> WelcomeTransition {
+    match action {
+        WelcomeAction::FullMode => WelcomeTransition {
+            step: WelcomeStep::Download,
+            soon: false,
+        },
+        WelcomeAction::SimplifiedMode | WelcomeAction::Details => {
+            WelcomeTransition { step, soon: true }
+        }
+        WelcomeAction::Close | WelcomeAction::OpenLibraryManager => WelcomeTransition {
+            step: match step {
+                WelcomeStep::Welcome => WelcomeStep::Welcome,
+                WelcomeStep::Download => WelcomeStep::MoreSounds,
+                WelcomeStep::MoreSounds | WelcomeStep::Done => WelcomeStep::Done,
+            },
+            soon: false,
+        },
+    }
+}
 
 /// A note being dragged in the piano roll.
 #[derive(Clone, Copy)]
@@ -462,15 +570,132 @@ fn main() -> eframe::Result {
             .with_title("Sound Pro")
             .with_inner_size([1200.0, 700.0])
             .with_min_inner_size([640.0, 360.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(app_icon()),
         ..Default::default()
     };
     let start = std::env::args_os().nth(1).map(PathBuf::from);
+    // First-run welcome: shown only when the persisted step is not Done. Tests
+    // build `App::new` directly, which leaves `welcome_open` off. For the
+    // screenshot self-test, `SOUND_PRO_SHOW_WELCOME=1|2|3` forces the dialog
+    // open at the requested step regardless of the saved state.
+    let welcome_override =
+        std::env::var("SOUND_PRO_SHOW_WELCOME")
+            .ok()
+            .and_then(|v| match v.as_str() {
+                "1" => Some(WelcomeStep::Welcome),
+                "2" => Some(WelcomeStep::Download),
+                "3" => Some(WelcomeStep::MoreSounds),
+                _ => None,
+            });
     eframe::run_native(
         "Sound Pro",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(start)))),
+        Box::new(move |_cc| {
+            #[allow(unused_mut)]
+            let mut app = App::new(start);
+            let step = welcome_override.unwrap_or(app.audio.welcome);
+            app.welcome_open = !step.is_done();
+            app.welcome_step = step;
+            // Screenshot self-test: `SOUND_PRO_SHOW_MANAGER=1` opens the library
+            // manager window at start for the visual self-check.
+            if std::env::var_os("SOUND_PRO_SHOW_MANAGER").is_some() {
+                app.open_library_manager();
+                app.welcome_open = false;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                app.native_menu = Some(macos_menu::NativeMenu::install(&_cc.egui_ctx));
+            }
+            Ok(Box::new(app))
+        }),
     )
+}
+
+/// Window and Dock icon; without it eframe falls back to its own placeholder.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../packaging/sound-pro.png"))
+        .unwrap_or_default()
+}
+
+/// Loads the app icon (an RGBA PNG with rounded corners baked in) as an egui
+/// texture, once.
+fn load_welcome_icon(ctx: &egui::Context) -> egui::TextureHandle {
+    let icon = app_icon();
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    ctx.load_texture("welcome-app-icon", image, egui::TextureOptions::LINEAR)
+}
+
+/// Draws a rounded, borderless button with `bg` fill and `text` colour. Button
+/// hits are checked by the caller via `rect_contains_pointer`.
+fn welcome_button(ui: &egui::Ui, rect: Rect, bg: Color32, text_color: Color32, label: &str) {
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(WELCOME_CORNER), bg);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(WELCOME_BODY_SIZE),
+        text_color,
+    );
+}
+
+/// Paints the download-step icon: a rounded square with a diagonal gradient
+/// (orange top-left → pink centre → blue bottom-right) and a white ring with a
+/// downward arrow in the middle, all drawn programmatically (no images).
+fn draw_download_icon(painter: &egui::Painter, rect: Rect) {
+    // Round the square by clipping to a rounded-rect mask, then draw the
+    // diagonal gradient as two triangles across the square.
+    // Round the square by clipping to a rounded-rect mask, then draw the
+    // diagonal gradient as two triangles across the square.
+    let rounded = painter.with_clip_rect(rect);
+    rounded.rect_filled(rect, CornerRadius::same(14), WELCOME_TRACK);
+    let tl = rect.left_top();
+    let tr = rect.right_top();
+    let bl = rect.left_bottom();
+    let br = rect.right_bottom();
+    let mut mesh = egui::Mesh::default();
+    let idx = mesh.vertices.len() as u32;
+    mesh.colored_vertex(tl, WELCOME_ICON_GRADIENT_TL);
+    mesh.colored_vertex(tr, WELCOME_ICON_GRADIENT_C);
+    mesh.colored_vertex(bl, WELCOME_ICON_GRADIENT_C);
+    mesh.colored_vertex(br, WELCOME_ICON_GRADIENT_BR);
+    // Two triangles: TL-TR-BL (orange→pink→pink) and TR-BL-BR (pink→pink→blue).
+    mesh.add_triangle(idx, idx + 1, idx + 2);
+    mesh.add_triangle(idx + 1, idx + 2, idx + 3);
+    rounded.add(egui::Shape::mesh(std::sync::Arc::new(mesh)));
+
+    // White ring + downward arrow, centred.
+    let c = rect.center();
+    let r = rect.width() * 0.24;
+    rounded.circle_stroke(c, r, Stroke::new(3.0_f32, Color32::WHITE));
+    let arrow_y_top = c.y - r * 0.5;
+    let arrow_y_bottom = c.y + r * 0.5;
+    let shaft_x = c.x;
+    rounded.line_segment(
+        [
+            Pos2::new(shaft_x, arrow_y_top),
+            Pos2::new(shaft_x, arrow_y_bottom),
+        ],
+        Stroke::new(3.0_f32, Color32::WHITE),
+    );
+    rounded.line_segment(
+        [
+            Pos2::new(shaft_x, arrow_y_bottom),
+            Pos2::new(shaft_x - r * 0.35, arrow_y_bottom - r * 0.35),
+        ],
+        Stroke::new(3.0_f32, Color32::WHITE),
+    );
+    rounded.line_segment(
+        [
+            Pos2::new(shaft_x, arrow_y_bottom),
+            Pos2::new(shaft_x + r * 0.35, arrow_y_bottom - r * 0.35),
+        ],
+        Stroke::new(3.0_f32, Color32::WHITE),
+    );
 }
 
 /// Whether a text field has the keyboard (SPEC-037). Any widget that was
@@ -725,6 +950,8 @@ type PendingBankLoad = (
 );
 
 struct App {
+    #[cfg(target_os = "macos")]
+    native_menu: Option<macos_menu::NativeMenu>,
     editor: Editor,
     /// Frames drawn so far; used by the `SOUND_PRO_SCREENSHOT` self-snapshot.
     frames: u32,
@@ -746,6 +973,8 @@ struct App {
     export_normalize: bool,
     export_target_db: f32,
     export_pending: bool,
+    /// Pending license-restriction warning before export, when non-empty.
+    export_restriction: Option<daw_app::bank_library::ExportRestrictions>,
     /// File lengths read from headers while files hover (SPEC-050 §2).
     probes: HashMap<PathBuf, Result<u64, String>>,
     /// Waveforms of hovered files, filling in as they decode.
@@ -870,10 +1099,29 @@ struct App {
     about_open: bool,
     /// The sound library window is open (SPEC-066).
     library_open: bool,
+    /// The Sound Library Manager window is open (SPEC-…).
+    library_manager_open: bool,
+    /// The manager's data model, rebuilt when the window opens.
+    sound_library: Option<daw_app::sound_library::SoundLibrary>,
+    /// Ids of manager tree nodes whose children are expanded (SPEC-…).
+    library_expanded: std::collections::BTreeSet<String>,
     /// The credits window is open (SPEC-066).
     credits_open: bool,
     /// The first-run dialog is open (SPEC-066).
     first_run_open: bool,
+    /// The welcome dialog flow is open, and its current step. Defaults to
+    /// closed; only `main()` turns it on, so `App::new` in tests never shows it.
+    welcome_open: bool,
+    /// Current step of the welcome flow, mirroring `self.audio.welcome` while
+    /// the dialog is open.
+    welcome_step: WelcomeStep,
+    /// App icon as a texture, loaded lazily once for the welcome dialog.
+    welcome_icon: Option<egui::TextureHandle>,
+    /// «Скоро» notice is showing inside the welcome dialog.
+    welcome_soon: bool,
+    /// A generic «Скоро» notice dialog, opened from menu items whose backend
+    /// is not implemented yet (reinstall / move library / key commands).
+    soon_notice_open: bool,
     /// Installed banks from the registry, refreshed when the window opens.
     installed_banks: Vec<daw_app::bank_library::InstalledBank>,
     /// A bank being loaded on a background thread after the user picked it in
@@ -888,6 +1136,10 @@ struct App {
     download_tx: std::sync::mpsc::Sender<DownloadMsg>,
     download_rx: std::sync::mpsc::Receiver<DownloadMsg>,
     downloads: HashMap<String, DownloadState>,
+    /// The batch download queue driving the first-run «Загрузка основных
+    /// звуков» step and the menu «Загрузить основные/все звуки» actions
+    /// (SPEC-076). `None` while no batch is queued.
+    download_queue: Option<daw_app::download_queue::DownloadQueue>,
     /// Native file/folder dialogs, shown on a worker thread (SPEC-066/SPEC-067).
     dialog_tx: std::sync::mpsc::Sender<DialogMsg>,
     dialog_rx: std::sync::mpsc::Receiver<DialogMsg>,
@@ -897,6 +1149,11 @@ struct App {
     download_accept: Option<DownloadAccept>,
     /// The «Новая дорожка» dialog, when open (SPEC-049).
     new_track: Option<shell::NewTrack>,
+    /// True once the non-commercial install warning has been shown this install
+    /// session; the warning is shown at most once per session.
+    nc_warning_shown: bool,
+    /// The non-commercial install warning dialog is currently open.
+    pending_install_nc: bool,
     outputs: Vec<String>,
     inputs: Vec<String>,
     /// Visible panels of the main window (SPEC-034).
@@ -1020,6 +1277,8 @@ impl App {
         let (download_tx, download_rx) = std::sync::mpsc::channel();
         let (dialog_tx, dialog_rx) = std::sync::mpsc::channel();
         let mut app = Self {
+            #[cfg(target_os = "macos")]
+            native_menu: None,
             editor: Editor::new(),
             #[cfg(feature = "audio")]
             recorder: None,
@@ -1044,6 +1303,7 @@ impl App {
             export_normalize: false,
             export_target_db: -1.0,
             export_pending: false,
+            export_restriction: None,
             probes: HashMap::new(),
             hover_peaks: HashMap::new(),
             hover_tx,
@@ -1108,8 +1368,16 @@ impl App {
             audio_open: false,
             about_open: false,
             library_open: false,
+            library_manager_open: false,
+            sound_library: None,
+            library_expanded: std::collections::BTreeSet::new(),
             credits_open: false,
             first_run_open: false,
+            welcome_open: false,
+            welcome_step: WelcomeStep::Welcome,
+            welcome_icon: None,
+            welcome_soon: false,
+            soon_notice_open: false,
             installed_banks: Vec::new(),
             pending_bank_load: None,
             library_status: String::new(),
@@ -1117,11 +1385,14 @@ impl App {
             download_tx,
             download_rx,
             downloads: HashMap::new(),
+            download_queue: None,
             download_accept: None,
             dialog_tx,
             dialog_rx,
             dialog_guard: daw_gui::dialog::DialogGuard::default(),
             new_track: None,
+            nc_warning_shown: false,
+            pending_install_nc: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
             layout: Layout::default(),
@@ -2082,6 +2353,126 @@ impl App {
         });
     }
 
+    /// Builds and starts a batch download queue over `banks`, replacing any
+    /// queue already running (SPEC-076). The queue drives its own worker
+    /// thread; this only stashes the handle for the UI to poll.
+    fn start_download_queue(&mut self, banks: Vec<daw_app::bank_library::CatalogEntry>) {
+        if banks.is_empty() {
+            self.library_status = "Нет банков для загрузки".to_owned();
+            return;
+        }
+        let queue = daw_app::download_queue::DownloadQueue::new(banks);
+        queue.start();
+        self.download_queue = Some(queue);
+    }
+
+    /// Starts the «Основные звуки» batch queue (SPEC-076): the essential pack
+    /// banks that are not yet installed.
+    fn start_essential_queue(&mut self) {
+        self.refresh_installed_banks();
+        match daw_app::essential_sounds::essential_banks_missing() {
+            Ok(banks) => {
+                if banks.is_empty() {
+                    self.library_status = "Основные звуки уже установлены".to_owned();
+                    return;
+                }
+                self.start_download_queue(banks);
+            }
+            Err(e) => self.library_status = format!("Не удалось проверить установку: {e}"),
+        }
+    }
+
+    /// Starts a batch queue over every downloadable, not-yet-installed bank
+    /// (SPEC-076 §4).
+    fn start_all_queue(&mut self) {
+        self.refresh_installed_banks();
+        let installed: std::collections::HashSet<String> =
+            self.installed_banks.iter().map(|b| b.id.clone()).collect();
+        let banks: Vec<daw_app::bank_library::CatalogEntry> = daw_app::bank_library::catalog()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(daw_app::bank_library::is_downloadable)
+            .filter(|e| !installed.contains(&e.id))
+            .collect();
+        if banks.is_empty() {
+            self.library_status = "Все доступные звуки уже установлены".to_owned();
+            return;
+        }
+        self.start_download_queue(banks);
+    }
+
+    /// «Переустановить библиотеку звуков» (SPEC-076 §4): re-download the
+    /// essential pack so every archive is re-fetched and re-verified against
+    /// its pinned SHA-256 (and re-extracted atomically). This is the
+    /// corruption-recovery path — a corrupt install is replaced by a clean
+    /// one rather than diffed on disk.
+    fn reinstall_library(&mut self) {
+        self.refresh_installed_banks();
+        let banks = daw_app::essential_sounds::essential_banks();
+        if banks.is_empty() {
+            self.library_status = "Нет банков для переустановки".to_owned();
+            return;
+        }
+        self.start_download_queue(banks);
+        self.library_status = "Переустановка начата".to_owned();
+    }
+
+    /// «Переместить библиотеку звуков…» (SPEC-076 §4): asks for a folder,
+    /// then copies installed banks there and records the new path. Uses the
+    /// existing rfd-based dialog worker; a settings field stores the chosen
+    /// path for the next launch.
+    fn move_library_dialog(&mut self) {
+        self.library_status = "Перемещение библиотеки пока не реализовано".to_owned();
+        self.soon_notice_open = true;
+    }
+
+    /// Polls the active batch download queue (SPEC-076), refreshing the
+    /// installed set and repainting while it runs. Idle/done/cancelled queues
+    /// are cleared.
+    fn poll_download_queue(&mut self, ctx: &egui::Context) {
+        let Some(queue) = self.download_queue.as_ref() else {
+            return;
+        };
+        let snap = queue.snapshot();
+        let active = queue.is_active();
+        if !active {
+            // Finished (or cancelled): refresh installed banks once.
+            self.refresh_installed_banks();
+            match snap.phase {
+                daw_app::download_queue::QueuePhase::Done if snap.failed.is_empty() => {
+                    self.library_status = "Загрузка завершена".to_owned();
+                }
+                daw_app::download_queue::QueuePhase::Done => {
+                    self.library_status = format!(
+                        "Загрузка завершена с ошибками: {} из {} банков",
+                        snap.failed.len(),
+                        snap.installed.len() + snap.failed.len()
+                    );
+                }
+                daw_app::download_queue::QueuePhase::Cancelled => {
+                    self.library_status = "Загрузка отменена".to_owned();
+                }
+                _ => {}
+            }
+            // Auto-advance the first-run welcome flow when the «Основные
+            // звуки» queue finishes cleanly (SPEC-076).
+            let finished_clean =
+                snap.phase == daw_app::download_queue::QueuePhase::Done && snap.failed.is_empty();
+            if finished_clean && self.welcome_step == WelcomeStep::Download {
+                self.welcome_step = WelcomeStep::MoreSounds;
+                self.audio.welcome = WelcomeStep::MoreSounds;
+                if let Some(path) = &self.audio_path
+                    && let Err(e) = self.audio.save(path)
+                {
+                    self.status = format!("Не удалось сохранить настройки: {e}");
+                }
+            }
+            self.download_queue = None;
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     /// Applies finished bank downloads and repaints while one is in flight
     /// (SPEC-067).
     fn poll_downloads(&mut self, ctx: &egui::Context) {
@@ -2582,7 +2973,99 @@ impl App {
     /// the UI stays responsive (SPEC-052). The file dialog itself is also shown
     /// off the UI thread; the picked path comes back through [`Self::poll_dialog`].
     fn start_export(&mut self) {
-        self.request_dialog(DialogKind::ExportMix);
+        if self.begin_export_request() {
+            self.request_dialog(DialogKind::ExportMix);
+        }
+    }
+
+    /// Collects the distinct sampler bank ids used by the project's instrument
+    /// tracks (SPEC-052 §6), skipping the built-in piano and legacy paths that
+    /// are not registry ids.
+    fn project_bank_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for track in &self.editor.session().tracks {
+            if let audio_core::TrackInstrument::Sampler { bank_id } = &track.instrument {
+                if !ids.iter().any(|id| id == bank_id) {
+                    ids.push(bank_id.clone());
+                }
+            }
+        }
+        ids
+    }
+
+    /// Intercepts the export before the file dialog: if any sampler bank in the
+    /// project carries a license restriction, show the warning dialog instead of
+    /// opening the file picker. Returns `true` when export may proceed.
+    fn begin_export_request(&mut self) -> bool {
+        let requirements = daw_app::bank_library::requirements_for_banks(self.project_bank_ids());
+        let restrictions = daw_app::bank_library::export_restrictions(&requirements);
+        if restrictions.is_empty() {
+            return true;
+        }
+        self.export_restriction = Some(restrictions);
+        false
+    }
+
+    /// The license-restriction warning shown before export (SPEC-052 §6). Lists
+    /// non-commercial banks with the «нельзя монетизировать» warning and the
+    /// ready attribution text for CC-BY banks, with «Скопировать». Buttons are
+    /// «Отмена» and «Экспортировать».
+    fn export_restriction_window(&mut self, ctx: &egui::Context) {
+        let Some(restrictions) = self.export_restriction.as_ref() else {
+            return;
+        };
+        let mut proceed = false;
+        let mut cancel = false;
+        let mut open = true;
+        let attribution = restrictions.attribution_text.clone();
+        let nc_names = restrictions.non_commercial_names.clone();
+        egui::Window::new("Ограничения лицензий")
+            .id(egui::Id::new("export-restriction"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                if !nc_names.is_empty() {
+                    ui.label(
+                        "Музыку с этим звуком нельзя монетизировать \
+                         (только некоммерческое использование)",
+                    );
+                    for name in &nc_names {
+                        ui.label(format!("• {name}"));
+                    }
+                    ui.add_space(6.0);
+                }
+                if !attribution.trim().is_empty() {
+                    ui.label("Нужно указать автора:");
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&attribution);
+                        });
+                    ui.add_space(4.0);
+                    if ui.button("Скопировать").clicked() {
+                        ui.ctx().copy_text(attribution.clone());
+                    }
+                    ui.add_space(6.0);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Отмена").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Экспортировать").clicked() {
+                        proceed = true;
+                    }
+                });
+            });
+        if proceed || cancel || !open {
+            self.export_restriction = None;
+        }
+        if proceed {
+            self.request_dialog(DialogKind::ExportMix);
+        }
     }
 
     /// Collects a finished export and reports its result.
@@ -2604,6 +3087,7 @@ impl App {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Файл", |ui| {
@@ -2674,11 +3158,44 @@ impl App {
                     self.duplicate_clip();
                 }
             });
-            ui.menu_button("Справка", |ui| {
-                if ui.button("Библиотека звуков…").clicked() {
-                    self.open_library();
+            ui.menu_button("Библиотека звуков", |ui| {
+                if ui
+                    .add_enabled(
+                        !self.core_sounds_installed(),
+                        egui::Button::new("Загрузить основные звуки"),
+                    )
+                    .clicked()
+                {
+                    self.soon_notice_open = true;
                     ui.close();
                 }
+                if ui.button("Загрузить все доступные звуки").clicked() {
+                    self.start_all_queue();
+                    self.open_library_manager();
+                    ui.close();
+                }
+                if ui.button("Переустановить библиотеку звуков").clicked()
+                {
+                    self.reinstall_library();
+                    ui.close();
+                }
+                if ui.button("Открыть менеджер библиотеки звуков…").clicked()
+                {
+                    self.open_library_manager();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Авторство и лицензии…").clicked() {
+                    self.credits_open = true;
+                    ui.close();
+                }
+                if ui.button("Переместить библиотеку звуков…").clicked()
+                {
+                    self.move_library_dialog();
+                    ui.close();
+                }
+            });
+            ui.menu_button("Справка", |ui| {
                 if ui.button("Авторы…").clicked() {
                     self.credits_open = true;
                     ui.close();
@@ -6626,10 +7143,64 @@ impl App {
             });
     }
 
+    /// A generic «Скоро» notice, opened from menu items whose backend is not
+    /// implemented yet (reinstall / move library / key commands / feedback).
+    fn soon_notice_window(&mut self, ctx: &egui::Context) {
+        if !self.soon_notice_open {
+            return;
+        }
+        let mut open = self.soon_notice_open;
+        let mut should_close = false;
+        egui::Window::new("Скоро")
+            .id(egui::Id::new("soon-notice"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label("Эта возможность появится в одной из следующих версий.");
+                if ui.button("Хорошо").clicked() {
+                    should_close = true;
+                }
+            });
+        self.soon_notice_open = open && !should_close;
+    }
+
+    /// Whether the core sounds have been installed. There is no real
+    /// "core sounds" downloader yet, so this is always false; the menu item
+    /// stays enabled and routes to the «Скоро» notice.
+    #[cfg(not(target_os = "macos"))]
+    fn core_sounds_installed(&self) -> bool {
+        false
+    }
+
     /// Opens the sound library window, refreshing the installed list (SPEC-066).
     fn open_library(&mut self) {
         self.library_open = true;
         self.refresh_installed_banks();
+    }
+
+    /// Opens the Sound Library Manager, rebuilding its model from the installed
+    /// banks (SPEC-…).
+    fn open_library_manager(&mut self) {
+        self.refresh_installed_banks();
+        let installed: Vec<String> = self.installed_banks.iter().map(|b| b.id.clone()).collect();
+        self.sound_library = Some(
+            daw_app::sound_library::SoundLibrary::new(installed).unwrap_or_else(|e| {
+                self.library_status = e.to_string();
+                daw_app::sound_library::SoundLibrary::new(std::iter::empty::<String>())
+                    .expect("sound library always builds from the embedded file")
+            }),
+        );
+        // Default-expand every top-level group so the tree is browsable; nested
+        // subgroups start collapsed.
+        self.library_expanded.clear();
+        if let Some(lib) = self.sound_library.as_ref() {
+            for group in lib.groups() {
+                self.library_expanded.insert(group.id.clone());
+            }
+        }
+        self.library_manager_open = true;
     }
 
     /// Reloads the installed-bank list into `installed_banks` (SPEC-066).
@@ -6729,6 +7300,440 @@ impl App {
         if !open {
             self.library_open = false;
         }
+    }
+
+    /// The Sound Library Manager window (SPEC-…): a tree of content packages
+    /// with tri-state checkboxes, a status column, and a bottom summary panel.
+    fn library_manager_window(&mut self, ctx: &egui::Context) {
+        if !self.library_manager_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Менеджер библиотеки звуков")
+            .id(egui::Id::new("library-manager"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(640.0)
+            .default_height(520.0)
+            .show(ctx, |ui| self.library_manager_ui(ui));
+        if !open {
+            self.library_manager_open = false;
+        }
+    }
+
+    fn library_manager_ui(&mut self, ui: &mut egui::Ui) {
+        // Rebuild the model if it is missing (e.g. after a test opened the flag).
+        if self.sound_library.is_none() {
+            let installed: Vec<String> =
+                self.installed_banks.iter().map(|b| b.id.clone()).collect();
+            self.sound_library = Some(
+                daw_app::sound_library::SoundLibrary::new(installed).unwrap_or_else(|e| {
+                    self.library_status = e.to_string();
+                    daw_app::sound_library::SoundLibrary::new(std::iter::empty::<String>())
+                        .expect("sound library always builds")
+                }),
+            );
+        }
+
+        // Column headers.
+        ui.horizontal(|ui| {
+            ui.strong("Дополнительные пакеты контента");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.strong("Статус");
+            });
+        });
+        ui.separator();
+
+        // Tree body. Row index drives the stripe pattern and the selected-row
+        // highlight. We collect the toggle/expand actions to apply after the
+        // borrow ends (egui closures borrow `ui` immutably, but toggling mutates
+        // `self.sound_library`).
+        let mut toggled: Option<String> = None;
+        let mut expand_toggled: Option<String> = None;
+        let mut row = 0_usize;
+        let mut select_all = false;
+        let mut install = false;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let groups = self
+                    .sound_library
+                    .as_ref()
+                    .expect("model built above")
+                    .groups()
+                    .to_vec();
+                for group in &groups {
+                    row = self.manager_row(ui, group, 0, row, &mut toggled, &mut expand_toggled);
+                }
+            });
+
+        ui.add_space(8.0);
+        ui.separator();
+
+        // Live batch-queue progress (SPEC-076): shown while a queue is active
+        // so the manager reflects the real downloader state.
+        if let Some(queue) = &self.download_queue {
+            let snap = queue.snapshot();
+            if queue.is_active() {
+                let fraction = snap.fraction();
+                let caption = if let Some(current) = &snap.current {
+                    format!(
+                        "{} из {} ({}): {}",
+                        welcome::format_megabytes(snap.received),
+                        welcome::format_gigabytes(snap.total),
+                        current,
+                        daw_app::download_queue::format_speed(snap.speed_bps),
+                    )
+                } else {
+                    format!(
+                        "{} из {}",
+                        welcome::format_megabytes(snap.received),
+                        welcome::format_gigabytes(snap.total),
+                    )
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(caption)
+                        .desired_width(ui.available_width()),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Пауза").clicked() {
+                        queue.pause();
+                    }
+                    if ui.button("Продолжить").clicked() {
+                        queue.resume();
+                    }
+                    if ui.button("Отмена").clicked() {
+                        queue.cancel();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.separator();
+            }
+        }
+
+        // Bottom summary: sizes and action buttons.
+        let (dl, inst) = {
+            let lib = self.sound_library.as_ref().expect("model built above");
+            (lib.download_bytes(), lib.installed_bytes())
+        };
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} загрузка / для установки требуется {}",
+                welcome::format_gigabytes(dl),
+                welcome::format_gigabytes(inst),
+            ));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let primary = egui::Button::new("Установить")
+                    .fill(MANAGER_SELECTED)
+                    .stroke(egui::Stroke::NONE);
+                if ui.add(primary).clicked() {
+                    install = true;
+                }
+                if ui.button("Отмена").clicked() {
+                    self.library_manager_open = false;
+                }
+                if ui.button("Выбрать все неустановленные").clicked() {
+                    select_all = true;
+                }
+            });
+        });
+
+        if !self.library_status.is_empty() {
+            ui.add_space(4.0);
+            ui.label(&self.library_status);
+        }
+
+        // Apply deferred mutations.
+        if select_all {
+            if let Some(lib) = self.sound_library.as_mut() {
+                let _ = lib.select_all_uninstalled();
+            }
+        }
+        if let Some(id) = toggled {
+            if let Some(lib) = self.sound_library.as_mut() {
+                lib.toggle(&id);
+            }
+        }
+        if let Some(id) = expand_toggled {
+            if self.library_expanded.contains(&id) {
+                self.library_expanded.remove(&id);
+            } else {
+                self.library_expanded.insert(id);
+            }
+        }
+        if install {
+            let has_nc = self
+                .sound_library
+                .as_ref()
+                .is_some_and(|lib| lib.selected_has_non_commercial());
+            if has_nc && !self.nc_warning_shown {
+                self.nc_warning_shown = true;
+                self.pending_install_nc = true;
+            } else {
+                self.install_selected_library();
+            }
+        }
+    }
+
+    /// Renders the one-time non-commercial install warning and acts on it.
+    /// Called from the manager window while `pending_install_nc` is set.
+    fn nc_install_warning_window(&mut self, ctx: &egui::Context) {
+        if !self.pending_install_nc {
+            return;
+        }
+        let mut proceed = false;
+        let mut cancel = false;
+        egui::Window::new("Только некоммерческое использование")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    "Музыку с этим звуком нельзя монетизировать (только некоммерческое использование)",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Отмена").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .button("Всё равно установить")
+                        .clicked()
+                    {
+                        proceed = true;
+                    }
+                });
+            });
+        if proceed {
+            self.pending_install_nc = false;
+            self.install_selected_library();
+        } else if cancel {
+            self.pending_install_nc = false;
+        }
+    }
+
+    /// Renders one row of the manager tree and returns the next row index.
+    fn manager_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &daw_app::sound_library::Package,
+        depth: usize,
+        mut row: usize,
+        toggled: &mut Option<String>,
+        expand_toggled: &mut Option<String>,
+    ) -> usize {
+        let lib = self.sound_library.as_ref().expect("model built");
+        let tri = lib.tri_state(&node.id);
+        let status = lib.status(&node.id);
+        let has_children = !node.children.is_empty();
+        let expanded = self.library_expanded.contains(&node.id);
+
+        let stripe = if row % 2 == 0 {
+            MANAGER_ROW_A
+        } else {
+            MANAGER_ROW_B
+        };
+        let selected = tri == daw_app::sound_library::TriState::Checked
+            || tri == daw_app::sound_library::TriState::Partial;
+
+        // Row background.
+        let row_rect = ui.available_rect_before_wrap();
+        let row_h = 22.0;
+        let rect = Rect::from_min_size(row_rect.min, Vec2::new(row_rect.width(), row_h));
+        let bg = if selected { MANAGER_SELECTED } else { stripe };
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
+
+        let indent = depth as f32 * 18.0;
+        // Disclosure arrow for nodes with children, placed before the checkbox.
+        let arrow_w = if has_children { 14.0 } else { 0.0 };
+        let checkbox_rect = Rect::from_min_size(
+            Pos2::new(rect.min.x + indent + arrow_w + 6.0, rect.center().y - 7.0),
+            Vec2::splat(14.0),
+        );
+
+        // Disclosure arrow.
+        if has_children {
+            let arrow_pos = Pos2::new(rect.min.x + indent + 4.0, rect.center().y);
+            ui.painter().text(
+                arrow_pos,
+                egui::Align2::LEFT_CENTER,
+                if expanded { "▾" } else { "▸" },
+                FontId::proportional(13.0),
+                if selected {
+                    Color32::WHITE
+                } else {
+                    MANAGER_MUTED
+                },
+            );
+        }
+
+        // Checkbox (click toggles).
+        let (rect_checked, partial) = match tri {
+            daw_app::sound_library::TriState::Checked => (true, false),
+            daw_app::sound_library::TriState::Partial => (true, true),
+            daw_app::sound_library::TriState::Unchecked => (false, false),
+        };
+        ui.painter().rect_stroke(
+            checkbox_rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0_f32, Color32::from_rgb(180, 180, 185)),
+            egui::StrokeKind::Inside,
+        );
+        if rect_checked {
+            let inner = checkbox_rect.shrink(3.0);
+            ui.painter()
+                .rect_filled(inner, CornerRadius::same(1), Color32::WHITE);
+        } else if partial {
+            // Dash in the middle for the partial state.
+            let y = checkbox_rect.center().y;
+            ui.painter().line_segment(
+                [
+                    Pos2::new(checkbox_rect.min.x + 3.0, y),
+                    Pos2::new(checkbox_rect.max.x - 3.0, y),
+                ],
+                Stroke::new(2.0_f32, Color32::WHITE),
+            );
+        }
+
+        // Title text, with the «Скоро» suffix for groups that are ComingSoon.
+        let text_pos = Pos2::new(checkbox_rect.max.x + 8.0, rect.center().y);
+        let title_color = if selected {
+            Color32::WHITE
+        } else {
+            MANAGER_TEXT
+        };
+        ui.painter().text(
+            text_pos,
+            egui::Align2::LEFT_CENTER,
+            &node.title,
+            FontId::proportional(14.0),
+            title_color,
+        );
+        let title_w = ui
+            .painter()
+            .layout_no_wrap(node.title.clone(), FontId::proportional(14.0), title_color)
+            .size()
+            .x;
+        if status == daw_app::sound_library::Status::ComingSoon && !has_children {
+            ui.painter().text(
+                Pos2::new(text_pos.x + title_w + 8.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "— Скоро",
+                FontId::proportional(12.0),
+                MANAGER_MUTED,
+            );
+        }
+
+        // Status column, right-aligned.
+        let status_color = if selected {
+            Color32::WHITE
+        } else {
+            MANAGER_MUTED
+        };
+        let status_text = status.label();
+        ui.painter().text(
+            Pos2::new(rect.max.x - 10.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            status_text,
+            FontId::proportional(13.0),
+            status_color,
+        );
+        let status_width = ui
+            .painter()
+            .layout_no_wrap(
+                status_text.to_owned(),
+                FontId::proportional(13.0),
+                status_color,
+            )
+            .size()
+            .x;
+
+        // License badge for a leaf bank, drawn in its own right-aligned column
+        // to the left of the status text, so it never overlaps the status.
+        // A non-commercial bank is emphasised so the user sees it before the
+        // install warning.
+        if let Some(label) = node.license_label() {
+            let is_nc = node.bank.as_ref().is_some_and(|b| {
+                daw_app::bank_library::license_class(&b.license.spdx)
+                    == daw_app::bank_library::LicenseClass::NonCommercial
+            });
+            let badge_text = format!("[{label}]");
+            let badge_color = if selected {
+                Color32::from_rgb(255, 220, 130)
+            } else if is_nc {
+                Color32::from_rgb(230, 180, 90)
+            } else {
+                MANAGER_MUTED
+            };
+            // Right-aligned badge just left of the status, with a fixed gutter.
+            let badge_right = rect.max.x - 10.0 - status_width - 10.0;
+            ui.painter().text(
+                Pos2::new(badge_right, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                badge_text,
+                FontId::proportional(11.0),
+                badge_color,
+            );
+        }
+
+        // Interaction: clicking the disclosure arrow toggles expansion; clicking
+        // the row toggles selection.
+        if has_children {
+            let arrow_rect = Rect::from_min_size(
+                Pos2::new(rect.min.x + indent, rect.center().y - 10.0),
+                Vec2::new(arrow_w + 4.0, 20.0),
+            );
+            let arrow_resp = ui.interact(
+                arrow_rect,
+                ui.id().with(("manager-arrow", &node.id)),
+                egui::Sense::click(),
+            );
+            if arrow_resp.clicked() {
+                *expand_toggled = Some(node.id.clone());
+            }
+        }
+        let response = ui.interact(
+            rect,
+            ui.id().with(("manager-row", &node.id)),
+            egui::Sense::click(),
+        );
+        if response.clicked() {
+            *toggled = Some(node.id.clone());
+        }
+
+        // Allocate the row's vertical space and advance.
+        ui.advance_cursor_after_rect(rect);
+        row += 1;
+
+        if has_children && expanded {
+            for child in &node.children {
+                row = self.manager_row(ui, child, depth + 1, row, toggled, expand_toggled);
+            }
+        }
+        row
+    }
+
+    /// Queues the real bank downloader for every selected, downloadable bank;
+    /// skips «Скоро» items with a message. Downloads run in the background and
+    /// their progress is polled by [`Self::poll_downloads`].
+    fn install_selected_library(&mut self) {
+        let banks = self
+            .sound_library
+            .as_ref()
+            .expect("model built")
+            .selected_downloadable_banks();
+        if banks.is_empty() {
+            self.library_status = "Выбранные пункты ещё недоступны для загрузки".to_owned();
+            return;
+        }
+        // Route through the batch queue so the manager shows aggregate
+        // progress, pause/cancel, and a single installed-state update
+        // (SPEC-076).
+        self.start_download_queue(banks);
+        self.library_status = "Загрузка начата".to_owned();
     }
 
     fn library_ui(&mut self, ui: &mut egui::Ui) {
@@ -6935,13 +7940,19 @@ impl App {
     }
 
     /// The credits window: built-in piano plus installed banks (SPEC-066 §4).
+    /// Shows author and source link per bank, and offers a copyable release
+    /// description for banks that require attribution (SPEC-076 §9).
     fn credits_window(&mut self, ctx: &egui::Context) {
         if !self.credits_open {
             return;
         }
         let mut open = true;
-        let text = daw_app::bank_library::credits_text(&self.installed_banks);
-        egui::Window::new("Авторы")
+        let catalog = daw_app::bank_library::catalog().unwrap_or_default();
+        let text =
+            daw_app::bank_library::credits_text_with_sources(&self.installed_banks, &catalog);
+        let release_text =
+            daw_app::bank_library::release_attribution_text(&self.installed_banks, &catalog);
+        egui::Window::new("Авторство и лицензии")
             .id(egui::Id::new("credits"))
             .open(&mut open)
             .resizable(true)
@@ -6955,10 +7966,23 @@ impl App {
                         ui.monospace(&text);
                     });
                 ui.add_space(6.0);
-                if ui.button("Скопировать авторов").clicked() {
-                    ui.ctx().copy_text(text.clone());
-                    self.library_status = "Список авторов скопирован".to_owned();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Скопировать авторов").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                        self.library_status = "Список авторов скопирован".to_owned();
+                    }
+                    let can_copy_release = !release_text.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            can_copy_release,
+                            egui::Button::new("Скопировать описание релиза"),
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(release_text.clone());
+                        self.library_status = "Описание релиза скопировано".to_owned();
+                    }
+                });
             });
         if !open {
             self.credits_open = false;
@@ -7004,6 +8028,502 @@ impl App {
         }
         if open_library {
             self.open_library();
+        }
+    }
+
+    /// The first-run welcome flow (SPEC-…): a modal-ish, borderless window
+    /// modelled on Logic Pro's «Welcome to Logic Pro». Step `Welcome` shows the
+    /// choice («Упрощённый режим» / «Полный режим»); step `Download` shows the
+    /// «Загрузка основных звуков» step after «Полный режим».
+    fn welcome_window(&mut self, ctx: &egui::Context) {
+        if !self.welcome_open {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let mut action = None;
+
+        // Dim the app behind the dialog.
+        egui::Area::new(egui::Id::new("welcome-backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, CornerRadius::ZERO, WELCOME_BACKDROP);
+            });
+
+        let dialog_rect = Rect::from_center_size(screen.center(), WELCOME_SIZE);
+        egui::Area::new(egui::Id::new("welcome-dialog"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(dialog_rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(WELCOME_SIZE);
+                let painter = ui.painter();
+                painter.rect_filled(dialog_rect, CornerRadius::same(WELCOME_CORNER), WELCOME_BG);
+                let content = dialog_rect.shrink2(Vec2::new(WELCOME_MARGIN, WELCOME_MARGIN));
+                self.welcome_body(ui, content, &mut action);
+                self.welcome_footer(ui, content, &mut action);
+            });
+
+        if let Some(a) = action {
+            self.apply_welcome_action(a);
+        }
+    }
+
+    /// The icon + title + paragraphs for the current welcome step, laid out in
+    /// `content`. Pushes a [`WelcomeAction`] into `action` when a button is
+    /// clicked.
+    fn welcome_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        content: Rect,
+        action: &mut Option<WelcomeAction>,
+    ) {
+        let icon_size = Vec2::splat(WELCOME_ICON);
+        let icon_rect = Rect::from_min_size(content.min, icon_size);
+        let text_left = icon_rect.max.x + WELCOME_MARGIN;
+
+        match self.welcome_step {
+            WelcomeStep::Welcome => {
+                // App icon (rounded square, alpha baked into the PNG).
+                if self.welcome_icon.is_none() {
+                    self.welcome_icon = Some(load_welcome_icon(ui.ctx()));
+                }
+                if let Some(tex) = &self.welcome_icon {
+                    ui.painter().image(
+                        tex.id(),
+                        icon_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                let title_rect = Rect::from_min_max(
+                    Pos2::new(text_left, content.min.y),
+                    Pos2::new(content.max.x, content.min.y + WELCOME_TITLE_SIZE),
+                );
+                ui.painter().text(
+                    title_rect.left_top(),
+                    egui::Align2::LEFT_TOP,
+                    "Добро пожаловать в Sound Pro",
+                    FontId::proportional(WELCOME_TITLE_SIZE),
+                    WELCOME_TITLE,
+                );
+                let body = [
+                    "Выберите, как вы хотите пользоваться приложением.",
+                    "Опытным пользователям подойдёт полный режим: он включает весь набор профессиональных инструментов.",
+                    "Новичкам подойдёт упрощённый режим: он оставляет только основные возможности для создания музыки.",
+                ];
+                let mut y = title_rect.max.y + 12.0;
+                for line in body {
+                    let galley = ui.painter().layout_no_wrap(
+                        line.to_owned(),
+                        FontId::proportional(WELCOME_BODY_SIZE),
+                        WELCOME_BODY,
+                    );
+                    let max_width = content.max.x - text_left;
+                    let galley = if galley.size().x > max_width {
+                        ui.painter().layout(
+                            line.to_owned(),
+                            FontId::proportional(WELCOME_BODY_SIZE),
+                            WELCOME_BODY,
+                            max_width,
+                        )
+                    } else {
+                        galley
+                    };
+                    let pos = Pos2::new(text_left, y);
+                    y += galley.size().y + 6.0;
+                    ui.painter().galley(pos, galley, WELCOME_BODY);
+                    if line != body[0] {
+                        y += 6.0;
+                    }
+                }
+                // «Подробнее…» — left-aligned grey button under the text.
+                let btn_rect =
+                    Rect::from_min_size(Pos2::new(text_left, y + 6.0), Vec2::new(120.0, 28.0));
+                welcome_button(
+                    ui,
+                    btn_rect,
+                    WELCOME_BUTTON_BG,
+                    WELCOME_BUTTON_TEXT,
+                    "Подробнее…",
+                );
+                if ui.rect_contains_pointer(btn_rect) && ui.input(|i| i.pointer.primary_clicked()) {
+                    *action = Some(WelcomeAction::Details);
+                }
+            }
+            WelcomeStep::Download => {
+                draw_download_icon(ui.painter(), icon_rect);
+                ui.painter().text(
+                    Pos2::new(text_left, content.min.y),
+                    egui::Align2::LEFT_TOP,
+                    "Загрузка основных звуков",
+                    FontId::proportional(WELCOME_TITLE_SIZE),
+                    WELCOME_TITLE,
+                );
+                let body = "Для начала работы Sound Pro загружает основной набор инструментов и лупов. Это может занять до часа в зависимости от скорости вашего интернета.";
+                let max_width = content.max.x - text_left;
+                let galley = ui.painter().layout(
+                    body.to_owned(),
+                    FontId::proportional(WELCOME_BODY_SIZE),
+                    WELCOME_BODY,
+                    max_width,
+                );
+                ui.painter().galley(
+                    Pos2::new(text_left, content.min.y + WELCOME_TITLE_SIZE + 12.0),
+                    galley,
+                    WELCOME_BODY,
+                );
+            }
+            WelcomeStep::MoreSounds => {
+                // App icon (same texture as the welcome step).
+                if self.welcome_icon.is_none() {
+                    self.welcome_icon = Some(load_welcome_icon(ui.ctx()));
+                }
+                if let Some(tex) = &self.welcome_icon {
+                    ui.painter().image(
+                        tex.id(),
+                        icon_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                ui.painter().text(
+                    Pos2::new(text_left, content.min.y),
+                    egui::Align2::LEFT_TOP,
+                    "Доступно больше звуков",
+                    FontId::proportional(WELCOME_TITLE_SIZE),
+                    WELCOME_TITLE,
+                );
+                let body = "Вы можете загрузить дополнительные звуки, инструменты и лупы, выбрав Sound Pro > Библиотека звуков > Открыть менеджер библиотеки звуков…, затем отметив нужные пункты.";
+                let max_width = content.max.x - text_left;
+                let galley = ui.painter().layout(
+                    body.to_owned(),
+                    FontId::proportional(WELCOME_BODY_SIZE),
+                    WELCOME_BODY,
+                    max_width,
+                );
+                ui.painter().galley(
+                    Pos2::new(text_left, content.min.y + WELCOME_TITLE_SIZE + 12.0),
+                    galley,
+                    WELCOME_BODY,
+                );
+            }
+            WelcomeStep::Done => {}
+        }
+
+        if self.welcome_soon {
+            ui.painter().text(
+                Pos2::new(content.min.x, content.max.y - WELCOME_FOOTER_H),
+                egui::Align2::LEFT_BOTTOM,
+                "Скоро",
+                FontId::proportional(WELCOME_BODY_SIZE),
+                WELCOME_BODY,
+            );
+        }
+    }
+
+    /// The bottom panel: a thin full-width separator above a footer with the
+    /// step-specific buttons. Pushes a [`WelcomeAction`] on click.
+    fn welcome_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+        content: Rect,
+        action: &mut Option<WelcomeAction>,
+    ) {
+        // Separator across the full dialog width.
+        let sep_y = content.max.y - WELCOME_FOOTER_H - 1.0;
+        ui.painter().line_segment(
+            [
+                Pos2::new(content.min.x, sep_y),
+                Pos2::new(content.max.x, sep_y),
+            ],
+            Stroke::new(1.0_f32, WELCOME_SEPARATOR),
+        );
+
+        let footer = Rect::from_min_max(
+            Pos2::new(content.min.x, sep_y + 1.0),
+            Pos2::new(content.max.x, content.max.y),
+        );
+
+        match self.welcome_step {
+            WelcomeStep::Welcome => {
+                // Right-aligned: «Упрощённый режим» then «Полный режим» (primary).
+                let full_w = 130.0;
+                let simple_w = 150.0;
+                let gap = 12.0;
+                let btn_h = 28.0;
+                let y = footer.center().y - btn_h / 2.0;
+                let full_rect = Rect::from_min_size(
+                    Pos2::new(footer.max.x - full_w, y),
+                    Vec2::new(full_w, btn_h),
+                );
+                let simple_rect = Rect::from_min_size(
+                    Pos2::new(full_rect.min.x - gap - simple_w, y),
+                    Vec2::new(simple_w, btn_h),
+                );
+                welcome_button(
+                    ui,
+                    simple_rect,
+                    WELCOME_BUTTON_BG,
+                    WELCOME_BUTTON_TEXT,
+                    "Упрощённый режим",
+                );
+                welcome_button(
+                    ui,
+                    full_rect,
+                    WELCOME_PRIMARY,
+                    WELCOME_BUTTON_TEXT,
+                    "Полный режим",
+                );
+                if ui.rect_contains_pointer(simple_rect)
+                    && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::SimplifiedMode);
+                }
+                if ui.rect_contains_pointer(full_rect) && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::FullMode);
+                }
+            }
+            WelcomeStep::Download => {
+                // Left: thin progress bar (~57% width) + caption; right: the
+                // step-specific buttons (pause/resume, cancel, download, close).
+                let (received, total) = self.welcome_download_progress();
+                let bar_w = footer.width() * 0.57;
+                let bar_h = 6.0;
+                let bar_rect = Rect::from_min_size(
+                    Pos2::new(footer.min.x, footer.center().y - bar_h / 2.0 - 8.0),
+                    Vec2::new(bar_w, bar_h),
+                );
+                let fraction = welcome::progress_fraction(received, total);
+                ui.painter()
+                    .rect_filled(bar_rect, CornerRadius::same(3), WELCOME_TRACK);
+                if fraction > 0.0 {
+                    let fill =
+                        Rect::from_min_size(bar_rect.min, Vec2::new(bar_w * fraction, bar_h));
+                    ui.painter()
+                        .rect_filled(fill, CornerRadius::same(3), WELCOME_PRIMARY);
+                }
+                let caption = welcome::download_progress_text(received, total);
+                ui.painter().text(
+                    Pos2::new(footer.min.x, bar_rect.max.y + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    caption,
+                    FontId::proportional(WELCOME_BODY_SIZE),
+                    WELCOME_BODY,
+                );
+
+                // Queue state drives the buttons on the right.
+                let queue_phase = self.download_queue.as_ref().map(|q| q.snapshot().phase);
+                let running = matches!(
+                    queue_phase,
+                    Some(daw_app::download_queue::QueuePhase::Downloading)
+                        | Some(daw_app::download_queue::QueuePhase::Paused)
+                );
+                let paused = matches!(
+                    queue_phase,
+                    Some(daw_app::download_queue::QueuePhase::Paused)
+                );
+
+                let btn_h = 28.0;
+                let gap = 12.0;
+                let y = footer.center().y - btn_h / 2.0;
+                // Right-aligned buttons, stacked from the right edge.
+                let mut x = footer.max.x;
+
+                if running {
+                    // «Загрузить позже» (grey, right-most).
+                    let later_w = 150.0;
+                    x -= later_w;
+                    let later_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(later_w, btn_h));
+                    welcome_button(
+                        ui,
+                        later_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        "Загрузить позже",
+                    );
+                    if ui.rect_contains_pointer(later_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        *action = Some(WelcomeAction::Close);
+                    }
+                    x -= gap;
+
+                    // «Пауза» / «Продолжить».
+                    let toggle_w = 110.0;
+                    x -= toggle_w;
+                    let toggle_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(toggle_w, btn_h));
+                    let toggle_label = if paused {
+                        "Продолжить"
+                    } else {
+                        "Пауза"
+                    };
+                    welcome_button(
+                        ui,
+                        toggle_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        toggle_label,
+                    );
+                    if ui.rect_contains_pointer(toggle_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        if let Some(queue) = &self.download_queue {
+                            if paused {
+                                queue.resume();
+                            } else {
+                                queue.pause();
+                            }
+                        }
+                    }
+                    x -= gap;
+
+                    // «Отмена» cancels the queue but keeps the dialog on this
+                    // step (so the user can restart or skip).
+                    let cancel_w = 90.0;
+                    x -= cancel_w;
+                    let cancel_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(cancel_w, btn_h));
+                    welcome_button(
+                        ui,
+                        cancel_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        "Отмена",
+                    );
+                    if ui.rect_contains_pointer(cancel_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        if let Some(queue) = &self.download_queue {
+                            queue.cancel();
+                        }
+                    }
+                } else {
+                    // Not running: «Загрузить позже» (grey) + «Загрузить» (primary).
+                    let later_w = 150.0;
+                    x -= later_w;
+                    let later_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(later_w, btn_h));
+                    welcome_button(
+                        ui,
+                        later_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        "Загрузить позже",
+                    );
+                    if ui.rect_contains_pointer(later_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        *action = Some(WelcomeAction::Close);
+                    }
+                    x -= gap;
+
+                    let download_w = 110.0;
+                    x -= download_w;
+                    let download_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(download_w, btn_h));
+                    welcome_button(
+                        ui,
+                        download_rect,
+                        WELCOME_PRIMARY,
+                        WELCOME_BUTTON_TEXT,
+                        "Загрузить",
+                    );
+                    if ui.rect_contains_pointer(download_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        self.start_essential_queue();
+                    }
+                }
+            }
+            WelcomeStep::MoreSounds => {
+                // Right-aligned: «Загрузить позже» (grey) then «Загрузить больше
+                // звуков…» (primary, opens the library manager).
+                let primary_w = 200.0;
+                let later_w = 140.0;
+                let gap = 12.0;
+                let btn_h = 28.0;
+                let y = footer.center().y - btn_h / 2.0;
+                let primary_rect = Rect::from_min_size(
+                    Pos2::new(footer.max.x - primary_w, y),
+                    Vec2::new(primary_w, btn_h),
+                );
+                let later_rect = Rect::from_min_size(
+                    Pos2::new(primary_rect.min.x - gap - later_w, y),
+                    Vec2::new(later_w, btn_h),
+                );
+                welcome_button(
+                    ui,
+                    later_rect,
+                    WELCOME_BUTTON_BG,
+                    WELCOME_BUTTON_TEXT,
+                    "Загрузить позже",
+                );
+                welcome_button(
+                    ui,
+                    primary_rect,
+                    WELCOME_PRIMARY,
+                    WELCOME_BUTTON_TEXT,
+                    "Загрузить больше звуков…",
+                );
+                if ui.rect_contains_pointer(later_rect) && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::Close);
+                }
+                if ui.rect_contains_pointer(primary_rect)
+                    && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    *action = Some(WelcomeAction::OpenLibraryManager);
+                }
+            }
+            WelcomeStep::Done => {}
+        }
+    }
+
+    /// The bytes downloaded / total for the download step, read from the live
+    /// [`DownloadQueue`] snapshot (SPEC-076). Returns `(0, total)` before the
+    /// queue starts so the step shows the real total size with no progress.
+    fn welcome_download_progress(&self) -> (u64, u64) {
+        match &self.download_queue {
+            Some(queue) => {
+                let snap = queue.snapshot();
+                (snap.received, snap.total)
+            }
+            None => {
+                let total = daw_app::essential_sounds::essential_download_bytes();
+                (0, total)
+            }
+        }
+    }
+
+    /// Applies a welcome action, advancing the pure state machine and
+    /// persisting the step outside any realtime path.
+    fn apply_welcome_action(&mut self, action: WelcomeAction) {
+        // «Полный режим» advances to the download step and starts the
+        // «Основные звуки» queue (SPEC-076).
+        if action == WelcomeAction::FullMode {
+            self.start_essential_queue();
+        }
+        let t = welcome_transition(self.welcome_step, action);
+        self.welcome_soon = t.soon;
+        if t.step != self.welcome_step {
+            self.welcome_step = t.step;
+            self.audio.welcome = t.step;
+            if let Some(path) = &self.audio_path
+                && let Err(e) = self.audio.save(path)
+            {
+                self.status = format!("Не удалось сохранить настройки: {e}");
+            }
+        }
+        if action == WelcomeAction::OpenLibraryManager {
+            self.open_library_manager();
+        }
+        if t.step.is_done() {
+            self.welcome_open = false;
         }
     }
 
@@ -7139,7 +8659,14 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Логи:");
                 if ui.button("Открыть папку").clicked() {
-                    if let Err(e) = std::process::Command::new("xdg-open").arg(dir).spawn() {
+                    let opener = if cfg!(target_os = "macos") {
+                        "open"
+                    } else if cfg!(windows) {
+                        "explorer"
+                    } else {
+                        "xdg-open"
+                    };
+                    if let Err(e) = std::process::Command::new(opener).arg(dir).spawn() {
                         self.status = format!("Не удалось открыть папку логов: {e}");
                     }
                 }
@@ -7356,6 +8883,7 @@ impl eframe::App for App {
         self.poll_imports(ctx);
         self.poll_export();
         self.poll_downloads(ctx);
+        self.poll_download_queue(ctx);
         self.poll_dialog(ctx);
         self.poll_bank_load(ctx);
         // Everything done during one mouse press is one undo step.
@@ -7371,6 +8899,9 @@ impl eframe::App for App {
             self.confirm_quit = true;
         }
 
+        #[cfg(target_os = "macos")]
+        self.poll_native_menu(ctx);
+        #[cfg(not(target_os = "macos"))]
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu(ui));
         egui::TopBottomPanel::top("transport")
             .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(6.0))
@@ -7441,12 +8972,17 @@ impl eframe::App for App {
         self.audio_window(ctx);
         self.about_window(ctx);
         self.library_window(ctx);
+        self.library_manager_window(ctx);
+        self.nc_install_warning_window(ctx);
         self.credits_window(ctx);
         self.install_license_window(ctx);
         self.first_run_window(ctx);
+        self.welcome_window(ctx);
+        self.soon_notice_window(ctx);
         self.download_accept_window(ctx);
         self.new_track_window(ctx);
         self.export_window(ctx);
+        self.export_restriction_window(ctx);
 
         if let Some(folder) = self.delete_folder {
             let name = self
@@ -8560,6 +10096,121 @@ mod sound_library_tests {
         let mut app = App::new(None);
         app.open_library();
         assert!(app.library_open);
+    }
+
+    #[test]
+    fn library_manager_window_renders_headlessly() {
+        let mut app = App::new(None);
+        app.open_library_manager();
+        assert!(app.library_manager_open);
+        assert!(app.sound_library.is_some());
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.library_manager_window(ctx);
+        });
+        // The model built with all 20 groups; the top-level groups were
+        // default-expanded for browsing.
+        let lib = app.sound_library.as_ref().expect("model");
+        assert_eq!(lib.groups().len(), 20);
+        assert!(app.library_expanded.contains("sound-packs"));
+    }
+}
+
+#[cfg(test)]
+mod welcome_tests {
+    use super::*;
+
+    #[test]
+    fn simplified_keeps_welcome_and_shows_soon() {
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::SimplifiedMode);
+        assert_eq!(t.step, WelcomeStep::Welcome);
+        assert!(t.soon);
+        assert!(!t.step.is_done());
+    }
+
+    #[test]
+    fn details_keeps_step_and_shows_soon() {
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::Details);
+        assert_eq!(t.step, WelcomeStep::Welcome);
+        assert!(t.soon);
+    }
+
+    #[test]
+    fn full_mode_advances_to_download() {
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::FullMode);
+        assert_eq!(t.step, WelcomeStep::Download);
+        assert!(!t.soon);
+        assert!(!t.step.is_done());
+    }
+
+    #[test]
+    fn close_on_download_advances_to_more_sounds() {
+        let t = welcome_transition(WelcomeStep::Download, WelcomeAction::Close);
+        assert_eq!(t.step, WelcomeStep::MoreSounds);
+        assert!(!t.soon);
+        assert!(!t.step.is_done());
+    }
+
+    #[test]
+    fn close_on_more_sounds_completes_flow() {
+        let t = welcome_transition(WelcomeStep::MoreSounds, WelcomeAction::Close);
+        assert_eq!(t.step, WelcomeStep::Done);
+        assert!(!t.soon);
+        assert!(t.step.is_done());
+    }
+
+    #[test]
+    fn close_on_welcome_stays_welcome() {
+        // «Загрузить позже»/«Закрыть» on the choice step should not occur via
+        // the UI, but the pure function stays total and idempotent.
+        let t = welcome_transition(WelcomeStep::Welcome, WelcomeAction::Close);
+        assert_eq!(t.step, WelcomeStep::Welcome);
+        assert!(!t.soon);
+    }
+
+    #[test]
+    fn welcome_window_renders_headlessly() {
+        let mut app = App::new(None);
+        app.welcome_open = true;
+        app.welcome_step = WelcomeStep::Welcome;
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.welcome_window(ctx);
+        });
+        assert!(app.welcome_open);
+        assert_eq!(app.welcome_step, WelcomeStep::Welcome);
+    }
+
+    #[test]
+    fn download_step_renders_headlessly() {
+        let mut app = App::new(None);
+        app.welcome_open = true;
+        app.welcome_step = WelcomeStep::Download;
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.welcome_window(ctx);
+        });
+        assert!(app.welcome_open);
+        assert_eq!(app.welcome_step, WelcomeStep::Download);
+    }
+
+    #[test]
+    fn app_new_defaults_welcome_closed() {
+        let app = App::new(None);
+        assert!(!app.welcome_open);
+        assert_eq!(app.welcome_step, WelcomeStep::Welcome);
     }
 }
 

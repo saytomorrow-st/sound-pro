@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "sneakybass",
+  "name": "Sneakybass",
+  "family": "bass",
+  "version": "1.000",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Sneakybass by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.sneakybass",
+  "sha256": "df57ef935f2d006d83f898f615893cd2e9f93d00d01fb03921c54cd6dd5014dd",
+  "size_bytes": 340462855,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.sneakybass/license?ref=v1.000",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.sneakybass/releases/download/v1.000/Sneakybass_v1.000.zip",
+    "sha256": "df57ef935f2d006d83f898f615893cd2e9f93d00d01fb03921c54cd6dd5014dd",
+    "size_bytes": 340462855,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Sneakybass/Programs/01-sneakybass_keyswitch.sfz",
+  "format": "zip",
+  "verified": true
+}

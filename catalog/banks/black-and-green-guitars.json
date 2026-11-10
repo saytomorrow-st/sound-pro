@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "black-and-green-guitars",
+  "name": "Black and Green Guitars",
+  "family": "guitar",
+  "version": "1.000",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Black and Green Guitars by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.black-and-green-guitars",
+  "sha256": "ba95221d32fb6386c5d0a0799b93904fd55520aca017c5f121da290075c140c0",
+  "size_bytes": 481838512,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.black-and-green-guitars/license?ref=v1.000",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.black-and-green-guitars/releases/download/v1.000/Karoryfer_Black_And_Green_Guitars_1000.zip",
+    "sha256": "ba95221d32fb6386c5d0a0799b93904fd55520aca017c5f121da290075c140c0",
+    "size_bytes": 481838512,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Programs/01-green_keyswitch.sfz",
+  "format": "zip",
+  "verified": true
+}

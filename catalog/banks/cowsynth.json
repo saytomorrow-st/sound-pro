@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "cowsynth",
+  "name": "Cowsynth",
+  "family": "synth",
+  "version": "1.001",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Cowsynth by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.cowsynth",
+  "sha256": "2c80a928db69280d3f8f4d066383c9f6adc0d8ba086c6f1a1abe2c5eaa5fc239",
+  "size_bytes": 14072509,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.cowsynth/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.cowsynth/releases/download/v1.001/Karoryfer.Cowsynth.v1.001.zip",
+    "sha256": "2c80a928db69280d3f8f4d066383c9f6adc0d8ba086c6f1a1abe2c5eaa5fc239",
+    "size_bytes": 14072509,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Cowsynth/cowsynth_asthmatic_organ.sfz",
+  "format": "zip",
+  "verified": true
+}

@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "freepats-drawbar-organ",
+  "name": "FreePats Drawbar Organ Emulation",
+  "family": "synth",
+  "version": "2019-07-12",
+  "author": "FreePats (Roberto <roberto@zenvoid.org>)",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Drawbar Organ Emulation by FreePats (Roberto <roberto@zenvoid.org>), CC0 1.0",
+  "source_url": "https://freepats.zenvoid.org/Organ/electric-organ.html",
+  "sha256": "e2da18b0a4d13be7020037e18e4a719387433357e7603d0773990e794dcf5d0f",
+  "size_bytes": 6042972,
+  "license_check": {
+    "url": "https://freepats.zenvoid.org/Organ/electric-organ.html",
+    "sha256": "96dcffa82af2b1656aa076ed230f2e9d6d53b0a60cde2e322333febcc6c2d6d3",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://freepats.zenvoid.org/Organ/DrawbarOrganEmulation/DrawbarOrganEmulation-SFZ-20190712.tar.xz",
+    "sha256": "e2da18b0a4d13be7020037e18e4a719387433357e7603d0773990e794dcf5d0f",
+    "size_bytes": 6042972,
+    "redirect_hosts": []
+  },
+  "sfz": "DrawbarOrganEmulation-SFZ-20190712/DrawbarOrganEmulation-20190712.sfz",
+  "format": "tar.xz",
+  "verified": true
+}

@@ -5,7 +5,7 @@
 
 ## Что за проект
 
-Открытая DAW на Rust для Linux и Windows. Движок (`crates/audio-core`) не зависит
+Открытая DAW на Rust для Linux, Windows и macOS. Движок (`crates/audio-core`) не зависит
 от платформы и аудиоустройств; оболочка (`crates/daw-app`) подключает бэкенды.
 
 ## Обязательный цикл

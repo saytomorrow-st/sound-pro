@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "greg-sullivan-e-pianos",
+  "name": "Greg Sullivan E-Pianos",
+  "family": "piano",
+  "version": "3.0",
+  "author": "Greg Sullivan",
+  "license": {
+    "spdx": "CC-BY-3.0",
+    "url": "https://creativecommons.org/licenses/by/3.0/",
+    "attribution_required": true
+  },
+  "attribution": "Greg Sullivan E-Pianos by Greg Sullivan, CC-BY 3.0",
+  "source_url": "https://github.com/sfzinstruments/GregSullivan.E-Pianos",
+  "sha256": "b6cb93e68f0d67efa8d453c75607e357e0fdbd29cc6c36a25ccf6091f492c590",
+  "size_bytes": 19250842,
+  "license_check": {
+    "url": "https://creativecommons.org/licenses/by/3.0/legalcode.txt",
+    "sha256": "11dbf7126ae9794e4a7dc54334f3c82a67efcf22df888d396dc2ed707b2a3f9b",
+    "mode": "text-hash"
+  },
+  "download": {
+    "url": "https://codeload.github.com/sfzinstruments/GregSullivan.E-Pianos/zip/8c3e581acda3594b553948ff0222d4f84a698376",
+    "sha256": "b6cb93e68f0d67efa8d453c75607e357e0fdbd29cc6c36a25ccf6091f492c590",
+    "size_bytes": 19250842,
+    "redirect_hosts": []
+  },
+  "sfz": "GregSullivan.E-Pianos-master/CP80/CP80.sfz",
+  "format": "zip",
+  "verified": true
+}

@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest]
+        os: [ubuntu-22.04, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -69,6 +69,9 @@ jobs:
             exit 1
           fi
           echo "(no bundled ALSA: audio uses the host ALSA/PipeWire)"
+      - name: DMG
+        if: runner.os == 'macOS'
+        run: packaging/macos/build-app.sh target/release/sound-pro "$VERSION" dist
       - name: Zip
         if: runner.os == 'Windows'
         shell: pwsh

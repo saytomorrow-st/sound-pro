@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "freepats-timpani",
+  "name": "FreePats Timpani",
+  "family": "percussion",
+  "version": "2024-08-10",
+  "author": "FreePats (Roberto <roberto@zenvoid.org>)",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Timpani by FreePats (Roberto <roberto@zenvoid.org>), CC0 1.0",
+  "source_url": "https://github.com/freepats/timpani",
+  "sha256": "c883b0db915232b4815418e9c6b18c5b4ed73f9f7d84de3ec25785f18b8dab85",
+  "size_bytes": 9373264,
+  "license_check": {
+    "url": "https://api.github.com/repos/freepats/timpani/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/freepats/timpani/releases/download/2024-08-10/Timpani-SFZ%2BFLAC-20240810.7z",
+    "sha256": "c883b0db915232b4815418e9c6b18c5b4ed73f9f7d84de3ec25785f18b8dab85",
+    "size_bytes": 9373264,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Timpani SFZ+FLAC-20240810/Timpani 20240809.sfz",
+  "format": "7z",
+  "verified": true
+}

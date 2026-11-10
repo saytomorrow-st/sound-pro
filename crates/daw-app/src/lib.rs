@@ -34,6 +34,8 @@ pub mod bank_cache;
 pub mod bank_download;
 pub mod bank_integrity;
 pub mod bank_library;
+pub mod download_queue;
+pub mod essential_sounds;
 pub mod instrument;
 pub mod logging;
 pub mod meminfo;
@@ -42,7 +44,9 @@ pub mod nodes;
 pub mod pcm_cache;
 pub mod piano;
 pub mod sample_bank;
+pub mod sound_library;
 pub mod stream_loader;
+pub mod welcome;
 
 /// Errors from assembling a session graph (SPEC-010).
 ///

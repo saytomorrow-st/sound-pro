@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "freepats-synthesizer-percussion",
+  "name": "FreePats Synthesizer Percussion",
+  "family": "drums",
+  "version": "2022-07-18",
+  "author": "FreePats (Roberto <roberto@zenvoid.org>)",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Synthesizer Percussion by FreePats (Roberto <roberto@zenvoid.org>), CC0 1.0",
+  "source_url": "https://github.com/freepats/synthesizer-percussion",
+  "sha256": "dbb2e5bb8268022fffa6dcc3d11a93368316038bf3ae81a965c58e9d490ed23b",
+  "size_bytes": 1853650,
+  "license_check": {
+    "url": "https://api.github.com/repos/freepats/synthesizer-percussion/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://freepats.zenvoid.org/Percussion/SynthesizerPercussion/SynthesizerPercussion-SFZ-20220718.7z",
+    "sha256": "dbb2e5bb8268022fffa6dcc3d11a93368316038bf3ae81a965c58e9d490ed23b",
+    "size_bytes": 1853650,
+    "redirect_hosts": []
+  },
+  "sfz": "SynthesizerPercussion-SFZ-20220718/SynthesizerPercussion-20220718.sfz",
+  "format": "7z",
+  "verified": true
+}

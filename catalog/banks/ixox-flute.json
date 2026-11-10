@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "ixox-flute",
+  "name": "Ixox Flute",
+  "family": "winds",
+  "version": "4.0",
+  "author": "Ixox",
+  "license": {
+    "spdx": "CC-BY-4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0/",
+    "attribution_required": true
+  },
+  "attribution": "Ixox Flute by Ixox, CC-BY 4.0",
+  "source_url": "https://github.com/sfzinstruments/Ixox.Flute",
+  "sha256": "e5fb9116de784e1635e5fe842a6285745d6949424037dffa8246d542ad921079",
+  "size_bytes": 9526829,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/Ixox.Flute/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://codeload.github.com/sfzinstruments/Ixox.Flute/zip/0cc54468bb0d2d9b32921958585caad65ba8df21",
+    "sha256": "e5fb9116de784e1635e5fe842a6285745d6949424037dffa8246d542ad921079",
+    "size_bytes": 9526829,
+    "redirect_hosts": []
+  },
+  "sfz": "Ixox.Flute-master/Ixox Flute.sfz",
+  "format": "zip",
+  "verified": true
+}

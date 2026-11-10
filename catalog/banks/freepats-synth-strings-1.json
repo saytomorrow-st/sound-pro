@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "freepats-synth-strings-1",
+  "name": "FreePats Synth Strings 1",
+  "family": "synth",
+  "version": "2020-05-28",
+  "author": "FreePats",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "FreePats Synth Strings 1 by FreePats, CC0 1.0",
+  "source_url": "https://github.com/freepats/synth-strings-1",
+  "sha256": "912709514f5dc4ae5f50e07e5b7141133afe15869165dea7551604ff998cee2c",
+  "size_bytes": 3380050,
+  "license_check": {
+    "url": "https://api.github.com/repos/freepats/synth-strings-1/license",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/freepats/synth-strings-1/releases/download/2020-05-28/SynthStrings1-SFZ%2BWAV-20200528.7z",
+    "sha256": "912709514f5dc4ae5f50e07e5b7141133afe15869165dea7551604ff998cee2c",
+    "size_bytes": 3380050,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "SynthStrings1 SFZ+WAV-20200528/SynthStrings1 20200528.sfz",
+  "format": "7z",
+  "verified": true
+}

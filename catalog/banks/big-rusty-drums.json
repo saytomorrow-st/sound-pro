@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "big-rusty-drums",
+  "name": "Big Rusty Drums",
+  "family": "drums",
+  "version": "1.100",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "Big Rusty Drums by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.big-rusty-drums",
+  "sha256": "d4a9990acd19376d91ce446dae415c81428728b5adebb6a88eddbb3a6aac8744",
+  "size_bytes": 619600370,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.big-rusty-drums/license?ref=v1.100",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.big-rusty-drums/releases/download/v1.100/Big_Rusty_Drums_1100.zip",
+    "sha256": "d4a9990acd19376d91ce446dae415c81428728b5adebb6a88eddbb3a6aac8744",
+    "size_bytes": 619600370,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "Programs/01-full.sfz",
+  "format": "zip",
+  "verified": true
+}

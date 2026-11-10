@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::logging::LogLevel;
+use crate::welcome::WelcomeStep;
 use audio_core::Interpolation;
 
 /// Buffer sizes offered in the settings window, in frames.
@@ -26,6 +27,8 @@ pub struct AudioSettings {
     pub interpolation: Interpolation,
     /// Log verbosity (info by default).
     pub log_level: LogLevel,
+    /// First-run welcome flow stage; [`WelcomeStep::Welcome`] by default.
+    pub welcome: WelcomeStep,
 }
 
 /// The settings-file word for `interpolation`.
@@ -67,6 +70,9 @@ impl AudioSettings {
                         _ => Interpolation::Linear,
                     };
                 }
+                "welcome" => {
+                    settings.welcome = WelcomeStep::parse(value);
+                }
                 _ => {}
             }
         }
@@ -92,6 +98,9 @@ impl AudioSettings {
         if self.interpolation != Interpolation::default() {
             let name = interpolation_name(self.interpolation);
             text.push_str(&format!("interpolation = {name}\n"));
+        }
+        if self.welcome != WelcomeStep::default() {
+            text.push_str(&format!("welcome = {}\n", self.welcome.name()));
         }
         text
     }
@@ -119,15 +128,23 @@ fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
-/// The config directory: `$XDG_CONFIG_HOME/sound-pro`,
-/// `~/.config/sound-pro`, or `%APPDATA%\sound-pro`.
+/// Home-relative config base when neither `XDG_CONFIG_HOME` nor `APPDATA` is set.
+const HOME_CONFIG_SUBDIR: &str = if cfg!(target_os = "macos") {
+    "Library/Application Support"
+} else {
+    ".config"
+};
+
+/// The config directory: `$XDG_CONFIG_HOME/sound-pro`, `%APPDATA%\sound-pro`,
+/// else `~/Library/Application Support/sound-pro` (macOS) or
+/// `~/.config/sound-pro`.
 #[must_use]
 pub fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(HOME_CONFIG_SUBDIR)))?;
     Some(base.join("sound-pro"))
 }
 
@@ -194,4 +211,49 @@ pub fn buffer_ms(frames: u32, rate: u32) -> f64 {
         return 0.0;
     }
     f64::from(frames) * 1000.0 / f64::from(rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn welcome_defaults_to_welcome_step() {
+        assert_eq!(AudioSettings::default().welcome, WelcomeStep::Welcome);
+        assert_eq!(AudioSettings::parse("").welcome, WelcomeStep::Welcome);
+    }
+
+    #[test]
+    fn welcome_roundtrips_through_text() {
+        for step in [
+            WelcomeStep::Welcome,
+            WelcomeStep::Download,
+            WelcomeStep::MoreSounds,
+            WelcomeStep::Done,
+        ] {
+            let settings = AudioSettings {
+                welcome: step,
+                ..AudioSettings::default()
+            };
+            let text = settings.to_text();
+            let parsed = AudioSettings::parse(&text);
+            assert_eq!(parsed.welcome, step, "text was: {text}");
+        }
+    }
+
+    #[test]
+    fn old_settings_file_without_welcome_key_parses_as_not_done() {
+        // A settings file written before the welcome field existed.
+        let old = "# Sound Pro audio settings\noutput = My Device\nbuffer = 512\n";
+        let parsed = AudioSettings::parse(old);
+        assert_eq!(parsed.welcome, WelcomeStep::Welcome);
+        assert_eq!(parsed.output.as_deref(), Some("My Device"));
+        assert_eq!(parsed.buffer_frames, Some(512));
+    }
+
+    #[test]
+    fn welcome_key_is_ignored_when_invalid() {
+        let parsed = AudioSettings::parse("welcome = bogus\n");
+        assert_eq!(parsed.welcome, WelcomeStep::Welcome);
+    }
 }

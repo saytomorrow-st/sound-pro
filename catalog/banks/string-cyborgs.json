@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "string-cyborgs",
+  "name": "String Cyborgs",
+  "family": "strings",
+  "version": "1.001",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "String Cyborgs by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.string-cyborgs",
+  "sha256": "92974bfef97c7dfc0e50abb9a262d6d39b8551efa5750b5fce5a62cb532da3e2",
+  "size_bytes": 63765812,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.string-cyborgs/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.string-cyborgs/releases/download/v1.001/Karoryfer.String_Cyborgs.v1.001.zip",
+    "sha256": "92974bfef97c7dfc0e50abb9a262d6d39b8551efa5750b5fce5a62cb532da3e2",
+    "size_bytes": 63765812,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "String_Cyborgs/Programs/Blackheart.sfz",
+  "format": "zip",
+  "verified": true
+}

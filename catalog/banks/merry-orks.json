@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "merry-orks",
+  "name": "272 Merry Orks",
+  "family": "voice",
+  "version": "1.001",
+  "author": "Karoryfer Samples",
+  "license": {
+    "spdx": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "attribution_required": false
+  },
+  "attribution": "272 Merry Orks by Karoryfer Samples, CC0 1.0",
+  "source_url": "https://github.com/sfzinstruments/karoryfer.272-merry-orks",
+  "sha256": "c5151c24a57fddfc3997d52df3506bbfceaf4ed897fc587ee4190ba79886c427",
+  "size_bytes": 40439723,
+  "license_check": {
+    "url": "https://api.github.com/repos/sfzinstruments/karoryfer.272-merry-orks/license?ref=v1.001",
+    "sha256": null,
+    "mode": "metadata"
+  },
+  "download": {
+    "url": "https://github.com/sfzinstruments/karoryfer.272-merry-orks/releases/download/v1.001/Karoryfer.272_Merry_Orks.v1.001.zip",
+    "sha256": "c5151c24a57fddfc3997d52df3506bbfceaf4ed897fc587ee4190ba79886c427",
+    "size_bytes": 40439723,
+    "redirect_hosts": [
+      ".githubusercontent.com"
+    ]
+  },
+  "sfz": "272_Merry_Orks/ork_dialogue.sfz",
+  "format": "zip",
+  "verified": true
+}
