@@ -826,6 +826,10 @@ fn unpack_archive(
         "tar.gz" => unpack_tar(archive, dest, cancel, limits, |file| {
             Box::new(flate2::read::GzDecoder::new(file))
         }),
+        "tar.xz" => unpack_tar(archive, dest, cancel, limits, |file| {
+            Box::new(xz2::read::XzDecoder::new(file))
+        }),
+        "7z" => unpack_7z(archive, dest, cancel, limits),
         other => Err(DownloadError::UnsupportedFormat(other.to_owned())),
     }
 }
@@ -1065,6 +1069,149 @@ fn unpack_tar(
         }
     }
     Ok(())
+}
+
+/// Unpacks a 7z archive using `sevenz-rust`, applying the same safety checks
+/// as the tar/zip paths (zip-slip, size caps, duplicate detection, atomic
+/// `create_new` writes, cancellation).
+///
+/// Note: the 7z format does not encode symlinks the way tar/zip do — a 7z
+/// "symlink" entry is just a regular file whose contents are the link target.
+/// We therefore treat every non-directory entry as a regular file and write
+/// its bytes verbatim, which is both safe and the behavior users expect.
+fn unpack_7z(
+    archive: &Path,
+    dest: &Path,
+    cancel: &Arc<AtomicBool>,
+    limits: &Limits,
+) -> Result<(), DownloadError> {
+    let file = std::fs::File::open(archive)
+        .map_err(|e| DownloadError::Io(archive.to_path_buf(), e.to_string()))?;
+
+    let mut state = UnpackState::new();
+    let mut count = 0usize;
+    // The closure cannot return our structured `DownloadError` directly
+    // (`sevenz-rust` only accepts its own `Error`), so we stash the first
+    // error here and stop iteration immediately; it is returned below.
+    let mut first_err: Option<DownloadError> = None;
+
+    let result = sevenz_rust::decompress_with_extract_fn(
+        file,
+        dest,
+        |entry: &sevenz_rust::SevenZArchiveEntry,
+         reader: &mut dyn std::io::Read,
+         _dest_path: &std::path::PathBuf|
+         -> Result<bool, sevenz_rust::Error> {
+            // Cancellation and entry-count limits are enforced from within the
+            // closure because `sevenz-rust` does not expose the total entry
+            // count up front.
+            if cancel.load(Ordering::Relaxed) {
+                first_err = Some(DownloadError::Cancelled);
+                return Ok(false);
+            }
+            count += 1;
+            if count > limits.max_entries {
+                first_err = Some(DownloadError::TooManyEntries(count));
+                return Ok(false);
+            }
+
+            let name = entry.name().to_owned();
+            if entry.is_anti_item() {
+                first_err = Some(DownloadError::UnsafeEntry(format!(
+                    "7z anti-item (deletion marker) is not allowed: {name:?}"
+                )));
+                return Ok(false);
+            }
+
+            let out_path = match safe_join(dest, &name) {
+                Ok(p) => p,
+                Err(e) => {
+                    first_err = Some(e);
+                    return Ok(false);
+                }
+            };
+
+            if entry.is_directory() {
+                if let Err(e) = std::fs::create_dir_all(&out_path) {
+                    first_err = Some(DownloadError::Io(out_path, e.to_string()));
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+
+            let declared = entry.size();
+            if declared > limits.max_entry_bytes {
+                first_err = Some(DownloadError::UnsafeEntry(format!(
+                    "entry {name:?} is too large ({declared} bytes)"
+                )));
+                return Ok(false);
+            }
+            if let Err(e) = state.register(&name) {
+                first_err = Some(e);
+                return Ok(false);
+            }
+
+            if let Some(parent) = out_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    first_err = Some(DownloadError::Io(parent.to_path_buf(), e.to_string()));
+                    return Ok(false);
+                }
+            }
+
+            // `create_new` so a duplicate/collision can never overwrite a file.
+            let mut out = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    first_err = Some(io_err(&out_path, e));
+                    return Ok(false);
+                }
+            };
+
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut actual: u64 = 0;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    first_err = Some(DownloadError::Cancelled);
+                    return Ok(false);
+                }
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        first_err = Some(DownloadError::Unpack(e.to_string()));
+                        return Ok(false);
+                    }
+                };
+                actual = actual.saturating_add(n as u64);
+                if actual > declared {
+                    first_err = Some(DownloadError::UnsafeEntry(format!(
+                        "entry {name:?} has more bytes than its declared size ({declared})"
+                    )));
+                    return Ok(false);
+                }
+                if let Err(e) = state.add_bytes(n as u64, limits) {
+                    first_err = Some(e);
+                    return Ok(false);
+                }
+                if let Err(e) = out.write_all(&buf[..n]) {
+                    first_err = Some(io_err(&out_path, e));
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        },
+    );
+
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    // A genuine `sevenz-rust` failure (bad signature, unsupported compression
+    // method, truncated archive, ...) that our own checks did not catch.
+    result.map_err(|e| DownloadError::Unpack(e.to_string()))
 }
 
 /// Validates an archive entry name and returns it as clean, `/`-separated
@@ -2258,6 +2405,57 @@ mod http_tests {
         out
     }
 
+    /// Build a `.tar.xz` archive (xz-compressed tar), used to exercise the
+    /// `tar.xz` unpack path (FreePats / Salamander Grand).
+    fn make_tar_xz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut builder = tar::Builder::new(&mut cursor);
+            for (name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, *name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        xz_bytes(&cursor.into_inner())
+    }
+
+    fn xz_bytes(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut enc = xz2::write::XzEncoder::new(&mut out, 6);
+            enc.write_all(raw).unwrap();
+            enc.finish().unwrap();
+        }
+        out
+    }
+
+    /// Build a `.7z` archive (solid LZMA2), used to exercise the `7z` unpack
+    /// path. `sevenz-rust` stores directory entries as stream-less entries and
+    /// regular files as streamed entries; we emit exactly the files given.
+    fn make_7z_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = sevenz_rust::SevenZWriter::new(&mut cursor).expect("7z writer");
+            for (name, data) in entries {
+                let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+                entry.name = (*name).to_owned();
+                entry.has_stream = true;
+                entry.is_directory = false;
+                writer
+                    .push_archive_entry(entry, Some(Cursor::new(*data)))
+                    .expect("push 7z entry");
+            }
+            let _ = writer.finish().expect("finish 7z");
+        }
+        cursor.into_inner()
+    }
+
     /// Rewrites the first central-directory entry's `uncompressed_size` field
     /// (offset +24 within the central header) to `forged`, so `ZipFile::size()`
     /// understates the actual stored bytes. This models an archive that lies
@@ -3120,6 +3318,135 @@ mod http_tests {
         let result =
             download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
         assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // tar.xz archives (FreePats / Salamander Grand)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tar_xz_archive_unpacks() {
+        let archive = make_tar_xz_bytes(&[
+            ("bank/bank.sfz", b"<region> sample=bank.wav"),
+            ("bank/bank.wav", b"RIFFfake"),
+        ]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.xz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-xz");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        let bank = result.expect("tar.xz download succeeds");
+        assert_eq!(bank.id, "test-bank");
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+        let leftover = std::fs::read_dir(&banks)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+    }
+
+    #[test]
+    fn tar_xz_duplicate_entry_is_rejected() {
+        let archive = make_tar_xz_bytes(&[("bank/bank.sfz", b"one"), ("bank/bank.sfz", b"two")]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "tar.xz",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("tar-xz-dup");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // 7z archives (FreePats)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sevenz_archive_unpacks() {
+        let archive = make_7z_bytes(&[
+            ("bank/bank.sfz", b"<region> sample=bank.wav"),
+            ("bank/bank.wav", b"RIFFfake"),
+        ]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "7z",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("sevenz");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        let bank = result.expect("7z download succeeds");
+        assert_eq!(bank.id, "test-bank");
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.sfz")
+                .exists()
+        );
+        assert!(
+            banks
+                .join("test-bank")
+                .join("bank")
+                .join("bank.wav")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn sevenz_zip_slip_is_rejected() {
+        let archive = make_7z_bytes(&[("../evil.txt", b"boom")]);
+        let size = archive.len() as u64;
+        let hash = sha256(&archive);
+        let archive_arc = Arc::new(archive);
+        let server = license_then_archive_server(archive_arc);
+
+        let e = cc0_entry(
+            server.url("/archive"),
+            server.url("/license"),
+            "7z",
+            size,
+            hash,
+        );
+        let banks = temp_banks_dir("sevenz-slip");
+        let result =
+            download_bank_into_with_https(&e, &banks, &Progress::new(size), &cancel_flag(), false);
+        assert!(matches!(result, Err(DownloadError::UnsafeEntry(_))));
+        assert!(!banks.join("test-bank").exists());
     }
 
     #[test]
