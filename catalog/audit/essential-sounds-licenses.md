@@ -16,11 +16,13 @@
 
 ## Подтверждено (SHA-256 реальной загрузкой, 2026-11-09)
 
-Ниже — 19 банков Karoryfer (все CC0-1.0) и 9 дополнительных банков второго
+Ниже — 19 банков Karoryfer (все CC0-1.0), 9 дополнительных банков второго
 захода (VSCO-2-CE, VCSL, Muldjord Kit, Ixox Flute, Greg Sullivan E-Pianos,
-Sonatina Symphonic Orchestra, GTownChurch, AKG R 20 E IRs, Mellotron-SFZ),
+Sonatina Symphonic Orchestra, GTownChurch, AKG R 20 E IRs, Mellotron-SFZ)
+и 10 банков FreePats третьего захода (Harp, Timpani, Church/Drawbar/Rock/
+Percussive Organ, Synth Pad Choir, Synth Strings 1/2, Synthesizer Percussion),
 добавленные в каталог. Для каждого скачан архив, посчитан SHA-256, проверено
-содержимое (`.sfz` + WAV/FLAC/OGG/MP3), а текст лицензии прочитан из
+содержимое (`.sfz` + WAV/FLAC, без SF2), а текст лицензии прочитан из
 первоисточника. Индивидуальные отчёты — `catalog/audit/<bank_id>.md`.
 
 | Банк (id) | Категория | size_bytes | SHA-256 (первые 16) | Формат сэмплов |
@@ -53,6 +55,16 @@ Sonatina Symphonic Orchestra, GTownChurch, AKG R 20 E IRs, Mellotron-SFZ),
 | sonatina-symphonic-orchestra | Strings | 1 377 249 014 | 1791e3a5f8ceb6b7 | flac, wav |
 | akg-r20e-ir | ImpulseResponses | 7 187 061 | a4b08b094c006c1a | wav |
 | mellotron-sfz | Synth | 510 946 413 | 6eb52869300463a9 | wav |
+| freepats-harp | Strings | 9 502 812 | e7dacbb92ff11bbb | wav |
+| freepats-timpani | Percussion | 9 373 264 | c883b0db915232b4 | flac |
+| freepats-church-organ | Orchestral | 13 033 856 | 1f0b70a2c2af14cd | wav |
+| freepats-drawbar-organ | Synth | 6 042 972 | e2da18b0a4d13be7 | wav |
+| freepats-rock-organ | Synth | 12 576 272 | 07321d9498dc3198 | wav |
+| freepats-percussive-organ | Synth | 12 423 412 | c4841f2e7f352692 | wav |
+| freepats-synth-pad-choir | Synth | 6 815 491 | 703ef30fad4861f8 | flac |
+| freepats-synth-strings-1 | Synth | 3 380 050 | 912709514f5dc4ae | wav |
+| freepats-synth-strings-2 | Synth | 5 703 244 | ceec5966314d9ed7 | flac |
+| freepats-synthesizer-percussion | Drums | 1 853 650 | dbb2e5bb8268022f | wav |
 
 ## Сводная таблица
 
@@ -71,9 +83,11 @@ Sonatina Symphonic Orchestra, GTownChurch, AKG R 20 E IRs, Mellotron-SFZ),
 | VSCO-2-CE | `sgossner/VSCO-2-CE` → `LICENSE` | `CC0-1.0` | да | нет |
 | FreePats: Harp (Concert Harp) | freepats.zenvoid.org/OrchestralStrings/harp.html | `CC0-1.0` | да | нет |
 | FreePats: Timpani | `freepats/timpani` → `LICENSE.txt`, README | `CC0-1.0` | да | нет |
-| FreePats: Pipe Organ | freepats.zenvoid.org/Organ/pipe-organ.html | `CC0-1.0` | да | нет |
+| FreePats: Church Organ (Pipe Organ) | freepats.zenvoid.org/Organ/pipe-organ.html | `CC0-1.0` | да | нет |
+| FreePats: Drawbar/Rock/Percussive Organ | freepats.zenvoid.org/Organ/electric-organ.html | `CC0-1.0` | да | нет |
 | FreePats: Choir (Synth Pad Choir) | `freepats/synth-pad-choir` → `LICENSE.txt`, README | `CC0-1.0` | да (синтетика) | нет |
 | FreePats: Strings (Synth Strings 1/2) | `freepats/synth-strings-1/2` → `LICENSE.txt` | `CC0-1.0` | да (синтетика) | нет |
+| FreePats: Synthesizer Percussion | `freepats/synthesizer-percussion` → `LICENSE` (CC0 1.0) | `CC0-1.0` | да (синтетика) | нет |
 | Karoryfer: Shinyguitar, Growlybass, Swagbass, Bigcat Cello, War Tuba, Gogodze Phu Vol II | `sfzinstruments/karoryfer.*` → `LICENSE` (CC0 1.0 Universal) | `CC0-1.0` | да | нет |
 | Ixox Flute | `sfzinstruments/Ixox.Flute` → `LICENSE`, README | `CC-BY-4.0` | да | да |
 | Muldjord Kit | `sfzinstruments/DrumGizmo.MuldjordKit` → `LICENSE`, README | `CC-BY-4.0` | да | да |
@@ -122,7 +136,11 @@ URL текстов (все прочитаны):
   но только для **фотографии**, сэмплы CC0. Страницы `Piano/acoustic-grand-piano`
   упоминают одновременно CC0 и Attribution 3.0 — для него состав не подтверждён.
   `Percussion/acoustic-drum-kit` — Attribution 4.0 (Muldjord). Настоящего хора
-  у FreePats нет (только синтетический `synth-pad-choir`).
+  у FreePats нет (только синтетический `synth-pad-choir`). Все 10 включённых
+  банков подтверждены CC0 текстом «Published under the terms of Creative
+  Commons CC0 public domain dedication» (zenvoid) либо «Creative Commons Legal
+  Code — CC0 1.0 Universal» (GitHub `freepats/*`); органы — с одной страницы
+  `Organ/electric-organ.html`.
 - Karoryfer: в каждом репозитории `LICENSE` — CC0 1.0 Universal (проверены
   Shinyguitar, Growlybass, Swagbass, Bigcat Cello, War Tuba, Gogodze Phu Vol II).
 - Splendid Grand: README «Public Domain samples by AKAI… released as public
@@ -137,9 +155,11 @@ URL текстов (все прочитаны):
 Годятся: Greg Sullivan (CC-BY-3.0), Karoryfer (шесть банков, CC0), Ixox Flute
 и Muldjord Kit (CC-BY-4.0), VSCO-2-CE и VCSL (CC0), Sonatina и GTownChurch
 (Sampling Plus, некоммерческое), AKG R 20 E IRs (MIT), Mellotron-SFZ
-(некоммерческое, цитата владельца). FreePats Harp/Timpani/Pipe Organ/Synth Pad
-Choir/Synth Strings (CC0) годятся по лицензии, но их архивы `.tar.xz`/`.7z` не
-поддерживаются загрузчиком — **не включены**. Условно: Splendid Grand,
-Wavestate Pads, GeneralUser GS. Не годятся: VPO (GPL/SA), Maestro
-(proprietary), Northern Trumpets (коммерческая). Не подтверждены:
-Church Steinway, OrgueEglise.
+(некоммерческое, цитата владельца). FreePats (10 банков: Harp, Timpani,
+Church/Drawbar/Rock/Percussive Organ, Synth Pad Choir, Synth Strings 1/2,
+Synthesizer Percussion) — все CC0, архивы `.tar.xz`/`.7z` теперь
+поддерживаются загрузчиком — **включены**. Salamander Grand уже покрыт банком
+`salamander-grand-v3` (V3 той же библиотеки), отдельный банк не добавлялся.
+Условно: Splendid Grand, Wavestate Pads, GeneralUser GS. Не годятся: VPO
+(GPL/SA), Maestro (proprietary), Northern Trumpets (коммерческая).
+Не подтверждены: Church Steinway, OrgueEglise.

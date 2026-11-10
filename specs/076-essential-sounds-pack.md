@@ -57,6 +57,13 @@ Drawbar/Rock/Percussive/Church Organ, Synth Pad Choir, Synth Strings,
 Synthesizer Percussion) и Salamander Grand больше не отклоняются по формату —
 загрузчик теперь распаковывает `tar.xz` и `7z` (см. «Поддержка архивов»).
 
+Дополнительно (третий заход, 2026-11-09) **включены** 10 банков FreePats
+(все CC0-1.0): Harp, Timpani, Church/Drawbar/Rock/Percussive Organ, Synth Pad
+Choir, Synth Strings 1/2, Synthesizer Percussion. Загрузчик теперь распаковывает
+`.tar.xz` (xz2) и `.7z` (sevenz-rust), и валидатор каталога принимает эти
+форматы. Salamander Grand остаётся покрыт `salamander-grand-v3` (V3 той же
+библиотеки), отдельный банк не добавлялся.
+
 ## Поведение
 
 1. **Мета-пакет** — файл `catalog/packs/essential-sounds.json` (отдельный от
@@ -76,13 +83,13 @@ Synthesizer Percussion) и Salamander Grand больше не отклоняют
 |---|---|---|---|
 | Пианино | Splendid Grand (PD, AKAI) | Osiris Piano (уже в каталоге) | 77 |
 | Эл. пианино | Greg Sullivan E-Pianos (CC-BY-3.0) | — | 21,5 |
-| Органы | — (дыра, см. ниже) | FreePats Pipe Organ (CC0) | не подтверждено |
+| Органы | FreePats Church/Drawbar/Rock/Percussive Organ (CC0) | FreePats Pipe Organ (CC0) | подтверждено |
 | Гитары | Shinyguitar (CC0) | — | 352 |
 | Бас | Growlybass, Swagbass (CC0) | — | 160 + 138 |
 | Струнные | Bigcat Cello (CC0) + VSCO-2-CE Strings | — | Cello: не подтверждено |
 | Медь | War Tuba (CC0) + VSCO-2-CE Brass | — | 104 |
 | Дерево | Ixox Flute (CC-BY-4.0) + VSCO-2-CE Woodwinds | — | 10,7 |
-| Хор | — (дыра) | FreePats Synth Pad Choir (CC0, синтетика) | не подтверждено |
+| Хор | — (дыра) | FreePats Synth Pad Choir (CC0, синтетика) | подтверждено |
 | Барабаны (Drummer-аналог) | Muldjord Kit (CC-BY-4.0) | — | 347 |
 | Перкуссия | Gogodze Phu Vol II (CC0) | VCSL-срезы | 133 |
 | Синты/пэды | Wavestate Pads (CC0, источник уточнить) | FreePats synth-* | 160 |
@@ -177,13 +184,16 @@ Synthesizer Percussion) и Salamander Grand больше не отклоняют
 | Арфа | FreePats Concert Harp (из VCSL) | CC0 подтверждена |
 | Тимпани | FreePats Timpani (из VCSL); VSCO-2-CE Percussion | CC0 подтверждена |
 | 808/909 | не найдено; `TicTokMen.Moogdrums1/RetroDrums1`, `OrchestralPercussion` — лицензия не проверялась | не подтверждено |
-| Органы | FreePats Pipe Organ (CC0) — теперь загружается (поддержка `tar.xz`); OrgueEglise — лицензия не найдена | CC0 подтверждена у FreePats |
+| Органы | FreePats Pipe Organ (CC0) — теперь включён (поддержка `tar.xz`); OrgueEglise — лицензия не найдена | CC0 подтверждена у FreePats |
 | Лупы | кандидатов не найдено | не подтверждено |
 | Церковное пианино | Church Steinway (Pianobook) | не подтверждено |
 
 Отклонены по лицензии: VPO 3.2 (GPL/SA), Maestro (all rights reserved),
-Northern Trumpets (коммерческая). Sonatina и GTownChurch (CC Sampling Plus
-1.0) включены как «Только некоммерческое» по решению владельца.
+Northern Trumpets (коммерческая). FreePats включены после добавления поддержки
+`.tar.xz`/`.7z` в загрузчик. Salamander Grand уже покрыт `salamander-grand-v3`
+(V3 той же библиотеки) — отдельный банк не добавлялся.
+Sonatina и GTownChurch (CC Sampling Plus 1.0) включены как «Только
+некоммерческое» по решению владельца.
 
 ## Граничные случаи
 
