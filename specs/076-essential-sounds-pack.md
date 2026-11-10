@@ -1,8 +1,11 @@
 # SPEC-076: мета-пакет «Основной набор» (Essential Sounds Pack)
 
-Статус: draft
+Статус: implemented
 Владелец: saytomorrow-st
-Для агента: запрещено реализовывать (сначала закрыть дыры и аудит, см. ниже)
+
+> Реализовано. «Основной набор» — захардкоженный список из 8 id каталога в
+> `crates/daw-app/src/essential_sounds.rs` (`ESSENTIAL_BANK_IDS`), а не
+> отдельный манифест (см. «Реализация» ниже).
 
 ## Проблема
 
@@ -48,11 +51,11 @@ GTownChurch (CC Sampling Plus 1.0, «Только некоммерческое»
 Mellotron-SFZ (только некоммерческое, цитата владельца в манифесте). Отчёты —
 `catalog/audit/<bank_id>.md`.
 
-Отклонены: все FreePats (Harp, Timpani, Pipe Organ, Drawbar/Rock/Percussive/
-Church Organ, Synth Pad Choir, Synth Strings, Synthesizer Percussion) —
-архивы `.tar.xz`/`.7z` не поддерживаются загрузчиком (`bank_download`
-распаковывает только `zip`/`tar.bz2`); Salamander Grand — `tar.xz`
-(уже покрыт `salamander-grand-v3`).
+Отклонены по лицензии: VPO 3.2 (GPL/SA), Maestro (all rights reserved),
+Northern Trumpets (коммерческая). FreePats (Harp, Timpani, Pipe Organ,
+Drawbar/Rock/Percussive/Church Organ, Synth Pad Choir, Synth Strings,
+Synthesizer Percussion) и Salamander Grand больше не отклоняются по формату —
+загрузчик теперь распаковывает `tar.xz` и `7z` (см. «Поддержка архивов»).
 
 ## Поведение
 
@@ -115,6 +118,57 @@ Church Organ, Synth Pad Choir, Synth Strings, Synthesizer Percussion) —
    обязательна и не скрывается; для CC0 и PD — показывается по доброй воле.
    Credits содержит ссылку на `catalog/audit/*.md`.
 
+## Реализация (как сделано, вместо манифеста)
+
+Выбран простой вариант: «Основной набор» — **захардкоженный список id** в
+`crates/daw-app/src/essential_sounds.rs`, а не файл `catalog/packs/*.json`
+(варианты из «Поведения» выше остаются справочными). Причины: пакет мал,
+версионируется вместе с бинарём, и не требует новой схемы каталога.
+
+- `ESSENTIAL_BANK_IDS` — 8 банков CC0/CC-BY (базовый набор из брифа):
+  Salamander Grand, Virtuosity Drums, Shinyguitar, Meatbass, Bigcat Cello,
+  Bear Sax, String Cyborgs, Merry Orks. Банк, которого нет в каталоге,
+  непроверенный или без известного размера, пропускается (не валит пакет).
+- `essential_banks()` / `essential_banks_missing()` / `essential_installed()` /
+  `essential_download_bytes()` — резолв и состояние установки из реестра
+  банков на диске (единый статус «Не установлено / Загрузка / Установлено /
+  Не завершено» читается из реального состояния диска, не из флага).
+- **Очередь** `crates/daw-app/src/download_queue.rs` (`DownloadQueue`): батч
+  банков в фоновом потоке, общий прогресс в байтах и по банкам, скорость и
+  ETA (форматирование с десятичной запятой, «Xм Yс»), пауза/продолжение,
+  отмена. Каждый банк качается через `bank_download::download_bank_into`.
+  Прогресс отдаётся снимком `QueueSnapshot` (мьютекс) — GUI читает его каждый
+  кадр, вся I/O остаётся в воркере (realtime-контракт соблюдён).
+- **Загрузчик** `bank_download.rs`: докачка частично скачанного через
+  HTTP Range, повторная проверка SHA-256 после загрузки, распаковка,
+  атомарная установка (временный каталог → `rename`), повтор при сетевой
+  ошибке с ограничением.
+- **Шаг первого запуска** (`welcome`): при «Полный режим» стартует
+  `start_essential_queue`; прогресс-бар/байты читаются из `QueueSnapshot`;
+  кнопки «Пауза»/«Продолжить», «Отмена», «Загрузить», «Загрузить позже»;
+  по чистом завершении — авто-переход к «Доступно больше звуков».
+- **Меню «Библиотека звуков»** (`macos_menu.rs`): «Загрузить основные звуки»
+  неактивно, когда essential установлены; «Загрузить все доступные звуки» —
+  все непроверенные банки; «Переустановить библиотеку звуков» — перекачка
+  essential с проверкой SHA; «Переместить библиотеку звуков…» — заглушка.
+- **Менеджер**: «Установить» ставит выбранные банки через очередь (общий
+  прогресс, пауза/отмена внутри окна); строки «Установлено / Не установлено»
+  и реальные размеры «N ГБ загрузка / требуется M ГБ».
+
+## Поддержка архивов
+
+`bank_download.rs::unpack_archive` распаковывает:
+
+- `zip` (crate `zip`), `tar.gz` (crate `flate2`), `tar.bz2` (`bzip2`),
+  `tar.xz` (`xz2`, feature `static` — связывает liblzma, C), `7z`
+  (`sevenz-rust`, чистый Rust). Формат из записи каталога берётся из
+  `format`/расширения URL; неизвестный формат отклоняется явным
+  «формат не поддерживается».
+- Все пути внутри архива валидируются (`validate_entry_name` + `safe_join`)
+  против обхода каталога и коллизий регистра; симлинки/hardlink отклоняются.
+- `7z` не различает симлинки от обычных файлов (хранятся как обычные файлы) —
+  задокументировано в коде.
+
 ## Дыры и кандидаты
 
 | Дыра | Кандидаты | Статус лицензии |
@@ -123,15 +177,13 @@ Church Organ, Synth Pad Choir, Synth Strings, Synthesizer Percussion) —
 | Арфа | FreePats Concert Harp (из VCSL) | CC0 подтверждена |
 | Тимпани | FreePats Timpani (из VCSL); VSCO-2-CE Percussion | CC0 подтверждена |
 | 808/909 | не найдено; `TicTokMen.Moogdrums1/RetroDrums1`, `OrchestralPercussion` — лицензия не проверялась | не подтверждено |
-| Органы | FreePats Pipe Organ (CC0) — формат `tar.xz` не поддерживается; OrgueEglise — лицензия не найдена | CC0 подтверждена только у FreePats, но не загружается |
+| Органы | FreePats Pipe Organ (CC0) — теперь загружается (поддержка `tar.xz`); OrgueEglise — лицензия не найдена | CC0 подтверждена у FreePats |
 | Лупы | кандидатов не найдено | не подтверждено |
 | Церковное пианино | Church Steinway (Pianobook) | не подтверждено |
 
 Отклонены по лицензии: VPO 3.2 (GPL/SA), Maestro (all rights reserved),
-Northern Trumpets (коммерческая). Отклонены по формату архива: все FreePats
-(`tar.xz`/`7z`), Salamander Grand (`tar.xz`, уже покрыт `salamander-grand-v3`).
-Sonatina и GTownChurch (CC Sampling Plus 1.0) включены как «Только
-некоммерческое» по решению владельца.
+Northern Trumpets (коммерческая). Sonatina и GTownChurch (CC Sampling Plus
+1.0) включены как «Только некоммерческое» по решению владельца.
 
 ## Граничные случаи
 

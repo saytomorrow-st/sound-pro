@@ -2454,6 +2454,19 @@ impl App {
                 }
                 _ => {}
             }
+            // Auto-advance the first-run welcome flow when the «Основные
+            // звуки» queue finishes cleanly (SPEC-076).
+            let finished_clean =
+                snap.phase == daw_app::download_queue::QueuePhase::Done && snap.failed.is_empty();
+            if finished_clean && self.welcome_step == WelcomeStep::Download {
+                self.welcome_step = WelcomeStep::MoreSounds;
+                self.audio.welcome = WelcomeStep::MoreSounds;
+                if let Some(path) = &self.audio_path
+                    && let Err(e) = self.audio.save(path)
+                {
+                    self.status = format!("Не удалось сохранить настройки: {e}");
+                }
+            }
             self.download_queue = None;
             return;
         }
@@ -7357,6 +7370,48 @@ impl App {
         ui.add_space(8.0);
         ui.separator();
 
+        // Live batch-queue progress (SPEC-076): shown while a queue is active
+        // so the manager reflects the real downloader state.
+        if let Some(queue) = &self.download_queue {
+            let snap = queue.snapshot();
+            if queue.is_active() {
+                let fraction = snap.fraction();
+                let caption = if let Some(current) = &snap.current {
+                    format!(
+                        "{} из {} ({}): {}",
+                        welcome::format_megabytes(snap.received),
+                        welcome::format_gigabytes(snap.total),
+                        current,
+                        daw_app::download_queue::format_speed(snap.speed_bps),
+                    )
+                } else {
+                    format!(
+                        "{} из {}",
+                        welcome::format_megabytes(snap.received),
+                        welcome::format_gigabytes(snap.total),
+                    )
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(caption)
+                        .desired_width(ui.available_width()),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Пауза").clicked() {
+                        queue.pause();
+                    }
+                    if ui.button("Продолжить").clicked() {
+                        queue.resume();
+                    }
+                    if ui.button("Отмена").clicked() {
+                        queue.cancel();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.separator();
+            }
+        }
+
         // Bottom summary: sizes and action buttons.
         let (dl, inst) = {
             let lib = self.sound_library.as_ref().expect("model built above");
@@ -7673,19 +7728,11 @@ impl App {
             self.library_status = "Выбранные пункты ещё недоступны для загрузки".to_owned();
             return;
         }
-        let mut started = 0_usize;
-        for entry in banks {
-            if self.downloads.contains_key(&entry.id) {
-                continue;
-            }
-            self.start_download(entry);
-            started += 1;
-        }
-        self.library_status = if started == 0 {
-            "Выбранные банки уже загружаются".to_owned()
-        } else {
-            format!("Загрузка начата: {started} шт.")
-        };
+        // Route through the batch queue so the manager shows aggregate
+        // progress, pause/cancel, and a single installed-state update
+        // (SPEC-076).
+        self.start_download_queue(banks);
+        self.library_status = "Загрузка начата".to_owned();
     }
 
     fn library_ui(&mut self, ui: &mut egui::Ui) {
@@ -8239,7 +8286,8 @@ impl App {
                 }
             }
             WelcomeStep::Download => {
-                // Left: thin progress bar (~57% width) + caption; right: two buttons.
+                // Left: thin progress bar (~57% width) + caption; right: the
+                // step-specific buttons (pause/resume, cancel, download, close).
                 let (received, total) = self.welcome_download_progress();
                 let bar_w = footer.width() * 0.57;
                 let bar_h = 6.0;
@@ -8265,40 +8313,130 @@ impl App {
                     WELCOME_BODY,
                 );
 
-                let close_w = 110.0;
-                let later_w = 150.0;
-                let gap = 12.0;
+                // Queue state drives the buttons on the right.
+                let queue_phase = self.download_queue.as_ref().map(|q| q.snapshot().phase);
+                let running = matches!(
+                    queue_phase,
+                    Some(daw_app::download_queue::QueuePhase::Downloading)
+                        | Some(daw_app::download_queue::QueuePhase::Paused)
+                );
+                let paused = matches!(
+                    queue_phase,
+                    Some(daw_app::download_queue::QueuePhase::Paused)
+                );
+
                 let btn_h = 28.0;
+                let gap = 12.0;
                 let y = footer.center().y - btn_h / 2.0;
-                let close_rect = Rect::from_min_size(
-                    Pos2::new(footer.max.x - close_w, y),
-                    Vec2::new(close_w, btn_h),
-                );
-                let later_rect = Rect::from_min_size(
-                    Pos2::new(close_rect.min.x - gap - later_w, y),
-                    Vec2::new(later_w, btn_h),
-                );
-                welcome_button(
-                    ui,
-                    later_rect,
-                    WELCOME_BUTTON_BG,
-                    WELCOME_BUTTON_TEXT,
-                    "Загрузить позже",
-                );
-                welcome_button(
-                    ui,
-                    close_rect,
-                    WELCOME_PRIMARY,
-                    WELCOME_BUTTON_TEXT,
-                    "Закрыть",
-                );
-                if ui.rect_contains_pointer(later_rect) && ui.input(|i| i.pointer.primary_clicked())
-                {
-                    *action = Some(WelcomeAction::Close);
-                }
-                if ui.rect_contains_pointer(close_rect) && ui.input(|i| i.pointer.primary_clicked())
-                {
-                    *action = Some(WelcomeAction::Close);
+                // Right-aligned buttons, stacked from the right edge.
+                let mut x = footer.max.x;
+
+                if running {
+                    // «Загрузить позже» (grey, right-most).
+                    let later_w = 150.0;
+                    x -= later_w;
+                    let later_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(later_w, btn_h));
+                    welcome_button(
+                        ui,
+                        later_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        "Загрузить позже",
+                    );
+                    if ui.rect_contains_pointer(later_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        *action = Some(WelcomeAction::Close);
+                    }
+                    x -= gap;
+
+                    // «Пауза» / «Продолжить».
+                    let toggle_w = 110.0;
+                    x -= toggle_w;
+                    let toggle_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(toggle_w, btn_h));
+                    let toggle_label = if paused {
+                        "Продолжить"
+                    } else {
+                        "Пауза"
+                    };
+                    welcome_button(
+                        ui,
+                        toggle_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        toggle_label,
+                    );
+                    if ui.rect_contains_pointer(toggle_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        if let Some(queue) = &self.download_queue {
+                            if paused {
+                                queue.resume();
+                            } else {
+                                queue.pause();
+                            }
+                        }
+                    }
+                    x -= gap;
+
+                    // «Отмена» cancels the queue but keeps the dialog on this
+                    // step (so the user can restart or skip).
+                    let cancel_w = 90.0;
+                    x -= cancel_w;
+                    let cancel_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(cancel_w, btn_h));
+                    welcome_button(
+                        ui,
+                        cancel_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        "Отмена",
+                    );
+                    if ui.rect_contains_pointer(cancel_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        if let Some(queue) = &self.download_queue {
+                            queue.cancel();
+                        }
+                    }
+                } else {
+                    // Not running: «Загрузить позже» (grey) + «Загрузить» (primary).
+                    let later_w = 150.0;
+                    x -= later_w;
+                    let later_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(later_w, btn_h));
+                    welcome_button(
+                        ui,
+                        later_rect,
+                        WELCOME_BUTTON_BG,
+                        WELCOME_BUTTON_TEXT,
+                        "Загрузить позже",
+                    );
+                    if ui.rect_contains_pointer(later_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        *action = Some(WelcomeAction::Close);
+                    }
+                    x -= gap;
+
+                    let download_w = 110.0;
+                    x -= download_w;
+                    let download_rect =
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(download_w, btn_h));
+                    welcome_button(
+                        ui,
+                        download_rect,
+                        WELCOME_PRIMARY,
+                        WELCOME_BUTTON_TEXT,
+                        "Загрузить",
+                    );
+                    if ui.rect_contains_pointer(download_rect)
+                        && ui.input(|i| i.pointer.primary_clicked())
+                    {
+                        self.start_essential_queue();
+                    }
                 }
             }
             WelcomeStep::MoreSounds => {
@@ -8345,23 +8483,30 @@ impl App {
         }
     }
 
-    /// The bytes downloaded / total for the download step. Wired to the live
-    /// bank-download state (the only downloader the app has); empty when no
-    /// download is running, so by default this step shows a stub at `0 МБ из
-    /// 0,00 ГБ` until a real «основной набор» downloader is added.
+    /// The bytes downloaded / total for the download step, read from the live
+    /// [`DownloadQueue`] snapshot (SPEC-076). Returns `(0, total)` before the
+    /// queue starts so the step shows the real total size with no progress.
     fn welcome_download_progress(&self) -> (u64, u64) {
-        let mut received = 0_u64;
-        let mut total = 0_u64;
-        for state in self.downloads.values() {
-            received += state.progress.bytes();
-            total += state.progress.total();
+        match &self.download_queue {
+            Some(queue) => {
+                let snap = queue.snapshot();
+                (snap.received, snap.total)
+            }
+            None => {
+                let total = daw_app::essential_sounds::essential_download_bytes();
+                (0, total)
+            }
         }
-        (received, total)
     }
 
     /// Applies a welcome action, advancing the pure state machine and
     /// persisting the step outside any realtime path.
     fn apply_welcome_action(&mut self, action: WelcomeAction) {
+        // «Полный режим» advances to the download step and starts the
+        // «Основные звуки» queue (SPEC-076).
+        if action == WelcomeAction::FullMode {
+            self.start_essential_queue();
+        }
         let t = welcome_transition(self.welcome_step, action);
         self.welcome_soon = t.soon;
         if t.step != self.welcome_step {
