@@ -598,10 +598,7 @@ mod tests {
         let mut lib = library();
         let salamander = lib.find("salamander-grand-v3").unwrap().download_bytes;
         let osiris = lib.find("osiris-piano").unwrap().download_bytes;
-        let greg_sullivan = lib
-            .find("greg-sullivan-e-pianos")
-            .unwrap()
-            .download_bytes;
+        let greg_sullivan = lib.find("greg-sullivan-e-pianos").unwrap().download_bytes;
         assert_eq!(lib.download_bytes(), 0);
 
         lib.toggle("salamander-grand-v3");
