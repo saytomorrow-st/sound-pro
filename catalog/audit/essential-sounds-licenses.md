@@ -16,10 +16,12 @@
 
 ## Подтверждено (SHA-256 реальной загрузкой, 2026-11-09)
 
-Ниже — 19 банков Karoryfer (все CC0-1.0), добавленные в каталог. Для каждого
-скачан архив, посчитан SHA-256, проверено содержимое (`.sfz` + WAV/FLAC), а
-текст лицензии прочитан из первоисточника (`LICENSE` → «Creative Commons Legal
-Code»). Индивидуальные отчёты — `catalog/audit/<bank_id>.md`.
+Ниже — 19 банков Karoryfer (все CC0-1.0) и 9 дополнительных банков второго
+захода (VSCO-2-CE, VCSL, Muldjord Kit, Ixox Flute, Greg Sullivan E-Pianos,
+Sonatina Symphonic Orchestra, GTownChurch, AKG R 20 E IRs, Mellotron-SFZ),
+добавленные в каталог. Для каждого скачан архив, посчитан SHA-256, проверено
+содержимое (`.sfz` + WAV/FLAC/OGG/MP3), а текст лицензии прочитан из
+первоисточника. Индивидуальные отчёты — `catalog/audit/<bank_id>.md`.
 
 | Банк (id) | Категория | size_bytes | SHA-256 (первые 16) | Формат сэмплов |
 |---|---|---|---|---|
@@ -42,18 +44,27 @@ Code»). Индивидуальные отчёты — `catalog/audit/<bank_id>.
 | caveman-cosmonaut | Synth | 97 546 345 | e494eb1656b9d637 | wav |
 | cowsynth | Synth | 14 072 509 | 2c80a928db69280d | wav |
 | merry-orks | Voice | 40 439 723 | c5151c24a57fddfc | wav |
+| vcsl | Strings | 4 047 406 738 | d7bd399a124ad36f | wav, ogg, mp3 |
+| vsco-2-ce | Strings | 2 297 598 334 | 4a4446628df0e1a1 | wav, mp3 |
+| muldjord-kit | Drums | 345 968 791 | 90a1e2d8c749a67d | flac |
+| ixox-flute | Winds | 9 526 829 | e5fb9116de784e16 | flac |
+| greg-sullivan-e-pianos | Piano | 19 250 842 | b6cb93e68f0d67ef | flac |
+| gtownchurch | Percussion | 457 439 813 | 6347d07cd88ddb2f | wav |
+| sonatina-symphonic-orchestra | Strings | 1 377 249 014 | 1791e3a5f8ceb6b7 | flac, wav |
+| akg-r20e-ir | ImpulseResponses | 7 187 061 | a4b08b094c006c1a | wav |
+| mellotron-sfz | Synth | 510 946 413 | 6eb52869300463a9 | wav |
 
 ## Сводная таблица
 
 | Банк | Первоисточник текста лицензии | SPDX | В каталог | Атрибуция |
 |---|---|---|---|---|
 | Greg Sullivan E-Pianos | `sfzinstruments/GregSullivan.E-Pianos` → `LICENSE` (CC Legal Code, Attribution 3.0) | `CC-BY-3.0` | да | да |
-| Sonatina Symphonic Orchestra | `peastman/sso` → `LICENSE`, README | нет в SPDX (CC Sampling Plus 1.0) | нет | да |
+| Sonatina Symphonic Orchestra | `peastman/sso` → `LICENSE`, README | нет в SPDX (CC Sampling Plus 1.0) | да (некоммерческое) | да |
 | Virtual Playing Orchestra 3.2 | `open-soundfonts/Virtual_Playing_Orchestra_3` → `LICENSE` (GPL-3.0), `Documentation/license.htm` | `GPL-3.0` + части `CC-BY-SA` | нет | — |
 | GeneralUser GS 2.0.3 | `mrbumpy409/GeneralUser-GS` → `documentation/LICENSE.txt` | нет (собственная «License v2.0») | нет (условно) | не требуется текстом |
 | Maestro Concert Grand | `sfzinstruments/MatsHelgesson.MaestroConcertGrandPiano` → `mcgreadme.txt` | нет (proprietary) | нет | — |
 | Church Steinway | не подтверждено | не подтверждено | нет | не подтверждено |
-| GTownChurch | `sfzinstruments/GTownChurchSamplingProject` → README | нет в SPDX (CC Sampling Plus 1.0) | нет | да |
+| GTownChurch | `sfzinstruments/GTownChurchSamplingProject` → README | нет в SPDX (CC Sampling Plus 1.0) | да (некоммерческое) | да |
 | OrgueEglise | не подтверждено (README и `.sfz` без лицензии) | не подтверждено | нет | не подтверждено |
 | Northern Trumpets | vgtrumpet.com/product/northern-trumpets-sfz/ | коммерческая | нет | — |
 | VCSL | `sgossner/VCSL` → `LICENSE` | `CC0-1.0` | да | нет |
@@ -68,6 +79,8 @@ Code»). Индивидуальные отчёты — `catalog/audit/<bank_id>.
 | Muldjord Kit | `sfzinstruments/DrumGizmo.MuldjordKit` → `LICENSE`, README | `CC-BY-4.0` | да | да |
 | Splendid Grand Piano | `sfzinstruments/SplendidGrandPiano` → README | public domain (SPDX не назначен) | условно | нет |
 | Wavestate Pads | `fdivitto/KorgWavestate-SoundLibrary` → `LICENSE` (CC0); drolez.com: «CC0-1.0» | `CC0-1.0` (источник пака не подтверждён) | условно | нет |
+| AKG R 20 E Spring Reverb IRs | `DomMcsweeney/AKG-R-20-E-Spring-Reverb-Impulse-Responses` → `LICENSE` | `MIT` | да | да |
+| Mellotron-SFZ | `ExistentiaVirae/Mellotron-SFZ` → README (цитата владельца) | нет в SPDX (только некоммерческое) | да (некоммерческое) | да |
 
 ## Подробности и оговорки
 
@@ -78,9 +91,9 @@ URL текстов (все прочитаны):
 - Sonatina: <https://github.com/peastman/sso/blob/master/LICENSE>: «Creative Commons
   Sampling Plus 1.0». README SSO также признаёт, что происхождение части
   старых сэмплов неизвестно. Sampling Plus разрешает копирование всего
-  произведения только для некоммерческих целей → по смыслу NC (класс
-  «Только некоммерческое»), но Sampling Plus не является стандартной
-  share-alike/GPL-лицензией и не отсекается автоматически; **отклонить вручную**.
+  произведения только для некоммерческих целей → класс «Только
+  некоммерческое». **Включён** по решению владельца (некоммерческое,
+  предупреждение перед установкой).
 - VPO 3.2: проверен клон `open-soundfonts/Virtual_Playing_Orchestra_3`
   (`LICENSE` = GPL-3.0; `Documentation/license.htm` перечисляет CC-BY-SA 3.0/4.0
   для Philharmonia, No Budget Orchestra и др.). Первоисточник
@@ -96,7 +109,8 @@ URL текстов (все прочитаны):
   `sfzinstruments.github.io` поле `license` отсутствует. Не подтверждено.
 - GTownChurch: README, раздел License: Creative Commons Sampling Plus 1.0
   (<https://creativecommons.org/licenses/sampling+/1.0/>), распространение
-  только некоммерческое → отклонить.
+  только некоммерческое → **включён** как «Только некоммерческое» (решение
+  владельца).
 - OrgueEglise: README и `.sfz` — только «converted by S. Christian Collins»,
   лицензии нет; в `instruments.yml` записи нет. Не подтверждено.
 - Northern Trumpets: на странице продукта цена €16.87 (коммерческая), хотя
@@ -121,8 +135,11 @@ URL текстов (все прочитаны):
 ## Итог по политике каталога
 
 Годятся: Greg Sullivan (CC-BY-3.0), Karoryfer (шесть банков, CC0), Ixox Flute
-и Muldjord Kit (CC-BY-4.0), VSCO-2-CE и VCSL (CC0), FreePats Harp/Timpani/Pipe
-Organ/Synth Pad Choir/Synth Strings (CC0). Условно: Splendid Grand, Wavestate Pads,
-GeneralUser GS. Не годятся: Sonatina, GTownChurch (Sampling Plus), VPO (GPL/SA),
-Maestro (proprietary), Northern Trumpets (коммерческая). Не подтверждены:
+и Muldjord Kit (CC-BY-4.0), VSCO-2-CE и VCSL (CC0), Sonatina и GTownChurch
+(Sampling Plus, некоммерческое), AKG R 20 E IRs (MIT), Mellotron-SFZ
+(некоммерческое, цитата владельца). FreePats Harp/Timpani/Pipe Organ/Synth Pad
+Choir/Synth Strings (CC0) годятся по лицензии, но их архивы `.tar.xz`/`.7z` не
+поддерживаются загрузчиком — **не включены**. Условно: Splendid Grand,
+Wavestate Pads, GeneralUser GS. Не годятся: VPO (GPL/SA), Maestro
+(proprietary), Northern Trumpets (коммерческая). Не подтверждены:
 Church Steinway, OrgueEglise.

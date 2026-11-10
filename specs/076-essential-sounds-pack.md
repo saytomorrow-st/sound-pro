@@ -38,9 +38,21 @@
 (Meatbass, Fashionbass, Sneakybass, Ergo EUB, DSmolken Double Bass), «Струнные»
 (String Cyborgs, Bigcat Cello), «Дерево» (Bear Sax, Weresax), «Барабаны»
 (Virtuosity, Swirly, Unruly, Big Rusty Drums), «Синты/пэды» (Caveman Cosmonaut,
-Cowsynth) и «Голос» (272 Merry Orks). Остальные кандидаты (VSCO-2-CE, VCSL,
-FreePats, Greg Sullivan, Ixox Flute, Muldjord Kit) по-прежнему ждут аудита с
-реальным SHA-256.
+Cowsynth) и «Голос» (272 Merry Orks).
+
+Дополнительно (второй заход, 2026-11-09) **подтверждены** реальной загрузкой
+ещё 9 банков: VSCO-2-CE и VCSL (CC0-1.0), Muldjord Kit и Ixox Flute
+(CC-BY-4.0), Greg Sullivan E-Pianos (CC-BY-3.0), Sonatina Symphonic Orchestra и
+GTownChurch (CC Sampling Plus 1.0, «Только некоммерческое» — владелец принял
+решение включать, класс `NonCommercial`), AKG R 20 E Spring Reverb IRs (MIT) и
+Mellotron-SFZ (только некоммерческое, цитата владельца в манифесте). Отчёты —
+`catalog/audit/<bank_id>.md`.
+
+Отклонены: все FreePats (Harp, Timpani, Pipe Organ, Drawbar/Rock/Percussive/
+Church Organ, Synth Pad Choir, Synth Strings, Synthesizer Percussion) —
+архивы `.tar.xz`/`.7z` не поддерживаются загрузчиком (`bank_download`
+распаковывает только `zip`/`tar.bz2`); Salamander Grand — `tar.xz`
+(уже покрыт `salamander-grand-v3`).
 
 ## Поведение
 
@@ -111,12 +123,15 @@ FreePats, Greg Sullivan, Ixox Flute, Muldjord Kit) по-прежнему жду�
 | Арфа | FreePats Concert Harp (из VCSL) | CC0 подтверждена |
 | Тимпани | FreePats Timpani (из VCSL); VSCO-2-CE Percussion | CC0 подтверждена |
 | 808/909 | не найдено; `TicTokMen.Moogdrums1/RetroDrums1`, `OrchestralPercussion` — лицензия не проверялась | не подтверждено |
-| Органы | FreePats Pipe Organ (CC0). GTownChurch — Sampling Plus (не подходит); OrgueEglise — лицензия не найдена | CC0 подтверждена только у FreePats |
+| Органы | FreePats Pipe Organ (CC0) — формат `tar.xz` не поддерживается; OrgueEglise — лицензия не найдена | CC0 подтверждена только у FreePats, но не загружается |
 | Лупы | кандидатов не найдено | не подтверждено |
 | Церковное пианино | Church Steinway (Pianobook) | не подтверждено |
 
-Отклонены по лицензии: Sonatina (Sampling Plus), VPO 3.2 (GPL/SA),
-Maestro (all rights reserved), Northern Trumpets (коммерческая).
+Отклонены по лицензии: VPO 3.2 (GPL/SA), Maestro (all rights reserved),
+Northern Trumpets (коммерческая). Отклонены по формату архива: все FreePats
+(`tar.xz`/`7z`), Salamander Grand (`tar.xz`, уже покрыт `salamander-grand-v3`).
+Sonatina и GTownChurch (CC Sampling Plus 1.0) включены как «Только
+некоммерческое» по решению владельца.
 
 ## Граничные случаи
 
