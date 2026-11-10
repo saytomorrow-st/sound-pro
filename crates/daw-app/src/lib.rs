@@ -34,6 +34,8 @@ pub mod bank_cache;
 pub mod bank_download;
 pub mod bank_integrity;
 pub mod bank_library;
+pub mod download_queue;
+pub mod essential_sounds;
 pub mod instrument;
 pub mod logging;
 pub mod meminfo;
