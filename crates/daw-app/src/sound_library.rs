@@ -517,10 +517,10 @@ mod tests {
         assert_eq!(packs.children.len(), 23);
         assert!(packs.children.iter().all(|c| c.bank.is_none()));
 
-        // Drum Kit has four catalog bank leaves plus two subgroups
+        // Drum Kit has five catalog bank leaves plus two subgroups
         // (Стерео-ударные, Многоканальные ударные) that nest further.
         let drums = lib.find("drum-kit").expect("drum-kit group");
-        assert_eq!(drums.children.len(), 6);
+        assert_eq!(drums.children.len(), 7);
         assert!(drums.children.iter().any(|c| c.id == "virtuosity-drums"));
         assert!(drums.children.iter().any(|c| c.id == "swirly-drums"));
         let stereo = drums
@@ -538,13 +538,15 @@ mod tests {
     fn piano_group_pulls_catalog_banks_as_children() {
         let lib = library();
         let piano = lib.find("piano").expect("piano group");
-        assert_eq!(piano.children.len(), 2);
+        assert_eq!(piano.children.len(), 3);
         assert_eq!(piano.children[0].id, "salamander-grand-v3");
         assert_eq!(piano.children[1].id, "osiris-piano");
+        assert_eq!(piano.children[2].id, "greg-sullivan-e-pianos");
         assert!(piano.children[0].is_leaf());
         // Real sizes come from the catalog.
         assert!(piano.children[0].download_bytes > 0);
         assert!(piano.children[1].download_bytes > 0);
+        assert!(piano.children[2].download_bytes > 0);
     }
 
     #[test]
@@ -596,23 +598,28 @@ mod tests {
         let mut lib = library();
         let salamander = lib.find("salamander-grand-v3").unwrap().download_bytes;
         let osiris = lib.find("osiris-piano").unwrap().download_bytes;
+        let greg_sullivan = lib
+            .find("greg-sullivan-e-pianos")
+            .unwrap()
+            .download_bytes;
         assert_eq!(lib.download_bytes(), 0);
 
         lib.toggle("salamander-grand-v3");
         assert_eq!(lib.download_bytes(), salamander);
         assert_eq!(lib.installed_bytes(), salamander);
 
-        // Selecting the group equals selecting both leaves; no double count.
+        // Selecting the group equals selecting all three leaves; no double
+        // count.
         lib.toggle("piano"); // now Checked
-        assert_eq!(lib.download_bytes(), salamander + osiris);
-        assert_eq!(lib.installed_bytes(), salamander + osiris);
+        assert_eq!(lib.download_bytes(), salamander + osiris + greg_sullivan);
+        assert_eq!(lib.installed_bytes(), salamander + osiris + greg_sullivan);
     }
 
     #[test]
     fn select_all_uninstalled_picks_only_real_uninstalled_leaves() {
         let mut lib = library();
         let added = lib.select_all_uninstalled();
-        assert_eq!(added, 21); // all catalog banks are uninstalled leaves
+        assert_eq!(added, 30); // all catalog banks are uninstalled leaves
         assert!(lib.is_selected("salamander-grand-v3"));
         assert!(lib.is_selected("osiris-piano"));
         assert!(lib.is_selected("virtuosity-drums"));
@@ -623,7 +630,7 @@ mod tests {
     fn select_all_uninstalled_skips_installed() {
         let mut lib = SoundLibrary::new(["salamander-grand-v3".to_owned()]).expect("library");
         let added = lib.select_all_uninstalled();
-        assert_eq!(added, 20); // all but the already-installed salamander
+        assert_eq!(added, 29); // all but the already-installed salamander
         assert!(!lib.is_selected("salamander-grand-v3"));
         assert!(lib.is_selected("osiris-piano"));
     }
@@ -648,7 +655,7 @@ mod tests {
         let mut lib = library();
         let _ = lib.select_all_uninstalled();
         let banks = lib.selected_downloadable_banks();
-        assert_eq!(banks.len(), 21);
+        assert_eq!(banks.len(), 30);
         assert!(banks.iter().all(bank_library::is_downloadable));
     }
 
@@ -677,10 +684,10 @@ mod tests {
     }
 
     #[test]
-    fn selected_has_non_commercial_is_false_without_nc_banks() {
+    fn selected_has_non_commercial_detects_nc_banks() {
         let mut lib = library();
         let _ = lib.select_all_uninstalled();
-        // The current catalog has no NC banks.
-        assert!(!lib.selected_has_non_commercial());
+        // The catalog now includes non-commercial (Sampling Plus / NC) banks.
+        assert!(lib.selected_has_non_commercial());
     }
 }

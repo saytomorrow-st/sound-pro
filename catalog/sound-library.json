@@ -230,7 +230,8 @@
         "virtuosity-drums",
         "swirly-drums",
         "unruly-drums",
-        "big-rusty-drums"
+        "big-rusty-drums",
+        "muldjord-kit"
       ],
       "sub": [
         {
@@ -357,7 +358,10 @@
           "title": "Струнные",
           "banks": [
             "string-cyborgs",
-            "bigcat-cello"
+            "bigcat-cello",
+            "vsco-2-ce",
+            "vcsl",
+            "sonatina-symphonic-orchestra"
           ]
         },
         {
@@ -365,21 +369,26 @@
           "title": "Деревянные духовые",
           "banks": [
             "bear-sax",
-            "weresax"
+            "weresax",
+            "ixox-flute"
           ]
         }
       ]
     },
     {
       "id": "percussion",
-      "title": "Перкуссия"
+      "title": "Перкуссия",
+      "banks": [
+        "gtownchurch"
+      ]
     },
     {
       "id": "piano",
       "title": "Фортепиано",
       "banks": [
         "salamander-grand-v3",
-        "osiris-piano"
+        "osiris-piano",
+        "greg-sullivan-e-pianos"
       ]
     },
     {
@@ -392,7 +401,10 @@
     },
     {
       "id": "vintage-mellotron",
-      "title": "Винтажный меллотрон"
+      "title": "Винтажный меллотрон",
+      "banks": [
+        "mellotron-sfz"
+      ]
     },
     {
       "id": "world",
@@ -511,7 +523,10 @@
       "sub": [
         {
           "id": "stereoirs",
-          "title": "Стерео"
+          "title": "Стерео",
+          "banks": [
+            "akg-r20e-ir"
+          ]
         },
         {
           "id": "surroundirs",

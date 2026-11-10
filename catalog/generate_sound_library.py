@@ -164,7 +164,7 @@ SUB_TITLES = {
 }
 
 # Sound Pro bank ids attached to the piano group (from our own bank catalog).
-PIANO_BANKS = ["salamander-grand-v3", "osiris-piano"]
+PIANO_BANKS = ["salamander-grand-v3", "osiris-piano", "greg-sullivan-e-pianos"]
 
 # Sound Pro bank ids attached to other groups (from our own bank catalog).
 # Keyed by Sound Pro group id; banks become the group's leaf children with
@@ -182,6 +182,7 @@ GROUP_BANKS = {
         "swirly-drums",
         "unruly-drums",
         "big-rusty-drums",
+        "muldjord-kit",
     ],
     "guitar": [
         "shinyguitar",
@@ -192,16 +193,29 @@ GROUP_BANKS = {
         "caveman-cosmonaut",
         "cowsynth",
     ],
+    "percussion": [
+        "gtownchurch",
+    ],
     "instrumentsorchestralstrings": [
         "string-cyborgs",
         "bigcat-cello",
+        "vsco-2-ce",
+        "vcsl",
+        "sonatina-symphonic-orchestra",
     ],
     "instrumentsorchestralwoodwinds": [
         "bear-sax",
         "weresax",
+        "ixox-flute",
     ],
     "instrumentsworldvoice": [
         "merry-orks",
+    ],
+    "vintage-mellotron": [
+        "mellotron-sfz",
+    ],
+    "stereoirs": [
+        "akg-r20e-ir",
     ],
 }
 
@@ -238,6 +252,8 @@ def main():
             node["installed"] = True
         if sp_id == "piano":
             node["banks"] = PIANO_BANKS
+        elif sp_id in GROUP_BANKS:
+            node["banks"] = GROUP_BANKS[sp_id]
         subs = g.get("sub", [])
         if subs:
             node["sub"] = [build_node(s) for s in subs]
